@@ -1,4 +1,5 @@
 import {
+  Activity,
   Bot,
   CheckCircle2,
   Circle,
@@ -15,12 +16,13 @@ import {
   Search,
   Square,
   Terminal,
-  UserCircle2
+  UserCircle2,
+  X
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
 
-type View = "tasks" | "agents" | "projects" | "connectors";
+type View = "tasks" | "agents" | "projects" | "connectors" | "runs";
 
 interface User {
   id: string;
@@ -42,6 +44,7 @@ interface Project {
 
 interface Agent {
   id: string;
+  kind: "worker" | "dispatcher";
   name: string;
   description: string;
   model: string;
@@ -66,8 +69,10 @@ interface Task {
   agent_id: string;
   project_name: string;
   agent_name: string;
+  agent_kind: "worker" | "dispatcher";
   latest_run_status?: string | null;
   latest_run_id?: string | null;
+  has_runs?: boolean;
   open_pr_on_success: boolean;
   updated_at?: string;
   created_at?: string;
@@ -92,6 +97,24 @@ interface RunEvent {
 interface Run {
   id: string;
   status: string;
+  kind?: "worker" | "dispatcher";
+}
+
+interface AgentRun {
+  id: string;
+  kind: "worker" | "dispatcher";
+  trigger: string;
+  status: string;
+  model: string;
+  task_id?: string | null;
+  task_number?: number | null;
+  task_title?: string | null;
+  project_name?: string | null;
+  agent_name: string;
+  queued_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+  error?: string | null;
 }
 
 const BOARD_COLUMNS = [
@@ -111,6 +134,9 @@ export function App() {
   const [defaultModel, setDefaultModel] = useState("gpt-5.5");
   const [tasks, setTasks] = useState<Task[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
+  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
+  const [selectedRun, setSelectedRun] = useState<AgentRun | null>(null);
+  const [agentRunEvents, setAgentRunEvents] = useState<RunEvent[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [query, setQuery] = useState("");
@@ -118,7 +144,7 @@ export function App() {
   const [message, setMessage] = useState<string | null>(null);
 
   const selectedTask = useMemo(
-    () => tasks.find((task) => task.id === selectedTaskId) ?? tasks[0],
+    () => (selectedTaskId ? tasks.find((task) => task.id === selectedTaskId) : undefined),
     [selectedTaskId, tasks]
   );
 
@@ -132,6 +158,26 @@ export function App() {
         .includes(needle)
     );
   }, [query, tasks]);
+
+  const filteredRuns = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return agentRuns;
+    return agentRuns.filter((run) =>
+      [
+        run.kind,
+        run.trigger,
+        run.status,
+        run.model,
+        run.agent_name,
+        run.project_name ?? "",
+        run.task_title ?? "",
+        run.task_number ? `TASK-${run.task_number}` : ""
+      ]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle)
+    );
+  }, [agentRuns, query]);
 
   useEffect(() => {
     void boot();
@@ -166,6 +212,14 @@ export function App() {
     return () => source.close();
   }, [selectedTask?.latest_run_id, selectedTask?.latest_run_status]);
 
+  useEffect(() => {
+    if (!selectedRun) {
+      setAgentRunEvents([]);
+      return;
+    }
+    void loadAgentRunEvents(selectedRun);
+  }, [selectedRun?.id, selectedRun?.kind]);
+
   async function boot() {
     const status = await api<{ hasAdmin: boolean }>("/api/onboarding/status");
     setHasAdmin(status.hasAdmin);
@@ -174,7 +228,14 @@ export function App() {
   }
 
   async function reloadAll() {
-    await Promise.all([reloadProjects(), reloadAgents(), reloadTasks(), reloadModels(), reloadRepos(false)]);
+    await Promise.all([
+      reloadProjects(),
+      reloadAgents(),
+      reloadTasks(),
+      reloadModels(),
+      reloadAgentRuns(),
+      reloadRepos(false)
+    ]);
   }
 
   async function reloadProjects() {
@@ -196,7 +257,17 @@ export function App() {
   async function reloadTasks() {
     const data = await api<{ tasks: Task[] }>("/api/tasks");
     setTasks(data.tasks);
-    if (!selectedTaskId && data.tasks[0]) setSelectedTaskId(data.tasks[0].id);
+    if (selectedTaskId && !data.tasks.some((task) => task.id === selectedTaskId)) {
+      setSelectedTaskId(null);
+    }
+  }
+
+  async function reloadAgentRuns() {
+    const data = await api<{ runs: AgentRun[] }>("/api/agent-runs");
+    setAgentRuns(data.runs);
+    if (selectedRun && !data.runs.some((run) => run.id === selectedRun.id && run.kind === selectedRun.kind)) {
+      setSelectedRun(null);
+    }
   }
 
   async function reloadRepos(refresh: boolean) {
@@ -212,13 +283,20 @@ export function App() {
     setEvents(data.events);
   }
 
+  async function loadAgentRunEvents(run: AgentRun) {
+    const data = await api<{ events: RunEvent[] }>(`/api/agent-runs/${run.kind}/${run.id}/events`);
+    setAgentRunEvents(data.events);
+  }
+
   async function runTask(task: Task) {
     setBusyRunId(task.id);
     try {
-      const data = await api<{ run: Run }>(`/api/tasks/${task.id}/runs`, { method: "POST" });
-      setMessage(`Run queued: ${shortId(data.run.id)}`);
+      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(`/api/tasks/${task.id}/runs`, {
+        method: "POST"
+      });
+      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Run"} queued: ${shortId(data.run.id)}`);
       setSelectedTaskId(task.id);
-      await reloadTasks();
+      await Promise.all([reloadTasks(), reloadAgentRuns()]);
     } finally {
       setBusyRunId(null);
     }
@@ -243,6 +321,7 @@ export function App() {
 
         <nav className="nav-list">
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
+          <NavButton icon={<Activity />} label="Agent Runs" active={view === "runs"} onClick={() => setView("runs")} />
           <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
@@ -294,18 +373,30 @@ export function App() {
             events={events}
             busyRunId={busyRunId}
             onCreate={async (payload) => {
-              const data = await api<{ task: Task }>("/api/tasks", {
+              await api<{ task: Task }>("/api/tasks", {
                 method: "POST",
                 body: JSON.stringify(payload)
               });
-              setSelectedTaskId(data.task.id);
               await reloadTasks();
             }}
             onSelect={setSelectedTaskId}
+            onClose={() => setSelectedTaskId(null)}
             onRun={runTask}
             onCancel={async (runId) => {
               await api(`/api/runs/${runId}/cancel`, { method: "POST" });
-              await reloadTasks();
+              await Promise.all([reloadTasks(), reloadAgentRuns()]);
+            }}
+          />
+        ) : null}
+
+        {view === "runs" ? (
+          <AgentRunsView
+            runs={filteredRuns}
+            selectedRun={selectedRun}
+            events={agentRunEvents}
+            onSelect={(run) => {
+              setSelectedRun(run);
+              void loadAgentRunEvents(run);
             }}
           />
         ) : null}
@@ -344,11 +435,12 @@ function TasksView(props: {
   busyRunId: string | null;
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
   onSelect: (id: string) => void;
+  onClose: () => void;
   onRun: (task: Task) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
 }) {
   return (
-    <div className="tasks-page">
+    <div className={`tasks-page ${props.selectedTask ? "has-detail" : ""}`}>
       <section className="task-create">
         <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
       </section>
@@ -382,13 +474,16 @@ function TasksView(props: {
           );
         })}
       </section>
-      <TaskDetail
-        task={props.selectedTask}
-        events={props.events}
-        busyRunId={props.busyRunId}
-        onRun={props.onRun}
-        onCancel={props.onCancel}
-      />
+      {props.selectedTask ? (
+        <TaskDetail
+          task={props.selectedTask}
+          events={props.events}
+          busyRunId={props.busyRunId}
+          onClose={props.onClose}
+          onRun={props.onRun}
+          onCancel={props.onCancel}
+        />
+      ) : null}
     </div>
   );
 }
@@ -401,21 +496,27 @@ function TaskForm(props: {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [projectId, setProjectId] = useState("");
-  const [agentId, setAgentId] = useState("");
+  const [agentId, setAgentId] = useState("auto");
+  const workerAgents = props.agents.filter((agent) => agent.kind !== "dispatcher");
 
   useEffect(() => {
     if (!projectId && props.projects[0]) setProjectId(props.projects[0].id);
-    if (!agentId && props.agents[0]) setAgentId(props.agents[0].id);
-  }, [props.projects, props.agents, projectId, agentId]);
+  }, [props.projects, projectId]);
 
   return (
     <form
       className="inline-create"
       onSubmit={async (event) => {
         event.preventDefault();
-        await props.onCreate({ title, body, projectId, agentId });
+        await props.onCreate({
+          title,
+          body,
+          projectId,
+          ...(agentId === "auto" ? {} : { agentId })
+        });
         setTitle("");
         setBody("");
+        setAgentId("auto");
       }}
     >
       <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
@@ -428,7 +529,8 @@ function TaskForm(props: {
         ))}
       </select>
       <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
-        {props.agents.map((agent) => (
+        <option value="auto">Auto-route</option>
+        {workerAgents.map((agent) => (
           <option value={agent.id} key={agent.id}>
             {agent.name}
           </option>
@@ -446,6 +548,7 @@ function TaskDetail(props: {
   task?: Task;
   events: RunEvent[];
   busyRunId: string | null;
+  onClose: () => void;
   onRun: (task: Task) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
 }) {
@@ -458,16 +561,21 @@ function TaskDetail(props: {
   }
 
   const active = isActiveRun(props.task.latest_run_status);
-  const hasRun = Boolean(props.task.latest_run_id || props.task.latest_run_status);
+  const hasRun = Boolean(props.task.has_runs || props.task.latest_run_id || props.task.latest_run_status);
   const showRun = !hasRun;
   const showStop = active && Boolean(props.task.latest_run_id);
   return (
     <aside className="detail-panel">
       <div className="detail-top">
-        <div>
-          <span className="task-key">TASK-{props.task.number}</span>
-          <h2>{props.task.title}</h2>
-          <p>{props.task.project_name} / {props.task.agent_name}</p>
+        <div className="detail-title-row">
+          <div>
+            <span className="task-key">TASK-{props.task.number}</span>
+            <h2>{props.task.title}</h2>
+            <p>{props.task.project_name} / {props.task.agent_name}</p>
+          </div>
+          <button className="icon-button" onClick={props.onClose} title="Close task">
+            <X size={15} />
+          </button>
         </div>
         <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
       </div>
@@ -494,6 +602,59 @@ function TaskDetail(props: {
       ) : null}
       <RunTimeline events={props.events} />
     </aside>
+  );
+}
+
+function AgentRunsView(props: {
+  runs: AgentRun[];
+  selectedRun: AgentRun | null;
+  events: RunEvent[];
+  onSelect: (run: AgentRun) => void;
+}) {
+  return (
+    <div className="two-pane runs-view">
+      <section className="panel">
+        <div className="panel-head">
+          <h2>Agent Runs</h2>
+          <small>{props.runs.length}</small>
+        </div>
+        <div className="rows">
+          {props.runs.map((run) => (
+            <button
+              className={`row-card ${props.selectedRun?.id === run.id ? "selected" : ""}`}
+              key={`${run.kind}-${run.id}`}
+              onClick={() => props.onSelect(run)}
+            >
+              {run.kind === "dispatcher" ? <Activity size={16} /> : <Bot size={16} />}
+              <span>
+                <strong>{runTitle(run)}</strong>
+                <small>{run.agent_name} / {run.trigger}</small>
+              </span>
+              <TaskStatus status={run.status} />
+            </button>
+          ))}
+          {props.runs.length === 0 ? <EmptyState text="No agent runs" /> : null}
+        </div>
+      </section>
+      <section className="panel">
+        {props.selectedRun ? (
+          <div className="stack">
+            <div className="detail-top">
+              <span className="task-key">{props.selectedRun.kind}</span>
+              <h2>{runTitle(props.selectedRun)}</h2>
+              <p>
+                {props.selectedRun.agent_name} / {props.selectedRun.model} / {props.selectedRun.trigger}
+              </p>
+              <TaskStatus status={props.selectedRun.status} />
+            </div>
+            {props.selectedRun.error ? <div className="notice">{props.selectedRun.error}</div> : null}
+            <RunTimeline events={props.events} />
+          </div>
+        ) : (
+          <EmptyState text="Select a run" />
+        )}
+      </section>
+    </div>
   );
 }
 
@@ -528,7 +689,7 @@ function AgentsView(props: {
               <Bot size={16} />
               <span>
                 <strong>{agent.name}</strong>
-                <small>{agent.model}</small>
+                <small>{agent.kind} / {agent.model}</small>
               </span>
             </button>
           ))}
@@ -831,6 +992,7 @@ function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: s
 function emptyAgent(defaultModel: string): Agent {
   return {
     id: "",
+    kind: "worker",
     name: "New Agent",
     description: "",
     model: defaultModel,
@@ -846,7 +1008,7 @@ function taskBucket(task: Task): (typeof BOARD_COLUMNS)[number]["id"] {
 function runBucket(status?: string | null): (typeof BOARD_COLUMNS)[number]["id"] {
   if (["queued", "running", "cancel_requested"].includes(status ?? "")) return "running";
   if (["succeeded", "done", "completed"].includes(status ?? "")) return "completed";
-  if (["failed", "cancelled", "canceled"].includes(status ?? "")) return "failed";
+  if (["failed", "cancelled", "canceled", "needs_attention", "blocked"].includes(status ?? "")) return "failed";
   return "open";
 }
 
@@ -856,6 +1018,7 @@ function isActiveRun(status?: string | null): boolean {
 
 function statusLabel(status?: string | null): string {
   if (!status || status === "open") return "Open";
+  if (status === "needs_attention") return "Needs attention";
   if (status === "cancel_requested") return "Stopping";
   return status.replace(/_/g, " ");
 }
@@ -869,10 +1032,18 @@ function eventText(event: RunEvent): string {
 function viewTitle(view: View): string {
   return {
     tasks: "Tasks",
+    runs: "Agent Runs",
     agents: "Agents",
     projects: "Projects",
     connectors: "Connectors"
   }[view];
+}
+
+function runTitle(run: AgentRun): string {
+  if (run.kind === "dispatcher") {
+    return run.task_number ? `Dispatch TASK-${run.task_number}` : "Heartbeat dispatch";
+  }
+  return run.task_number ? `TASK-${run.task_number} ${run.task_title ?? ""}` : "Worker run";
 }
 
 function shortId(id: string): string {

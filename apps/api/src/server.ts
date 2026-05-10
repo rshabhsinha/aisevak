@@ -3,6 +3,7 @@ import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
 import {
   buildCodexPrompt,
+  buildDispatcherPrompt,
   createPool,
   decryptSecret,
   encryptSecret,
@@ -29,6 +30,7 @@ import Fastify, {
   type FastifyRequest
 } from "fastify";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
@@ -265,14 +267,24 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const result = await pool.query(
       `SELECT tasks.*,
               projects.name AS project_name,
-              agents.name AS agent_name,
+              CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
+              agents.kind AS agent_kind,
               latest.status AS latest_run_status,
-              latest.id AS latest_run_id
+              latest.id AS latest_run_id,
+              EXISTS (
+                SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id
+                UNION ALL
+                SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.task_id = tasks.id
+              ) AS has_runs
        FROM tasks
        JOIN projects ON projects.id = tasks.project_id
        JOIN agents ON agents.id = tasks.agent_id
        LEFT JOIN LATERAL (
-         SELECT id, status FROM task_runs WHERE task_runs.task_id = tasks.id ORDER BY created_at DESC LIMIT 1
+         SELECT id, status
+         FROM task_runs
+         WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+         ORDER BY created_at DESC
+         LIMIT 1
        ) latest ON true
        ORDER BY tasks.created_at DESC`
     );
@@ -282,11 +294,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/tasks", async (request) => {
     const user = requireUser(request);
     const body = taskSchema.parse(request.body);
+    const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
     const result = await pool.query(
       `INSERT INTO tasks (title, body, project_id, agent_id, created_by, open_pr_on_success)
        VALUES ($1, $2, $3, $4, $5, $6)
        RETURNING *`,
-      [body.title, body.body ?? "", body.projectId, body.agentId, user.id, body.openPrOnSuccess ?? false]
+      [body.title, body.body ?? "", body.projectId, agentId, user.id, body.openPrOnSuccess ?? false]
     );
     return { task: result.rows[0] };
   });
@@ -322,45 +335,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/tasks/:id/runs", async (request) => {
     requireUser(request);
     const { id: taskId } = idParams.parse(request.params);
-    const taskResult = await pool.query<TaskJoin>(
-      `SELECT tasks.*, projects.local_path, projects.workspace_mode, projects.source, projects.default_branch,
-              agents.name AS agent_name, agents.description AS agent_description,
-              agents.model AS agent_model, agents.instructions AS agent_instructions
-       FROM tasks
-       JOIN projects ON projects.id = tasks.project_id
-       JOIN agents ON agents.id = tasks.agent_id
-       WHERE tasks.id = $1`,
-      [taskId]
-    );
-    const task = mustRow(taskResult.rows[0]);
-
-    await ensureNoDirectProjectRun(pool, task.project_id, task.workspace_mode);
-
-    const branch = task.source === "github" ? taskBranchName(task.number, task.title) : null;
-    const codexHome = managedCodexHome(env.managedRoot, task.id);
-    await mkdir(codexHome, { recursive: true });
-    const prompt = buildCodexPrompt({
-      agentName: task.agent_name,
-      agentInstructions: task.agent_instructions,
-      taskTitle: task.title,
-      taskBody: task.body,
-      projectPath: task.local_path,
-      branch
-    });
-    const agentSnapshot = {
-      name: task.agent_name,
-      description: task.agent_description,
-      model: task.agent_model,
-      instructions: task.agent_instructions
-    };
-    const session = await upsertTaskSession(pool, task.id, codexHome, agentSnapshot);
-    const runResult = await pool.query(
-      `INSERT INTO task_runs (task_id, task_session_id, status, cwd, branch, model, prompt)
-       VALUES ($1, $2, 'queued', $3, $4, $5, $6)
-       RETURNING *`,
-      [task.id, session.id, task.local_path, branch, task.agent_model, prompt]
-    );
-    return { run: runResult.rows[0] };
+    const task = await getTaskJoin(pool, taskId);
+    if (task.agent_kind === "dispatcher") {
+      const run = await queueDispatcherRun(pool, { taskId, trigger: "auto_route" });
+      return { run, kind: "dispatcher" };
+    }
+    const run = await queueWorkerRun(pool, taskId, "manual");
+    return { run, kind: "worker" };
   });
 
   app.post("/api/runs/:id/cancel", async (request) => {
@@ -388,6 +369,141 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     requireUser(request);
     const { id } = idParams.parse(request.params);
     await streamRunEvents(pool, id, reply);
+  });
+
+  app.get("/api/agent-runs", async (request) => {
+    requireUser(request);
+    const result = await pool.query(
+      `SELECT *
+       FROM (
+         SELECT task_runs.id,
+                'worker' AS kind,
+                task_runs.trigger,
+                task_runs.status::text,
+                task_runs.model,
+                task_runs.task_id,
+                tasks.number AS task_number,
+                tasks.title AS task_title,
+                projects.name AS project_name,
+                COALESCE(task_sessions.agent_snapshot->>'name', agents.name) AS agent_name,
+                task_runs.queued_at,
+                task_runs.started_at,
+                task_runs.finished_at,
+                task_runs.error
+         FROM task_runs
+         JOIN tasks ON tasks.id = task_runs.task_id
+         JOIN projects ON projects.id = tasks.project_id
+         JOIN agents ON agents.id = tasks.agent_id
+         JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
+         WHERE task_runs.run_kind = 'worker'
+         UNION ALL
+         SELECT dispatcher_runs.id,
+                'dispatcher' AS kind,
+                dispatcher_runs.trigger,
+                dispatcher_runs.status::text,
+                dispatcher_runs.model,
+                dispatcher_runs.task_id,
+                tasks.number AS task_number,
+                tasks.title AS task_title,
+                projects.name AS project_name,
+                'Dispatcher' AS agent_name,
+                dispatcher_runs.queued_at,
+                dispatcher_runs.started_at,
+                dispatcher_runs.finished_at,
+                dispatcher_runs.error
+         FROM dispatcher_runs
+         LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+         LEFT JOIN projects ON projects.id = tasks.project_id
+       ) runs
+       ORDER BY queued_at DESC
+       LIMIT 200`
+    );
+    return { runs: result.rows };
+  });
+
+  app.get("/api/agent-runs/:kind/:id/events", async (request) => {
+    requireUser(request);
+    const params = runEventsParams.parse(request.params);
+    if (params.kind === "dispatcher") {
+      const result = await pool.query(
+        "SELECT * FROM dispatcher_run_events WHERE dispatcher_run_id = $1 ORDER BY seq ASC",
+        [params.id]
+      );
+      return { events: result.rows };
+    }
+    const result = await pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [
+      params.id
+    ]);
+    return { events: result.rows };
+  });
+
+  app.get("/api/agent-tools/context", async (request) => {
+    await requireAgentTool(pool, request);
+    return getDispatcherContext(pool);
+  });
+
+  app.post("/api/agent-tools/tasks", async (request) => {
+    const context = await requireAgentTool(pool, request);
+    const body = agentToolCreateTaskSchema.parse(request.body);
+    const projectId = body.projectId ?? context.taskProjectId ?? (await getFirstProjectId(pool));
+    const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
+    const result = await pool.query(
+      `INSERT INTO tasks (title, body, status, project_id, agent_id)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [body.title, body.body ?? "", body.status ?? "open", projectId, agentId]
+    );
+    return { task: result.rows[0] };
+  });
+
+  app.patch("/api/agent-tools/tasks/:key", async (request) => {
+    await requireAgentTool(pool, request);
+    const { key } = taskKeyParams.parse(request.params);
+    const task = await getTaskByKey(pool, key);
+    const body = agentToolPatchTaskSchema.parse(request.body);
+    const result = await pool.query(
+      `UPDATE tasks
+       SET title = COALESCE($2, title),
+           body = COALESCE($3, body),
+           status = COALESCE($4, status),
+           agent_id = COALESCE($5, agent_id),
+           updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [task.id, body.title ?? null, body.body ?? null, body.status ?? null, body.agentId ?? null]
+    );
+    return { task: mustRow(result.rows[0]) };
+  });
+
+  app.post("/api/agent-tools/tasks/:key/comment", async (request) => {
+    await requireAgentTool(pool, request);
+    const { key } = taskKeyParams.parse(request.params);
+    const task = await getTaskByKey(pool, key);
+    const body = agentToolCommentSchema.parse(request.body);
+    const result = await pool.query(
+      `INSERT INTO task_comments (task_id, body)
+       VALUES ($1, $2)
+       RETURNING *`,
+      [task.id, body.body]
+    );
+    return { comment: result.rows[0] };
+  });
+
+  app.post("/api/agent-tools/tasks/:key/assign-run", async (request) => {
+    const context = await requireAgentTool(pool, request);
+    if (context.role !== "dispatcher") {
+      throw app.httpErrors.forbidden("Only Dispatcher can start worker runs");
+    }
+    const { key } = taskKeyParams.parse(request.params);
+    const task = await getTaskByKey(pool, key);
+    const body = agentToolAssignSchema.parse(request.body);
+    const agent = await getWorkerAgentByIdentifier(pool, body.agent);
+    await pool.query("UPDATE tasks SET agent_id = $2, status = 'open', updated_at = now() WHERE id = $1", [
+      task.id,
+      agent.id
+    ]);
+    const run = body.run ? await queueWorkerRun(pool, task.id, "agent_tool") : null;
+    return { taskId: task.id, agent, run };
   });
 
   app.post("/api/github/app-manifest/start", async (request) => {
@@ -536,6 +652,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 }
 
 const idParams = z.object({ id: z.string().uuid() });
+const taskKeyParams = z.object({ key: z.string().min(1) });
+const runEventsParams = z.object({
+  kind: z.enum(["worker", "dispatcher"]),
+  id: z.string().uuid()
+});
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
 const onboardingSchema = loginSchema.extend({
   name: z.string().min(1),
@@ -569,11 +690,29 @@ const taskSchema = z.object({
   title: z.string().min(1),
   body: z.string().optional(),
   projectId: z.string().uuid(),
-  agentId: z.string().uuid(),
+  agentId: z.string().uuid().optional(),
   openPrOnSuccess: z.boolean().optional()
 });
 const taskPatchSchema = taskSchema.partial().extend({
   status: z.string().optional()
+});
+const agentToolCreateTaskSchema = z.object({
+  title: z.string().min(1),
+  body: z.string().optional(),
+  status: z.string().optional(),
+  projectId: z.string().uuid().optional(),
+  agentId: z.string().uuid().optional()
+});
+const agentToolPatchTaskSchema = z.object({
+  title: z.string().min(1).optional(),
+  body: z.string().optional(),
+  status: z.string().optional(),
+  agentId: z.string().uuid().optional()
+});
+const agentToolCommentSchema = z.object({ body: z.string().min(1) });
+const agentToolAssignSchema = z.object({
+  agent: z.string().min(1),
+  run: z.boolean().optional()
 });
 const githubManifestSchema = z.object({ name: z.string().optional() });
 const githubCallbackSchema = z.object({
@@ -605,6 +744,7 @@ interface TaskJoin {
   body: string;
   project_id: string;
   agent_id: string;
+  agent_kind: "worker" | "dispatcher";
   source: "local_path" | "github";
   local_path: string;
   workspace_mode: "direct" | "git_worktree";
@@ -613,6 +753,12 @@ interface TaskJoin {
   agent_description: string;
   agent_model: string;
   agent_instructions: string;
+}
+
+interface AgentToolContext {
+  role: "worker" | "dispatcher";
+  taskId: string | null;
+  taskProjectId: string | null;
 }
 
 function requireUser(request: FastifyRequest): AuthUser {
@@ -665,12 +811,21 @@ async function createSession(pool: DbPool, reply: FastifyReply, user: AuthUser):
 async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> {
   const defaults = [
     {
+      kind: "dispatcher",
+      name: "Dispatcher",
+      description: "Routes Todo and Needs attention tasks to the right worker agent.",
+      instructions:
+        "You are the Aisevak Dispatcher. Review the task board, assign work to enabled worker agents, start worker runs with the aisevak CLI, and move ambiguous or blocked work to Needs attention with a precise comment."
+    },
+    {
+      kind: "worker",
       name: "Builder",
       description: "Implements tasks end to end, runs checks, and leaves a concise summary.",
       instructions:
         "You are a senior product engineer. Make the requested change, keep edits scoped, run relevant verification, and summarize the result."
     },
     {
+      kind: "worker",
       name: "Reviewer",
       description: "Reviews code for regressions, missing tests, and risky behavior.",
       instructions:
@@ -680,10 +835,10 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
 
   for (const agent of defaults) {
     const result = await pool.query(
-      `INSERT INTO agents (name, description, model, instructions, enabled)
-       VALUES ($1, $2, $3, $4, true)
+      `INSERT INTO agents (kind, name, description, model, instructions, enabled)
+       VALUES ($1, $2, $3, $4, $5, true)
        RETURNING *`,
-      [agent.name, agent.description, env.codexDefaultModel, agent.instructions]
+      [agent.kind, agent.name, agent.description, env.codexDefaultModel, agent.instructions]
     );
     await insertAgentVersion(pool, mustRow(result.rows[0]), userId);
   }
@@ -695,6 +850,93 @@ async function insertAgentVersion(pool: DbPool, agent: Record<string, unknown>, 
      VALUES ($1, $2, $3, $4, $5, $6)`,
     [agent.id, agent.name, agent.description, agent.model, agent.instructions, userId]
   );
+}
+
+async function getTaskJoin(pool: DbPool, taskId: string): Promise<TaskJoin> {
+  const taskResult = await pool.query<TaskJoin>(
+    `SELECT tasks.*, projects.local_path, projects.workspace_mode, projects.source, projects.default_branch,
+            agents.kind AS agent_kind,
+            agents.name AS agent_name, agents.description AS agent_description,
+            agents.model AS agent_model, agents.instructions AS agent_instructions
+     FROM tasks
+     JOIN projects ON projects.id = tasks.project_id
+     JOIN agents ON agents.id = tasks.agent_id
+     WHERE tasks.id = $1`,
+    [taskId]
+  );
+  return mustRow(taskResult.rows[0]);
+}
+
+async function queueWorkerRun(
+  pool: DbPool,
+  taskId: string,
+  trigger: "manual" | "agent_tool"
+): Promise<Record<string, unknown>> {
+  const task = await getTaskJoin(pool, taskId);
+  if (task.agent_kind === "dispatcher") {
+    throw new Error("Auto-route tasks must be dispatched before a worker run can start");
+  }
+  await ensureNoDirectProjectRun(pool, task.project_id, task.workspace_mode);
+
+  const branch = task.source === "github" ? taskBranchName(task.number, task.title) : null;
+  const codexHome = managedCodexHome(env.managedRoot, task.id);
+  await mkdir(codexHome, { recursive: true });
+  const prompt = buildCodexPrompt({
+    agentName: task.agent_name,
+    agentInstructions: task.agent_instructions,
+    taskTitle: task.title,
+    taskBody: task.body,
+    projectPath: task.local_path,
+    branch
+  });
+  const agentSnapshot = {
+    name: task.agent_name,
+    description: task.agent_description,
+    model: task.agent_model,
+    instructions: task.agent_instructions
+  };
+  const session = await upsertTaskSession(pool, task.id, codexHome, agentSnapshot);
+  const runResult = await pool.query(
+    `INSERT INTO task_runs (task_id, task_session_id, run_kind, trigger, status, cwd, branch, model, prompt)
+     VALUES ($1, $2, 'worker', $3, 'queued', $4, $5, $6, $7)
+     RETURNING *`,
+    [task.id, session.id, trigger, task.local_path, branch, task.agent_model, prompt]
+  );
+  return mustRow(runResult.rows[0]);
+}
+
+async function queueDispatcherRun(
+  pool: DbPool,
+  options: { taskId?: string | null; trigger: "heartbeat" | "auto_route" }
+): Promise<Record<string, unknown>> {
+  const dispatcher = await getDispatcherAgent(pool);
+  const context = await getDispatcherContext(pool);
+  const targetTask = options.taskId ? context.tasks.find((task) => task.id === options.taskId) : null;
+  const targetTaskNumber = typeof targetTask?.number === "number" ? targetTask.number : null;
+  const codexHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
+  await mkdir(codexHome, { recursive: true });
+  const prompt = buildDispatcherPrompt({
+    dispatcherInstructions: dispatcher.instructions,
+    targetTaskNumber,
+    tasksJson: JSON.stringify(context.tasks, null, 2),
+    agentsJson: JSON.stringify(context.agents, null, 2),
+    projectsJson: JSON.stringify(context.projects, null, 2)
+  });
+  const result = await pool.query(
+    `INSERT INTO dispatcher_runs (task_id, trigger, scope, status, cwd, codex_home, model, prompt)
+     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
+     RETURNING *`,
+    [
+      options.taskId ?? null,
+      options.trigger,
+      options.taskId ? "task" : "heartbeat",
+      env.managedRoot,
+      codexHome,
+      dispatcher.model,
+      prompt
+    ]
+  );
+  return mustRow(result.rows[0]);
 }
 
 async function upsertTaskSession(
@@ -724,12 +966,145 @@ async function ensureNoDirectProjectRun(
     `SELECT count(*)
      FROM task_runs
      JOIN tasks ON tasks.id = task_runs.task_id
-     WHERE tasks.project_id = $1 AND task_runs.status IN ('queued', 'running', 'cancel_requested')`,
+     WHERE tasks.project_id = $1
+       AND task_runs.run_kind = 'worker'
+       AND task_runs.status IN ('queued', 'running', 'cancel_requested')`,
     [projectId]
   );
   if (Number(active.rows[0]?.count ?? 0) > 0) {
     throw new Error("This direct-mode project already has an active run");
   }
+}
+
+async function getDispatcherAgent(pool: DbPool): Promise<{
+  id: string;
+  model: string;
+  instructions: string;
+}> {
+  const result = await pool.query<{ id: string; model: string; instructions: string }>(
+    "SELECT id, model, instructions FROM agents WHERE kind = 'dispatcher' AND enabled = true ORDER BY created_at ASC LIMIT 1"
+  );
+  return mustRow(result.rows[0]);
+}
+
+async function getWorkerAgentByIdentifier(pool: DbPool, identifier: string): Promise<{
+  id: string;
+  name: string;
+  model: string;
+}> {
+  const normalized = identifier.trim();
+  const result = await pool.query<{ id: string; name: string; model: string }>(
+    `SELECT id, name, model
+     FROM agents
+     WHERE kind = 'worker'
+       AND enabled = true
+       AND (id::text = $1 OR lower(name) = lower($1))
+     ORDER BY created_at ASC
+     LIMIT 1`,
+    [normalized]
+  );
+  return mustRow(result.rows[0]);
+}
+
+async function getDispatcherContext(pool: DbPool): Promise<{
+  tasks: Array<Record<string, unknown>>;
+  agents: Array<Record<string, unknown>>;
+  projects: Array<Record<string, unknown>>;
+}> {
+  const tasks = await pool.query(
+    `SELECT tasks.id,
+            tasks.number,
+            tasks.title,
+            tasks.body,
+            tasks.status,
+            tasks.project_id,
+            projects.name AS project_name,
+            CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
+            agents.kind AS agent_kind,
+            latest.status AS latest_worker_status,
+            latest.id AS latest_worker_run_id
+     FROM tasks
+     JOIN projects ON projects.id = tasks.project_id
+     JOIN agents ON agents.id = tasks.agent_id
+     LEFT JOIN LATERAL (
+       SELECT id, status
+       FROM task_runs
+       WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+       ORDER BY created_at DESC
+       LIMIT 1
+     ) latest ON true
+     WHERE latest.status IN ('queued', 'running', 'cancel_requested', 'failed')
+        OR tasks.status IN ('needs_attention', 'blocked')
+        OR (
+          tasks.status = 'open'
+          AND COALESCE(latest.status::text, '') NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
+        )
+     ORDER BY tasks.created_at ASC`
+  );
+  const agents = await pool.query(
+    `SELECT id, kind, name, description, model, enabled
+     FROM agents
+     WHERE enabled = true
+     ORDER BY kind ASC, created_at ASC`
+  );
+  const projects = await pool.query(
+    `SELECT id, name, source, local_path, workspace_mode, default_branch
+     FROM projects
+     WHERE active = true
+     ORDER BY created_at ASC`
+  );
+  return { tasks: tasks.rows, agents: agents.rows, projects: projects.rows };
+}
+
+async function requireAgentTool(pool: DbPool, request: FastifyRequest): Promise<AgentToolContext> {
+  const authorization = request.headers.authorization;
+  const token = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
+  if (!token) {
+    const error = new Error("Agent tool token required") as Error & { statusCode: number };
+    error.statusCode = 401;
+    throw error;
+  }
+  const result = await pool.query<{
+    role: "worker" | "dispatcher";
+    task_id: string | null;
+    task_project_id: string | null;
+  }>(
+    `SELECT agent_tool_tokens.role,
+            agent_tool_tokens.task_id,
+            tasks.project_id AS task_project_id
+     FROM agent_tool_tokens
+     LEFT JOIN tasks ON tasks.id = agent_tool_tokens.task_id
+     WHERE agent_tool_tokens.token_hash = $1
+       AND agent_tool_tokens.expires_at > now()
+     LIMIT 1`,
+    [hashToken(token)]
+  );
+  const row = result.rows[0];
+  if (!row) {
+    const error = new Error("Invalid agent tool token") as Error & { statusCode: number };
+    error.statusCode = 401;
+    throw error;
+  }
+  return { role: row.role, taskId: row.task_id, taskProjectId: row.task_project_id };
+}
+
+async function getFirstProjectId(pool: DbPool): Promise<string> {
+  const result = await pool.query<{ id: string }>(
+    "SELECT id FROM projects WHERE active = true ORDER BY created_at ASC LIMIT 1"
+  );
+  return mustRow(result.rows[0]).id;
+}
+
+async function getTaskByKey(pool: DbPool, key: string): Promise<{ id: string; number: number }> {
+  const numberMatch = key.match(/^(?:TASK-)?(\d+)$/i);
+  const result = numberMatch
+    ? await pool.query<{ id: string; number: number }>("SELECT id, number FROM tasks WHERE number = $1", [
+        Number(numberMatch[1])
+      ])
+    : await pool.query<{ id: string; number: number }>("SELECT id, number FROM tasks WHERE id = $1", [
+        key
+      ]);
+  return mustRow(result.rows[0]);
 }
 
 async function upsertSecret(pool: DbPool, name: string, value: string): Promise<string> {

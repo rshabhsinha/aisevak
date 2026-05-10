@@ -100,6 +100,7 @@ export const projects = pgTable("projects", {
 
 export const agents = pgTable("agents", {
   id,
+  kind: text("kind").notNull().default("worker"),
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
   model: text("model").notNull().default("gpt-5.5"),
@@ -167,6 +168,9 @@ export const taskRuns = pgTable("task_runs", {
   taskSessionId: uuid("task_session_id").notNull().references(() => taskSessions.id, {
     onDelete: "cascade"
   }),
+  runKind: text("run_kind").notNull().default("worker"),
+  trigger: text("trigger").notNull().default("manual"),
+  parentRunId: uuid("parent_run_id"),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   branch: text("branch"),
@@ -185,6 +189,40 @@ export const taskRuns = pgTable("task_runs", {
   updatedAt
 });
 
+export const dispatcherRuns = pgTable("dispatcher_runs", {
+  id,
+  taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+  trigger: text("trigger").notNull().default("heartbeat"),
+  scope: text("scope").notNull().default("heartbeat"),
+  status: runStatusEnum("status").notNull().default("queued"),
+  cwd: text("cwd").notNull(),
+  codexHome: text("codex_home").notNull(),
+  codexThreadId: text("codex_thread_id"),
+  model: text("model").notNull(),
+  prompt: text("prompt").notNull(),
+  rawStdout: text("raw_stdout").notNull().default(""),
+  rawStderr: text("raw_stderr").notNull().default(""),
+  exitCode: integer("exit_code"),
+  error: text("error"),
+  queuedAt: timestamp("queued_at", { withTimezone: true }).notNull().defaultNow(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  createdAt,
+  updatedAt
+});
+
+export const dispatcherRunEvents = pgTable("dispatcher_run_events", {
+  id,
+  dispatcherRunId: uuid("dispatcher_run_id").notNull().references(() => dispatcherRuns.id, {
+    onDelete: "cascade"
+  }),
+  seq: integer("seq").notNull(),
+  eventType: text("event_type").notNull(),
+  text: text("text"),
+  payload: jsonb("payload").notNull(),
+  createdAt
+});
+
 export const runEvents = pgTable("run_events", {
   id,
   runId: uuid("run_id").notNull().references(() => taskRuns.id, { onDelete: "cascade" }),
@@ -194,6 +232,25 @@ export const runEvents = pgTable("run_events", {
   payload: jsonb("payload").notNull(),
   createdAt
 });
+
+export const agentToolTokens = pgTable(
+  "agent_tool_tokens",
+  {
+    id,
+    tokenHash: text("token_hash").notNull(),
+    taskRunId: uuid("task_run_id").references(() => taskRuns.id, { onDelete: "cascade" }),
+    dispatcherRunId: uuid("dispatcher_run_id").references(() => dispatcherRuns.id, {
+      onDelete: "cascade"
+    }),
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    role: text("role").notNull().default("worker"),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    createdAt
+  },
+  (table) => ({
+    tokenUnique: uniqueIndex("agent_tool_tokens_token_hash_unique").on(table.tokenHash)
+  })
+);
 
 export const githubConnections = pgTable("github_connections", {
   id,

@@ -1,4 +1,9 @@
-import type { CodexCommandOptions, CodexPromptOptions, NormalizedCodexEvent } from "./types.js";
+import type {
+  CodexCommandOptions,
+  CodexPromptOptions,
+  DispatcherPromptOptions,
+  NormalizedCodexEvent
+} from "./types.js";
 
 export function buildCodexArgs(options: CodexCommandOptions = {}): string[] {
   const args = [
@@ -59,6 +64,44 @@ export function buildCodexPrompt(options: CodexPromptOptions): string {
     options.taskBody?.trim() ? options.taskBody.trim() : "No additional body was provided.",
     "",
     "Work autonomously. Make the required code changes, run appropriate checks, and summarize what changed."
+  ];
+
+  return lines.filter((line): line is string => line !== undefined).join("\n");
+}
+
+export function buildDispatcherPrompt(options: DispatcherPromptOptions): string {
+  const lines = [
+    "# Dispatcher Instructions",
+    "You are Aisevak's Dispatcher agent. Your job is to turn task-board state into the next useful worker runs.",
+    "Treat the following instructions as the controlling system prompt for this dispatcher session.",
+    options.dispatcherInstructions.trim(),
+    "",
+    "# Available Board Tools",
+    "Use the `aisevak` CLI that is already on PATH. Do not write directly to the database.",
+    "- `aisevak context` prints the current task, project, and agent state.",
+    "- `aisevak task assign TASK-123 --agent \"Builder\" --run` assigns a worker and queues that worker run.",
+    "- `aisevak task attention TASK-123 \"reason\"` moves a task to Needs attention with a comment.",
+    "- `aisevak task comment TASK-123 \"note\"` leaves a task comment.",
+    "- `aisevak task create --title \"...\" --body \"...\" --status needs_attention` creates follow-up work.",
+    "",
+    "# Routing Rules",
+    "Only route tasks to enabled worker agents. Do not route tasks to Dispatcher.",
+    "Prefer one clear worker run per task. If a task is ambiguous, move it to Needs attention with a precise reason.",
+    "If a task already has an active worker run, leave it alone.",
+    options.targetTaskNumber
+      ? `This is a user-requested single-task dispatch. Focus on TASK-${options.targetTaskNumber}.`
+      : "This is a heartbeat dispatch. Review Todo and Needs attention tasks.",
+    "",
+    "# Current Tasks JSON",
+    options.tasksJson,
+    "",
+    "# Available Agents JSON",
+    options.agentsJson,
+    "",
+    "# Projects JSON",
+    options.projectsJson,
+    "",
+    "Inspect the repository only when that helps routing. Finish by summarizing which task-board actions you took."
   ];
 
   return lines.filter((line): line is string => line !== undefined).join("\n");

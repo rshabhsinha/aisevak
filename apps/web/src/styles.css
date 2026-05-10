@@ -255,9 +255,13 @@ label {
 .tasks-page {
   height: calc(100vh - 66px);
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 360px;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   gap: 0;
+}
+
+.tasks-page.has-detail {
+  grid-template-columns: minmax(0, 1fr) 420px;
 }
 
 .task-create {
@@ -375,6 +379,7 @@ label {
 
 .detail-panel {
   grid-row: 2;
+  grid-column: 2;
   background: #ffffff;
   border-left: 1px solid #e6e6e8;
   overflow: auto;
@@ -391,6 +396,13 @@ label {
   display: grid;
   gap: 10px;
   margin-bottom: 14px;
+}
+
+.detail-title-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: start;
 }
 
 .detail-top h2 {
@@ -601,6 +613,7 @@ label {
 
   .detail-panel {
     grid-row: auto;
+    grid-column: auto;
     border-left: 0;
     border-top: 1px solid #e6e6e8;
   }

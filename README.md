@@ -1,6 +1,17 @@
 # Aisevak
 
-A self-hosted task list for running local Codex sessions against local or imported GitHub repositories.
+A self-hosted task board for running local Codex sessions against local or imported GitHub repositories.
+
+Tasks can be assigned directly to a worker agent or left on `Auto-route`. Auto-routed tasks are picked up by the Dispatcher agent, either when a user clicks Run or on the default 5 minute heartbeat. Dispatcher runs do not appear on the task board; the `Agent Runs` tab shows every Dispatcher and worker Codex session.
+
+Codex runs receive an `aisevak` CLI on PATH so agents can update the board without touching the database directly:
+
+```bash
+aisevak context
+aisevak task assign TASK-12 --agent Builder --run
+aisevak task attention TASK-12 "Blocked on missing GitHub token"
+aisevak task create --title "Add regression test" --status needs_attention
+```
 
 ## Local development
 

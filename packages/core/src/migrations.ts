@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS projects (
 
 CREATE TABLE IF NOT EXISTS agents (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  kind text NOT NULL DEFAULT 'worker',
   name text NOT NULL,
   description text NOT NULL DEFAULT '',
   model text NOT NULL DEFAULT 'gpt-5.5',
@@ -126,6 +127,9 @@ CREATE TABLE IF NOT EXISTS task_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
   task_session_id uuid NOT NULL REFERENCES task_sessions(id) ON DELETE CASCADE,
+  run_kind text NOT NULL DEFAULT 'worker',
+  trigger text NOT NULL DEFAULT 'manual',
+  parent_run_id uuid,
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
@@ -146,6 +150,41 @@ CREATE TABLE IF NOT EXISTS task_runs (
 
 CREATE INDEX IF NOT EXISTS task_runs_status_idx ON task_runs(status);
 
+CREATE TABLE IF NOT EXISTS dispatcher_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  trigger text NOT NULL DEFAULT 'heartbeat',
+  scope text NOT NULL DEFAULT 'heartbeat',
+  status run_status NOT NULL DEFAULT 'queued',
+  cwd text NOT NULL,
+  codex_home text NOT NULL,
+  codex_thread_id text,
+  model text NOT NULL,
+  prompt text NOT NULL,
+  raw_stdout text NOT NULL DEFAULT '',
+  raw_stderr text NOT NULL DEFAULT '',
+  exit_code integer,
+  error text,
+  queued_at timestamptz NOT NULL DEFAULT now(),
+  started_at timestamptz,
+  finished_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS dispatcher_runs_status_idx ON dispatcher_runs(status);
+
+CREATE TABLE IF NOT EXISTS dispatcher_run_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  dispatcher_run_id uuid NOT NULL REFERENCES dispatcher_runs(id) ON DELETE CASCADE,
+  seq integer NOT NULL,
+  event_type text NOT NULL,
+  text text,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (dispatcher_run_id, seq)
+);
+
 CREATE TABLE IF NOT EXISTS run_events (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   run_id uuid NOT NULL REFERENCES task_runs(id) ON DELETE CASCADE,
@@ -155,6 +194,17 @@ CREATE TABLE IF NOT EXISTS run_events (
   payload jsonb NOT NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
   UNIQUE (run_id, seq)
+);
+
+CREATE TABLE IF NOT EXISTS agent_tool_tokens (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_hash text NOT NULL UNIQUE,
+  task_run_id uuid REFERENCES task_runs(id) ON DELETE CASCADE,
+  dispatcher_run_id uuid REFERENCES dispatcher_runs(id) ON DELETE CASCADE,
+  task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  role text NOT NULL DEFAULT 'worker',
+  expires_at timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
 );
 
 CREATE TABLE IF NOT EXISTS github_connections (
@@ -228,7 +278,33 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 `;
 
+const additiveSql = `
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
+
+UPDATE agents
+SET kind = 'dispatcher', updated_at = now()
+WHERE lower(name) IN ('dispatcher', 'orchestrator')
+  AND kind <> 'dispatcher';
+
+INSERT INTO agents (kind, name, description, model, instructions, enabled)
+SELECT
+  'dispatcher',
+  'Dispatcher',
+  'Routes Todo and Needs attention tasks to the right worker agent.',
+  COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.5'),
+  'You are the Aisevak Dispatcher. Review the task board, assign work to enabled worker agents, start worker runs with the aisevak CLI, and move ambiguous or blocked work to Needs attention with a precise comment.',
+  true
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher');
+`;
+
 export async function runMigrations(pool: Pool): Promise<void> {
+  await pool.query("SELECT set_config('aisevak.default_model', $1, false)", [
+    process.env.CODEX_DEFAULT_MODEL ?? "gpt-5.5"
+  ]);
   await pool.query(enumSql);
   await pool.query(tableSql);
+  await pool.query(additiveSql);
 }

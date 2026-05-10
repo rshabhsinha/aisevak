@@ -10,6 +10,9 @@ export type RunStatus =
   | "failed";
 export type ImportJobStatus = "queued" | "running" | "succeeded" | "failed";
 export type GithubAuthMode = "app" | "pat";
+export type AgentKind = "worker" | "dispatcher";
+export type RunKind = "worker" | "dispatcher";
+export type RunTrigger = "manual" | "heartbeat" | "auto_route" | "agent_tool";
 
 export interface CodexCommandOptions {
   resumeThreadId?: string | null;
@@ -35,4 +38,12 @@ export interface NormalizedCodexEvent {
   status?: string;
   usage?: Record<string, unknown>;
   raw: unknown;
+}
+
+export interface DispatcherPromptOptions {
+  dispatcherInstructions: string;
+  tasksJson: string;
+  agentsJson: string;
+  projectsJson: string;
+  targetTaskNumber?: number | null;
 }
