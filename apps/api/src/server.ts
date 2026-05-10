@@ -361,8 +361,34 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.get("/api/runs/:id/events", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
-    const result = await pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [id]);
-    return { events: result.rows };
+    const [runResult, eventsResult] = await Promise.all([
+      pool.query(
+        `SELECT task_runs.id,
+                'worker' AS kind,
+                task_runs.trigger,
+                task_runs.status::text,
+                task_runs.model,
+                task_runs.task_id,
+                tasks.number AS task_number,
+                tasks.title AS task_title,
+                projects.name AS project_name,
+                COALESCE(task_sessions.agent_snapshot->>'name', agents.name) AS agent_name,
+                task_runs.prompt,
+                task_runs.queued_at,
+                task_runs.started_at,
+                task_runs.finished_at,
+                task_runs.error
+         FROM task_runs
+         JOIN tasks ON tasks.id = task_runs.task_id
+         JOIN projects ON projects.id = tasks.project_id
+         JOIN agents ON agents.id = tasks.agent_id
+         JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
+         WHERE task_runs.id = $1`,
+        [id]
+      ),
+      pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [id])
+    ]);
+    return { run: runResult.rows[0] ?? null, events: eventsResult.rows };
   });
 
   app.get("/api/runs/:id/stream", async (request, reply) => {
@@ -425,16 +451,64 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     requireUser(request);
     const params = runEventsParams.parse(request.params);
     if (params.kind === "dispatcher") {
-      const result = await pool.query(
-        "SELECT * FROM dispatcher_run_events WHERE dispatcher_run_id = $1 ORDER BY seq ASC",
-        [params.id]
-      );
-      return { events: result.rows };
+      const [runResult, eventsResult] = await Promise.all([
+        pool.query(
+          `SELECT dispatcher_runs.id,
+                  'dispatcher' AS kind,
+                  dispatcher_runs.trigger,
+                  dispatcher_runs.status::text,
+                  dispatcher_runs.model,
+                  dispatcher_runs.task_id,
+                  tasks.number AS task_number,
+                  tasks.title AS task_title,
+                  projects.name AS project_name,
+                  'Dispatcher' AS agent_name,
+                  dispatcher_runs.prompt,
+                  dispatcher_runs.queued_at,
+                  dispatcher_runs.started_at,
+                  dispatcher_runs.finished_at,
+                  dispatcher_runs.error
+           FROM dispatcher_runs
+           LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+           LEFT JOIN projects ON projects.id = tasks.project_id
+           WHERE dispatcher_runs.id = $1`,
+          [params.id]
+        ),
+        pool.query(
+          "SELECT * FROM dispatcher_run_events WHERE dispatcher_run_id = $1 ORDER BY seq ASC",
+          [params.id]
+        )
+      ]);
+      return { run: mustRow(runResult.rows[0]), events: eventsResult.rows };
     }
-    const result = await pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [
-      params.id
+    const [runResult, eventsResult] = await Promise.all([
+      pool.query(
+        `SELECT task_runs.id,
+                'worker' AS kind,
+                task_runs.trigger,
+                task_runs.status::text,
+                task_runs.model,
+                task_runs.task_id,
+                tasks.number AS task_number,
+                tasks.title AS task_title,
+                projects.name AS project_name,
+                COALESCE(task_sessions.agent_snapshot->>'name', agents.name) AS agent_name,
+                task_runs.prompt,
+                task_runs.queued_at,
+                task_runs.started_at,
+                task_runs.finished_at,
+                task_runs.error
+         FROM task_runs
+         JOIN tasks ON tasks.id = task_runs.task_id
+         JOIN projects ON projects.id = tasks.project_id
+         JOIN agents ON agents.id = tasks.agent_id
+         JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
+         WHERE task_runs.id = $1`,
+        [params.id]
+      ),
+      pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [params.id])
     ]);
-    return { events: result.rows };
+    return { run: mustRow(runResult.rows[0]), events: eventsResult.rows };
   });
 
   app.get("/api/agent-tools/context", async (request) => {

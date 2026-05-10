@@ -2,11 +2,17 @@ import {
   Activity,
   Bot,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Circle,
+  CircleAlert,
   CircleDashed,
   CircleX,
+  Copy,
+  Eye,
   FolderGit2,
   Github,
+  Hammer,
   LayoutDashboard,
   Loader2,
   LogOut,
@@ -17,10 +23,19 @@ import {
   Square,
   Terminal,
   UserCircle2,
+  Wrench,
   X
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 import type { FormEvent, ReactNode } from "react";
+import {
+  deriveAgentRunTimelineRows,
+  formatElapsed,
+  normalizeCompactToolLabel,
+  type AgentRunTimelineRun,
+  type AgentRunTimelineRow,
+  type AgentRunWorkLogEntry
+} from "./agentRunTimeline";
 
 type View = "tasks" | "agents" | "projects" | "connectors" | "runs";
 
@@ -92,6 +107,7 @@ interface RunEvent {
   event_type: string;
   text?: string | null;
   payload: unknown;
+  created_at?: string;
 }
 
 interface Run {
@@ -111,6 +127,7 @@ interface AgentRun {
   task_title?: string | null;
   project_name?: string | null;
   agent_name: string;
+  prompt?: string | null;
   queued_at: string;
   started_at?: string | null;
   finished_at?: string | null;
@@ -138,6 +155,7 @@ export function App() {
   const [selectedRun, setSelectedRun] = useState<AgentRun | null>(null);
   const [agentRunEvents, setAgentRunEvents] = useState<RunEvent[]>([]);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedTaskRun, setSelectedTaskRun] = useState<AgentRunTimelineRun | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
   const [query, setQuery] = useState("");
   const [busyRunId, setBusyRunId] = useState<string | null>(null);
@@ -190,6 +208,7 @@ export function App() {
   useEffect(() => {
     if (!selectedTask?.latest_run_id) {
       setEvents([]);
+      setSelectedTaskRun(null);
       return;
     }
     void loadEvents(selectedTask.latest_run_id);
@@ -279,12 +298,22 @@ export function App() {
   }
 
   async function loadEvents(runId: string) {
-    const data = await api<{ events: RunEvent[] }>(`/api/runs/${runId}/events`);
+    const data = await api<{ run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
+      `/api/runs/${runId}/events`
+    );
+    setSelectedTaskRun(data.run ?? null);
     setEvents(data.events);
   }
 
   async function loadAgentRunEvents(run: AgentRun) {
-    const data = await api<{ events: RunEvent[] }>(`/api/agent-runs/${run.kind}/${run.id}/events`);
+    const data = await api<{ run?: AgentRun; events: RunEvent[] }>(
+      `/api/agent-runs/${run.kind}/${run.id}/events`
+    );
+    if (data.run) {
+      setSelectedRun((current) =>
+        current?.id === run.id && current.kind === run.kind ? { ...current, ...data.run } : current
+      );
+    }
     setAgentRunEvents(data.events);
   }
 
@@ -370,6 +399,7 @@ export function App() {
             agents={agents}
             projects={projects}
             selectedTask={selectedTask}
+            selectedTaskRun={selectedTaskRun}
             events={events}
             busyRunId={busyRunId}
             onCreate={async (payload) => {
@@ -431,6 +461,7 @@ function TasksView(props: {
   projects: Project[];
   agents: Agent[];
   selectedTask?: Task;
+  selectedTaskRun: AgentRunTimelineRun | null;
   events: RunEvent[];
   busyRunId: string | null;
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
@@ -477,6 +508,7 @@ function TasksView(props: {
       {props.selectedTask ? (
         <TaskDetail
           task={props.selectedTask}
+          run={props.selectedTaskRun}
           events={props.events}
           busyRunId={props.busyRunId}
           onClose={props.onClose}
@@ -546,6 +578,7 @@ function TaskForm(props: {
 
 function TaskDetail(props: {
   task?: Task;
+  run: AgentRunTimelineRun | null;
   events: RunEvent[];
   busyRunId: string | null;
   onClose: () => void;
@@ -564,6 +597,20 @@ function TaskDetail(props: {
   const hasRun = Boolean(props.task.has_runs || props.task.latest_run_id || props.task.latest_run_status);
   const showRun = !hasRun;
   const showStop = active && Boolean(props.task.latest_run_id);
+  const taskRun =
+    props.run ??
+    (props.task.latest_run_id || props.events.length > 0
+      ? {
+          id: props.task.latest_run_id ?? props.task.id,
+          kind: "worker" as const,
+          status: props.task.latest_run_status ?? props.task.status,
+          agent_name: props.task.agent_name,
+          prompt: props.task.body || props.task.title,
+          queued_at: props.task.created_at ?? props.task.updated_at ?? null,
+          started_at: props.task.updated_at ?? null,
+          finished_at: active ? null : props.task.updated_at ?? null
+        }
+      : null);
   return (
     <aside className="detail-panel">
       <div className="detail-top">
@@ -600,7 +647,7 @@ function TaskDetail(props: {
           ) : null}
         </div>
       ) : null}
-      <RunTimeline events={props.events} />
+      <CodexSessionTimeline run={taskRun} events={props.events} />
     </aside>
   );
 }
@@ -648,7 +695,7 @@ function AgentRunsView(props: {
               <TaskStatus status={props.selectedRun.status} />
             </div>
             {props.selectedRun.error ? <div className="notice">{props.selectedRun.error}</div> : null}
-            <RunTimeline events={props.events} />
+            <CodexSessionTimeline run={props.selectedRun} events={props.events} />
           </div>
         ) : (
           <EmptyState text="Select a run" />
@@ -884,19 +931,293 @@ function ConnectorsView(props: {
   );
 }
 
-function RunTimeline({ events }: { events: RunEvent[] }) {
+function CodexSessionTimeline({ run, events }: { run: AgentRunTimelineRun | null; events: RunEvent[] }) {
+  const rows = useMemo(() => deriveAgentRunTimelineRows({ run, events }), [events, run]);
+
+  if (!run && events.length === 0) {
+    return (
+      <div className="chat-timeline empty-chat">
+        <span className="muted">No run events yet.</span>
+      </div>
+    );
+  }
+
   return (
-    <div className="run-log">
-      {events.length === 0 ? <span className="muted">No run events yet.</span> : null}
-      {events.map((event) => (
-        <div className="log-line" key={event.id}>
-          <span>{event.seq}</span>
-          <strong>{event.event_type}</strong>
-          <p>{eventText(event)}</p>
-        </div>
+    <div className="chat-timeline">
+      {rows.length === 0 ? <span className="muted">No run events yet.</span> : null}
+      {rows.map((row) => (
+        <TimelineRow row={row} key={row.id} />
       ))}
     </div>
   );
+}
+
+function TimelineRow({ row }: { row: AgentRunTimelineRow }) {
+  if (row.kind === "work") return <WorkGroupSection groupedEntries={row.groupedEntries} />;
+  if (row.kind === "working") return <WorkingTimelineRow row={row} />;
+  if (row.message.role === "user") return <UserTimelineRow row={row} />;
+  if (row.message.role === "assistant") return <AssistantTimelineRow row={row} />;
+  return <SystemTimelineRow row={row} />;
+}
+
+function UserTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
+  return (
+    <div className="timeline-user-row">
+      <div className="user-bubble">
+        <CollapsibleText text={row.message.text} />
+        <TimelineMeta createdAt={row.message.createdAt} completedAt={row.message.completedAt} />
+      </div>
+    </div>
+  );
+}
+
+function AssistantTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
+  return (
+    <div className="timeline-assistant-row">
+      <div className="assistant-message group-assistant">
+        <BasicMarkdown text={row.message.text || (row.message.streaming ? "" : "(empty response)")} />
+        <div className="assistant-meta-row">
+          <TimelineMeta
+            createdAt={row.message.createdAt}
+            completedAt={row.message.completedAt}
+            durationStart={row.durationStart}
+          />
+          {!row.message.streaming && row.message.text.trim() ? (
+            <CopyButton text={row.message.text} label="Copy message" />
+          ) : null}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function SystemTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
+  return (
+    <div className="system-row">
+      <span>{row.message.text}</span>
+    </div>
+  );
+}
+
+function WorkGroupSection({ groupedEntries }: { groupedEntries: AgentRunWorkLogEntry[] }) {
+  const [isExpanded, setIsExpanded] = useState(false);
+  const maxVisible = 6;
+  const hasOverflow = groupedEntries.length > maxVisible;
+  const visibleEntries =
+    hasOverflow && !isExpanded ? groupedEntries.slice(-maxVisible) : groupedEntries;
+  const hiddenCount = groupedEntries.length - visibleEntries.length;
+  const onlyToolEntries = groupedEntries.every((entry) => entry.tone === "tool");
+
+  return (
+    <div className="work-group">
+      {hasOverflow || !onlyToolEntries ? (
+        <div className="work-group-head">
+          <span>{onlyToolEntries ? "Tool calls" : "Work log"} ({groupedEntries.length})</span>
+          {hasOverflow ? (
+            <button type="button" onClick={() => setIsExpanded((value) => !value)}>
+              {isExpanded ? "Show less" : `Show ${hiddenCount} more`}
+            </button>
+          ) : null}
+        </div>
+      ) : null}
+      <div className="work-group-rows">
+        {visibleEntries.map((entry) => (
+          <SimpleWorkEntryRow workEntry={entry} key={entry.id} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function SimpleWorkEntryRow({ workEntry }: { workEntry: AgentRunWorkLogEntry }) {
+  const [expanded, setExpanded] = useState(false);
+  const Icon = workEntryIcon(workEntry);
+  const heading = toolWorkEntryHeading(workEntry);
+  const preview = workEntryPreview(workEntry);
+  const displayText = preview ? `${heading} - ${preview}` : heading;
+  const hasDetail = Boolean(workEntry.detail?.trim());
+
+  return (
+    <div className={`work-entry ${workEntry.tone}`}>
+      <button
+        type="button"
+        className="work-entry-main"
+        onClick={() => setExpanded((value) => !value)}
+        title={displayText}
+      >
+        <span className="work-entry-icon">
+          <Icon size={13} />
+        </span>
+        <span className="work-entry-text">
+          <strong>{heading}</strong>
+          {preview ? <span> - {preview}</span> : null}
+        </span>
+        {hasDetail ? (
+          <span className="work-entry-chevron">
+            {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          </span>
+        ) : null}
+      </button>
+      {expanded && hasDetail ? <pre className="work-entry-detail">{workEntry.detail}</pre> : null}
+    </div>
+  );
+}
+
+function WorkingTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "working" }> }) {
+  return (
+    <div className="working-row">
+      <span className="working-dots">
+        <i />
+        <i />
+        <i />
+      </span>
+      <span>{row.createdAt ? <>Working for <LiveElapsed createdAt={row.createdAt} /></> : "Working..."}</span>
+    </div>
+  );
+}
+
+function CollapsibleText({ text }: { text: string }) {
+  const [expanded, setExpanded] = useState(false);
+  const shouldCollapse = text.length > 600 || text.split("\n").length > 8;
+  const collapsed = shouldCollapse && !expanded;
+
+  return (
+    <div>
+      <div className={`collapsible-message ${collapsed ? "collapsed" : ""}`}>
+        <BasicMarkdown text={text} plain />
+      </div>
+      {shouldCollapse ? (
+        <button className="text-button" type="button" onClick={() => setExpanded((value) => !value)}>
+          {expanded ? "Show less" : "Show full message"}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+function BasicMarkdown({ text, plain = false }: { text: string; plain?: boolean }) {
+  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
+  return (
+    <div className={`basic-markdown ${plain ? "plain" : ""}`}>
+      {blocks.map((block, index) =>
+        block.type === "code" ? (
+          <CodeBlock code={block.content} language={block.language} key={`${block.type}-${index}`} />
+        ) : (
+          <p key={`${block.type}-${index}`}>{block.content}</p>
+        )
+      )}
+    </div>
+  );
+}
+
+function CodeBlock({ code, language }: { code: string; language?: string }) {
+  return (
+    <div className="code-block">
+      <div className="code-block-head">
+        <span>{language || "text"}</span>
+        <CopyButton text={code} label="Copy code" />
+      </div>
+      <pre>{code}</pre>
+    </div>
+  );
+}
+
+function CopyButton({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      className="copy-button"
+      type="button"
+      title={copied ? "Copied" : label}
+      onClick={async () => {
+        await navigator.clipboard?.writeText(text);
+        setCopied(true);
+        window.setTimeout(() => setCopied(false), 1200);
+      }}
+    >
+      {copied ? <CheckCircle2 size={13} /> : <Copy size={13} />}
+    </button>
+  );
+}
+
+function TimelineMeta(props: {
+  createdAt: string;
+  completedAt?: string;
+  durationStart?: string;
+}) {
+  const duration = props.durationStart ? formatElapsed(props.durationStart, props.completedAt) : null;
+  return (
+    <span className="timeline-meta">
+      {formatTimestamp(props.createdAt)}
+      {duration ? ` - ${duration}` : ""}
+    </span>
+  );
+}
+
+function LiveElapsed({ createdAt }: { createdAt: string }) {
+  const [now, setNow] = useState(() => new Date().toISOString());
+  useEffect(() => {
+    const id = window.setInterval(() => setNow(new Date().toISOString()), 1000);
+    return () => window.clearInterval(id);
+  }, []);
+  return <span>{formatElapsed(createdAt, now) ?? "0s"}</span>;
+}
+
+function workEntryIcon(workEntry: AgentRunWorkLogEntry) {
+  if (workEntry.itemType === "command_execution" || workEntry.command) return Terminal;
+  if (workEntry.itemType === "web_search") return Eye;
+  if (workEntry.itemType === "mcp_tool_call") return Wrench;
+  if (workEntry.itemType === "dynamic_tool_call") return Hammer;
+  if (workEntry.tone === "error") return CircleAlert;
+  if (workEntry.tone === "thinking") return Bot;
+  if (workEntry.tone === "info") return CheckCircle2;
+  return Activity;
+}
+
+function toolWorkEntryHeading(workEntry: AgentRunWorkLogEntry): string {
+  const raw = workEntry.toolTitle || workEntry.label;
+  const normalized = normalizeCompactToolLabel(raw);
+  return `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}`;
+}
+
+function workEntryPreview(workEntry: AgentRunWorkLogEntry): string | null {
+  const preview = workEntry.command || workEntry.detail;
+  if (!preview) return null;
+  const normalizedPreview = normalizeCompactToolLabel(preview).toLowerCase();
+  const normalizedHeading = normalizeCompactToolLabel(toolWorkEntryHeading(workEntry)).toLowerCase();
+  if (normalizedPreview === normalizedHeading) return null;
+  return preview.replace(/\s+/g, " ").trim();
+}
+
+function parseMarkdownBlocks(text: string): Array<{ type: "text" | "code"; content: string; language?: string }> {
+  const blocks: Array<{ type: "text" | "code"; content: string; language?: string }> = [];
+  const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
+  let cursor = 0;
+  let match: RegExpExecArray | null;
+  while ((match = fence.exec(text))) {
+    if (match.index > cursor) {
+      pushTextBlocks(blocks, text.slice(cursor, match.index));
+    }
+    blocks.push({ type: "code", language: match[1]?.trim() || undefined, content: match[2] ?? "" });
+    cursor = match.index + match[0].length;
+  }
+  if (cursor < text.length) {
+    pushTextBlocks(blocks, text.slice(cursor));
+  }
+  return blocks.length > 0 ? blocks : [{ type: "text", content: "" }];
+}
+
+function pushTextBlocks(
+  blocks: Array<{ type: "text" | "code"; content: string; language?: string }>,
+  text: string
+): void {
+  const chunks = text
+    .split(/\n{2,}/)
+    .map((chunk) => chunk.trim())
+    .filter(Boolean);
+  for (const chunk of chunks) {
+    blocks.push({ type: "text", content: chunk });
+  }
 }
 
 function TaskStatus({ status }: { status?: string | null }) {
@@ -1023,10 +1344,10 @@ function statusLabel(status?: string | null): string {
   return status.replace(/_/g, " ");
 }
 
-function eventText(event: RunEvent): string {
-  if (event.text) return event.text;
-  const raw = event.payload as { raw?: { item?: { text?: string; command?: string; aggregated_output?: string } } };
-  return raw.raw?.item?.text ?? raw.raw?.item?.command ?? raw.raw?.item?.aggregated_output ?? JSON.stringify(event.payload);
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 function viewTitle(view: View): string {
