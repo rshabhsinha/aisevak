@@ -458,6 +458,9 @@ function TaskDetail(props: {
   }
 
   const active = isActiveRun(props.task.latest_run_status);
+  const hasRun = Boolean(props.task.latest_run_id || props.task.latest_run_status);
+  const showRun = !hasRun;
+  const showStop = active && Boolean(props.task.latest_run_id);
   return (
     <aside className="detail-panel">
       <div className="detail-top">
@@ -469,22 +472,26 @@ function TaskDetail(props: {
         <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
       </div>
       <p className="task-body">{props.task.body || "No description."}</p>
-      <div className="button-row">
-        <button
-          className="button"
-          disabled={props.busyRunId === props.task.id}
-          onClick={() => props.onRun(props.task!)}
-        >
-          {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
-          Run
-        </button>
-        {active && props.task.latest_run_id ? (
-          <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
-            <Square size={15} />
-            Stop
-          </button>
-        ) : null}
-      </div>
+      {showRun || showStop ? (
+        <div className="button-row">
+          {showRun ? (
+            <button
+              className="button"
+              disabled={props.busyRunId === props.task.id}
+              onClick={() => props.onRun(props.task!)}
+            >
+              {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
+              Run
+            </button>
+          ) : null}
+          {showStop ? (
+            <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
+              <Square size={15} />
+              Stop
+            </button>
+          ) : null}
+        </div>
+      ) : null}
       <RunTimeline events={props.events} />
     </aside>
   );
