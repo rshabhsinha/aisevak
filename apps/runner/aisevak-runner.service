@@ -1,0 +1,17 @@
+[Unit]
+Description=Aisevak host runner
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/aisevak/current
+EnvironmentFile=/opt/aisevak/.env
+ExecStart=/usr/bin/env pnpm --filter @aisevak/runner start
+Restart=always
+RestartSec=5
+User=aisevak
+Group=aisevak
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,284 @@
+import {
+  boolean,
+  integer,
+  jsonb,
+  pgEnum,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+  uuid
+} from "drizzle-orm/pg-core";
+
+export const userRoleEnum = pgEnum("user_role", ["owner", "admin", "member"]);
+export const projectSourceEnum = pgEnum("project_source", ["local_path", "github"]);
+export const workspaceModeEnum = pgEnum("workspace_mode", ["direct", "git_worktree"]);
+export const runStatusEnum = pgEnum("run_status", [
+  "queued",
+  "running",
+  "cancel_requested",
+  "cancelled",
+  "succeeded",
+  "failed"
+]);
+export const importJobStatusEnum = pgEnum("import_job_status", [
+  "queued",
+  "running",
+  "succeeded",
+  "failed"
+]);
+export const githubAuthModeEnum = pgEnum("github_auth_mode", ["app", "pat"]);
+
+const id = uuid("id").defaultRandom().primaryKey();
+const createdAt = timestamp("created_at", { withTimezone: true }).notNull().defaultNow();
+const updatedAt = timestamp("updated_at", { withTimezone: true }).notNull().defaultNow();
+
+export const users = pgTable(
+  "users",
+  {
+    id,
+    email: text("email").notNull(),
+    name: text("name").notNull(),
+    passwordHash: text("password_hash").notNull(),
+    role: userRoleEnum("role").notNull().default("member"),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    emailUnique: uniqueIndex("users_email_unique").on(table.email)
+  })
+);
+
+export const sessions = pgTable("sessions", {
+  id,
+  userId: uuid("user_id").notNull().references(() => users.id, { onDelete: "cascade" }),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  createdAt
+});
+
+export const invites = pgTable("invites", {
+  id,
+  email: text("email"),
+  role: userRoleEnum("role").notNull().default("member"),
+  tokenHash: text("token_hash").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  acceptedAt: timestamp("accepted_at", { withTimezone: true }),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt
+});
+
+export const secrets = pgTable(
+  "secrets",
+  {
+    id,
+    name: text("name").notNull(),
+    encryptedValue: text("encrypted_value").notNull(),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    nameUnique: uniqueIndex("secrets_name_unique").on(table.name)
+  })
+);
+
+export const projects = pgTable("projects", {
+  id,
+  name: text("name").notNull(),
+  source: projectSourceEnum("source").notNull().default("local_path"),
+  localPath: text("local_path").notNull(),
+  workspaceMode: workspaceModeEnum("workspace_mode").notNull().default("direct"),
+  githubOwner: text("github_owner"),
+  githubRepo: text("github_repo"),
+  defaultBranch: text("default_branch"),
+  remoteUrl: text("remote_url"),
+  githubRepositoryId: uuid("github_repository_id"),
+  active: boolean("active").notNull().default(true),
+  createdAt,
+  updatedAt
+});
+
+export const agents = pgTable("agents", {
+  id,
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  model: text("model").notNull().default("gpt-5.5"),
+  instructions: text("instructions").notNull(),
+  enabled: boolean("enabled").notNull().default(true),
+  createdAt,
+  updatedAt
+});
+
+export const agentVersions = pgTable("agent_versions", {
+  id,
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+  name: text("name").notNull(),
+  description: text("description").notNull().default(""),
+  model: text("model").notNull(),
+  instructions: text("instructions").notNull(),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt
+});
+
+export const tasks = pgTable("tasks", {
+  id,
+  number: integer("number").notNull().generatedAlwaysAsIdentity(),
+  title: text("title").notNull(),
+  body: text("body").notNull().default(""),
+  status: text("status").notNull().default("open"),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "restrict" }),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  openPrOnSuccess: boolean("open_pr_on_success").notNull().default(false),
+  createdAt,
+  updatedAt
+});
+
+export const taskComments = pgTable("task_comments", {
+  id,
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  authorId: uuid("author_id").references(() => users.id, { onDelete: "set null" }),
+  body: text("body").notNull(),
+  createdAt
+});
+
+export const taskSessions = pgTable(
+  "task_sessions",
+  {
+    id,
+    taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+    agentVersionId: uuid("agent_version_id").references(() => agentVersions.id, {
+      onDelete: "set null"
+    }),
+    agentSnapshot: jsonb("agent_snapshot").notNull(),
+    codexHome: text("codex_home").notNull(),
+    codexThreadId: text("codex_thread_id"),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    taskUnique: uniqueIndex("task_sessions_task_unique").on(table.taskId)
+  })
+);
+
+export const taskRuns = pgTable("task_runs", {
+  id,
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  taskSessionId: uuid("task_session_id").notNull().references(() => taskSessions.id, {
+    onDelete: "cascade"
+  }),
+  status: runStatusEnum("status").notNull().default("queued"),
+  cwd: text("cwd").notNull(),
+  branch: text("branch"),
+  worktreePath: text("worktree_path"),
+  codexThreadId: text("codex_thread_id"),
+  model: text("model").notNull(),
+  prompt: text("prompt").notNull(),
+  rawStdout: text("raw_stdout").notNull().default(""),
+  rawStderr: text("raw_stderr").notNull().default(""),
+  exitCode: integer("exit_code"),
+  error: text("error"),
+  queuedAt: timestamp("queued_at", { withTimezone: true }).notNull().defaultNow(),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  createdAt,
+  updatedAt
+});
+
+export const runEvents = pgTable("run_events", {
+  id,
+  runId: uuid("run_id").notNull().references(() => taskRuns.id, { onDelete: "cascade" }),
+  seq: integer("seq").notNull(),
+  eventType: text("event_type").notNull(),
+  text: text("text"),
+  payload: jsonb("payload").notNull(),
+  createdAt
+});
+
+export const githubConnections = pgTable("github_connections", {
+  id,
+  authMode: githubAuthModeEnum("auth_mode").notNull(),
+  name: text("name").notNull(),
+  appId: text("app_id"),
+  clientId: text("client_id"),
+  privateKeySecretId: uuid("private_key_secret_id").references(() => secrets.id, {
+    onDelete: "set null"
+  }),
+  webhookSecretId: uuid("webhook_secret_id").references(() => secrets.id, {
+    onDelete: "set null"
+  }),
+  patSecretId: uuid("pat_secret_id").references(() => secrets.id, { onDelete: "set null" }),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt
+});
+
+export const githubInstallations = pgTable("github_installations", {
+  id,
+  connectionId: uuid("connection_id").notNull().references(() => githubConnections.id, {
+    onDelete: "cascade"
+  }),
+  installationId: text("installation_id").notNull(),
+  accountLogin: text("account_login").notNull(),
+  repositorySelection: text("repository_selection").notNull().default("selected"),
+  permissions: jsonb("permissions").notNull().default({}),
+  createdAt,
+  updatedAt
+});
+
+export const githubRepositories = pgTable(
+  "github_repositories",
+  {
+    id,
+    connectionId: uuid("connection_id").notNull().references(() => githubConnections.id, {
+      onDelete: "cascade"
+    }),
+    installationId: uuid("installation_id").references(() => githubInstallations.id, {
+      onDelete: "set null"
+    }),
+    owner: text("owner").notNull(),
+    name: text("name").notNull(),
+    fullName: text("full_name").notNull(),
+    cloneUrl: text("clone_url").notNull(),
+    defaultBranch: text("default_branch").notNull(),
+    importedProjectId: uuid("imported_project_id"),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    repoUnique: uniqueIndex("github_repositories_connection_full_name_unique").on(
+      table.connectionId,
+      table.fullName
+    )
+  })
+);
+
+export const repoImportJobs = pgTable("repo_import_jobs", {
+  id,
+  githubRepositoryId: uuid("github_repository_id").notNull().references(() => githubRepositories.id, {
+    onDelete: "cascade"
+  }),
+  status: importJobStatusEnum("status").notNull().default("queued"),
+  localPath: text("local_path"),
+  error: text("error"),
+  startedAt: timestamp("started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt
+});
+
+export const pullRequests = pgTable("pull_requests", {
+  id,
+  taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+  branch: text("branch").notNull(),
+  title: text("title").notNull(),
+  body: text("body").notNull().default(""),
+  number: integer("number"),
+  url: text("url"),
+  state: text("state").notNull().default("queued"),
+  error: text("error"),
+  createdAt,
+  updatedAt
+});
