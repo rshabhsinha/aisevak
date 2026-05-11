@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  buildCodexArgs,
+  buildCodexAppServerArgs,
   buildCodexConfigToml,
   buildCodexPrompt,
   normalizeCodexEvent,
@@ -9,21 +9,8 @@ import {
 } from "./codex.js";
 
 describe("codex helpers", () => {
-  it("always builds dangerous JSON exec args", () => {
-    expect(buildCodexArgs({ model: "gpt-5.5" })).toEqual([
-      "exec",
-      "--json",
-      "--dangerously-bypass-approvals-and-sandbox",
-      "--skip-git-repo-check",
-      "--model",
-      "gpt-5.5",
-      "-"
-    ]);
-  });
-
-  it("builds resume args using the captured thread id", () => {
-    expect(buildCodexArgs({ resumeThreadId: "thread_123" })).toContain("resume");
-    expect(buildCodexArgs({ resumeThreadId: "thread_123" })).toContain("thread_123");
+  it("builds app-server stdio args", () => {
+    expect(buildCodexAppServerArgs()).toEqual(["app-server", "--listen", "stdio://"]);
   });
 
   it("writes the no-approval danger config", () => {
@@ -52,6 +39,23 @@ describe("codex helpers", () => {
       JSON.stringify({ method: "thread.started", params: { thread_id: "abc" } })
     );
     expect(normalizeCodexEvent(raw).threadId).toBe("abc");
+  });
+
+  it("normalizes app-server notifications", () => {
+    const raw = parseCodexJsonLine(
+      JSON.stringify({
+        method: "item/completed",
+        params: {
+          threadId: "thread_123",
+          turnId: "turn_123",
+          item: { id: "item_1", type: "agentMessage", text: "Done" }
+        }
+      })
+    );
+    const event = normalizeCodexEvent(raw);
+    expect(event.threadId).toBe("thread_123");
+    expect(event.itemId).toBe("item_1");
+    expect(event.text).toBe("Done");
   });
 
   it("keeps malformed lines as parse events", () => {

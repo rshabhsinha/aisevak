@@ -1,29 +1,11 @@
 import type {
-  CodexCommandOptions,
   CodexPromptOptions,
   DispatcherPromptOptions,
   NormalizedCodexEvent
 } from "./types.js";
 
-export function buildCodexArgs(options: CodexCommandOptions = {}): string[] {
-  const args = [
-    "exec",
-    "--json",
-    "--dangerously-bypass-approvals-and-sandbox",
-    "--skip-git-repo-check"
-  ];
-
-  if (isExplicitModel(options.model)) {
-    args.push("--model", options.model);
-  }
-
-  if (options.resumeThreadId) {
-    args.push("resume", options.resumeThreadId, "-");
-  } else {
-    args.push("-");
-  }
-
-  return args;
+export function buildCodexAppServerArgs(): string[] {
+  return ["app-server", "--listen", "stdio://"];
 }
 
 export function buildCodexConfigToml(model?: string | null): string {
@@ -130,19 +112,28 @@ export function normalizeCodexEvent(raw: unknown): NormalizedCodexEvent {
   if (method) {
     const params = objectValue(record.params);
     const item = objectValue(params?.item);
+    const turn = objectValue(params?.turn);
+    const thread = objectValue(params?.thread);
     const delta = objectValue(params?.delta);
-    const threadId = stringValue(params?.thread_id) ?? stringValue(record.thread_id);
+    const threadId =
+      stringValue(params?.threadId) ??
+      stringValue(params?.thread_id) ??
+      stringValue(thread?.id) ??
+      stringValue(record.thread_id);
     const text =
       stringValue(item?.text) ??
       stringValue(item?.content) ??
+      stringValue(item?.aggregatedOutput) ??
+      stringValue(item?.aggregated_output) ??
+      stringValue(params?.delta) ??
       stringValue(delta?.text) ??
       stringValue(params?.text);
     return {
       type: method,
       text,
       threadId,
-      itemId: stringValue(item?.id) ?? stringValue(params?.item_id),
-      status: stringValue(params?.status),
+      itemId: stringValue(item?.id) ?? stringValue(params?.itemId) ?? stringValue(params?.item_id),
+      status: stringValue(params?.status) ?? stringValue(item?.status) ?? stringValue(turn?.status),
       usage: objectValue(params?.usage),
       raw
     };
@@ -171,7 +162,15 @@ export function normalizeCodexEvent(raw: unknown): NormalizedCodexEvent {
 export function extractThreadId(event: NormalizedCodexEvent): string | undefined {
   if (event.threadId) return event.threadId;
   const raw = event.raw as Record<string, unknown>;
-  return stringValue(raw?.thread_id) ?? stringValue(objectValue(raw?.params)?.thread_id);
+  const params = objectValue(raw?.params);
+  const result = objectValue(raw?.result);
+  return (
+    stringValue(raw?.thread_id) ??
+    stringValue(params?.threadId) ??
+    stringValue(params?.thread_id) ??
+    stringValue(objectValue(params?.thread)?.id) ??
+    stringValue(objectValue(result?.thread)?.id)
+  );
 }
 
 export function redactSecrets(text: string, secrets: Array<string | null | undefined>): string {

@@ -11,6 +11,7 @@ export interface AgentRunTimelineRun {
   id: string;
   kind: "worker" | "dispatcher";
   status: string;
+  model?: string | null;
   agent_name: string;
   prompt?: string | null;
   queued_at?: string | null;
@@ -73,8 +74,19 @@ export type AgentRunTimelineRow =
 export function deriveAgentRunTimelineRows(input: {
   run: AgentRunTimelineRun | null;
   events: AgentRunTimelineEvent[];
+  pendingMessages?: AgentRunChatMessage[];
 }): AgentRunTimelineRow[] {
-  const timelineEntries = deriveTimelineEntries(input.run, input.events);
+  const timelineEntries = [
+    ...deriveTimelineEntries(input.run, input.events),
+    ...(input.pendingMessages ?? []).map(
+      (message): TimelineEntry => ({
+        id: `pending:${message.id}`,
+        kind: "message",
+        createdAt: message.createdAt,
+        message
+      })
+    )
+  ].sort(compareTimelineEntries);
   const durationStartByMessageId = computeMessageDurationStart(
     timelineEntries.flatMap((entry) => (entry.kind === "message" ? [entry.message] : []))
   );
@@ -156,7 +168,8 @@ function deriveTimelineEntries(
   const entries: TimelineEntry[] = [];
   const createdAtFallback = run?.queued_at ?? run?.started_at ?? new Date(0).toISOString();
   const prompt = run?.prompt?.trim();
-  if (prompt) {
+  const hasUserMessageEvent = events.some((event) => event.event_type === "thread.message-sent");
+  if (prompt && !hasUserMessageEvent) {
     entries.push({
       id: `prompt:${run?.id ?? "run"}`,
       kind: "message",
@@ -173,26 +186,32 @@ function deriveTimelineEntries(
   }
 
   const workByItemId = new Map<string, AgentRunWorkLogEntry>();
-  const sortedEvents = [...events].sort((left, right) => left.seq - right.seq);
+  const assistantByItemId = new Map<string, AgentRunChatMessage>();
+  const sortedEvents = [...events].sort(compareEventRows);
 
   for (const event of sortedEvents) {
     const eventCreatedAt = event.created_at ?? createdAtFallback;
     const normalized = rawRecord(event.payload);
     const raw = rawRecord(normalized?.raw) ?? normalized;
-    const item = rawRecord(raw?.item);
-    const itemId = stringValue(item?.id) ?? `event:${event.id}`;
+    const params = rawRecord(raw?.params);
+    const item = rawRecord(raw?.item) ?? rawRecord(params?.item);
+    const itemId =
+      stringValue(item?.id) ??
+      stringValue(params?.itemId) ??
+      stringValue(params?.item_id) ??
+      `event:${event.id}`;
     const itemType = stringValue(item?.type);
 
-    if (itemType === "agent_message") {
-      const text = stringValue(item?.text) ?? event.text;
+    if (event.event_type === "thread.message-sent") {
+      const text = stringValue(normalized?.text) ?? event.text;
       if (!text?.trim()) continue;
       entries.push({
-        id: `assistant:${event.id}`,
+        id: `user:${event.id}`,
         kind: "message",
         createdAt: eventCreatedAt,
         message: {
-          id: `assistant:${event.id}`,
-          role: "assistant",
+          id: `user:${event.id}`,
+          role: "user",
           text,
           createdAt: eventCreatedAt,
           completedAt: eventCreatedAt,
@@ -202,8 +221,60 @@ function deriveTimelineEntries(
       continue;
     }
 
+    if (event.event_type === "item/agentMessage/delta") {
+      const delta = event.text ?? stringValue(params?.delta);
+      if (!delta) continue;
+      const previous = assistantByItemId.get(itemId);
+      const message: AgentRunChatMessage = {
+        id: `assistant:${itemId}`,
+        role: "assistant",
+        text: `${previous?.text ?? ""}${delta}`,
+        createdAt: previous?.createdAt ?? eventCreatedAt,
+        streaming: true
+      };
+      assistantByItemId.set(itemId, message);
+      upsertMessageEntry(entries, message);
+      continue;
+    }
+
+    if (itemType === "agent_message" || itemType === "agentMessage") {
+      const text = stringValue(item?.text) ?? stringValue(item?.content) ?? event.text;
+      if (!text?.trim()) continue;
+      const previous = assistantByItemId.get(itemId);
+      const message: AgentRunChatMessage = {
+        id: previous?.id ?? `assistant:${itemId}`,
+        role: "assistant",
+        text,
+        createdAt: previous?.createdAt ?? eventCreatedAt,
+        completedAt: eventCreatedAt,
+        streaming: false
+      };
+      assistantByItemId.set(itemId, message);
+      upsertMessageEntry(entries, message);
+      continue;
+    }
+
+    if (event.event_type === "item/completed" && event.text?.trim()) {
+      entries.push({
+        id: `assistant:${event.id}`,
+        kind: "message",
+        createdAt: eventCreatedAt,
+        message: {
+          id: `assistant:${event.id}`,
+          role: "assistant",
+          text: event.text,
+          createdAt: eventCreatedAt,
+          completedAt: eventCreatedAt,
+          streaming: false
+        }
+      });
+      continue;
+    }
+
     if (itemType === "reasoning") {
-      const text = stringValue(item?.text) ?? event.text;
+      const summary = stringArrayValue(item?.summary).join("\n");
+      const content = stringArrayValue(item?.content).join("\n");
+      const text = stringValue(item?.text) ?? event.text ?? (summary || content);
       if (!text?.trim()) continue;
       entries.push({
         id: `thinking:${event.id}`,
@@ -220,10 +291,10 @@ function deriveTimelineEntries(
       continue;
     }
 
-    if (itemType === "command_execution") {
+    if (itemType === "command_execution" || itemType === "commandExecution") {
       const command = stringValue(item?.command);
-      const output = stringValue(item?.aggregated_output);
-      const exitCode = numberValue(item?.exit_code);
+      const output = stringValue(item?.aggregated_output) ?? stringValue(item?.aggregatedOutput);
+      const exitCode = numberValue(item?.exit_code) ?? numberValue(item?.exitCode);
       const status = stringValue(item?.status);
       const previous = workByItemId.get(itemId);
       const entry: AgentRunWorkLogEntry = {
@@ -257,7 +328,27 @@ function deriveTimelineEntries(
       continue;
     }
 
-    if (event.event_type === "turn.failed" || event.event_type === "parse.error") {
+    if (event.event_type === "turn/completed") {
+      const turnStatus = stringValue(rawRecord(rawRecord(raw?.params)?.turn)?.status);
+      if (turnStatus !== "failed") {
+        for (const message of assistantByItemId.values()) {
+          if (!message.streaming) continue;
+          upsertMessageEntry(entries, {
+            ...message,
+            completedAt: eventCreatedAt,
+            streaming: false
+          });
+        }
+        continue;
+      }
+    }
+
+    if (
+      event.event_type === "turn.failed" ||
+      event.event_type === "parse.error" ||
+      (event.event_type === "turn/completed" &&
+        stringValue(rawRecord(rawRecord(raw?.params)?.turn)?.status) === "failed")
+    ) {
       entries.push({
         id: `error:${event.id}`,
         kind: "work",
@@ -273,8 +364,13 @@ function deriveTimelineEntries(
       continue;
     }
 
-    if (event.event_type === "thread.started") {
-      const threadId = stringValue(raw?.thread_id) ?? stringValue(normalized?.threadId);
+    if (event.event_type === "thread.started" || event.event_type === "thread/started") {
+      const rawParams = rawRecord(raw?.params);
+      const threadId =
+        stringValue(raw?.thread_id) ??
+        stringValue(rawParams?.threadId) ??
+        stringValue(rawRecord(rawParams?.thread)?.id) ??
+        stringValue(normalized?.threadId);
       entries.push({
         id: `system:${event.id}`,
         kind: "work",
@@ -291,6 +387,16 @@ function deriveTimelineEntries(
   }
 
   return entries.sort(compareTimelineEntries);
+}
+
+function compareEventRows(left: AgentRunTimelineEvent, right: AgentRunTimelineEvent): number {
+  const leftTime = left.created_at ?? "";
+  const rightTime = right.created_at ?? "";
+  return (
+    leftTime.localeCompare(rightTime) ||
+    left.seq - right.seq ||
+    String(left.id).localeCompare(String(right.id))
+  );
 }
 
 function computeMessageDurationStart(messages: ReadonlyArray<AgentRunChatMessage>): Map<string, string> {
@@ -336,6 +442,21 @@ function replaceWorkEntry(entries: TimelineEntry[], replacement: AgentRunWorkLog
   }
 }
 
+function upsertMessageEntry(entries: TimelineEntry[], message: AgentRunChatMessage): void {
+  const index = entries.findIndex((entry) => entry.kind === "message" && entry.message.id === message.id);
+  const replacement: TimelineEntry = {
+    id: message.id,
+    kind: "message",
+    createdAt: message.createdAt,
+    message
+  };
+  if (index >= 0) {
+    entries[index] = replacement;
+    return;
+  }
+  entries.push(replacement);
+}
+
 function eventText(event: AgentRunTimelineEvent): string {
   if (event.text) return event.text;
   const normalized = rawRecord(event.payload);
@@ -367,4 +488,8 @@ function stringValue(value: unknown): string | undefined {
 
 function numberValue(value: unknown): number | null {
   return typeof value === "number" ? value : null;
+}
+
+function stringArrayValue(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }

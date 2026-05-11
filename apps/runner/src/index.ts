@@ -1,5 +1,4 @@
 import {
-  buildCodexArgs,
   buildCodexConfigToml,
   buildDispatcherPrompt,
   createPool,
@@ -17,12 +16,13 @@ import {
   runMigrations,
   type DbPool
 } from "@aisevak/core";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { runCodexAppServerTurn } from "./appServerClient.js";
 
 const env = {
   managedRoot: process.env.MANAGED_ROOT ?? "/srv/aisevak",
@@ -264,7 +264,6 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   );
   const job = mustRow(detail.rows[0]);
 
-  let child: ChildProcessWithoutNullStreams | undefined;
   let stdout = "";
   let stderr = "";
   let exitCode: number | null = null;
@@ -281,9 +280,13 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       taskId: job.task_id
     });
     const toolBin = await writeAgentTool(job.codex_home);
-    const args = buildCodexArgs({ model: job.model, resumeThreadId: job.codex_thread_id });
-    child = spawn(env.codexBinary, args, {
+    const turn = await runCodexAppServerTurn({
+      codexBinary: env.codexBinary,
       cwd: job.cwd,
+      codexHome: job.codex_home,
+      model: job.model,
+      prompt: job.prompt,
+      threadId: job.codex_thread_id,
       env: {
         ...process.env,
         CODEX_HOME: job.codex_home,
@@ -292,46 +295,28 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
         ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
       },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-
-    let seq = 0;
-    let stdoutBuffer = "";
-    child.stdout.on("data", async (chunk) => {
-      const text = redactSecrets(String(chunk), [apiKey, toolToken]);
-      stdout += text;
-      stdoutBuffer += text;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        await persistDispatcherCodexLine(pool, job, line, seq++);
+      secrets: [apiKey, toolToken],
+      onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq),
+      onThreadId: async (threadId) => {
+        await pool.query(
+          "UPDATE dispatcher_runs SET codex_thread_id = $2, updated_at = now() WHERE id = $1",
+          [job.id, threadId]
+        );
+      },
+      shouldCancel: async () => {
+        const current = await pool.query<{ status: string }>(
+          "SELECT status FROM dispatcher_runs WHERE id = $1",
+          [job.id]
+        );
+        return current.rows[0]?.status === "cancel_requested";
       }
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += redactSecrets(String(chunk), [apiKey, toolToken]);
-    });
-    child.stdin.write(job.prompt);
-    child.stdin.end();
-
-    const cancellation = watchDispatcherCancellation(pool, job.id, () => {
-      child?.kill("SIGTERM");
-    });
-
-    exitCode = await waitForClose(child);
-    clearInterval(cancellation);
-    if (stdoutBuffer.trim()) {
-      await persistDispatcherCodexLine(pool, job, stdoutBuffer, seq++);
-    }
-    const current = await pool.query<{ status: string }>(
-      "SELECT status FROM dispatcher_runs WHERE id = $1",
-      [job.id]
-    );
+    stdout = turn.rawStdout;
+    stderr = turn.rawStderr;
+    exitCode = turn.exitCode;
     finalStatus =
-      current.rows[0]?.status === "cancel_requested"
-        ? "cancelled"
-        : exitCode === 0
-          ? "succeeded"
-          : "failed";
+      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
@@ -356,11 +341,25 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     `UPDATE task_runs
      SET status = 'running', started_at = now(), updated_at = now()
      WHERE id = (
-       SELECT id
-       FROM task_runs
-       WHERE status = 'queued' AND run_kind = 'worker'
-       ORDER BY queued_at ASC
+       SELECT candidate.id
+       FROM task_runs candidate
+       JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
+       JOIN projects candidate_project ON candidate_project.id = candidate_task.project_id
+       WHERE candidate.status = 'queued'
+         AND candidate.run_kind = 'worker'
+         AND (
+           candidate_project.workspace_mode <> 'direct'
+           OR NOT EXISTS (
+             SELECT 1
+             FROM task_runs active
+             JOIN tasks active_task ON active_task.id = active.task_id
+             WHERE active_task.project_id = candidate_task.project_id
+               AND active.status = 'running'
+           )
+         )
+       ORDER BY candidate.queued_at ASC
        LIMIT 1
+       FOR UPDATE SKIP LOCKED
      )
      RETURNING id`
   );
@@ -387,7 +386,6 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
   );
   const job = mustRow(detail.rows[0]);
 
-  let child: ChildProcessWithoutNullStreams | undefined;
   let stdout = "";
   let stderr = "";
   let exitCode: number | null = null;
@@ -409,9 +407,13 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       taskId: job.task_id
     });
     const toolBin = await writeAgentTool(job.codex_home);
-    const args = buildCodexArgs({ model: job.model, resumeThreadId: job.codex_thread_id });
-    child = spawn(env.codexBinary, args, {
+    const turn = await runCodexAppServerTurn({
+      codexBinary: env.codexBinary,
       cwd,
+      codexHome: job.codex_home,
+      model: job.model,
+      prompt: job.prompt,
+      threadId: job.codex_thread_id,
       env: {
         ...process.env,
         CODEX_HOME: job.codex_home,
@@ -420,40 +422,29 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
         ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
       },
-      stdio: ["pipe", "pipe", "pipe"]
-    });
-
-    let seq = 0;
-    let stdoutBuffer = "";
-    child.stdout.on("data", async (chunk) => {
-      const text = redactSecrets(String(chunk), [apiKey, toolToken]);
-      stdout += text;
-      stdoutBuffer += text;
-      const lines = stdoutBuffer.split(/\r?\n/);
-      stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) {
-        await persistCodexLine(pool, job, line, seq++);
+      secrets: [apiKey, toolToken],
+      onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
+      onThreadId: async (threadId) => {
+        await pool.query(
+          `UPDATE task_sessions SET codex_thread_id = $2, updated_at = now() WHERE id = $1`,
+          [job.task_session_id, threadId]
+        );
+        await pool.query("UPDATE task_runs SET codex_thread_id = $2 WHERE id = $1", [job.id, threadId]);
+      },
+      shouldCancel: async () => {
+        const current = await pool.query<{ status: string }>(
+          "SELECT status FROM task_runs WHERE id = $1",
+          [job.id]
+        );
+        return current.rows[0]?.status === "cancel_requested";
       }
     });
-    child.stderr.on("data", (chunk) => {
-      stderr += redactSecrets(String(chunk), [apiKey, toolToken]);
-    });
-    child.stdin.write(job.prompt);
-    child.stdin.end();
-
-    const cancellation = watchCancellation(pool, job.id, () => {
-      child?.kill("SIGTERM");
-    });
-
-    exitCode = await waitForClose(child);
-    clearInterval(cancellation);
-    if (stdoutBuffer.trim()) {
-      await persistCodexLine(pool, job, stdoutBuffer, seq++);
-    }
-    const current = await pool.query<{ status: string }>("SELECT status FROM task_runs WHERE id = $1", [
-      job.id
-    ]);
-    finalStatus = current.rows[0]?.status === "cancel_requested" ? "cancelled" : exitCode === 0 ? "succeeded" : "failed";
+    stdout = turn.rawStdout;
+    stderr = turn.rawStderr;
+    exitCode = turn.exitCode;
+    finalStatus =
+      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
@@ -562,29 +553,6 @@ async function persistDispatcherCodexLine(
      ON CONFLICT (dispatcher_run_id, seq) DO NOTHING`,
     [job.id, seq, normalized.type, normalized.text ?? null, normalized]
   );
-}
-
-function watchCancellation(pool: DbPool, runId: string, onCancel: () => void): NodeJS.Timeout {
-  return setInterval(async () => {
-    const result = await pool.query<{ status: string }>("SELECT status FROM task_runs WHERE id = $1", [
-      runId
-    ]);
-    if (result.rows[0]?.status === "cancel_requested") {
-      onCancel();
-    }
-  }, 1000);
-}
-
-function watchDispatcherCancellation(pool: DbPool, runId: string, onCancel: () => void): NodeJS.Timeout {
-  return setInterval(async () => {
-    const result = await pool.query<{ status: string }>(
-      "SELECT status FROM dispatcher_runs WHERE id = $1",
-      [runId]
-    );
-    if (result.rows[0]?.status === "cancel_requested") {
-      onCancel();
-    }
-  }, 1000);
 }
 
 async function createAgentToolToken(
@@ -895,12 +863,6 @@ async function git(args: string[], cwd?: string, token?: string): Promise<{ stdo
 async function defaultBranch(cwd: string): Promise<string> {
   const result = await git(["symbolic-ref", "refs/remotes/origin/HEAD"], cwd);
   return result.stdout.trim().split("/").pop() || "main";
-}
-
-function waitForClose(child: ChildProcessWithoutNullStreams): Promise<number | null> {
-  return new Promise((resolve) => {
-    child.on("close", resolve);
-  });
 }
 
 function mustRow<T>(row: T | undefined): T {

@@ -7,3 +7,4 @@ coverage
 *.log
 tmp
 data
+.aisevak-dev

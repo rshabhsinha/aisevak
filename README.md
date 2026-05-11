@@ -35,4 +35,4 @@ The installer creates app directories under `/opt/aisevak` and managed workspace
 
 ## Security model
 
-This app is for trusted small teams. Codex task runs intentionally use `--dangerously-bypass-approvals-and-sandbox`, `approval_policy = "never"`, and `sandbox_mode = "danger-full-access"`. Run it on a dedicated machine or VM.
+This app is for trusted small teams. Codex sessions are driven through `codex app-server` with approvals disabled and `danger-full-access` sandbox policy. Run it on a dedicated machine or VM.

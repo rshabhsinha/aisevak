@@ -154,20 +154,21 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const body = codexProbeSchema.parse(request.body ?? {});
     const apiKey = body.openaiApiKey || (await readSecret(pool, "openai_api_key"));
     const version = await runCommand(env.codexBinary, ["--version"], undefined, apiKey);
-    const help = await runCommand(env.codexBinary, ["exec", "--help"], undefined, apiKey);
+    const help = await runCommand(env.codexBinary, ["app-server", "--help"], undefined, apiKey);
     let liveProbe: CommandResult | null = null;
     if (body.runLiveProbe) {
+      await mkdir(env.managedRoot, { recursive: true });
       liveProbe = await runCommand(
         env.codexBinary,
-        ["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-"],
-        "Reply with exactly: probe ok",
+        ["app-server", "generate-json-schema", "--out", `${env.managedRoot}/probe-schema`],
+        undefined,
         apiKey
       );
     }
     return {
       version,
-      execHelpContainsJson: help.stdout.includes("--json"),
-      execHelpContainsDangerous: help.stdout.includes("--dangerously-bypass-approvals-and-sandbox"),
+      appServerHelpContainsStdio: help.stdout.includes("stdio://"),
+      appServerHelpContainsSchema: help.stdout.includes("generate-json-schema"),
       liveProbe
     };
   });
@@ -344,6 +345,28 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return { run, kind: "worker" };
   });
 
+  app.post("/api/tasks/:id/messages", async (request) => {
+    requireUser(request);
+    const { id: taskId } = idParams.parse(request.params);
+    const body = sessionMessageSchema.parse(request.body);
+    const task = await getTaskJoin(pool, taskId);
+    if (task.agent_kind === "dispatcher") {
+      const run = await queueDispatcherMessage(pool, { taskId, prompt: body.message });
+      return { run, kind: "dispatcher" };
+    }
+    const run = await queueWorkerRun(pool, taskId, "manual", {
+      promptOverride: body.message,
+      allowQueuedFollowUp: true
+    });
+    return { run, kind: "worker" };
+  });
+
+  app.get("/api/tasks/:id/session", async (request) => {
+    requireUser(request);
+    const { id: taskId } = idParams.parse(request.params);
+    return getTaskSessionTimeline(pool, taskId);
+  });
+
   app.post("/api/runs/:id/cancel", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
@@ -388,7 +411,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       ),
       pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [id])
     ]);
-    return { run: runResult.rows[0] ?? null, events: eventsResult.rows };
+    return {
+      run: runResult.rows[0] ?? null,
+      events: withSyntheticUserMessages(runResult.rows, eventsResult.rows)
+    };
   });
 
   app.get("/api/runs/:id/stream", async (request, reply) => {
@@ -479,36 +505,33 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
           [params.id]
         )
       ]);
-      return { run: mustRow(runResult.rows[0]), events: eventsResult.rows };
+      return {
+        run: mustRow(runResult.rows[0]),
+        events: withSyntheticUserMessages(runResult.rows, eventsResult.rows)
+      };
     }
-    const [runResult, eventsResult] = await Promise.all([
-      pool.query(
-        `SELECT task_runs.id,
-                'worker' AS kind,
-                task_runs.trigger,
-                task_runs.status::text,
-                task_runs.model,
-                task_runs.task_id,
-                tasks.number AS task_number,
-                tasks.title AS task_title,
-                projects.name AS project_name,
-                COALESCE(task_sessions.agent_snapshot->>'name', agents.name) AS agent_name,
-                task_runs.prompt,
-                task_runs.queued_at,
-                task_runs.started_at,
-                task_runs.finished_at,
-                task_runs.error
-         FROM task_runs
-         JOIN tasks ON tasks.id = task_runs.task_id
-         JOIN projects ON projects.id = tasks.project_id
-         JOIN agents ON agents.id = tasks.agent_id
-         JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
-         WHERE task_runs.id = $1`,
-        [params.id]
-      ),
-      pool.query("SELECT * FROM run_events WHERE run_id = $1 ORDER BY seq ASC", [params.id])
+    const source = await pool.query<{ task_id: string }>("SELECT task_id FROM task_runs WHERE id = $1", [
+      params.id
     ]);
-    return { run: mustRow(runResult.rows[0]), events: eventsResult.rows };
+    return getTaskSessionTimeline(pool, mustRow(source.rows[0]).task_id);
+  });
+
+  app.post("/api/agent-runs/:kind/:id/messages", async (request) => {
+    requireUser(request);
+    const params = runEventsParams.parse(request.params);
+    const body = sessionMessageSchema.parse(request.body);
+    if (params.kind === "dispatcher") {
+      const run = await queueDispatcherMessage(pool, { sourceRunId: params.id, prompt: body.message });
+      return { run, kind: "dispatcher" };
+    }
+    const source = await pool.query<{ task_id: string }>("SELECT task_id FROM task_runs WHERE id = $1", [
+      params.id
+    ]);
+    const run = await queueWorkerRun(pool, mustRow(source.rows[0]).task_id, "manual", {
+      promptOverride: body.message,
+      allowQueuedFollowUp: true
+    });
+    return { run, kind: "worker" };
   });
 
   app.get("/api/agent-tools/context", async (request) => {
@@ -770,6 +793,9 @@ const taskSchema = z.object({
 const taskPatchSchema = taskSchema.partial().extend({
   status: z.string().optional()
 });
+const sessionMessageSchema = z.object({
+  message: z.string().trim().min(1)
+});
 const agentToolCreateTaskSchema = z.object({
   title: z.string().min(1),
   body: z.string().optional(),
@@ -827,6 +853,35 @@ interface TaskJoin {
   agent_description: string;
   agent_model: string;
   agent_instructions: string;
+}
+
+interface TimelineRunRow {
+  id: string;
+  kind: "worker" | "dispatcher";
+  trigger: string;
+  status: string;
+  model: string;
+  task_id?: string | null;
+  task_number?: number | null;
+  task_title?: string | null;
+  project_name?: string | null;
+  agent_name: string;
+  prompt?: string | null;
+  queued_at?: string | Date | null;
+  started_at?: string | Date | null;
+  finished_at?: string | Date | null;
+  error?: string | null;
+}
+
+interface TimelineEventRow {
+  id: string;
+  run_id?: string | null;
+  dispatcher_run_id?: string | null;
+  seq: number;
+  event_type: string;
+  text?: string | null;
+  payload: unknown;
+  created_at?: string | Date | null;
 }
 
 interface AgentToolContext {
@@ -944,25 +999,30 @@ async function getTaskJoin(pool: DbPool, taskId: string): Promise<TaskJoin> {
 async function queueWorkerRun(
   pool: DbPool,
   taskId: string,
-  trigger: "manual" | "agent_tool"
+  trigger: "manual" | "agent_tool",
+  options: { promptOverride?: string; allowQueuedFollowUp?: boolean } = {}
 ): Promise<Record<string, unknown>> {
   const task = await getTaskJoin(pool, taskId);
   if (task.agent_kind === "dispatcher") {
     throw new Error("Auto-route tasks must be dispatched before a worker run can start");
   }
-  await ensureNoDirectProjectRun(pool, task.project_id, task.workspace_mode);
+  if (!options.allowQueuedFollowUp) {
+    await ensureNoDirectProjectRun(pool, task.project_id, task.workspace_mode);
+  }
 
   const branch = task.source === "github" ? taskBranchName(task.number, task.title) : null;
   const codexHome = managedCodexHome(env.managedRoot, task.id);
   await mkdir(codexHome, { recursive: true });
-  const prompt = buildCodexPrompt({
-    agentName: task.agent_name,
-    agentInstructions: task.agent_instructions,
-    taskTitle: task.title,
-    taskBody: task.body,
-    projectPath: task.local_path,
-    branch
-  });
+  const prompt =
+    options.promptOverride ??
+    buildCodexPrompt({
+      agentName: task.agent_name,
+      agentInstructions: task.agent_instructions,
+      taskTitle: task.title,
+      taskBody: task.body,
+      projectPath: task.local_path,
+      branch
+    });
   const agentSnapshot = {
     name: task.agent_name,
     description: task.agent_description,
@@ -976,7 +1036,73 @@ async function queueWorkerRun(
      RETURNING *`,
     [task.id, session.id, trigger, task.local_path, branch, task.agent_model, prompt]
   );
-  return mustRow(runResult.rows[0]);
+  const run = mustRow(runResult.rows[0]);
+  await insertRunUserMessage(pool, String(run.id), prompt);
+  return run;
+}
+
+async function queueDispatcherMessage(
+  pool: DbPool,
+  options: { sourceRunId?: string; taskId?: string; prompt: string }
+): Promise<Record<string, unknown>> {
+  const existing = options.sourceRunId
+    ? await pool.query<{
+        task_id: string | null;
+        scope: string;
+        cwd: string;
+        codex_home: string;
+        codex_thread_id: string | null;
+        model: string;
+      }>(
+        `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model
+         FROM dispatcher_runs
+         WHERE id = $1`,
+        [options.sourceRunId]
+      )
+    : options.taskId
+      ? await pool.query<{
+          task_id: string | null;
+          scope: string;
+          cwd: string;
+          codex_home: string;
+          codex_thread_id: string | null;
+          model: string;
+        }>(
+          `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model
+           FROM dispatcher_runs
+           WHERE task_id = $1
+           ORDER BY created_at DESC
+           LIMIT 1`,
+          [options.taskId]
+        )
+      : { rows: [] };
+
+  const previous = existing.rows[0];
+  if (options.sourceRunId && !previous) {
+    throw new Error("Dispatcher run was not found");
+  }
+  const dispatcher = previous ? null : await getDispatcherAgent(pool);
+  const codexHome =
+    previous?.codex_home ?? managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
+  await mkdir(codexHome, { recursive: true });
+  const result = await pool.query(
+    `INSERT INTO dispatcher_runs
+       (task_id, trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt)
+     VALUES ($1, 'manual', $2, 'queued', $3, $4, $5, $6, $7)
+     RETURNING *`,
+    [
+      previous?.task_id ?? options.taskId ?? null,
+      previous?.scope ?? (options.taskId ? "task" : "heartbeat"),
+      previous?.cwd ?? env.managedRoot,
+      codexHome,
+      previous?.codex_thread_id ?? null,
+      previous?.model ?? dispatcher?.model,
+      options.prompt
+    ]
+  );
+  const run = mustRow(result.rows[0]);
+  await insertDispatcherUserMessage(pool, String(run.id), options.prompt);
+  return run;
 }
 
 async function queueDispatcherRun(
@@ -1010,7 +1136,121 @@ async function queueDispatcherRun(
       prompt
     ]
   );
-  return mustRow(result.rows[0]);
+  const run = mustRow(result.rows[0]);
+  await insertDispatcherUserMessage(pool, String(run.id), prompt);
+  return run;
+}
+
+async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
+  run: TimelineRunRow | null;
+  events: TimelineEventRow[];
+}> {
+  const [runsResult, eventsResult] = await Promise.all([
+    pool.query<TimelineRunRow>(
+      `SELECT task_runs.id,
+              'worker' AS kind,
+              task_runs.trigger,
+              task_runs.status::text,
+              task_runs.model,
+              task_runs.task_id,
+              tasks.number AS task_number,
+              tasks.title AS task_title,
+              projects.name AS project_name,
+              COALESCE(task_sessions.agent_snapshot->>'name', agents.name) AS agent_name,
+              task_runs.prompt,
+              task_runs.queued_at,
+              task_runs.started_at,
+              task_runs.finished_at,
+              task_runs.error
+       FROM task_runs
+       JOIN tasks ON tasks.id = task_runs.task_id
+       JOIN projects ON projects.id = tasks.project_id
+       JOIN agents ON agents.id = tasks.agent_id
+       JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
+       WHERE task_runs.task_id = $1 AND task_runs.run_kind = 'worker'
+       ORDER BY task_runs.queued_at ASC, task_runs.created_at ASC`,
+      [taskId]
+    ),
+    pool.query<TimelineEventRow>(
+      `SELECT run_events.*
+       FROM run_events
+       JOIN task_runs ON task_runs.id = run_events.run_id
+       WHERE task_runs.task_id = $1 AND task_runs.run_kind = 'worker'
+       ORDER BY task_runs.queued_at ASC, task_runs.created_at ASC, run_events.seq ASC`,
+      [taskId]
+    )
+  ]);
+  const runs = runsResult.rows;
+  const latest = runs.at(-1) ?? null;
+  const aggregateStatus =
+    runs.find((run) => run.status === "running" || run.status === "cancel_requested")?.status ??
+    runs.find((run) => run.status === "queued")?.status ??
+    latest?.status ??
+    "open";
+  return {
+    run: latest ? { ...latest, status: aggregateStatus, prompt: null } : null,
+    events: withSyntheticUserMessages(runs, eventsResult.rows)
+  };
+}
+
+async function insertRunUserMessage(pool: DbPool, runId: string, prompt: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO run_events (run_id, seq, event_type, text, payload)
+     VALUES ($1, -1, 'thread.message-sent', $2, $3)
+     ON CONFLICT (run_id, seq) DO NOTHING`,
+    [runId, prompt, { type: "thread.message-sent", role: "user", text: prompt }]
+  );
+}
+
+async function insertDispatcherUserMessage(pool: DbPool, runId: string, prompt: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
+     VALUES ($1, -1, 'thread.message-sent', $2, $3)
+     ON CONFLICT (dispatcher_run_id, seq) DO NOTHING`,
+    [runId, prompt, { type: "thread.message-sent", role: "user", text: prompt }]
+  );
+}
+
+function withSyntheticUserMessages(
+  runs: ReadonlyArray<Pick<TimelineRunRow, "id" | "prompt" | "queued_at">>,
+  events: ReadonlyArray<TimelineEventRow>
+): TimelineEventRow[] {
+  const runsWithUserEvents = new Set(
+    events
+      .filter((event) => event.event_type === "thread.message-sent")
+      .map((event) => event.run_id ?? event.dispatcher_run_id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0)
+  );
+  const synthetic = runs.flatMap((run): TimelineEventRow[] => {
+    if (!run.prompt?.trim() || runsWithUserEvents.has(run.id)) return [];
+    return [
+      {
+        id: `user-message:${run.id}`,
+        run_id: run.id,
+        seq: -1,
+        event_type: "thread.message-sent",
+        text: run.prompt,
+        payload: { type: "thread.message-sent", role: "user", text: run.prompt },
+        created_at: run.queued_at ?? null
+      }
+    ];
+  });
+  return [...synthetic, ...events].sort(compareTimelineEvents);
+}
+
+function compareTimelineEvents(left: TimelineEventRow, right: TimelineEventRow): number {
+  const leftTime = dateString(left.created_at);
+  const rightTime = dateString(right.created_at);
+  return (
+    leftTime.localeCompare(rightTime) ||
+    left.seq - right.seq ||
+    String(left.id).localeCompare(String(right.id))
+  );
+}
+
+function dateString(value: string | Date | null | undefined): string {
+  if (!value) return "";
+  return value instanceof Date ? value.toISOString() : value;
 }
 
 async function upsertTaskSession(

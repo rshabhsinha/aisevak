@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowUp,
   Bot,
   CheckCircle2,
   ChevronDown,
@@ -15,6 +16,7 @@ import {
   Hammer,
   LayoutDashboard,
   Loader2,
+  LockOpen,
   LogOut,
   Play,
   Plus,
@@ -32,6 +34,7 @@ import {
   deriveAgentRunTimelineRows,
   formatElapsed,
   normalizeCompactToolLabel,
+  type AgentRunChatMessage,
   type AgentRunTimelineRun,
   type AgentRunTimelineRow,
   type AgentRunWorkLogEntry
@@ -157,6 +160,8 @@ export function App() {
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [selectedTaskRun, setSelectedTaskRun] = useState<AgentRunTimelineRun | null>(null);
   const [events, setEvents] = useState<RunEvent[]>([]);
+  const [pendingTaskMessages, setPendingTaskMessages] = useState<Record<string, AgentRunChatMessage[]>>({});
+  const [pendingRunMessages, setPendingRunMessages] = useState<Record<string, AgentRunChatMessage[]>>({});
   const [query, setQuery] = useState("");
   const [busyRunId, setBusyRunId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -177,10 +182,12 @@ export function App() {
     );
   }, [query, tasks]);
 
+  const displayedAgentRuns = useMemo(() => collapseAgentRuns(agentRuns), [agentRuns]);
+
   const filteredRuns = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return agentRuns;
-    return agentRuns.filter((run) =>
+    if (!needle) return displayedAgentRuns;
+    return displayedAgentRuns.filter((run) =>
       [
         run.kind,
         run.trigger,
@@ -195,7 +202,7 @@ export function App() {
         .toLowerCase()
         .includes(needle)
     );
-  }, [agentRuns, query]);
+  }, [displayedAgentRuns, query]);
 
   useEffect(() => {
     void boot();
@@ -206,30 +213,21 @@ export function App() {
   }, [user]);
 
   useEffect(() => {
-    if (!selectedTask?.latest_run_id) {
+    if (!selectedTask) {
       setEvents([]);
       setSelectedTaskRun(null);
       return;
     }
-    void loadEvents(selectedTask.latest_run_id);
+    void loadTaskSession(selectedTask.id);
     if (!isActiveRun(selectedTask.latest_run_status)) return;
 
-    const source = new EventSource(`/api/runs/${selectedTask.latest_run_id}/stream`, {
-      withCredentials: true
-    });
-    source.addEventListener("run_event", (event) => {
-      const payload = JSON.parse((event as MessageEvent).data) as RunEvent;
-      setEvents((current) =>
-        current.some((existing) => existing.id === payload.id) ? current : [...current, payload]
-      );
-    });
-    source.addEventListener("done", () => {
-      source.close();
+    const timer = window.setInterval(() => {
+      void loadTaskSession(selectedTask.id);
       void reloadTasks();
-    });
-    source.onerror = () => source.close();
-    return () => source.close();
-  }, [selectedTask?.latest_run_id, selectedTask?.latest_run_status]);
+      void reloadAgentRuns();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedTask?.id, selectedTask?.latest_run_id, selectedTask?.latest_run_status]);
 
   useEffect(() => {
     if (!selectedRun) {
@@ -237,7 +235,13 @@ export function App() {
       return;
     }
     void loadAgentRunEvents(selectedRun);
-  }, [selectedRun?.id, selectedRun?.kind]);
+    if (!isActiveRun(selectedRun.status)) return;
+    const timer = window.setInterval(() => {
+      void loadAgentRunEvents(selectedRun);
+      void reloadAgentRuns();
+    }, 2000);
+    return () => window.clearInterval(timer);
+  }, [selectedRun?.id, selectedRun?.kind, selectedRun?.status]);
 
   async function boot() {
     const status = await api<{ hasAdmin: boolean }>("/api/onboarding/status");
@@ -281,12 +285,13 @@ export function App() {
     }
   }
 
-  async function reloadAgentRuns() {
+  async function reloadAgentRuns(): Promise<AgentRun[]> {
     const data = await api<{ runs: AgentRun[] }>("/api/agent-runs");
     setAgentRuns(data.runs);
     if (selectedRun && !data.runs.some((run) => run.id === selectedRun.id && run.kind === selectedRun.kind)) {
       setSelectedRun(null);
     }
+    return data.runs;
   }
 
   async function reloadRepos(refresh: boolean) {
@@ -297,21 +302,21 @@ export function App() {
     setRepos(data.repositories);
   }
 
-  async function loadEvents(runId: string) {
+  async function loadTaskSession(taskId: string) {
     const data = await api<{ run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
-      `/api/runs/${runId}/events`
+      `/api/tasks/${taskId}/session`
     );
     setSelectedTaskRun(data.run ?? null);
     setEvents(data.events);
   }
 
   async function loadAgentRunEvents(run: AgentRun) {
-    const data = await api<{ run?: AgentRun; events: RunEvent[] }>(
+    const data = await api<{ run?: Partial<AgentRun> | null; events: RunEvent[] }>(
       `/api/agent-runs/${run.kind}/${run.id}/events`
     );
     if (data.run) {
       setSelectedRun((current) =>
-        current?.id === run.id && current.kind === run.kind ? { ...current, ...data.run } : current
+        current && isSameAgentRunConversation(current, run) ? { ...current, ...data.run } : current
       );
     }
     setAgentRunEvents(data.events);
@@ -328,6 +333,56 @@ export function App() {
       await Promise.all([reloadTasks(), reloadAgentRuns()]);
     } finally {
       setBusyRunId(null);
+    }
+  }
+
+  async function sendTaskMessage(task: Task, messageText: string) {
+    const optimistic = optimisticMessage(messageText);
+    setPendingTaskMessages((current) => appendPendingMessage(current, task.id, optimistic));
+    setBusyRunId(task.id);
+    try {
+      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(`/api/tasks/${task.id}/messages`, {
+        method: "POST",
+        body: JSON.stringify({ message: messageText })
+      });
+      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Turn"} queued: ${shortId(data.run.id)}`);
+      setSelectedTaskId(task.id);
+      await Promise.all([reloadTasks(), reloadAgentRuns(), loadTaskSession(task.id)]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to send message.");
+      throw error;
+    } finally {
+      setPendingTaskMessages((current) => removePendingMessage(current, task.id, optimistic.id));
+      setBusyRunId(null);
+    }
+  }
+
+  async function sendAgentRunMessage(run: AgentRun, messageText: string) {
+    const key = agentRunConversationKey(run);
+    const optimistic = optimisticMessage(messageText);
+    setPendingRunMessages((current) => appendPendingMessage(current, key, optimistic));
+    try {
+      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(
+        `/api/agent-runs/${run.kind}/${run.id}/messages`,
+        {
+          method: "POST",
+          body: JSON.stringify({ message: messageText })
+        }
+      );
+      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Turn"} queued: ${shortId(data.run.id)}`);
+      const [runs] = await Promise.all([reloadAgentRuns(), reloadTasks()]);
+      const nextRun = findUpdatedConversationRun(runs, run, data.run.id, data.kind);
+      if (nextRun) {
+        setSelectedRun(nextRun);
+        await loadAgentRunEvents(nextRun);
+      } else {
+        await loadAgentRunEvents(run);
+      }
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Failed to send message.");
+      throw error;
+    } finally {
+      setPendingRunMessages((current) => removePendingMessage(current, key, optimistic.id));
     }
   }
 
@@ -401,6 +456,7 @@ export function App() {
             selectedTask={selectedTask}
             selectedTaskRun={selectedTaskRun}
             events={events}
+            pendingMessages={selectedTask ? (pendingTaskMessages[selectedTask.id] ?? []) : []}
             busyRunId={busyRunId}
             onCreate={async (payload) => {
               await api<{ task: Task }>("/api/tasks", {
@@ -412,6 +468,7 @@ export function App() {
             onSelect={setSelectedTaskId}
             onClose={() => setSelectedTaskId(null)}
             onRun={runTask}
+            onSendMessage={sendTaskMessage}
             onCancel={async (runId) => {
               await api(`/api/runs/${runId}/cancel`, { method: "POST" });
               await Promise.all([reloadTasks(), reloadAgentRuns()]);
@@ -424,10 +481,12 @@ export function App() {
             runs={filteredRuns}
             selectedRun={selectedRun}
             events={agentRunEvents}
+            pendingMessages={selectedRun ? (pendingRunMessages[agentRunConversationKey(selectedRun)] ?? []) : []}
             onSelect={(run) => {
               setSelectedRun(run);
               void loadAgentRunEvents(run);
             }}
+            onSendMessage={sendAgentRunMessage}
           />
         ) : null}
 
@@ -463,11 +522,13 @@ function TasksView(props: {
   selectedTask?: Task;
   selectedTaskRun: AgentRunTimelineRun | null;
   events: RunEvent[];
+  pendingMessages: AgentRunChatMessage[];
   busyRunId: string | null;
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
   onSelect: (id: string) => void;
   onClose: () => void;
   onRun: (task: Task) => Promise<void>;
+  onSendMessage: (task: Task, message: string) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
 }) {
   return (
@@ -510,9 +571,11 @@ function TasksView(props: {
           task={props.selectedTask}
           run={props.selectedTaskRun}
           events={props.events}
+          pendingMessages={props.pendingMessages}
           busyRunId={props.busyRunId}
           onClose={props.onClose}
           onRun={props.onRun}
+          onSendMessage={props.onSendMessage}
           onCancel={props.onCancel}
         />
       ) : null}
@@ -580,9 +643,11 @@ function TaskDetail(props: {
   task?: Task;
   run: AgentRunTimelineRun | null;
   events: RunEvent[];
+  pendingMessages: AgentRunChatMessage[];
   busyRunId: string | null;
   onClose: () => void;
   onRun: (task: Task) => Promise<void>;
+  onSendMessage: (task: Task, message: string) => Promise<void>;
   onCancel: (runId: string) => Promise<void>;
 }) {
   if (!props.task) {
@@ -647,7 +712,13 @@ function TaskDetail(props: {
           ) : null}
         </div>
       ) : null}
-      <CodexSessionTimeline run={taskRun} events={props.events} />
+      <CodexSessionTimeline run={taskRun} events={props.events} pendingMessages={props.pendingMessages} />
+      <SessionComposer
+        disabled={props.busyRunId === props.task.id}
+        modelLabel={taskRun?.model}
+        onSend={(message) => props.onSendMessage(props.task!, message)}
+        placeholder="Message this Codex session"
+      />
     </aside>
   );
 }
@@ -656,7 +727,9 @@ function AgentRunsView(props: {
   runs: AgentRun[];
   selectedRun: AgentRun | null;
   events: RunEvent[];
+  pendingMessages: AgentRunChatMessage[];
   onSelect: (run: AgentRun) => void;
+  onSendMessage: (run: AgentRun, message: string) => Promise<void>;
 }) {
   return (
     <div className="two-pane runs-view">
@@ -668,7 +741,7 @@ function AgentRunsView(props: {
         <div className="rows">
           {props.runs.map((run) => (
             <button
-              className={`row-card ${props.selectedRun?.id === run.id ? "selected" : ""}`}
+              className={`row-card ${isSameAgentRunConversation(props.selectedRun, run) ? "selected" : ""}`}
               key={`${run.kind}-${run.id}`}
               onClick={() => props.onSelect(run)}
             >
@@ -695,7 +768,16 @@ function AgentRunsView(props: {
               <TaskStatus status={props.selectedRun.status} />
             </div>
             {props.selectedRun.error ? <div className="notice">{props.selectedRun.error}</div> : null}
-            <CodexSessionTimeline run={props.selectedRun} events={props.events} />
+            <CodexSessionTimeline
+              run={props.selectedRun}
+              events={props.events}
+              pendingMessages={props.pendingMessages}
+            />
+            <SessionComposer
+              modelLabel={props.selectedRun.model}
+              onSend={(message) => props.onSendMessage(props.selectedRun!, message)}
+              placeholder="Message this Codex session"
+            />
           </div>
         ) : (
           <EmptyState text="Select a run" />
@@ -931,10 +1013,21 @@ function ConnectorsView(props: {
   );
 }
 
-function CodexSessionTimeline({ run, events }: { run: AgentRunTimelineRun | null; events: RunEvent[] }) {
-  const rows = useMemo(() => deriveAgentRunTimelineRows({ run, events }), [events, run]);
+function CodexSessionTimeline({
+  run,
+  events,
+  pendingMessages = []
+}: {
+  run: AgentRunTimelineRun | null;
+  events: RunEvent[];
+  pendingMessages?: AgentRunChatMessage[];
+}) {
+  const rows = useMemo(
+    () => deriveAgentRunTimelineRows({ run, events, pendingMessages }),
+    [events, pendingMessages, run]
+  );
 
-  if (!run && events.length === 0) {
+  if (!run && events.length === 0 && pendingMessages.length === 0) {
     return (
       <div className="chat-timeline empty-chat">
         <span className="muted">No run events yet.</span>
@@ -949,6 +1042,86 @@ function CodexSessionTimeline({ run, events }: { run: AgentRunTimelineRun | null
         <TimelineRow row={row} key={row.id} />
       ))}
     </div>
+  );
+}
+
+function SessionComposer(props: {
+  disabled?: boolean;
+  modelLabel?: string | null;
+  placeholder: string;
+  onSend: (message: string) => Promise<void>;
+}) {
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const trimmed = message.trim();
+  async function submitMessage() {
+    if (!trimmed || sending || props.disabled) return;
+    setError(null);
+    setSending(true);
+    try {
+      await props.onSend(trimmed);
+      setMessage("");
+    } catch (sendError) {
+      setError(sendError instanceof Error ? sendError.message : "Failed to send message.");
+    } finally {
+      setSending(false);
+    }
+  }
+  return (
+    <form
+      className="session-composer"
+      data-chat-composer-form="true"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        await submitMessage();
+      }}
+    >
+      <div className="session-composer-frame">
+        <div className="session-composer-box" data-chat-composer-surface="true">
+          <div className="session-composer-editor">
+            <textarea
+              value={message}
+              disabled={sending || props.disabled}
+              onChange={(event) => setMessage(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" || event.shiftKey) return;
+                event.preventDefault();
+                void submitMessage();
+              }}
+              placeholder={props.placeholder}
+              rows={3}
+            />
+          </div>
+          <div className="session-composer-footer" data-chat-composer-footer="true">
+            <div className="composer-left-actions">
+              <span className="composer-chip">
+                <Bot size={14} />
+                Build
+              </span>
+              <span className="composer-chip">
+                <LockOpen size={14} />
+                Full access
+              </span>
+              {props.modelLabel ? <span className="composer-chip">{props.modelLabel}</span> : null}
+            </div>
+            <div className="composer-right-actions" data-chat-composer-actions="right">
+              <span className="composer-shortcut">Shift Enter</span>
+              <button
+                className="composer-send-button"
+                type="submit"
+                disabled={!trimmed || sending || props.disabled}
+                aria-label={sending ? "Sending" : "Send message"}
+                title={sending ? "Sending" : "Send message"}
+              >
+                {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} />}
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+      {error ? <div className="composer-error">{error}</div> : null}
+    </form>
   );
 }
 
@@ -1164,10 +1337,12 @@ function LiveElapsed({ createdAt }: { createdAt: string }) {
 }
 
 function workEntryIcon(workEntry: AgentRunWorkLogEntry) {
-  if (workEntry.itemType === "command_execution" || workEntry.command) return Terminal;
-  if (workEntry.itemType === "web_search") return Eye;
-  if (workEntry.itemType === "mcp_tool_call") return Wrench;
-  if (workEntry.itemType === "dynamic_tool_call") return Hammer;
+  if (workEntry.itemType === "command_execution" || workEntry.itemType === "commandExecution" || workEntry.command) {
+    return Terminal;
+  }
+  if (workEntry.itemType === "web_search" || workEntry.itemType === "webSearch") return Eye;
+  if (workEntry.itemType === "mcp_tool_call" || workEntry.itemType === "mcpToolCall") return Wrench;
+  if (workEntry.itemType === "dynamic_tool_call" || workEntry.itemType === "dynamicToolCall") return Hammer;
   if (workEntry.tone === "error") return CircleAlert;
   if (workEntry.tone === "thinking") return Bot;
   if (workEntry.tone === "info") return CheckCircle2;
@@ -1369,6 +1544,95 @@ function runTitle(run: AgentRun): string {
 
 function shortId(id: string): string {
   return id.slice(0, 8);
+}
+
+type AgentRunRef = Pick<AgentRun, "kind" | "id"> & { task_id?: string | null };
+
+function collapseAgentRuns(runs: AgentRun[]): AgentRun[] {
+  const workerRunsByTask = new Map<string, AgentRun>();
+  const ungroupedRuns: AgentRun[] = [];
+
+  for (const run of runs) {
+    if (run.kind !== "worker" || !run.task_id) {
+      ungroupedRuns.push(run);
+      continue;
+    }
+    const current = workerRunsByTask.get(run.task_id);
+    if (!current || compareRunRecency(run, current) > 0) {
+      workerRunsByTask.set(run.task_id, run);
+    }
+  }
+
+  return [...workerRunsByTask.values(), ...ungroupedRuns].sort((left, right) =>
+    compareRunRecency(right, left)
+  );
+}
+
+function findUpdatedConversationRun(
+  runs: AgentRun[],
+  previousRun: AgentRun,
+  queuedRunId: string,
+  queuedRunKind: "worker" | "dispatcher"
+): AgentRun | undefined {
+  if (previousRun.kind === "worker" && previousRun.task_id) {
+    return collapseAgentRuns(runs).find((run) => isSameAgentRunConversation(run, previousRun));
+  }
+  return runs.find((run) => run.kind === queuedRunKind && run.id === queuedRunId);
+}
+
+function isSameAgentRunConversation(left: AgentRunRef | null | undefined, right: AgentRunRef | null | undefined): boolean {
+  if (!left || !right) return false;
+  return agentRunConversationKey(left) === agentRunConversationKey(right);
+}
+
+function agentRunConversationKey(run: AgentRunRef): string {
+  if (run.kind === "worker" && run.task_id) return `task:${run.task_id}`;
+  return `${run.kind}:${run.id}`;
+}
+
+function compareRunRecency(left: AgentRun, right: AgentRun): number {
+  return runTime(left).localeCompare(runTime(right)) || left.id.localeCompare(right.id);
+}
+
+function runTime(run: AgentRun): string {
+  return run.queued_at ?? run.started_at ?? run.finished_at ?? "";
+}
+
+function optimisticMessage(text: string): AgentRunChatMessage {
+  return {
+    id: `optimistic:${Date.now()}:${Math.random().toString(36).slice(2)}`,
+    role: "user",
+    text,
+    createdAt: new Date().toISOString(),
+    streaming: false
+  };
+}
+
+function appendPendingMessage(
+  current: Record<string, AgentRunChatMessage[]>,
+  key: string,
+  message: AgentRunChatMessage
+): Record<string, AgentRunChatMessage[]> {
+  return {
+    ...current,
+    [key]: [...(current[key] ?? []), message]
+  };
+}
+
+function removePendingMessage(
+  current: Record<string, AgentRunChatMessage[]>,
+  key: string,
+  messageId: string
+): Record<string, AgentRunChatMessage[]> {
+  const nextMessages = (current[key] ?? []).filter((message) => message.id !== messageId);
+  if (nextMessages.length === (current[key] ?? []).length) return current;
+  const next = { ...current };
+  if (nextMessages.length === 0) {
+    delete next[key];
+  } else {
+    next[key] = nextMessages;
+  }
+  return next;
 }
 
 async function api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {

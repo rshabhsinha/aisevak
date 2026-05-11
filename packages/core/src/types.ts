@@ -14,12 +14,6 @@ export type AgentKind = "worker" | "dispatcher";
 export type RunKind = "worker" | "dispatcher";
 export type RunTrigger = "manual" | "heartbeat" | "auto_route" | "agent_tool";
 
-export interface CodexCommandOptions {
-  resumeThreadId?: string | null;
-  model?: string | null;
-  skipGitRepoCheck?: boolean;
-}
-
 export interface CodexPromptOptions {
   agentName: string;
   agentInstructions: string;
