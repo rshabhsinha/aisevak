@@ -254,23 +254,6 @@ function deriveTimelineEntries(
       continue;
     }
 
-    if (event.event_type === "item/completed" && event.text?.trim()) {
-      entries.push({
-        id: `assistant:${event.id}`,
-        kind: "message",
-        createdAt: eventCreatedAt,
-        message: {
-          id: `assistant:${event.id}`,
-          role: "assistant",
-          text: event.text,
-          createdAt: eventCreatedAt,
-          completedAt: eventCreatedAt,
-          streaming: false
-        }
-      });
-      continue;
-    }
-
     if (itemType === "reasoning") {
       const summary = stringArrayValue(item?.summary).join("\n");
       const content = stringArrayValue(item?.content).join("\n");
@@ -325,6 +308,23 @@ function deriveTimelineEntries(
       } else {
         replaceWorkEntry(entries, entry);
       }
+      continue;
+    }
+
+    if (event.event_type === "item/completed" && event.text?.trim()) {
+      entries.push({
+        id: `assistant:${event.id}`,
+        kind: "message",
+        createdAt: eventCreatedAt,
+        message: {
+          id: `assistant:${event.id}`,
+          role: "assistant",
+          text: event.text,
+          createdAt: eventCreatedAt,
+          completedAt: eventCreatedAt,
+          streaming: false
+        }
+      });
       continue;
     }
 

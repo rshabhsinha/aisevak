@@ -147,7 +147,7 @@ const BOARD_COLUMNS = [
 export function App() {
   const [user, setUser] = useState<User | null>(null);
   const [hasAdmin, setHasAdmin] = useState<boolean | null>(null);
-  const [view, setView] = useState<View>("tasks");
+  const [view, setView] = useState<View>("runs");
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
@@ -391,9 +391,9 @@ export function App() {
   if (!user) return <Login onDone={boot} />;
 
   return (
-    <div className="workspace">
-      <aside className="sidenav">
-        <div className="brand">
+    <div className="app-layout">
+      <aside className="sidebar">
+        <div className="sidebar-brand">
           <span className="brand-mark">
             <Terminal size={17} />
           </span>
@@ -403,7 +403,7 @@ export function App() {
           </div>
         </div>
 
-        <nav className="nav-list">
+        <nav className="sidebar-nav">
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
           <NavButton icon={<Activity />} label="Agent Runs" active={view === "runs"} onClick={() => setView("runs")} />
           <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
@@ -411,106 +411,105 @@ export function App() {
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
         </nav>
 
-        <div className="nav-footer">
+        <div className="sidebar-footer">
           <div className="user-chip">
-            <UserCircle2 size={18} />
+            <UserCircle2 size={16} />
             <span>{user.role}</span>
           </div>
           <button
-            className="icon-button"
+            className="icon-button flat"
             title="Log out"
             onClick={async () => {
               await api("/api/logout", { method: "POST" });
               setUser(null);
             }}
           >
-            <LogOut size={16} />
+            <LogOut size={14} />
           </button>
         </div>
       </aside>
 
-      <main className="content">
-        <header className="topbar">
-          <div>
-            <div className="breadcrumb">Workspace / {viewTitle(view)}</div>
-            <h1>{viewTitle(view)}</h1>
-          </div>
-          <div className="toolbar">
-            <label className="search">
-              <Search size={15} />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search" />
-            </label>
-            <button className="button secondary" onClick={() => void reloadAll()} title="Refresh">
-              <RefreshCw size={15} />
+      <div className="main-content">
+        <header className="top-header">
+          <div className="header-title">{viewTitle(view)}</div>
+          <div className="header-actions">
+            <div className="search-bar">
+              <Search size={14} className="text-muted" />
+              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search..." />
+            </div>
+            <button className="icon-button flat" onClick={() => void reloadAll()} title="Refresh">
+              <RefreshCw size={14} />
             </button>
           </div>
         </header>
 
         {message ? <div className="notice">{message}</div> : null}
 
-        {view === "tasks" ? (
-          <TasksView
-            tasks={filteredTasks}
-            agents={agents}
-            projects={projects}
-            selectedTask={selectedTask}
-            selectedTaskRun={selectedTaskRun}
-            events={events}
-            pendingMessages={selectedTask ? (pendingTaskMessages[selectedTask.id] ?? []) : []}
-            busyRunId={busyRunId}
-            onCreate={async (payload) => {
-              await api<{ task: Task }>("/api/tasks", {
-                method: "POST",
-                body: JSON.stringify(payload)
-              });
-              await reloadTasks();
-            }}
-            onSelect={setSelectedTaskId}
-            onClose={() => setSelectedTaskId(null)}
-            onRun={runTask}
-            onSendMessage={sendTaskMessage}
-            onCancel={async (runId) => {
-              await api(`/api/runs/${runId}/cancel`, { method: "POST" });
-              await Promise.all([reloadTasks(), reloadAgentRuns()]);
-            }}
-          />
-        ) : null}
+        <main className="view-container">
+          {view === "tasks" ? (
+            <TasksView
+              tasks={filteredTasks}
+              agents={agents}
+              projects={projects}
+              selectedTask={selectedTask}
+              selectedTaskRun={selectedTaskRun}
+              events={events}
+              pendingMessages={selectedTask ? (pendingTaskMessages[selectedTask.id] ?? []) : []}
+              busyRunId={busyRunId}
+              onCreate={async (payload) => {
+                await api<{ task: Task }>("/api/tasks", {
+                  method: "POST",
+                  body: JSON.stringify(payload)
+                });
+                await reloadTasks();
+              }}
+              onSelect={setSelectedTaskId}
+              onClose={() => setSelectedTaskId(null)}
+              onRun={runTask}
+              onSendMessage={sendTaskMessage}
+              onCancel={async (runId) => {
+                await api(`/api/runs/${runId}/cancel`, { method: "POST" });
+                await Promise.all([reloadTasks(), reloadAgentRuns()]);
+              }}
+            />
+          ) : null}
 
-        {view === "runs" ? (
-          <AgentRunsView
-            runs={filteredRuns}
-            selectedRun={selectedRun}
-            events={agentRunEvents}
-            pendingMessages={selectedRun ? (pendingRunMessages[agentRunConversationKey(selectedRun)] ?? []) : []}
-            onSelect={(run) => {
-              setSelectedRun(run);
-              void loadAgentRunEvents(run);
-            }}
-            onSendMessage={sendAgentRunMessage}
-          />
-        ) : null}
+          {view === "runs" ? (
+            <AgentRunsView
+              runs={filteredRuns}
+              selectedRun={selectedRun}
+              events={agentRunEvents}
+              pendingMessages={selectedRun ? (pendingRunMessages[agentRunConversationKey(selectedRun)] ?? []) : []}
+              onSelect={(run) => {
+                setSelectedRun(run);
+                void loadAgentRunEvents(run);
+              }}
+              onSendMessage={sendAgentRunMessage}
+            />
+          ) : null}
 
-        {view === "agents" ? (
-          <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
-        ) : null}
+          {view === "agents" ? (
+            <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
+          ) : null}
 
-        {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
+          {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
 
-        {view === "connectors" ? (
-          <ConnectorsView
-            repos={repos}
-            onConnect={async (payload) => {
-              await api("/api/github/pat", { method: "POST", body: JSON.stringify(payload) });
-              await reloadRepos(true);
-            }}
-            onRefresh={() => reloadRepos(true)}
-            onImport={async (repoId) => {
-              await api(`/api/github/repositories/${repoId}/import`, { method: "POST" });
-              setMessage("Import queued");
-            }}
-          />
-        ) : null}
-      </main>
+          {view === "connectors" ? (
+            <ConnectorsView
+              repos={repos}
+              onConnect={async (payload) => {
+                await api("/api/github/pat", { method: "POST", body: JSON.stringify(payload) });
+                await reloadRepos(true);
+              }}
+              onRefresh={() => reloadRepos(true)}
+              onImport={async (repoId) => {
+                await api(`/api/github/repositories/${repoId}/import`, { method: "POST" });
+                setMessage("Import queued");
+              }}
+            />
+          ) : null}
+        </main>
+      </div>
     </div>
   );
 }
@@ -532,40 +531,43 @@ function TasksView(props: {
   onCancel: (runId: string) => Promise<void>;
 }) {
   return (
-    <div className={`tasks-page ${props.selectedTask ? "has-detail" : ""}`}>
-      <section className="task-create">
-        <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
-      </section>
-      <section className="task-board" aria-label="Tasks board">
-        {BOARD_COLUMNS.map((column) => {
-          const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
-          return (
-            <div className="board-column" key={column.id}>
-              <div className="column-head">
-                <span>
-                  {column.icon}
-                  {column.title}
-                </span>
-                <small>{tasks.length}</small>
+    <div className={`board-layout ${props.selectedTask ? "has-detail" : ""}`}>
+      <div className="board-main">
+        <div className="board-toolbar">
+          <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
+        </div>
+        <div className="board-columns">
+          {BOARD_COLUMNS.map((column) => {
+            const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
+            return (
+              <div className="kanban-col" key={column.id}>
+                <div className="kanban-head">
+                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    {column.icon} {column.title}
+                  </span>
+                  <span className="count-badge">{tasks.length}</span>
+                </div>
+                <div className="kanban-cards">
+                  {tasks.map((task) => (
+                    <button
+                      className={`kanban-card ${props.selectedTask?.id === task.id ? "selected" : ""}`}
+                      key={task.id}
+                      onClick={() => props.onSelect(task.id)}
+                    >
+                      <div className="card-top">
+                        <span className="task-key">TASK-{task.number}</span>
+                        <TaskStatus status={task.latest_run_status ?? task.status} />
+                      </div>
+                      <div className="card-title">{task.title}</div>
+                      <div className="card-desc">{task.project_name}</div>
+                    </button>
+                  ))}
+                </div>
               </div>
-              <div className="cards">
-                {tasks.map((task) => (
-                  <button
-                    className={`task-card ${props.selectedTask?.id === task.id ? "selected" : ""}`}
-                    key={task.id}
-                    onClick={() => props.onSelect(task.id)}
-                  >
-                    <span className="task-key">TASK-{task.number}</span>
-                    <strong>{task.title}</strong>
-                    <span>{task.project_name}</span>
-                    <TaskStatus status={task.latest_run_status ?? task.status} />
-                  </button>
-                ))}
-              </div>
-            </div>
-          );
-        })}
-      </section>
+            );
+          })}
+        </div>
+      </div>
       {props.selectedTask ? (
         <TaskDetail
           task={props.selectedTask}
@@ -631,7 +633,7 @@ function TaskForm(props: {
           </option>
         ))}
       </select>
-      <button className="button" type="submit">
+      <button className="button primary" type="submit">
         <Plus size={15} />
         Add
       </button>
@@ -652,8 +654,8 @@ function TaskDetail(props: {
 }) {
   if (!props.task) {
     return (
-      <aside className="detail-panel empty-panel">
-        <span>Select a task</span>
+      <aside className="side-panel">
+        <div className="empty-state">Select a task</div>
       </aside>
     );
   }
@@ -677,48 +679,52 @@ function TaskDetail(props: {
         }
       : null);
   return (
-    <aside className="detail-panel">
-      <div className="detail-top">
-        <div className="detail-title-row">
-          <div>
-            <span className="task-key">TASK-{props.task.number}</span>
-            <h2>{props.task.title}</h2>
-            <p>{props.task.project_name} / {props.task.agent_name}</p>
-          </div>
-          <button className="icon-button" onClick={props.onClose} title="Close task">
+    <aside className="side-panel">
+      <div className="detail-header-flat">
+        <div className="flex-between">
+          <span className="task-key">TASK-{props.task.number}</span>
+          <button className="icon-button flat" onClick={props.onClose} title="Close task">
             <X size={15} />
           </button>
         </div>
-        <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
-      </div>
-      <p className="task-body">{props.task.body || "No description."}</p>
-      {showRun || showStop ? (
-        <div className="button-row">
-          {showRun ? (
-            <button
-              className="button"
-              disabled={props.busyRunId === props.task.id}
-              onClick={() => props.onRun(props.task!)}
-            >
-              {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
-              Run
-            </button>
-          ) : null}
-          {showStop ? (
-            <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
-              <Square size={15} />
-              Stop
-            </button>
-          ) : null}
+        <h2>{props.task.title}</h2>
+        <p className="text-muted">{props.task.project_name} / {props.task.agent_name}</p>
+        <div className="mt-2">
+          <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
         </div>
-      ) : null}
-      <CodexSessionTimeline run={taskRun} events={props.events} pendingMessages={props.pendingMessages} />
-      <SessionComposer
-        disabled={props.busyRunId === props.task.id}
-        modelLabel={taskRun?.model}
-        onSend={(message) => props.onSendMessage(props.task!, message)}
-        placeholder="Message this Codex session"
-      />
+      </div>
+      <div className="detail-body">
+        <div className="task-body-text">{props.task.body || "No description."}</div>
+        {showRun || showStop ? (
+          <div className="action-row">
+            {showRun ? (
+              <button
+                className="button primary"
+                disabled={props.busyRunId === props.task.id}
+                onClick={() => props.onRun(props.task!)}
+              >
+                {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
+                Run
+              </button>
+            ) : null}
+            {showStop ? (
+              <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
+                <Square size={15} />
+                Stop
+              </button>
+            ) : null}
+          </div>
+        ) : null}
+      </div>
+      <div className="detail-chat">
+        <CodexSessionTimeline run={taskRun} events={props.events} pendingMessages={props.pendingMessages} />
+        <SessionComposer
+          disabled={props.busyRunId === props.task.id}
+          modelLabel={taskRun?.model}
+          onSend={(message) => props.onSendMessage(props.task!, message)}
+          placeholder="Message this Codex session"
+        />
+      </div>
     </aside>
   );
 }
@@ -732,57 +738,65 @@ function AgentRunsView(props: {
   onSendMessage: (run: AgentRun, message: string) => Promise<void>;
 }) {
   return (
-    <div className="two-pane runs-view">
-      <section className="panel">
-        <div className="panel-head">
-          <h2>Agent Runs</h2>
-          <small>{props.runs.length}</small>
+    <div className="master-detail">
+      <aside className="master-list">
+        <div className="master-header flex-between">
+          <h3>Agent Runs</h3>
+          <span className="count-badge">{props.runs.length}</span>
         </div>
-        <div className="rows">
+        <div className="list-scroll">
           {props.runs.map((run) => (
             <button
-              className={`row-card ${isSameAgentRunConversation(props.selectedRun, run) ? "selected" : ""}`}
+              className={`list-item ${isSameAgentRunConversation(props.selectedRun, run) ? "selected" : ""}`}
               key={`${run.kind}-${run.id}`}
               onClick={() => props.onSelect(run)}
             >
-              {run.kind === "dispatcher" ? <Activity size={16} /> : <Bot size={16} />}
-              <span>
-                <strong>{runTitle(run)}</strong>
-                <small>{run.agent_name} / {run.trigger}</small>
-              </span>
-              <TaskStatus status={run.status} />
+              <div className="list-item-icon">
+                {run.kind === "dispatcher" ? <Activity size={15} /> : <Bot size={15} />}
+              </div>
+              <div className="list-item-main">
+                <span className="list-item-title">{runTitle(run)}</span>
+                <span className="list-item-desc">{run.agent_name} / {run.trigger}</span>
+              </div>
+              <div>
+                <TaskStatus status={run.status} />
+              </div>
             </button>
           ))}
-          {props.runs.length === 0 ? <EmptyState text="No agent runs" /> : null}
+          {props.runs.length === 0 ? <div className="empty-list">No agent runs</div> : null}
         </div>
-      </section>
-      <section className="panel">
+      </aside>
+      <main className="detail-view">
         {props.selectedRun ? (
-          <div className="stack">
-            <div className="detail-top">
-              <span className="task-key">{props.selectedRun.kind}</span>
+          <div className="detail-scroll">
+            <div className="detail-header-flat">
+              <span className="meta-badge">{props.selectedRun.kind}</span>
               <h2>{runTitle(props.selectedRun)}</h2>
-              <p>
+              <p className="text-muted">
                 {props.selectedRun.agent_name} / {props.selectedRun.model} / {props.selectedRun.trigger}
               </p>
-              <TaskStatus status={props.selectedRun.status} />
+              <div className="mt-2">
+                <TaskStatus status={props.selectedRun.status} />
+              </div>
             </div>
-            {props.selectedRun.error ? <div className="notice">{props.selectedRun.error}</div> : null}
-            <CodexSessionTimeline
-              run={props.selectedRun}
-              events={props.events}
-              pendingMessages={props.pendingMessages}
-            />
-            <SessionComposer
-              modelLabel={props.selectedRun.model}
-              onSend={(message) => props.onSendMessage(props.selectedRun!, message)}
-              placeholder="Message this Codex session"
-            />
+            {props.selectedRun.error ? <div className="notice error">{props.selectedRun.error}</div> : null}
+            <div className="detail-chat">
+              <CodexSessionTimeline
+                run={props.selectedRun}
+                events={props.events}
+                pendingMessages={props.pendingMessages}
+              />
+              <SessionComposer
+                modelLabel={props.selectedRun.model}
+                onSend={(message) => props.onSendMessage(props.selectedRun!, message)}
+                placeholder="Message this Codex session"
+              />
+            </div>
           </div>
         ) : (
-          <EmptyState text="Select a run" />
+          <div className="empty-state">Select a run</div>
         )}
-      </section>
+      </main>
     </div>
   );
 }
@@ -799,38 +813,41 @@ function AgentsView(props: {
   }, [props.agents, editing]);
 
   return (
-    <div className="two-pane">
-      <section className="panel">
-        <div className="panel-head">
-          <h2>Agents</h2>
-          <button className="button secondary" onClick={() => setEditing(emptyAgent(props.defaultModel))}>
-            <Plus size={15} />
-            New
+    <div className="master-detail">
+      <aside className="master-list">
+        <div className="master-header flex-between">
+          <h3>Agents</h3>
+          <button className="icon-button flat" onClick={() => setEditing(emptyAgent(props.defaultModel))}>
+            <Plus size={14} />
           </button>
         </div>
-        <div className="rows">
+        <div className="list-scroll">
           {props.agents.map((agent) => (
             <button
-              className={`row-card ${editing?.id === agent.id ? "selected" : ""}`}
+              className={`list-item ${editing?.id === agent.id ? "selected" : ""}`}
               key={agent.id}
               onClick={() => setEditing(agent)}
             >
-              <Bot size={16} />
-              <span>
-                <strong>{agent.name}</strong>
-                <small>{agent.kind} / {agent.model}</small>
-              </span>
+              <div className="list-item-icon">
+                <Bot size={15} />
+              </div>
+              <div className="list-item-main">
+                <span className="list-item-title">{agent.name}</span>
+                <span className="list-item-desc">{agent.kind} / {agent.model}</span>
+              </div>
             </button>
           ))}
         </div>
-      </section>
-      <section className="panel">
+      </aside>
+      <main className="detail-view">
         {editing ? (
-          <AgentEditor agent={editing} models={props.models} defaultModel={props.defaultModel} onSaved={props.onSaved} />
+          <div className="form-view">
+            <AgentEditor agent={editing} models={props.models} defaultModel={props.defaultModel} onSaved={props.onSaved} />
+          </div>
         ) : (
-          <EmptyState text="Select an agent" />
+          <div className="empty-state">Select an agent</div>
         )}
-      </section>
+      </main>
     </div>
   );
 }
@@ -877,7 +894,7 @@ function AgentEditor(props: {
       <label>
         Prompt
         <textarea
-          className="prompt"
+          style={{ minHeight: 300, fontFamily: "monospace", fontSize: 13 }}
           value={draft.instructions}
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
@@ -889,10 +906,12 @@ function AgentEditor(props: {
           </span>
         ))}
       </div>
-      <button className="button" type="submit">
-        <CheckCircle2 size={15} />
-        Save agent
-      </button>
+      <div style={{ marginTop: 16 }}>
+        <button className="button primary" type="submit">
+          <CheckCircle2 size={15} />
+          Save agent
+        </button>
+      </div>
     </form>
   );
 }
@@ -903,50 +922,51 @@ function ProjectsView({ projects, onSaved }: { projects: Project[]; onSaved: () 
   const [workspaceMode, setWorkspaceMode] = useState<"direct" | "git_worktree">("direct");
 
   return (
-    <div className="two-pane">
-      <section className="panel">
-        <div className="panel-head">
-          <h2>Projects</h2>
-        </div>
-        <form
-          className="stack"
-          onSubmit={async (event) => {
-            event.preventDefault();
-            await api("/api/projects", {
-              method: "POST",
-              body: JSON.stringify({ name, localPath, workspaceMode })
-            });
-            setName("");
-            setLocalPath("");
-            await onSaved();
-          }}
-        >
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
-          <input value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
-          <select value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
+    <div className="flat-list-view">
+      <div className="flat-header">
+        <h3>Projects</h3>
+      </div>
+      <form
+        className="stack"
+        style={{ marginBottom: 32 }}
+        onSubmit={async (event) => {
+          event.preventDefault();
+          await api("/api/projects", {
+            method: "POST",
+            body: JSON.stringify({ name, localPath, workspaceMode })
+          });
+          setName("");
+          setLocalPath("");
+          await onSaved();
+        }}
+      >
+        <div style={{ display: "flex", gap: 12 }}>
+          <input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
+          <input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
+          <select style={{ flex: 1 }} value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
             <option value="direct">Direct folder</option>
             <option value="git_worktree">Git worktree</option>
           </select>
-          <button className="button" type="submit">
+          <button className="button primary" type="submit" style={{ flex: "0 0 auto" }}>
             <Plus size={15} />
-            Add project
+            Add
           </button>
-        </form>
-      </section>
-      <section className="panel">
-        <div className="rows">
-          {projects.map((project) => (
-            <div className="data-card" key={project.id}>
-              <FolderGit2 size={16} />
-              <span>
-                <strong>{project.name}</strong>
-                <small>{project.local_path}</small>
-              </span>
-              <em>{project.source}</em>
-            </div>
-          ))}
         </div>
-      </section>
+      </form>
+      <div>
+        {projects.map((project) => (
+          <div className="data-row" key={project.id}>
+            <div className="data-row-main">
+              <div className="data-icon"><FolderGit2 size={16}/></div>
+              <div>
+                <div className="data-title">{project.name}</div>
+                <div className="data-subtitle">{project.local_path}</div>
+              </div>
+            </div>
+            <div className="data-subtitle" style={{ textTransform: "capitalize" }}>{project.source}</div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -961,54 +981,64 @@ function ConnectorsView(props: {
   const [token, setToken] = useState("");
 
   return (
-    <div className="two-pane">
-      <section className="panel">
-        <div className="connector-card">
-          <Github size={24} />
-          <div>
-            <h2>GitHub</h2>
-            <p>Repository import and pull requests</p>
-          </div>
+    <div className="master-detail">
+      <aside className="master-list">
+        <div className="master-header">
+          <h3>Connections</h3>
         </div>
-        <form
-          className="stack"
-          onSubmit={async (event) => {
-            event.preventDefault();
-            await props.onConnect({ name, token });
-            setToken("");
-          }}
-        >
-          <input value={name} onChange={(event) => setName(event.target.value)} />
-          <input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
-          <div className="button-row">
-            <button className="button" type="submit">
-              <Github size={15} />
-              Connect
-            </button>
-            <button className="button secondary" type="button" onClick={props.onRefresh}>
-              <RefreshCw size={15} />
-              Refresh
-            </button>
+        <div style={{ padding: 20 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 20 }}>
+            <Github size={24} />
+            <div>
+              <div style={{ fontWeight: 600 }}>GitHub</div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Repository import</div>
+            </div>
           </div>
-        </form>
-      </section>
-      <section className="panel">
-        <div className="rows">
-          {props.repos.map((repo) => (
-            <div className="data-card" key={repo.id}>
-              <Github size={16} />
-              <span>
-                <strong>{repo.full_name}</strong>
-                <small>{repo.connection_name} / {repo.default_branch}</small>
-              </span>
-              <button className="button secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
-                {repo.imported_project_id ? "Imported" : "Import"}
+          <form
+            className="stack"
+            onSubmit={async (event) => {
+              event.preventDefault();
+              await props.onConnect({ name, token });
+              setToken("");
+            }}
+          >
+            <input value={name} onChange={(event) => setName(event.target.value)} />
+            <input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="button primary" type="submit">
+                <Github size={14} /> Connect
+              </button>
+              <button className="button secondary" type="button" onClick={props.onRefresh}>
+                <RefreshCw size={14} /> Refresh
               </button>
             </div>
-          ))}
-          {props.repos.length === 0 ? <EmptyState text="No repositories" /> : null}
+          </form>
         </div>
-      </section>
+      </aside>
+      <main className="detail-view">
+        <div className="detail-scroll">
+          <div className="flat-header">
+            <h3>Repositories</h3>
+          </div>
+          <div>
+            {props.repos.map((repo) => (
+              <div className="data-row" key={repo.id}>
+                <div className="data-row-main">
+                  <div className="data-icon"><Github size={16} /></div>
+                  <div>
+                    <div className="data-title">{repo.full_name}</div>
+                    <div className="data-subtitle">{repo.connection_name} / {repo.default_branch}</div>
+                  </div>
+                </div>
+                <button className="button secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
+                  {repo.imported_project_id ? "Imported" : "Import"}
+                </button>
+              </div>
+            ))}
+            {props.repos.length === 0 ? <div className="empty-list">No repositories</div> : null}
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
@@ -1030,14 +1060,14 @@ function CodexSessionTimeline({
   if (!run && events.length === 0 && pendingMessages.length === 0) {
     return (
       <div className="chat-timeline empty-chat">
-        <span className="muted">No run events yet.</span>
+        <span className="text-muted">No run events yet.</span>
       </div>
     );
   }
 
   return (
     <div className="chat-timeline">
-      {rows.length === 0 ? <span className="muted">No run events yet.</span> : null}
+      {rows.length === 0 ? <span className="text-muted">No run events yet.</span> : null}
       {rows.map((row) => (
         <TimelineRow row={row} key={row.id} />
       ))}
@@ -1403,25 +1433,28 @@ function TaskStatus({ status }: { status?: string | null }) {
 function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
   const [form, setForm] = useState({ name: "", email: "", password: "", openaiApiKey: "" });
   return (
-    <AuthShell title="Create workspace" subtitle="Set up the first owner account.">
+    <div className="auth-container">
       <form
-        className="stack"
+        className="auth-box"
         onSubmit={async (event) => {
           event.preventDefault();
           await api("/api/onboarding/admin", { method: "POST", body: JSON.stringify(form) });
           await onDone();
         }}
       >
-        <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Name" required />
-        <input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email" type="email" required />
-        <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password" type="password" required />
-        <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key" type="password" />
-        <button className="button" type="submit">
-          <CheckCircle2 size={15} />
-          Continue
-        </button>
+        <h1>Create workspace</h1>
+        <p>Set up the first owner account.</p>
+        <div className="stack">
+          <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Name" required />
+          <input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email" type="email" required />
+          <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password" type="password" required />
+          <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key" type="password" />
+          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
+            Continue
+          </button>
+        </div>
       </form>
-    </AuthShell>
+    </div>
   );
 }
 
@@ -1429,51 +1462,35 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   return (
-    <AuthShell title="Sign in" subtitle="Open the task board.">
+    <div className="auth-container">
       <form
-        className="stack"
+        className="auth-box"
         onSubmit={async (event: FormEvent) => {
           event.preventDefault();
           await api("/api/login", { method: "POST", body: JSON.stringify({ email, password }) });
           await onDone();
         }}
       >
-        <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" type="email" required />
-        <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
-        <button className="button" type="submit">
-          <Terminal size={15} />
-          Sign in
-        </button>
+        <h1>Sign in</h1>
+        <p>Open the task board.</p>
+        <div className="stack">
+          <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" type="email" required />
+          <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
+          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
+            Sign in
+          </button>
+        </div>
       </form>
-    </AuthShell>
-  );
-}
-
-function AuthShell({ title, subtitle, children }: { title: string; subtitle: string; children: ReactNode }) {
-  return (
-    <main className="auth">
-      <section className="auth-card">
-        <span className="brand-mark">
-          <Terminal size={18} />
-        </span>
-        <h1>{title}</h1>
-        <p>{subtitle}</p>
-        {children}
-      </section>
-    </main>
+    </div>
   );
 }
 
 function Splash() {
   return (
-    <main className="auth">
-      <Loader2 className="spin" />
-    </main>
+    <div className="auth-container">
+      <Loader2 className="spin" size={24} style={{ color: "var(--text-muted)" }} />
+    </div>
   );
-}
-
-function EmptyState({ text }: { text: string }) {
-  return <div className="empty">{text}</div>;
 }
 
 function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: string; active: boolean; onClick: () => void }) {
