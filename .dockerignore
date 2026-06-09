@@ -1,0 +1,15 @@
+.git
+.DS_Store
+.env
+.env.*
+.aisevak-dev
+.aisevak-managed
+data
+tmp
+coverage
+*.log
+
+node_modules
+**/node_modules
+dist
+**/dist

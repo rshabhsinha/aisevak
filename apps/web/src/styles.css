@@ -502,7 +502,4 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: 13px; font-w
 .composer-send-button { width: 34px; height: 34px; border: 0; border-radius: 999px; background: #171717; color: #ffffff; display: inline-flex; align-items: center; justify-content: center; cursor: pointer; transition: transform 0.15s ease, background 0.15s ease, opacity 0.15s ease; }
 .composer-send-button:hover:not(:disabled) { background: #000000; transform: scale(1.04); }
 .composer-send-button:disabled { cursor: default; opacity: 0.3; }
-.composer-error { color: #9f2346; font-size: 12px; line-height: 1.4; padding: 0 2px; }led) { background: #000000; transform: scale(1.04); }
-.composer-send-button:disabled { cursor: default; opacity: 0.3; }
-.composer-error { color: #9f2346; font-size: 12px; line-height: 1.4; padding: 0 2px; }.3; }
 .composer-error { color: #9f2346; font-size: 12px; line-height: 1.4; padding: 0 2px; }

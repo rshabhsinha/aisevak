@@ -33,6 +33,18 @@ sudo ./scripts/install.sh
 
 The installer creates app directories under `/opt/aisevak` and managed workspaces under `/srv/aisevak`, starts Docker Compose services, and installs a host-native runner service so Codex can access imported repositories on disk.
 
+## Host updates
+
+Keep a checkout of this repository on the EC2 host, then update from the deploy branch:
+
+```bash
+./scripts/update.sh main
+```
+
+The update script fast-forwards the checkout and runs the installer with sudo. Each install is staged under `/opt/aisevak/releases`, built before activation, then switched into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak` workspaces, and the Compose Postgres volume are preserved.
+
+When an active Postgres container exists, the installer writes a compressed backup to `/opt/aisevak/backups` before restarting services. Set `AISEVAK_REQUIRE_BACKUP=1` to abort updates if a backup cannot be created, or `AISEVAK_SKIP_BACKUP=1` to skip backups intentionally.
+
 ## Security model
 
 This app is for trusted small teams. Codex sessions are driven through `codex app-server` with approvals disabled and `danger-full-access` sandbox policy. Run it on a dedicated machine or VM.
