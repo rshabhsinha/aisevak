@@ -14,6 +14,18 @@ export type AgentKind = "worker" | "dispatcher";
 export type RunKind = "worker" | "dispatcher";
 export type RunTrigger = "manual" | "heartbeat" | "auto_route" | "agent_tool";
 
+export interface CodexSkillReference {
+  name: string;
+  description: string;
+}
+
+export interface CodexSkillSnapshot extends CodexSkillReference {
+  id: string;
+  instructions: string;
+  files: Record<string, string>;
+  sources: string[];
+}
+
 export interface CodexPromptOptions {
   agentName: string;
   agentInstructions: string;
@@ -22,6 +34,7 @@ export interface CodexPromptOptions {
   projectPath: string;
   branch?: string | null;
   previousContext?: string | null;
+  skills?: CodexSkillReference[];
 }
 
 export interface NormalizedCodexEvent {
@@ -40,4 +53,5 @@ export interface DispatcherPromptOptions {
   agentsJson: string;
   projectsJson: string;
   targetTaskNumber?: number | null;
+  skills?: CodexSkillReference[];
 }

@@ -14,11 +14,12 @@ import {
   parseCodexJsonLine,
   redactSecrets,
   runMigrations,
+  type CodexSkillSnapshot,
   type DbPool
 } from "@aisevak/core";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -67,6 +68,7 @@ interface RunJob {
   codex_thread_id: string | null;
   workspace_mode: "direct" | "git_worktree";
   project_source: "local_path" | "github";
+  skills_snapshot: CodexSkillSnapshot[];
 }
 
 interface DispatcherJob {
@@ -77,6 +79,7 @@ interface DispatcherJob {
   cwd: string;
   codex_home: string;
   codex_thread_id: string | null;
+  skills_snapshot: CodexSkillSnapshot[];
 }
 
 async function main(): Promise<void> {
@@ -232,16 +235,19 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   const context = await getDispatcherContext(pool);
   const codexHome = join(env.managedRoot, "codex-homes", `dispatcher-heartbeat`);
   await mkdir(codexHome, { recursive: true });
+  const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
     dispatcherInstructions: dispatcher.instructions,
     tasksJson: JSON.stringify(context.tasks, null, 2),
     agentsJson: JSON.stringify(context.agents, null, 2),
-    projectsJson: JSON.stringify(context.projects, null, 2)
+    projectsJson: JSON.stringify(context.projects, null, 2),
+    skills: skillsSnapshot.map((skill) => ({ name: skill.name, description: skill.description }))
   });
   await pool.query(
-    `INSERT INTO dispatcher_runs (trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt)
-     VALUES ('heartbeat', 'heartbeat', 'queued', $1, $2, $3, $4, $5)`,
-    [env.managedRoot, codexHome, dispatcher.threadId ?? null, dispatcher.model, prompt]
+    `INSERT INTO dispatcher_runs
+       (trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
+     VALUES ('heartbeat', 'heartbeat', 'queued', $1, $2, $3, $4, $5, $6)`,
+    [env.managedRoot, codexHome, dispatcher.threadId ?? null, dispatcher.model, prompt, skillsSnapshot]
   );
 }
 
@@ -257,7 +263,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   const picked = result.rows[0];
   if (!picked) return;
   const detail = await pool.query<DispatcherJob>(
-    `SELECT id, task_id, prompt, model, cwd, codex_home, codex_thread_id
+    `SELECT id, task_id, prompt, model, cwd, codex_home, codex_thread_id, skills_snapshot
      FROM dispatcher_runs
      WHERE id = $1`,
     [picked.id]
@@ -272,6 +278,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   try {
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    await materializeSkills(job.codex_home, job.skills_snapshot);
     const apiKey = await readSecret(pool, "openai_api_key");
     await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
@@ -290,6 +297,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       env: {
         ...process.env,
         CODEX_HOME: job.codex_home,
+        HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN: toolToken,
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
@@ -376,7 +384,8 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
             task_sessions.codex_home,
             task_sessions.codex_thread_id,
             projects.workspace_mode,
-            projects.source AS project_source
+            projects.source AS project_source,
+            task_runs.skills_snapshot
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      JOIN tasks ON tasks.id = task_runs.task_id
@@ -399,6 +408,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     ]);
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    await materializeSkills(job.codex_home, job.skills_snapshot);
     const apiKey = await readSecret(pool, "openai_api_key");
     await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
@@ -417,6 +427,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       env: {
         ...process.env,
         CODEX_HOME: job.codex_home,
+        HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN: toolToken,
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
@@ -509,6 +520,55 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
     await git(["checkout", "-B", job.branch], job.cwd);
   }
   return job.cwd;
+}
+
+async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
+  const skillsRoot = join(codexHome, ".agents", "skills");
+  await rm(skillsRoot, { recursive: true, force: true });
+  await mkdir(skillsRoot, { recursive: true });
+  for (const skill of skills ?? []) {
+    const skillDir = join(skillsRoot, safeSkillDirectoryName(skill.name));
+    await mkdir(skillDir, { recursive: true });
+    await writeFile(join(skillDir, "SKILL.md"), skillMarkdown(skill), "utf8");
+    for (const [relativePath, content] of Object.entries(skill.files ?? {})) {
+      const filePath = safeSkillFilePath(skillDir, relativePath);
+      await mkdir(dirname(filePath), { recursive: true });
+      await writeFile(filePath, content, "utf8");
+    }
+  }
+}
+
+function safeSkillDirectoryName(name: string): string {
+  if (!/^[a-z0-9][a-z0-9._-]*$/.test(name)) {
+    throw new Error(`Invalid skill name: ${name}`);
+  }
+  return name;
+}
+
+function skillMarkdown(skill: CodexSkillSnapshot): string {
+  return [
+    "---",
+    `name: ${skill.name}`,
+    `description: ${skill.description.replace(/\s+/g, " ").trim()}`,
+    "---",
+    "",
+    skill.instructions.trim(),
+    ""
+  ].join("\n");
+}
+
+function safeSkillFilePath(skillDir: string, relativePath: string): string {
+  const parts = relativePath.split("/");
+  if (
+    relativePath.startsWith("/") ||
+    relativePath.includes("\\") ||
+    relativePath === "SKILL.md" ||
+    relativePath.endsWith("/SKILL.md") ||
+    parts.some((part) => !part || part === "." || part === "..")
+  ) {
+    throw new Error(`Invalid skill file path: ${relativePath}`);
+  }
+  return join(skillDir, ...parts);
 }
 
 async function persistCodexLine(pool: DbPool, job: RunJob, line: string, seq: number): Promise<void> {
@@ -726,12 +786,14 @@ function fail(message) {
 }
 
 async function getDispatcherAgent(pool: DbPool): Promise<{
+  id: string;
   model: string;
   instructions: string;
   threadId: string | null;
 }> {
-  const result = await pool.query<{ model: string; instructions: string; thread_id: string | null }>(
-    `SELECT agents.model,
+  const result = await pool.query<{ id: string; model: string; instructions: string; thread_id: string | null }>(
+    `SELECT agents.id,
+            agents.model,
             agents.instructions,
             latest.codex_thread_id AS thread_id
      FROM agents
@@ -747,7 +809,46 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
      LIMIT 1`
   );
   const row = mustRow(result.rows[0]);
-  return { model: row.model, instructions: row.instructions, threadId: row.thread_id };
+  return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
+}
+
+async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
+  const result = await pool.query<{
+    id: string;
+    name: string;
+    description: string;
+    instructions: string;
+    files: unknown;
+  }>(
+    `SELECT skills.id,
+            skills.name,
+            skills.description,
+            skills.instructions,
+            skills.files
+     FROM agent_skills
+     JOIN skills ON skills.id = agent_skills.skill_id
+     WHERE agent_skills.agent_id = $1
+       AND skills.enabled = true
+     ORDER BY skills.name ASC`,
+    [agentId]
+  );
+  return result.rows.map((row) => ({
+    id: row.id,
+    name: row.name,
+    description: row.description,
+    instructions: row.instructions,
+    files: normalizeSkillFiles(row.files),
+    sources: ["agent"]
+  }));
+}
+
+function normalizeSkillFiles(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const files: Record<string, string> = {};
+  for (const [path, content] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof content === "string") files[path] = content;
+  }
+  return files;
 }
 
 async function getDispatcherContext(pool: DbPool): Promise<{

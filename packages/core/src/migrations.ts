@@ -32,6 +32,22 @@ CREATE TABLE IF NOT EXISTS sessions (
 
 CREATE INDEX IF NOT EXISTS sessions_token_hash_idx ON sessions(token_hash);
 
+CREATE TABLE IF NOT EXISTS api_keys (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL,
+  token_hash text NOT NULL UNIQUE,
+  token_prefix text NOT NULL,
+  created_by uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  expires_at timestamptz NOT NULL,
+  last_used_at timestamptz,
+  revoked_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS api_keys_token_hash_idx ON api_keys(token_hash);
+CREATE INDEX IF NOT EXISTS api_keys_created_by_idx ON api_keys(created_by);
+
 CREATE TABLE IF NOT EXISTS invites (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   email text,
@@ -79,6 +95,32 @@ CREATE TABLE IF NOT EXISTS agents (
   updated_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS skills (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  name text NOT NULL UNIQUE,
+  description text NOT NULL DEFAULT '',
+  instructions text NOT NULL,
+  files jsonb NOT NULL DEFAULT '{}'::jsonb,
+  enabled boolean NOT NULL DEFAULT true,
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS agent_skills (
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (agent_id, skill_id)
+);
+
+CREATE TABLE IF NOT EXISTS project_skills (
+  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (project_id, skill_id)
+);
+
 CREATE TABLE IF NOT EXISTS agent_versions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
@@ -102,6 +144,13 @@ CREATE TABLE IF NOT EXISTS tasks (
   open_pr_on_success boolean NOT NULL DEFAULT false,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS task_skills (
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  skill_id uuid NOT NULL REFERENCES skills(id) ON DELETE CASCADE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (task_id, skill_id)
 );
 
 CREATE TABLE IF NOT EXISTS task_comments (
@@ -137,6 +186,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   codex_thread_id text,
   model text NOT NULL,
   prompt text NOT NULL,
+  skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
   raw_stderr text NOT NULL DEFAULT '',
   exit_code integer,
@@ -161,6 +211,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   codex_thread_id text,
   model text NOT NULL,
   prompt text NOT NULL,
+  skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
   raw_stderr text NOT NULL DEFAULT '',
   exit_code integer,
@@ -283,6 +334,8 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 
 UPDATE agents
 SET kind = 'dispatcher', updated_at = now()

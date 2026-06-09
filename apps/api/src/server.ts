@@ -21,6 +21,7 @@ import {
   runMigrations,
   taskBranchName,
   verifyPassword,
+  type CodexSkillSnapshot,
   type DbPool,
   type UserRole
 } from "@aisevak/core";
@@ -70,7 +71,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.addHook("preHandler", async (request) => {
-    request.user = await getUserFromCookie(pool, request);
+    request.user = await getUserFromRequest(pool, request);
   });
 
   app.get("/api/health", async () => ({ ok: true }));
@@ -81,6 +82,49 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/me", async (request) => ({ user: request.user ?? null }));
+
+  app.get("/api/api-keys", async (request) => {
+    const user = requireUser(request);
+    const result = await pool.query(
+      `SELECT id, name, token_prefix, expires_at, last_used_at, revoked_at, created_at
+       FROM api_keys
+       WHERE created_by = $1
+       ORDER BY created_at DESC`,
+      [user.id]
+    );
+    return { apiKeys: result.rows };
+  });
+
+  app.post("/api/api-keys", async (request) => {
+    const user = requireUser(request);
+    const body = apiKeySchema.parse(request.body);
+    const expiresAt = new Date(body.expiresAt);
+    if (!Number.isFinite(expiresAt.getTime()) || expiresAt.getTime() <= Date.now()) {
+      throwBadRequest("Expiry must be a future date");
+    }
+    const secret = `avk_${newSessionToken()}`;
+    const tokenPrefix = secret.slice(0, 12);
+    const result = await pool.query(
+      `INSERT INTO api_keys (name, token_hash, token_prefix, created_by, expires_at)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, name, token_prefix, expires_at, last_used_at, revoked_at, created_at`,
+      [body.name, hashToken(secret), tokenPrefix, user.id, expiresAt]
+    );
+    return { apiKey: result.rows[0], secret };
+  });
+
+  app.delete("/api/api-keys/:id", async (request) => {
+    const user = requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const result = await pool.query(
+      `UPDATE api_keys
+       SET revoked_at = now(), updated_at = now()
+       WHERE id = $1 AND created_by = $2 AND revoked_at IS NULL
+       RETURNING id, name, token_prefix, expires_at, last_used_at, revoked_at, created_at`,
+      [id, user.id]
+    );
+    return { apiKey: result.rows[0] ?? null };
+  });
 
   app.get("/api/codex/models", async (request) => {
     requireUser(request);
@@ -175,7 +219,17 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/projects", async (request) => {
     requireUser(request);
-    const result = await pool.query("SELECT * FROM projects ORDER BY created_at DESC");
+    const result = await pool.query(
+      `SELECT projects.*,
+              COALESCE(
+                array_agg(project_skills.skill_id) FILTER (WHERE project_skills.skill_id IS NOT NULL),
+                '{}'::uuid[]
+              ) AS skill_ids
+       FROM projects
+       LEFT JOIN project_skills ON project_skills.project_id = projects.id
+       GROUP BY projects.id
+       ORDER BY projects.created_at DESC`
+    );
     return { projects: result.rows };
   });
 
@@ -194,7 +248,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.defaultBranch ?? null
       ]
     );
-    return { project: result.rows[0] };
+    const project = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    await syncAssignedSkills(pool, "project_skills", "project_id", String(project.id), body.skillIds ?? []);
+    return { project: { ...project, skill_ids: body.skillIds ?? [] } };
   });
 
   app.patch("/api/projects/:id", async (request) => {
@@ -212,12 +268,79 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
        RETURNING *`,
       [id, body.name ?? null, body.localPath ?? null, body.workspaceMode ?? null, body.active ?? null]
     );
-    return { project: mustRow(result.rows[0]) };
+    const project = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    if (body.skillIds) {
+      await syncAssignedSkills(pool, "project_skills", "project_id", id, body.skillIds);
+    }
+    return { project: { ...project, skill_ids: body.skillIds ?? (await getAssignedSkillIds(pool, "project_skills", "project_id", id)) } };
+  });
+
+  app.get("/api/skills", async (request) => {
+    requireUser(request);
+    const result = await pool.query("SELECT * FROM skills ORDER BY enabled DESC, name ASC");
+    return { skills: result.rows };
+  });
+
+  app.post("/api/skills", async (request) => {
+    const user = requireAdmin(request);
+    const body = skillSchema.parse(request.body);
+    validateSkillFiles(body.files ?? {});
+    const result = await pool.query(
+      `INSERT INTO skills (name, description, instructions, files, enabled, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       RETURNING *`,
+      [
+        body.name,
+        body.description,
+        body.instructions,
+        body.files ?? {},
+        body.enabled ?? true,
+        user.id
+      ]
+    );
+    return { skill: result.rows[0] };
+  });
+
+  app.patch("/api/skills/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    const body = skillPatchSchema.parse(request.body);
+    if (body.files) validateSkillFiles(body.files);
+    const result = await pool.query(
+      `UPDATE skills
+       SET name = COALESCE($2, name),
+           description = COALESCE($3, description),
+           instructions = COALESCE($4, instructions),
+           files = COALESCE($5, files),
+           enabled = COALESCE($6, enabled),
+           updated_at = now()
+       WHERE id = $1
+       RETURNING *`,
+      [
+        id,
+        body.name ?? null,
+        body.description ?? null,
+        body.instructions ?? null,
+        body.files ?? null,
+        body.enabled ?? null
+      ]
+    );
+    return { skill: mustRow(result.rows[0]) };
   });
 
   app.get("/api/agents", async (request) => {
     requireUser(request);
-    const result = await pool.query("SELECT * FROM agents ORDER BY created_at DESC");
+    const result = await pool.query(
+      `SELECT agents.*,
+              COALESCE(
+                array_agg(agent_skills.skill_id) FILTER (WHERE agent_skills.skill_id IS NOT NULL),
+                '{}'::uuid[]
+              ) AS skill_ids
+       FROM agents
+       LEFT JOIN agent_skills ON agent_skills.agent_id = agents.id
+       GROUP BY agents.id
+       ORDER BY agents.created_at DESC`
+    );
     return { agents: result.rows };
   });
 
@@ -231,8 +354,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       [body.name, body.description ?? "", body.model ?? env.codexDefaultModel, body.instructions, true]
     );
     const agent = mustRow(result.rows[0]);
+    await syncAssignedSkills(pool, "agent_skills", "agent_id", String(agent.id), body.skillIds ?? []);
     await insertAgentVersion(pool, agent, user.id);
-    return { agent };
+    return { agent: { ...agent, skill_ids: body.skillIds ?? [] } };
   });
 
   app.patch("/api/agents/:id", async (request) => {
@@ -259,8 +383,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       ]
     );
     const agent = mustRow(result.rows[0]);
+    if (body.skillIds) {
+      await syncAssignedSkills(pool, "agent_skills", "agent_id", id, body.skillIds);
+    }
     await insertAgentVersion(pool, agent, user.id);
-    return { agent };
+    return { agent: { ...agent, skill_ids: body.skillIds ?? (await getAssignedSkillIds(pool, "agent_skills", "agent_id", id)) } };
   });
 
   app.get("/api/tasks", async (request) => {
@@ -272,6 +399,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
               agents.kind AS agent_kind,
               latest.status AS latest_run_status,
               latest.id AS latest_run_id,
+              direct_skills.skill_ids,
+              resolved_skills.resolved_skill_ids,
               EXISTS (
                 SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id
                 UNION ALL
@@ -287,6 +416,22 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          ORDER BY created_at DESC
          LIMIT 1
        ) latest ON true
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(array_agg(task_skills.skill_id), '{}'::uuid[]) AS skill_ids
+         FROM task_skills
+         WHERE task_skills.task_id = tasks.id
+       ) direct_skills ON true
+       LEFT JOIN LATERAL (
+         SELECT COALESCE(array_agg(DISTINCT resolved.skill_id), '{}'::uuid[]) AS resolved_skill_ids
+         FROM (
+           SELECT agent_skills.skill_id FROM agent_skills WHERE agent_skills.agent_id = tasks.agent_id
+           UNION
+           SELECT project_skills.skill_id FROM project_skills WHERE project_skills.project_id = tasks.project_id
+           UNION
+           SELECT task_skills.skill_id FROM task_skills WHERE task_skills.task_id = tasks.id
+         ) resolved
+         JOIN skills ON skills.id = resolved.skill_id AND skills.enabled = true
+       ) resolved_skills ON true
        ORDER BY tasks.created_at DESC`
     );
     return { tasks: result.rows };
@@ -302,7 +447,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
        RETURNING *`,
       [body.title, body.body ?? "", body.projectId, agentId, user.id, body.openPrOnSuccess ?? false]
     );
-    return { task: result.rows[0] };
+    const task = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    await syncAssignedSkills(pool, "task_skills", "task_id", String(task.id), body.skillIds ?? []);
+    return { task: { ...task, skill_ids: body.skillIds ?? [] } };
   });
 
   app.patch("/api/tasks/:id", async (request) => {
@@ -330,7 +477,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.openPrOnSuccess ?? null
       ]
     );
-    return { task: mustRow(result.rows[0]) };
+    const task = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    if (body.skillIds) {
+      await syncAssignedSkills(pool, "task_skills", "task_id", id, body.skillIds);
+    }
+    return { task: { ...task, skill_ids: body.skillIds ?? (await getAssignedSkillIds(pool, "task_skills", "task_id", id)) } };
   });
 
   app.post("/api/tasks/:id/runs", async (request) => {
@@ -755,32 +906,59 @@ const runEventsParams = z.object({
   id: z.string().uuid()
 });
 const loginSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
+const apiKeySchema = z.object({
+  name: z.string().trim().min(1).max(80),
+  expiresAt: z.string().datetime()
+});
+const optionalOpenAiApiKeySchema = z.preprocess(
+  (value) => (typeof value === "string" && value.trim() === "" ? undefined : value),
+  z.string().trim().optional()
+);
 const onboardingSchema = loginSchema.extend({
   name: z.string().min(1),
-  openaiApiKey: z.string().optional()
+  openaiApiKey: optionalOpenAiApiKeySchema
 });
 const codexProbeSchema = z.object({
-  openaiApiKey: z.string().optional(),
+  openaiApiKey: optionalOpenAiApiKeySchema,
   runLiveProbe: z.boolean().optional()
 });
+const skillNameSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(64)
+  .regex(/^[a-z0-9][a-z0-9._-]*$/, "Use lowercase letters, numbers, dots, underscores, or hyphens");
+const skillFilesSchema = z.record(z.string()).default({});
+const skillSchema = z.object({
+  name: skillNameSchema,
+  description: z.string().trim().min(1),
+  instructions: z.string().min(1),
+  files: skillFilesSchema.optional(),
+  enabled: z.boolean().optional()
+});
+const skillPatchSchema = skillSchema.partial();
+const skillIdsSchema = z.array(z.string().uuid()).optional();
 const projectSchema = z.object({
   name: z.string().min(1),
   source: z.enum(["local_path", "github"]).optional(),
   localPath: z.string().min(1),
   workspaceMode: z.enum(["direct", "git_worktree"]).optional(),
-  defaultBranch: z.string().optional()
+  defaultBranch: z.string().optional(),
+  skillIds: skillIdsSchema
 });
 const projectPatchSchema = z.object({
   name: z.string().min(1).optional(),
   localPath: z.string().min(1).optional(),
   workspaceMode: z.enum(["direct", "git_worktree"]).optional(),
-  active: z.boolean().optional()
+  active: z.boolean().optional(),
+  skillIds: skillIdsSchema
 });
 const agentSchema = z.object({
   name: z.string().min(1),
   description: z.string().optional(),
   model: z.string().optional(),
-  instructions: z.string().min(1)
+  instructions: z.string().min(1),
+  skillIds: skillIdsSchema
 });
 const agentPatchSchema = agentSchema.partial().extend({ enabled: z.boolean().optional() });
 const taskSchema = z.object({
@@ -788,7 +966,8 @@ const taskSchema = z.object({
   body: z.string().optional(),
   projectId: z.string().uuid(),
   agentId: z.string().uuid().optional(),
-  openPrOnSuccess: z.boolean().optional()
+  openPrOnSuccess: z.boolean().optional(),
+  skillIds: skillIdsSchema
 });
 const taskPatchSchema = taskSchema.partial().extend({
   status: z.string().optional()
@@ -909,7 +1088,13 @@ function requireAdmin(request: FastifyRequest): AuthUser {
   return user;
 }
 
-async function getUserFromCookie(pool: DbPool, request: FastifyRequest): Promise<AuthUser | undefined> {
+async function getUserFromRequest(pool: DbPool, request: FastifyRequest): Promise<AuthUser | undefined> {
+  const bearerToken = bearerTokenFromRequest(request);
+  if (bearerToken) {
+    const apiKeyUser = await getUserFromApiKey(pool, bearerToken);
+    if (apiKeyUser) return apiKeyUser;
+  }
+
   const token = request.cookies.aisevak_session ?? request.cookies.ctr_session;
   if (!token) return undefined;
   const result = await pool.query<AuthUser>(
@@ -920,6 +1105,32 @@ async function getUserFromCookie(pool: DbPool, request: FastifyRequest): Promise
     [hashToken(token)]
   );
   return result.rows[0];
+}
+
+function bearerTokenFromRequest(request: FastifyRequest): string | undefined {
+  const authorization = request.headers.authorization;
+  if (!authorization?.startsWith("Bearer ")) return undefined;
+  const token = authorization.slice("Bearer ".length).trim();
+  return token || undefined;
+}
+
+async function getUserFromApiKey(pool: DbPool, token: string): Promise<AuthUser | undefined> {
+  const result = await pool.query<AuthUser & { api_key_id: string }>(
+    `SELECT users.id, users.email, users.name, users.role, api_keys.id AS api_key_id
+     FROM api_keys
+     JOIN users ON users.id = api_keys.created_by
+     WHERE api_keys.token_hash = $1
+       AND api_keys.revoked_at IS NULL
+       AND api_keys.expires_at > now()
+     LIMIT 1`,
+    [hashToken(token)]
+  );
+  const row = result.rows[0];
+  if (!row) return undefined;
+  await pool.query("UPDATE api_keys SET last_used_at = now(), updated_at = now() WHERE id = $1", [
+    row.api_key_id
+  ]);
+  return { id: row.id, email: row.email, name: row.name, role: row.role };
 }
 
 async function createSession(pool: DbPool, reply: FastifyReply, user: AuthUser): Promise<void> {
@@ -1013,6 +1224,11 @@ async function queueWorkerRun(
   const branch = task.source === "github" ? taskBranchName(task.number, task.title) : null;
   const codexHome = managedCodexHome(env.managedRoot, task.id);
   await mkdir(codexHome, { recursive: true });
+  const skillsSnapshot = await resolveTaskSkills(pool, task);
+  const skillRefs = skillsSnapshot.map((skill) => ({
+    name: skill.name,
+    description: skill.description
+  }));
   const prompt =
     options.promptOverride ??
     buildCodexPrompt({
@@ -1021,7 +1237,8 @@ async function queueWorkerRun(
       taskTitle: task.title,
       taskBody: task.body,
       projectPath: task.local_path,
-      branch
+      branch,
+      skills: skillRefs
     });
   const agentSnapshot = {
     name: task.agent_name,
@@ -1031,10 +1248,11 @@ async function queueWorkerRun(
   };
   const session = await upsertTaskSession(pool, task.id, codexHome, agentSnapshot);
   const runResult = await pool.query(
-    `INSERT INTO task_runs (task_id, task_session_id, run_kind, trigger, status, cwd, branch, model, prompt)
-     VALUES ($1, $2, 'worker', $3, 'queued', $4, $5, $6, $7)
+    `INSERT INTO task_runs
+       (task_id, task_session_id, run_kind, trigger, status, cwd, branch, model, prompt, skills_snapshot)
+     VALUES ($1, $2, 'worker', $3, 'queued', $4, $5, $6, $7, $8)
      RETURNING *`,
-    [task.id, session.id, trigger, task.local_path, branch, task.agent_model, prompt]
+    [task.id, session.id, trigger, task.local_path, branch, task.agent_model, prompt, skillsSnapshot]
   );
   const run = mustRow(runResult.rows[0]);
   await insertRunUserMessage(pool, String(run.id), prompt);
@@ -1053,8 +1271,9 @@ async function queueDispatcherMessage(
         codex_home: string;
         codex_thread_id: string | null;
         model: string;
+        skills_snapshot: CodexSkillSnapshot[];
       }>(
-        `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model
+        `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model, skills_snapshot
          FROM dispatcher_runs
          WHERE id = $1`,
         [options.sourceRunId]
@@ -1067,8 +1286,9 @@ async function queueDispatcherMessage(
           codex_home: string;
           codex_thread_id: string | null;
           model: string;
+          skills_snapshot: CodexSkillSnapshot[];
         }>(
-          `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model
+          `SELECT task_id, scope, cwd, codex_home, codex_thread_id, model, skills_snapshot
            FROM dispatcher_runs
            WHERE task_id = $1
            ORDER BY created_at DESC
@@ -1085,10 +1305,11 @@ async function queueDispatcherMessage(
   const codexHome =
     previous?.codex_home ?? managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
   await mkdir(codexHome, { recursive: true });
+  const skillsSnapshot = previous?.skills_snapshot ?? (dispatcher ? await resolveAgentSkills(pool, dispatcher.id) : []);
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
-       (task_id, trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt)
-     VALUES ($1, 'manual', $2, 'queued', $3, $4, $5, $6, $7)
+       (task_id, trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
+     VALUES ($1, 'manual', $2, 'queued', $3, $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       previous?.task_id ?? options.taskId ?? null,
@@ -1097,7 +1318,8 @@ async function queueDispatcherMessage(
       codexHome,
       previous?.codex_thread_id ?? null,
       previous?.model ?? dispatcher?.model,
-      options.prompt
+      options.prompt,
+      skillsSnapshot
     ]
   );
   const run = mustRow(result.rows[0]);
@@ -1115,16 +1337,19 @@ async function queueDispatcherRun(
   const targetTaskNumber = typeof targetTask?.number === "number" ? targetTask.number : null;
   const codexHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
   await mkdir(codexHome, { recursive: true });
+  const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
     dispatcherInstructions: dispatcher.instructions,
     targetTaskNumber,
     tasksJson: JSON.stringify(context.tasks, null, 2),
     agentsJson: JSON.stringify(context.agents, null, 2),
-    projectsJson: JSON.stringify(context.projects, null, 2)
+    projectsJson: JSON.stringify(context.projects, null, 2),
+    skills: skillsSnapshot.map((skill) => ({ name: skill.name, description: skill.description }))
   });
   const result = await pool.query(
-    `INSERT INTO dispatcher_runs (task_id, trigger, scope, status, cwd, codex_home, model, prompt)
-     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7)
+    `INSERT INTO dispatcher_runs
+       (task_id, trigger, scope, status, cwd, codex_home, model, prompt, skills_snapshot)
+     VALUES ($1, $2, $3, 'queued', $4, $5, $6, $7, $8)
      RETURNING *`,
     [
       options.taskId ?? null,
@@ -1133,7 +1358,8 @@ async function queueDispatcherRun(
       env.managedRoot,
       codexHome,
       dispatcher.model,
-      prompt
+      prompt,
+      skillsSnapshot
     ]
   );
   const run = mustRow(result.rows[0]);
@@ -1268,6 +1494,186 @@ async function upsertTaskSession(
     [taskId, codexHome, agentSnapshot]
   );
   return mustRow(result.rows[0]);
+}
+
+async function syncAssignedSkills(
+  pool: DbPool,
+  table: "agent_skills" | "project_skills" | "task_skills",
+  ownerColumn: "agent_id" | "project_id" | "task_id",
+  ownerId: string,
+  skillIds: string[]
+): Promise<void> {
+  assertAssignmentTable(table, ownerColumn);
+  const uniqueIds = [...new Set(skillIds)];
+  await assertSkillsExist(pool, uniqueIds);
+  await pool.query(`DELETE FROM ${table} WHERE ${ownerColumn} = $1`, [ownerId]);
+  for (const skillId of uniqueIds) {
+    await pool.query(
+      `INSERT INTO ${table} (${ownerColumn}, skill_id)
+       VALUES ($1, $2)
+       ON CONFLICT DO NOTHING`,
+      [ownerId, skillId]
+    );
+  }
+}
+
+async function getAssignedSkillIds(
+  pool: DbPool,
+  table: "agent_skills" | "project_skills" | "task_skills",
+  ownerColumn: "agent_id" | "project_id" | "task_id",
+  ownerId: string
+): Promise<string[]> {
+  assertAssignmentTable(table, ownerColumn);
+  const result = await pool.query<{ skill_id: string }>(
+    `SELECT skill_id FROM ${table} WHERE ${ownerColumn} = $1 ORDER BY created_at ASC`,
+    [ownerId]
+  );
+  return result.rows.map((row) => row.skill_id);
+}
+
+async function assertSkillsExist(pool: DbPool, skillIds: string[]): Promise<void> {
+  if (skillIds.length === 0) return;
+  const result = await pool.query<{ id: string }>("SELECT id FROM skills WHERE id = ANY($1::uuid[])", [
+    skillIds
+  ]);
+  if (result.rows.length !== skillIds.length) {
+    throwBadRequest("One or more selected skills do not exist");
+  }
+}
+
+function assertAssignmentTable(table: string, ownerColumn: string): void {
+  const allowed: Record<string, string> = {
+    agent_skills: "agent_id",
+    project_skills: "project_id",
+    task_skills: "task_id"
+  };
+  if (allowed[table] !== ownerColumn) {
+    throw new Error("Invalid skill assignment target");
+  }
+}
+
+async function resolveTaskSkills(pool: DbPool, task: Pick<TaskJoin, "id" | "project_id" | "agent_id">): Promise<CodexSkillSnapshot[]> {
+  const result = await pool.query<{
+    id: string;
+    name: string;
+    description: string;
+    instructions: string;
+    files: unknown;
+    source: string;
+  }>(
+    `SELECT skills.id,
+            skills.name,
+            skills.description,
+            skills.instructions,
+            skills.files,
+            assignments.source
+     FROM (
+       SELECT agent_skills.skill_id, 'agent' AS source
+       FROM agent_skills
+       WHERE agent_skills.agent_id = $1
+       UNION ALL
+       SELECT project_skills.skill_id, 'project' AS source
+       FROM project_skills
+       WHERE project_skills.project_id = $2
+       UNION ALL
+       SELECT task_skills.skill_id, 'task' AS source
+       FROM task_skills
+       WHERE task_skills.task_id = $3
+     ) assignments
+     JOIN skills ON skills.id = assignments.skill_id
+     WHERE skills.enabled = true
+     ORDER BY skills.name ASC, assignments.source ASC`,
+    [task.agent_id, task.project_id, task.id]
+  );
+  return mergeSkillRows(result.rows);
+}
+
+async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
+  const result = await pool.query<{
+    id: string;
+    name: string;
+    description: string;
+    instructions: string;
+    files: unknown;
+    source: string;
+  }>(
+    `SELECT skills.id,
+            skills.name,
+            skills.description,
+            skills.instructions,
+            skills.files,
+            'agent' AS source
+     FROM agent_skills
+     JOIN skills ON skills.id = agent_skills.skill_id
+     WHERE agent_skills.agent_id = $1
+       AND skills.enabled = true
+     ORDER BY skills.name ASC`,
+    [agentId]
+  );
+  return mergeSkillRows(result.rows);
+}
+
+function mergeSkillRows(
+  rows: Array<{
+    id: string;
+    name: string;
+    description: string;
+    instructions: string;
+    files: unknown;
+    source: string;
+  }>
+): CodexSkillSnapshot[] {
+  const byId = new Map<string, CodexSkillSnapshot>();
+  for (const row of rows) {
+    const existing = byId.get(row.id);
+    if (existing) {
+      if (!existing.sources.includes(row.source)) existing.sources.push(row.source);
+      continue;
+    }
+    byId.set(row.id, {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      instructions: row.instructions,
+      files: normalizeSkillFiles(row.files),
+      sources: [row.source]
+    });
+  }
+  return [...byId.values()];
+}
+
+function normalizeSkillFiles(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const files: Record<string, string> = {};
+  for (const [path, content] of Object.entries(value as Record<string, unknown>)) {
+    if (typeof content === "string") files[path] = content;
+  }
+  return files;
+}
+
+function validateSkillFiles(files: Record<string, string>): void {
+  for (const [path, content] of Object.entries(files)) {
+    if (typeof content !== "string") {
+      throwBadRequest(`Skill file ${path} must contain text`);
+    }
+    const parts = path.split("/");
+    if (
+      path.startsWith("/") ||
+      path.includes("\\") ||
+      parts.some((part) => !part || part === "." || part === "..")
+    ) {
+      throwBadRequest(`Skill file path is not allowed: ${path}`);
+    }
+    if (path === "SKILL.md" || path.endsWith("/SKILL.md")) {
+      throwBadRequest("Aisevak generates SKILL.md from the skill instructions");
+    }
+  }
+}
+
+function throwBadRequest(message: string): never {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = 400;
+  throw error;
 }
 
 async function ensureNoDirectProjectRun(

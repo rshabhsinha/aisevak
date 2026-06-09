@@ -34,6 +34,18 @@ describe("codex helpers", () => {
     expect(prompt).toContain("Git branch: agent/1-fix-bug");
   });
 
+  it("lists installed skills in task prompts", () => {
+    const prompt = buildCodexPrompt({
+      agentName: "Fixer",
+      agentInstructions: "Be direct.",
+      taskTitle: "Fix bug",
+      projectPath: "/repo",
+      skills: [{ name: "regression-tests", description: "Use when adding regression coverage." }]
+    });
+    expect(prompt).toContain("# Available Skills");
+    expect(prompt).toContain("$regression-tests: Use when adding regression coverage.");
+  });
+
   it("normalizes current JSONL events", () => {
     const raw = parseCodexJsonLine(
       JSON.stringify({ method: "thread.started", params: { thread_id: "abc" } })

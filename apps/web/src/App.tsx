@@ -1,6 +1,7 @@
 import {
   Activity,
   ArrowUp,
+  BookOpen,
   Bot,
   CheckCircle2,
   ChevronDown,
@@ -14,6 +15,7 @@ import {
   FolderGit2,
   Github,
   Hammer,
+  KeyRound,
   LayoutDashboard,
   Loader2,
   LockOpen,
@@ -24,6 +26,7 @@ import {
   Search,
   Square,
   Terminal,
+  Trash2,
   UserCircle2,
   Wrench,
   X
@@ -40,7 +43,7 @@ import {
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
 
-type View = "tasks" | "agents" | "projects" | "connectors" | "runs";
+type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api";
 
 interface User {
   id: string;
@@ -58,6 +61,7 @@ interface Project {
   github_owner?: string | null;
   github_repo?: string | null;
   default_branch?: string | null;
+  skill_ids?: string[];
 }
 
 interface Agent {
@@ -67,6 +71,16 @@ interface Agent {
   description: string;
   model: string;
   instructions: string;
+  enabled: boolean;
+  skill_ids?: string[];
+}
+
+interface Skill {
+  id: string;
+  name: string;
+  description: string;
+  instructions: string;
+  files: Record<string, string>;
   enabled: boolean;
 }
 
@@ -92,6 +106,8 @@ interface Task {
   latest_run_id?: string | null;
   has_runs?: boolean;
   open_pr_on_success: boolean;
+  skill_ids?: string[];
+  resolved_skill_ids?: string[];
   updated_at?: string;
   created_at?: string;
 }
@@ -137,6 +153,16 @@ interface AgentRun {
   error?: string | null;
 }
 
+interface ExternalApiKey {
+  id: string;
+  name: string;
+  token_prefix: string;
+  expires_at: string;
+  last_used_at?: string | null;
+  revoked_at?: string | null;
+  created_at: string;
+}
+
 const BOARD_COLUMNS = [
   { id: "open", title: "Todo", icon: <Circle size={15} /> },
   { id: "running", title: "Running", icon: <CircleDashed size={15} /> },
@@ -150,8 +176,10 @@ export function App() {
   const [view, setView] = useState<View>("runs");
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [skills, setSkills] = useState<Skill[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
   const [defaultModel, setDefaultModel] = useState("gpt-5.5");
+  const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
@@ -183,6 +211,14 @@ export function App() {
   }, [query, tasks]);
 
   const displayedAgentRuns = useMemo(() => collapseAgentRuns(agentRuns), [agentRuns]);
+
+  const filteredSkills = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return skills;
+    return skills.filter((skill) =>
+      [skill.name, skill.description, skill.instructions].join(" ").toLowerCase().includes(needle)
+    );
+  }, [query, skills]);
 
   const filteredRuns = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -254,6 +290,8 @@ export function App() {
     await Promise.all([
       reloadProjects(),
       reloadAgents(),
+      reloadSkills(),
+      reloadApiKeys(),
       reloadTasks(),
       reloadModels(),
       reloadAgentRuns(),
@@ -269,6 +307,16 @@ export function App() {
   async function reloadAgents() {
     const data = await api<{ agents: Agent[] }>("/api/agents");
     setAgents(data.agents);
+  }
+
+  async function reloadSkills() {
+    const data = await api<{ skills: Skill[] }>("/api/skills");
+    setSkills(data.skills);
+  }
+
+  async function reloadApiKeys() {
+    const data = await api<{ apiKeys: ExternalApiKey[] }>("/api/api-keys");
+    setApiKeys(data.apiKeys);
   }
 
   async function reloadModels() {
@@ -407,6 +455,8 @@ export function App() {
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
           <NavButton icon={<Activity />} label="Agent Runs" active={view === "runs"} onClick={() => setView("runs")} />
           <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
+          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
+          <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
           <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
         </nav>
@@ -450,6 +500,7 @@ export function App() {
             <TasksView
               tasks={filteredTasks}
               agents={agents}
+              skills={skills}
               projects={projects}
               selectedTask={selectedTask}
               selectedTaskRun={selectedTaskRun}
@@ -489,10 +540,14 @@ export function App() {
           ) : null}
 
           {view === "agents" ? (
-            <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
+            <AgentsView agents={agents} skills={skills} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
           ) : null}
 
-          {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
+          {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
+
+          {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
+
+          {view === "projects" ? <ProjectsView projects={projects} skills={skills} onSaved={reloadProjects} /> : null}
 
           {view === "connectors" ? (
             <ConnectorsView
@@ -518,6 +573,7 @@ function TasksView(props: {
   tasks: Task[];
   projects: Project[];
   agents: Agent[];
+  skills: Skill[];
   selectedTask?: Task;
   selectedTaskRun: AgentRunTimelineRun | null;
   events: RunEvent[];
@@ -534,7 +590,7 @@ function TasksView(props: {
     <div className={`board-layout ${props.selectedTask ? "has-detail" : ""}`}>
       <div className="board-main">
         <div className="board-toolbar">
-          <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
+          <TaskForm projects={props.projects} agents={props.agents} skills={props.skills} onCreate={props.onCreate} />
         </div>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
@@ -571,6 +627,7 @@ function TasksView(props: {
       {props.selectedTask ? (
         <TaskDetail
           task={props.selectedTask}
+          skills={props.skills}
           run={props.selectedTaskRun}
           events={props.events}
           pendingMessages={props.pendingMessages}
@@ -588,12 +645,14 @@ function TasksView(props: {
 function TaskForm(props: {
   projects: Project[];
   agents: Agent[];
+  skills: Skill[];
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [projectId, setProjectId] = useState("");
   const [agentId, setAgentId] = useState("auto");
+  const [skillIds, setSkillIds] = useState<string[]>([]);
   const workerAgents = props.agents.filter((agent) => agent.kind !== "dispatcher");
 
   useEffect(() => {
@@ -602,47 +661,53 @@ function TaskForm(props: {
 
   return (
     <form
-      className="inline-create"
+      className="task-create-form"
       onSubmit={async (event) => {
         event.preventDefault();
         await props.onCreate({
           title,
           body,
           projectId,
-          ...(agentId === "auto" ? {} : { agentId })
+          ...(agentId === "auto" ? {} : { agentId }),
+          skillIds
         });
         setTitle("");
         setBody("");
         setAgentId("auto");
+        setSkillIds([]);
       }}
     >
-      <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
-      <input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Details" />
-      <select value={projectId} onChange={(event) => setProjectId(event.target.value)} required>
-        {props.projects.map((project) => (
-          <option value={project.id} key={project.id}>
-            {project.name}
-          </option>
-        ))}
-      </select>
-      <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
-        <option value="auto">Auto-route</option>
-        {workerAgents.map((agent) => (
-          <option value={agent.id} key={agent.id}>
-            {agent.name}
-          </option>
-        ))}
-      </select>
-      <button className="button primary" type="submit">
-        <Plus size={15} />
-        Add
-      </button>
+      <div className="inline-create">
+        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
+        <input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Details" />
+        <select value={projectId} onChange={(event) => setProjectId(event.target.value)} required>
+          {props.projects.map((project) => (
+            <option value={project.id} key={project.id}>
+              {project.name}
+            </option>
+          ))}
+        </select>
+        <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
+          <option value="auto">Auto-route</option>
+          {workerAgents.map((agent) => (
+            <option value={agent.id} key={agent.id}>
+              {agent.name}
+            </option>
+          ))}
+        </select>
+        <button className="button primary" type="submit">
+          <Plus size={15} />
+          Add
+        </button>
+      </div>
+      <SkillPicker skills={props.skills} value={skillIds} onChange={setSkillIds} compact />
     </form>
   );
 }
 
 function TaskDetail(props: {
   task?: Task;
+  skills: Skill[];
   run: AgentRunTimelineRun | null;
   events: RunEvent[];
   pendingMessages: AgentRunChatMessage[];
@@ -664,6 +729,7 @@ function TaskDetail(props: {
   const hasRun = Boolean(props.task.has_runs || props.task.latest_run_id || props.task.latest_run_status);
   const showRun = !hasRun;
   const showStop = active && Boolean(props.task.latest_run_id);
+  const resolvedSkills = skillLabels(props.skills, props.task.resolved_skill_ids ?? props.task.skill_ids ?? []);
   const taskRun =
     props.run ??
     (props.task.latest_run_id || props.events.length > 0
@@ -692,6 +758,7 @@ function TaskDetail(props: {
         <div className="mt-2">
           <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
         </div>
+        {resolvedSkills.length > 0 ? <SkillChips labels={resolvedSkills} /> : null}
       </div>
       <div className="detail-body">
         <div className="task-body-text">{props.task.body || "No description."}</div>
@@ -803,6 +870,7 @@ function AgentRunsView(props: {
 
 function AgentsView(props: {
   agents: Agent[];
+  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -842,7 +910,13 @@ function AgentsView(props: {
       <main className="detail-view">
         {editing ? (
           <div className="form-view">
-            <AgentEditor agent={editing} models={props.models} defaultModel={props.defaultModel} onSaved={props.onSaved} />
+            <AgentEditor
+              agent={editing}
+              skills={props.skills}
+              models={props.models}
+              defaultModel={props.defaultModel}
+              onSaved={props.onSaved}
+            />
           </div>
         ) : (
           <div className="empty-state">Select an agent</div>
@@ -854,6 +928,7 @@ function AgentsView(props: {
 
 function AgentEditor(props: {
   agent: Agent;
+  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -899,6 +974,14 @@ function AgentEditor(props: {
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
       </label>
+      <div className="field-block">
+        <div className="field-label">Skills</div>
+        <SkillPicker
+          skills={props.skills}
+          value={draft.skill_ids ?? []}
+          onChange={(skillIds) => setDraft({ ...draft, skill_ids: skillIds })}
+        />
+      </div>
       <div className="model-list">
         {props.models.map((model) => (
           <span className="model-pill" key={model.id}>
@@ -916,10 +999,340 @@ function AgentEditor(props: {
   );
 }
 
-function ProjectsView({ projects, onSaved }: { projects: Project[]; onSaved: () => Promise<void> }) {
+function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void> }) {
+  const [name, setName] = useState("External integration");
+  const [expiresAt, setExpiresAt] = useState(() => localDateTimeInput(addDays(new Date(), 30)));
+  const [createdSecret, setCreatedSecret] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div className="flat-list-view api-view">
+      <div className="flat-header">
+        <h3>API</h3>
+      </div>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>API Keys</h4>
+            <p>Keys authenticate as your user account and inherit your current role.</p>
+          </div>
+        </div>
+        <form
+          className="api-key-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setError(null);
+            setCreatedSecret(null);
+            try {
+              const data = await api<{ apiKey: ExternalApiKey; secret: string }>("/api/api-keys", {
+                method: "POST",
+                body: JSON.stringify({
+                  name,
+                  expiresAt: new Date(expiresAt).toISOString()
+                })
+              });
+              setCreatedSecret(data.secret);
+              setName("External integration");
+              setExpiresAt(localDateTimeInput(addDays(new Date(), 30)));
+              await props.onSaved();
+            } catch (createError) {
+              setError(friendlyError(createError instanceof Error ? createError.message : "Could not create API key."));
+            }
+          }}
+        >
+          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" required />
+          <input
+            value={expiresAt}
+            onChange={(event) => setExpiresAt(event.target.value)}
+            type="datetime-local"
+            required
+          />
+          <button className="button primary" type="submit">
+            <Plus size={15} />
+            Create key
+          </button>
+        </form>
+        {error ? <div className="notice error">{error}</div> : null}
+        {createdSecret ? (
+          <div className="api-secret-box">
+            <div>
+              <strong>Copy this key now.</strong>
+              <p>It will not be shown again.</p>
+            </div>
+            <code>{createdSecret}</code>
+            <CopyButton text={createdSecret} label="Copy API key" />
+          </div>
+        ) : null}
+        <div className="api-key-list">
+          {props.apiKeys.map((key) => (
+            <div className="data-row" key={key.id}>
+              <div className="data-row-main">
+                <div className="data-icon">
+                  <KeyRound size={16} />
+                </div>
+                <div>
+                  <div className="data-title">{key.name}</div>
+                  <div className="data-subtitle">
+                    {key.token_prefix}... / expires {formatDateTime(key.expires_at)}
+                    {key.last_used_at ? ` / used ${formatDateTime(key.last_used_at)}` : ""}
+                  </div>
+                </div>
+              </div>
+              <div className="row-actions">
+                <TaskStatus status={apiKeyStatus(key)} />
+                {!key.revoked_at ? (
+                  <button
+                    className="icon-button flat"
+                    title="Revoke key"
+                    onClick={async () => {
+                      await api(`/api/api-keys/${key.id}`, { method: "DELETE" });
+                      await props.onSaved();
+                    }}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          ))}
+          {props.apiKeys.length === 0 ? <div className="empty-list">No API keys</div> : null}
+        </div>
+      </section>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>Docs</h4>
+            <p>Use the key as a bearer token with the existing Aisevak API.</p>
+          </div>
+          <CopyButton text={apiDocsText(apiBaseUrl())} label="Copy API docs" />
+        </div>
+        <ApiDocs />
+      </section>
+    </div>
+  );
+}
+
+function ApiDocs() {
+  const docs = apiDocs(apiBaseUrl());
+  return (
+    <div className="api-docs">
+      <div className="api-doc-block">
+        <h5>List projects, agents, and skills</h5>
+        <CodeBlock language="bash" code={docs.list} />
+      </div>
+      <div className="api-doc-block">
+        <h5>Create a task with optional skills</h5>
+        <CodeBlock language="bash" code={docs.createTask} />
+      </div>
+      <div className="api-doc-block">
+        <h5>Start a run</h5>
+        <CodeBlock language="bash" code={docs.startRun} />
+      </div>
+    </div>
+  );
+}
+
+function apiBaseUrl(): string {
+  return window.location.origin.replace("5173", "8787");
+}
+
+function apiDocs(baseUrl: string): { list: string; createTask: string; startRun: string } {
+  return {
+    list: `curl -H "Authorization: Bearer $AISEVAK_API_KEY" \\
+  ${baseUrl}/api/projects
+
+curl -H "Authorization: Bearer $AISEVAK_API_KEY" \\
+  ${baseUrl}/api/agents
+
+curl -H "Authorization: Bearer $AISEVAK_API_KEY" \\
+  ${baseUrl}/api/skills`,
+    createTask: `curl -X POST ${baseUrl}/api/tasks \\
+  -H "Authorization: Bearer $AISEVAK_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "title": "Add regression test",
+    "body": "Use the existing test style.",
+    "projectId": "PROJECT_UUID",
+    "agentId": "AGENT_UUID",
+    "skillIds": ["SKILL_UUID"]
+  }'`,
+    startRun: `curl -X POST ${baseUrl}/api/tasks/TASK_UUID/runs \\
+  -H "Authorization: Bearer $AISEVAK_API_KEY"`
+  };
+}
+
+function apiDocsText(baseUrl: string): string {
+  const docs = apiDocs(baseUrl);
+  return [
+    "# Aisevak API Quickstart",
+    "",
+    "Set your API key:",
+    "export AISEVAK_API_KEY=avk_...",
+    "",
+    "## List projects, agents, and skills",
+    "```bash",
+    docs.list,
+    "```",
+    "",
+    "## Create a task with optional skills",
+    "```bash",
+    docs.createTask,
+    "```",
+    "",
+    "## Start a run",
+    "```bash",
+    docs.startRun,
+    "```"
+  ].join("\n");
+}
+
+function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
+  const [editing, setEditing] = useState<Skill | null>(props.skills[0] ?? null);
+  useEffect(() => {
+    if (!editing && props.skills[0]) setEditing(props.skills[0]);
+  }, [props.skills, editing]);
+
+  return (
+    <div className="master-detail">
+      <aside className="master-list">
+        <div className="master-header flex-between">
+          <h3>Skills</h3>
+          <button className="icon-button flat" onClick={() => setEditing(emptySkill())} title="New skill">
+            <Plus size={14} />
+          </button>
+        </div>
+        <div className="list-scroll">
+          {props.skills.map((skill) => (
+            <button
+              className={`list-item ${editing?.id === skill.id ? "selected" : ""}`}
+              key={skill.id}
+              onClick={() => setEditing(skill)}
+            >
+              <div className="list-item-icon">
+                <BookOpen size={15} />
+              </div>
+              <div className="list-item-main">
+                <span className="list-item-title">${skill.name}</span>
+                <span className="list-item-desc">{skill.description}</span>
+              </div>
+              <TaskStatus status={skill.enabled ? "enabled" : "disabled"} />
+            </button>
+          ))}
+          {props.skills.length === 0 ? <div className="empty-list">No skills</div> : null}
+        </div>
+      </aside>
+      <main className="detail-view">
+        {editing ? (
+          <div className="form-view">
+            <SkillEditor skill={editing} onSaved={props.onSaved} />
+          </div>
+        ) : (
+          <div className="empty-state">Select a skill</div>
+        )}
+      </main>
+    </div>
+  );
+}
+
+function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
+  const [draft, setDraft] = useState(props.skill);
+  const [filesJson, setFilesJson] = useState(() => JSON.stringify(props.skill.files ?? {}, null, 2));
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setDraft(props.skill);
+    setFilesJson(JSON.stringify(props.skill.files ?? {}, null, 2));
+    setError(null);
+  }, [props.skill]);
+
+  return (
+    <form
+      className="stack"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setError(null);
+        let files: Record<string, string>;
+        try {
+          const parsed = JSON.parse(filesJson || "{}") as unknown;
+          files = normalizeFilesDraft(parsed);
+        } catch (parseError) {
+          setError(parseError instanceof Error ? parseError.message : "Files must be valid JSON.");
+          return;
+        }
+        const path = draft.id ? `/api/skills/${draft.id}` : "/api/skills";
+        try {
+          await api(path, {
+            method: draft.id ? "PATCH" : "POST",
+            body: JSON.stringify({ ...draft, files })
+          });
+          await props.onSaved();
+        } catch (saveError) {
+          setError(saveError instanceof Error ? saveError.message : "Failed to save skill.");
+        }
+      }}
+    >
+      <div className="form-grid">
+        <label>
+          Name
+          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+        </label>
+        <label className="toggle-field">
+          Enabled
+          <input
+            type="checkbox"
+            checked={draft.enabled}
+            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+          />
+        </label>
+      </div>
+      <label>
+        Description
+        <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+      </label>
+      <label>
+        Instructions
+        <textarea
+          className="textarea-mono"
+          style={{ minHeight: 260 }}
+          value={draft.instructions}
+          onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
+        />
+      </label>
+      <label>
+        Files JSON
+        <textarea
+          className="textarea-mono"
+          style={{ minHeight: 150 }}
+          value={filesJson}
+          onChange={(event) => setFilesJson(event.target.value)}
+        />
+      </label>
+      {error ? <div className="notice error">{error}</div> : null}
+      <div>
+        <button className="button primary" type="submit">
+          <CheckCircle2 size={15} />
+          Save skill
+        </button>
+      </div>
+    </form>
+  );
+}
+
+function ProjectsView({
+  projects,
+  skills,
+  onSaved
+}: {
+  projects: Project[];
+  skills: Skill[];
+  onSaved: () => Promise<void>;
+}) {
   const [name, setName] = useState("");
   const [localPath, setLocalPath] = useState("");
   const [workspaceMode, setWorkspaceMode] = useState<"direct" | "git_worktree">("direct");
+  const [skillIds, setSkillIds] = useState<string[]>([]);
 
   return (
     <div className="flat-list-view">
@@ -933,14 +1346,15 @@ function ProjectsView({ projects, onSaved }: { projects: Project[]; onSaved: () 
           event.preventDefault();
           await api("/api/projects", {
             method: "POST",
-            body: JSON.stringify({ name, localPath, workspaceMode })
+            body: JSON.stringify({ name, localPath, workspaceMode, skillIds })
           });
           setName("");
           setLocalPath("");
+          setSkillIds([]);
           await onSaved();
         }}
       >
-        <div style={{ display: "flex", gap: 12 }}>
+        <div className="wide-form-row">
           <input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
           <input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
           <select style={{ flex: 1 }} value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
@@ -952,6 +1366,7 @@ function ProjectsView({ projects, onSaved }: { projects: Project[]; onSaved: () 
             Add
           </button>
         </div>
+        <SkillPicker skills={skills} value={skillIds} onChange={setSkillIds} compact />
       </form>
       <div>
         {projects.map((project) => (
@@ -961,6 +1376,7 @@ function ProjectsView({ projects, onSaved }: { projects: Project[]; onSaved: () 
               <div>
                 <div className="data-title">{project.name}</div>
                 <div className="data-subtitle">{project.local_path}</div>
+                <SkillChips labels={skillLabels(skills, project.skill_ids ?? [])} />
               </div>
             </div>
             <div className="data-subtitle" style={{ textTransform: "capitalize" }}>{project.source}</div>
@@ -1432,14 +1848,29 @@ function TaskStatus({ status }: { status?: string | null }) {
 
 function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
   const [form, setForm] = useState({ name: "", email: "", password: "", openaiApiKey: "" });
+  const [error, setError] = useState<string | null>(null);
   return (
     <div className="auth-container">
       <form
         className="auth-box"
         onSubmit={async (event) => {
           event.preventDefault();
-          await api("/api/onboarding/admin", { method: "POST", body: JSON.stringify(form) });
-          await onDone();
+          setError(null);
+          const openaiApiKey = form.openaiApiKey.trim();
+          try {
+            await api("/api/onboarding/admin", {
+              method: "POST",
+              body: JSON.stringify({
+                name: form.name,
+                email: form.email,
+                password: form.password,
+                ...(openaiApiKey ? { openaiApiKey } : {})
+              })
+            });
+            await onDone();
+          } catch (onboardingError) {
+            setError(onboardingError instanceof Error ? onboardingError.message : "Could not create workspace.");
+          }
         }}
       >
         <h1>Create workspace</h1>
@@ -1447,8 +1878,9 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
         <div className="stack">
           <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Name" required />
           <input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email" type="email" required />
-          <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password" type="password" required />
-          <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key" type="password" />
+          <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password (8+ characters)" type="password" minLength={8} required />
+          <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key (optional)" type="password" />
+          {error ? <div className="notice error">{friendlyError(error)}</div> : null}
           <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
             Continue
           </button>
@@ -1502,6 +1934,54 @@ function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: s
   );
 }
 
+function SkillPicker(props: {
+  skills: Skill[];
+  value: string[];
+  onChange: (skillIds: string[]) => void;
+  compact?: boolean;
+}) {
+  const enabledSkills = props.skills.filter((skill) => skill.enabled);
+  if (enabledSkills.length === 0) {
+    return props.compact ? null : <div className="empty-list compact">No enabled skills</div>;
+  }
+  return (
+    <div className={`skill-picker ${props.compact ? "compact" : ""}`}>
+      {enabledSkills.map((skill) => {
+        const checked = props.value.includes(skill.id);
+        return (
+          <label className="skill-option" key={skill.id} title={skill.description}>
+            <input
+              type="checkbox"
+              checked={checked}
+              onChange={(event) => {
+                props.onChange(
+                  event.target.checked
+                    ? [...props.value, skill.id]
+                    : props.value.filter((skillId) => skillId !== skill.id)
+                );
+              }}
+            />
+            <span>${skill.name}</span>
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
+function SkillChips({ labels }: { labels: string[] }) {
+  if (labels.length === 0) return null;
+  return (
+    <div className="skill-chip-row">
+      {labels.map((label) => (
+        <span className="skill-chip" key={label}>
+          ${label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function emptyAgent(defaultModel: string): Agent {
   return {
     id: "",
@@ -1510,8 +1990,39 @@ function emptyAgent(defaultModel: string): Agent {
     description: "",
     model: defaultModel,
     instructions: "You are a focused coding agent. Complete the task, verify it, and summarize the result.",
+    enabled: true,
+    skill_ids: []
+  };
+}
+
+function emptySkill(): Skill {
+  return {
+    id: "",
+    name: "new-skill",
+    description: "Use when this repeatable workflow is relevant.",
+    instructions: "Describe the workflow Codex should follow when this skill is used.",
+    files: {},
     enabled: true
   };
+}
+
+function skillLabels(skills: Skill[], skillIds: string[]): string[] {
+  const byId = new Map(skills.map((skill) => [skill.id, skill.name]));
+  return skillIds.map((skillId) => byId.get(skillId)).filter((name): name is string => Boolean(name));
+}
+
+function normalizeFilesDraft(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("Files JSON must be an object of relative paths to text content.");
+  }
+  const files: Record<string, string> = {};
+  for (const [path, content] of Object.entries(value)) {
+    if (typeof content !== "string") {
+      throw new Error(`File ${path} must contain text.`);
+    }
+    files[path] = content;
+  }
+  return files;
 }
 
 function taskBucket(task: Task): (typeof BOARD_COLUMNS)[number]["id"] {
@@ -1520,8 +2031,8 @@ function taskBucket(task: Task): (typeof BOARD_COLUMNS)[number]["id"] {
 
 function runBucket(status?: string | null): (typeof BOARD_COLUMNS)[number]["id"] {
   if (["queued", "running", "cancel_requested"].includes(status ?? "")) return "running";
-  if (["succeeded", "done", "completed"].includes(status ?? "")) return "completed";
-  if (["failed", "cancelled", "canceled", "needs_attention", "blocked"].includes(status ?? "")) return "failed";
+  if (["succeeded", "done", "completed", "active", "enabled"].includes(status ?? "")) return "completed";
+  if (["failed", "cancelled", "canceled", "needs_attention", "blocked", "expired", "revoked", "disabled"].includes(status ?? "")) return "failed";
   return "open";
 }
 
@@ -1542,11 +2053,42 @@ function formatTimestamp(value: string): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function formatDateTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString([], {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit"
+  });
+}
+
+function addDays(date: Date, days: number): Date {
+  const next = new Date(date);
+  next.setDate(next.getDate() + days);
+  return next;
+}
+
+function localDateTimeInput(date: Date): string {
+  const offsetMs = date.getTimezoneOffset() * 60 * 1000;
+  return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
+}
+
+function apiKeyStatus(key: ExternalApiKey): string {
+  if (key.revoked_at) return "revoked";
+  if (new Date(key.expires_at).getTime() <= Date.now()) return "expired";
+  return "active";
+}
+
 function viewTitle(view: View): string {
   return {
     tasks: "Tasks",
     runs: "Agent Runs",
     agents: "Agents",
+    skills: "Skills",
+    api: "API",
     projects: "Projects",
     connectors: "Connectors"
   }[view];
@@ -1650,6 +2192,17 @@ function removePendingMessage(
     next[key] = nextMessages;
   }
   return next;
+}
+
+function friendlyError(message: string): string {
+  try {
+    const payload = JSON.parse(message) as { message?: unknown; error?: unknown };
+    if (typeof payload.message === "string") return payload.message;
+    if (typeof payload.error === "string") return payload.error;
+  } catch {
+    return message;
+  }
+  return message;
 }
 
 async function api<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {

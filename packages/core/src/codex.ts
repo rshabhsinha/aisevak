@@ -35,6 +35,7 @@ export function buildCodexPrompt(options: CodexPromptOptions): string {
     `You are running as agent: ${options.agentName}.`,
     "Treat the following instructions as the controlling system prompt for this task.",
     options.agentInstructions.trim(),
+    ...skillPromptSection(options.skills),
     "",
     "# Execution Context",
     `Project path: ${options.projectPath}`,
@@ -57,6 +58,7 @@ export function buildDispatcherPrompt(options: DispatcherPromptOptions): string 
     "You are Aisevak's Dispatcher agent. Your job is to turn task-board state into the next useful worker runs.",
     "Treat the following instructions as the controlling system prompt for this dispatcher session.",
     options.dispatcherInstructions.trim(),
+    ...skillPromptSection(options.skills),
     "",
     "# Available Board Tools",
     "Use the `aisevak` CLI that is already on PATH. Do not write directly to the database.",
@@ -87,6 +89,17 @@ export function buildDispatcherPrompt(options: DispatcherPromptOptions): string 
   ];
 
   return lines.filter((line): line is string => line !== undefined).join("\n");
+}
+
+function skillPromptSection(skills: CodexPromptOptions["skills"]): string[] {
+  const activeSkills = (skills ?? []).filter((skill) => skill.name.trim() && skill.description.trim());
+  if (activeSkills.length === 0) return [];
+  return [
+    "",
+    "# Available Skills",
+    "The following skills are installed for this session. Invoke a skill explicitly with `$skill-name` when it is directly useful, or use it implicitly when its description matches the work.",
+    ...activeSkills.map((skill) => `- $${skill.name}: ${skill.description}`)
+  ];
 }
 
 export function parseCodexJsonLine(line: string): unknown | null {

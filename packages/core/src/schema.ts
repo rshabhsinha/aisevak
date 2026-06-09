@@ -3,6 +3,7 @@ import {
   integer,
   jsonb,
   pgEnum,
+  primaryKey,
   pgTable,
   text,
   timestamp,
@@ -57,6 +58,25 @@ export const sessions = pgTable("sessions", {
   createdAt
 });
 
+export const apiKeys = pgTable(
+  "api_keys",
+  {
+    id,
+    name: text("name").notNull(),
+    tokenHash: text("token_hash").notNull(),
+    tokenPrefix: text("token_prefix").notNull(),
+    createdBy: uuid("created_by").notNull().references(() => users.id, { onDelete: "cascade" }),
+    expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
+    revokedAt: timestamp("revoked_at", { withTimezone: true }),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    tokenUnique: uniqueIndex("api_keys_token_hash_unique").on(table.tokenHash)
+  })
+);
+
 export const invites = pgTable("invites", {
   id,
   email: text("email"),
@@ -110,6 +130,48 @@ export const agents = pgTable("agents", {
   updatedAt
 });
 
+export const skills = pgTable(
+  "skills",
+  {
+    id,
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    instructions: text("instructions").notNull(),
+    files: jsonb("files").notNull().default({}),
+    enabled: boolean("enabled").notNull().default(true),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    nameUnique: uniqueIndex("skills_name_unique").on(table.name)
+  })
+);
+
+export const agentSkills = pgTable(
+  "agent_skills",
+  {
+    agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+    skillId: uuid("skill_id").notNull().references(() => skills.id, { onDelete: "cascade" }),
+    createdAt
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.agentId, table.skillId] })
+  })
+);
+
+export const projectSkills = pgTable(
+  "project_skills",
+  {
+    projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "cascade" }),
+    skillId: uuid("skill_id").notNull().references(() => skills.id, { onDelete: "cascade" }),
+    createdAt
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.projectId, table.skillId] })
+  })
+);
+
 export const agentVersions = pgTable("agent_versions", {
   id,
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
@@ -134,6 +196,18 @@ export const tasks = pgTable("tasks", {
   createdAt,
   updatedAt
 });
+
+export const taskSkills = pgTable(
+  "task_skills",
+  {
+    taskId: uuid("task_id").notNull().references(() => tasks.id, { onDelete: "cascade" }),
+    skillId: uuid("skill_id").notNull().references(() => skills.id, { onDelete: "cascade" }),
+    createdAt
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.taskId, table.skillId] })
+  })
+);
 
 export const taskComments = pgTable("task_comments", {
   id,
@@ -178,6 +252,7 @@ export const taskRuns = pgTable("task_runs", {
   codexThreadId: text("codex_thread_id"),
   model: text("model").notNull(),
   prompt: text("prompt").notNull(),
+  skillsSnapshot: jsonb("skills_snapshot").notNull().default([]),
   rawStdout: text("raw_stdout").notNull().default(""),
   rawStderr: text("raw_stderr").notNull().default(""),
   exitCode: integer("exit_code"),
@@ -200,6 +275,7 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
   codexThreadId: text("codex_thread_id"),
   model: text("model").notNull(),
   prompt: text("prompt").notNull(),
+  skillsSnapshot: jsonb("skills_snapshot").notNull().default([]),
   rawStdout: text("raw_stdout").notNull().default(""),
   rawStderr: text("raw_stderr").notNull().default(""),
   exitCode: integer("exit_code"),
