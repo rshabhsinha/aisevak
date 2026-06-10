@@ -93,7 +93,11 @@ export const secrets = pgTable(
   {
     id,
     name: text("name").notNull(),
+    description: text("description").notNull().default(""),
     encryptedValue: text("encrypted_value").notNull(),
+    agentAccessible: boolean("agent_accessible").notNull().default(false),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     createdAt,
     updatedAt
   },
@@ -189,7 +193,7 @@ export const tasks = pgTable("tasks", {
   title: text("title").notNull(),
   body: text("body").notNull().default(""),
   status: text("status").notNull().default("open"),
-  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "restrict" }),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   openPrOnSuccess: boolean("open_pr_on_success").notNull().default(false),

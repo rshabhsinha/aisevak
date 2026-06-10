@@ -6,4 +6,5 @@ export * from "./github.js";
 export * from "./migrations.js";
 export * from "./models.js";
 export * from "./schema.js";
+export * from "./skills.js";
 export * from "./types.js";

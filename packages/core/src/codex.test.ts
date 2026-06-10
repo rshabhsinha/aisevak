@@ -3,6 +3,7 @@ import {
   buildCodexAppServerArgs,
   buildCodexConfigToml,
   buildCodexPrompt,
+  buildDispatcherPrompt,
   normalizeCodexEvent,
   parseCodexJsonLine,
   redactSecrets
@@ -44,6 +45,29 @@ describe("codex helpers", () => {
     });
     expect(prompt).toContain("# Available Skills");
     expect(prompt).toContain("$regression-tests: Use when adding regression coverage.");
+  });
+
+  it("mentions on-demand credential tools in task prompts", () => {
+    const prompt = buildCodexPrompt({
+      agentName: "Fixer",
+      agentInstructions: "Be direct.",
+      taskTitle: "Call a service",
+      projectPath: "/repo"
+    });
+    expect(prompt).toContain("aisevak credential list");
+    expect(prompt).toContain("aisevak credential get <name>");
+    expect(prompt).toContain("aisevak credential add <name> --value-stdin");
+  });
+
+  it("tells dispatchers how to complete answer-only tasks", () => {
+    const prompt = buildDispatcherPrompt({
+      dispatcherInstructions: "Route the board.",
+      tasksJson: "[]",
+      agentsJson: "[]",
+      projectsJson: "[]"
+    });
+    expect(prompt).toContain("aisevak task complete TASK-123");
+    expect(prompt).toContain("If you can fully answer a task without a worker run");
   });
 
   it("normalizes current JSONL events", () => {

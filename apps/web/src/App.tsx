@@ -19,6 +19,7 @@ import {
   LayoutDashboard,
   Loader2,
   LockOpen,
+  LockKeyhole,
   LogOut,
   Play,
   Plus,
@@ -43,7 +44,7 @@ import {
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
 
-type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api";
+type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api" | "credentials";
 
 interface User {
   id: string;
@@ -61,7 +62,6 @@ interface Project {
   github_owner?: string | null;
   github_repo?: string | null;
   default_branch?: string | null;
-  skill_ids?: string[];
 }
 
 interface Agent {
@@ -72,7 +72,6 @@ interface Agent {
   model: string;
   instructions: string;
   enabled: boolean;
-  skill_ids?: string[];
 }
 
 interface Skill {
@@ -97,17 +96,15 @@ interface Task {
   title: string;
   body: string;
   status: string;
-  project_id: string;
+  project_id: string | null;
   agent_id: string;
-  project_name: string;
+  project_name: string | null;
   agent_name: string;
   agent_kind: "worker" | "dispatcher";
   latest_run_status?: string | null;
   latest_run_id?: string | null;
   has_runs?: boolean;
   open_pr_on_success: boolean;
-  skill_ids?: string[];
-  resolved_skill_ids?: string[];
   updated_at?: string;
   created_at?: string;
 }
@@ -163,6 +160,16 @@ interface ExternalApiKey {
   created_at: string;
 }
 
+interface Credential {
+  id: string;
+  name: string;
+  description: string;
+  agent_accessible: boolean;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 const BOARD_COLUMNS = [
   { id: "open", title: "Todo", icon: <Circle size={15} /> },
   { id: "running", title: "Running", icon: <CircleDashed size={15} /> },
@@ -180,6 +187,7 @@ export function App() {
   const [models, setModels] = useState<CodexModel[]>([]);
   const [defaultModel, setDefaultModel] = useState("gpt-5.5");
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
+  const [credentials, setCredentials] = useState<Credential[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
@@ -292,6 +300,7 @@ export function App() {
       reloadAgents(),
       reloadSkills(),
       reloadApiKeys(),
+      reloadCredentials(),
       reloadTasks(),
       reloadModels(),
       reloadAgentRuns(),
@@ -317,6 +326,15 @@ export function App() {
   async function reloadApiKeys() {
     const data = await api<{ apiKeys: ExternalApiKey[] }>("/api/api-keys");
     setApiKeys(data.apiKeys);
+  }
+
+  async function reloadCredentials() {
+    if (!user || user.role === "member") {
+      setCredentials([]);
+      return;
+    }
+    const data = await api<{ credentials: Credential[] }>("/api/credentials");
+    setCredentials(data.credentials);
   }
 
   async function reloadModels() {
@@ -457,6 +475,9 @@ export function App() {
           <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
           <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
+          {user.role !== "member" ? (
+            <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => setView("credentials")} />
+          ) : null}
           <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
         </nav>
@@ -500,7 +521,6 @@ export function App() {
             <TasksView
               tasks={filteredTasks}
               agents={agents}
-              skills={skills}
               projects={projects}
               selectedTask={selectedTask}
               selectedTaskRun={selectedTaskRun}
@@ -540,14 +560,16 @@ export function App() {
           ) : null}
 
           {view === "agents" ? (
-            <AgentsView agents={agents} skills={skills} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
+            <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
           ) : null}
 
           {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
 
           {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
 
-          {view === "projects" ? <ProjectsView projects={projects} skills={skills} onSaved={reloadProjects} /> : null}
+          {view === "credentials" ? <CredentialsView credentials={credentials} onSaved={reloadCredentials} /> : null}
+
+          {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
 
           {view === "connectors" ? (
             <ConnectorsView
@@ -573,7 +595,6 @@ function TasksView(props: {
   tasks: Task[];
   projects: Project[];
   agents: Agent[];
-  skills: Skill[];
   selectedTask?: Task;
   selectedTaskRun: AgentRunTimelineRun | null;
   events: RunEvent[];
@@ -590,7 +611,7 @@ function TasksView(props: {
     <div className={`board-layout ${props.selectedTask ? "has-detail" : ""}`}>
       <div className="board-main">
         <div className="board-toolbar">
-          <TaskForm projects={props.projects} agents={props.agents} skills={props.skills} onCreate={props.onCreate} />
+          <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
         </div>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
@@ -615,7 +636,7 @@ function TasksView(props: {
                         <TaskStatus status={task.latest_run_status ?? task.status} />
                       </div>
                       <div className="card-title">{task.title}</div>
-                      <div className="card-desc">{task.project_name}</div>
+                      <div className="card-desc">{task.project_name ?? "No project"}</div>
                     </button>
                   ))}
                 </div>
@@ -627,7 +648,6 @@ function TasksView(props: {
       {props.selectedTask ? (
         <TaskDetail
           task={props.selectedTask}
-          skills={props.skills}
           run={props.selectedTaskRun}
           events={props.events}
           pendingMessages={props.pendingMessages}
@@ -645,19 +665,13 @@ function TasksView(props: {
 function TaskForm(props: {
   projects: Project[];
   agents: Agent[];
-  skills: Skill[];
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [projectId, setProjectId] = useState("");
   const [agentId, setAgentId] = useState("auto");
-  const [skillIds, setSkillIds] = useState<string[]>([]);
   const workerAgents = props.agents.filter((agent) => agent.kind !== "dispatcher");
-
-  useEffect(() => {
-    if (!projectId && props.projects[0]) setProjectId(props.projects[0].id);
-  }, [props.projects, projectId]);
 
   return (
     <form
@@ -667,20 +681,19 @@ function TaskForm(props: {
         await props.onCreate({
           title,
           body,
-          projectId,
-          ...(agentId === "auto" ? {} : { agentId }),
-          skillIds
+          ...(projectId ? { projectId } : {}),
+          ...(agentId === "auto" ? {} : { agentId })
         });
         setTitle("");
         setBody("");
         setAgentId("auto");
-        setSkillIds([]);
       }}
     >
       <div className="inline-create">
         <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
         <input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Details" />
-        <select value={projectId} onChange={(event) => setProjectId(event.target.value)} required>
+        <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+          <option value="">No project</option>
           {props.projects.map((project) => (
             <option value={project.id} key={project.id}>
               {project.name}
@@ -700,14 +713,12 @@ function TaskForm(props: {
           Add
         </button>
       </div>
-      <SkillPicker skills={props.skills} value={skillIds} onChange={setSkillIds} compact />
     </form>
   );
 }
 
 function TaskDetail(props: {
   task?: Task;
-  skills: Skill[];
   run: AgentRunTimelineRun | null;
   events: RunEvent[];
   pendingMessages: AgentRunChatMessage[];
@@ -729,7 +740,7 @@ function TaskDetail(props: {
   const hasRun = Boolean(props.task.has_runs || props.task.latest_run_id || props.task.latest_run_status);
   const showRun = !hasRun;
   const showStop = active && Boolean(props.task.latest_run_id);
-  const resolvedSkills = skillLabels(props.skills, props.task.resolved_skill_ids ?? props.task.skill_ids ?? []);
+  const canStartRun = props.task.agent_kind === "dispatcher" || Boolean(props.task.project_id);
   const taskRun =
     props.run ??
     (props.task.latest_run_id || props.events.length > 0
@@ -754,11 +765,10 @@ function TaskDetail(props: {
           </button>
         </div>
         <h2>{props.task.title}</h2>
-        <p className="text-muted">{props.task.project_name} / {props.task.agent_name}</p>
+        <p className="text-muted">{props.task.project_name ?? "No project"} / {props.task.agent_name}</p>
         <div className="mt-2">
           <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
         </div>
-        {resolvedSkills.length > 0 ? <SkillChips labels={resolvedSkills} /> : null}
       </div>
       <div className="detail-body">
         <div className="task-body-text">{props.task.body || "No description."}</div>
@@ -767,7 +777,8 @@ function TaskDetail(props: {
             {showRun ? (
               <button
                 className="button primary"
-                disabled={props.busyRunId === props.task.id}
+                disabled={props.busyRunId === props.task.id || !canStartRun}
+                title={canStartRun ? "Run" : "Assign a project before starting a worker run"}
                 onClick={() => props.onRun(props.task!)}
               >
                 {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
@@ -870,7 +881,6 @@ function AgentRunsView(props: {
 
 function AgentsView(props: {
   agents: Agent[];
-  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -912,7 +922,6 @@ function AgentsView(props: {
           <div className="form-view">
             <AgentEditor
               agent={editing}
-              skills={props.skills}
               models={props.models}
               defaultModel={props.defaultModel}
               onSaved={props.onSaved}
@@ -928,7 +937,6 @@ function AgentsView(props: {
 
 function AgentEditor(props: {
   agent: Agent;
-  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -974,14 +982,6 @@ function AgentEditor(props: {
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
       </label>
-      <div className="field-block">
-        <div className="field-label">Skills</div>
-        <SkillPicker
-          skills={props.skills}
-          value={draft.skill_ids ?? []}
-          onChange={(skillIds) => setDraft({ ...draft, skill_ids: skillIds })}
-        />
-      </div>
       <div className="model-list">
         {props.models.map((model) => (
           <span className="model-pill" key={model.id}>
@@ -1150,14 +1150,12 @@ curl -H "Authorization: Bearer $AISEVAK_API_KEY" \\
   ${baseUrl}/api/skills`,
     createTask: `curl -X POST ${baseUrl}/api/tasks \\
   -H "Authorization: Bearer $AISEVAK_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "title": "Add regression test",
-    "body": "Use the existing test style.",
-    "projectId": "PROJECT_UUID",
-    "agentId": "AGENT_UUID",
-    "skillIds": ["SKILL_UUID"]
-  }'`,
+	  -H "Content-Type: application/json" \\
+	  -d '{
+	    "title": "Add regression test",
+	    "body": "Use the existing test style.",
+	    "agentId": "AGENT_UUID"
+	  }'`,
     startRun: `curl -X POST ${baseUrl}/api/tasks/TASK_UUID/runs \\
   -H "Authorization: Bearer $AISEVAK_API_KEY"`
   };
@@ -1185,6 +1183,117 @@ function apiDocsText(baseUrl: string): string {
     "```bash",
     docs.startRun,
     "```"
+  ].join("\n");
+}
+
+function CredentialsView(props: { credentials: Credential[]; onSaved: () => Promise<void> }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div className="flat-list-view api-view">
+      <div className="flat-header">
+        <h3>Credentials</h3>
+      </div>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>Agent Credentials</h4>
+            <p>Store service API keys and secrets that agents can fetch by name only when needed.</p>
+          </div>
+        </div>
+        <form
+          className="credential-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setError(null);
+            try {
+              await api("/api/credentials", {
+                method: "POST",
+                body: JSON.stringify({
+                  name,
+                  description,
+                  value
+                })
+              });
+              setName("");
+              setDescription("");
+              setValue("");
+              await props.onSaved();
+            } catch (createError) {
+              setError(friendlyError(createError instanceof Error ? createError.message : "Could not save credential."));
+            }
+          }}
+        >
+          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name, e.g. stripe_api_key" required />
+          <input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Service or purpose" />
+          <input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Secret value" type="password" required />
+          <button className="button primary" type="submit">
+            <Plus size={15} />
+            Add
+          </button>
+        </form>
+        {error ? <div className="notice error">{error}</div> : null}
+        <div className="api-key-list">
+          {props.credentials.map((credential) => (
+            <div className="data-row" key={credential.id}>
+              <div className="data-row-main">
+                <div className="data-icon">
+                  <LockKeyhole size={16} />
+                </div>
+                <div>
+                  <div className="data-title">{credential.name}</div>
+                  <div className="data-subtitle">
+                    {credential.description || "No description"}
+                    {credential.last_used_at ? ` / used ${formatDateTime(credential.last_used_at)}` : ""}
+                  </div>
+                </div>
+              </div>
+              <div className="row-actions">
+                <TaskStatus status="active" />
+                <button
+                  className="icon-button flat"
+                  title="Delete credential"
+                  onClick={async () => {
+                    await api(`/api/credentials/${credential.id}`, { method: "DELETE" });
+                    await props.onSaved();
+                  }}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+          {props.credentials.length === 0 ? <div className="empty-list">No credentials</div> : null}
+        </div>
+      </section>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>Agent Access</h4>
+            <p>Agents use the injected Aisevak CLI. Values are redacted from stored transcripts when echoed.</p>
+          </div>
+          <CopyButton text={credentialDocsText()} label="Copy credential docs" />
+        </div>
+        <CodeBlock language="bash" code={credentialDocsText()} />
+      </section>
+    </div>
+  );
+}
+
+function credentialDocsText(): string {
+  return [
+    "aisevak credential list",
+    "aisevak credential get <name>",
+    "printf %s \"$SECRET_VALUE\" | aisevak credential add <name> --value-stdin",
+    "",
+    "Example:",
+    "aisevak credential get stripe_api_key",
+    "printf %s \"$STRIPE_API_KEY\" | aisevak credential add stripe_api_key --value-stdin --description \"Stripe API key\""
   ].join("\n");
 }
 
@@ -1322,17 +1431,14 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
 
 function ProjectsView({
   projects,
-  skills,
   onSaved
 }: {
   projects: Project[];
-  skills: Skill[];
   onSaved: () => Promise<void>;
 }) {
   const [name, setName] = useState("");
   const [localPath, setLocalPath] = useState("");
   const [workspaceMode, setWorkspaceMode] = useState<"direct" | "git_worktree">("direct");
-  const [skillIds, setSkillIds] = useState<string[]>([]);
 
   return (
     <div className="flat-list-view">
@@ -1346,11 +1452,10 @@ function ProjectsView({
           event.preventDefault();
           await api("/api/projects", {
             method: "POST",
-            body: JSON.stringify({ name, localPath, workspaceMode, skillIds })
+            body: JSON.stringify({ name, localPath, workspaceMode })
           });
           setName("");
           setLocalPath("");
-          setSkillIds([]);
           await onSaved();
         }}
       >
@@ -1366,18 +1471,16 @@ function ProjectsView({
             Add
           </button>
         </div>
-        <SkillPicker skills={skills} value={skillIds} onChange={setSkillIds} compact />
       </form>
       <div>
         {projects.map((project) => (
           <div className="data-row" key={project.id}>
             <div className="data-row-main">
               <div className="data-icon"><FolderGit2 size={16}/></div>
-              <div>
-                <div className="data-title">{project.name}</div>
-                <div className="data-subtitle">{project.local_path}</div>
-                <SkillChips labels={skillLabels(skills, project.skill_ids ?? [])} />
-              </div>
+                <div>
+                  <div className="data-title">{project.name}</div>
+                  <div className="data-subtitle">{project.local_path}</div>
+                </div>
             </div>
             <div className="data-subtitle" style={{ textTransform: "capitalize" }}>{project.source}</div>
           </div>
@@ -1572,11 +1675,24 @@ function SessionComposer(props: {
 }
 
 function TimelineRow({ row }: { row: AgentRunTimelineRow }) {
+  if (row.kind === "comment") return <TaskCommentTimelineRow row={row} />;
   if (row.kind === "work") return <WorkGroupSection groupedEntries={row.groupedEntries} />;
   if (row.kind === "working") return <WorkingTimelineRow row={row} />;
   if (row.message.role === "user") return <UserTimelineRow row={row} />;
   if (row.message.role === "assistant") return <AssistantTimelineRow row={row} />;
   return <SystemTimelineRow row={row} />;
+}
+
+function TaskCommentTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "comment" }> }) {
+  return (
+    <div className="task-comment-row">
+      <div className="task-comment-bubble">
+        <div className="task-comment-label">Task comment</div>
+        <BasicMarkdown text={row.text} plain />
+        <TimelineMeta createdAt={row.createdAt} />
+      </div>
+    </div>
+  );
 }
 
 function UserTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
@@ -1934,54 +2050,6 @@ function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: s
   );
 }
 
-function SkillPicker(props: {
-  skills: Skill[];
-  value: string[];
-  onChange: (skillIds: string[]) => void;
-  compact?: boolean;
-}) {
-  const enabledSkills = props.skills.filter((skill) => skill.enabled);
-  if (enabledSkills.length === 0) {
-    return props.compact ? null : <div className="empty-list compact">No enabled skills</div>;
-  }
-  return (
-    <div className={`skill-picker ${props.compact ? "compact" : ""}`}>
-      {enabledSkills.map((skill) => {
-        const checked = props.value.includes(skill.id);
-        return (
-          <label className="skill-option" key={skill.id} title={skill.description}>
-            <input
-              type="checkbox"
-              checked={checked}
-              onChange={(event) => {
-                props.onChange(
-                  event.target.checked
-                    ? [...props.value, skill.id]
-                    : props.value.filter((skillId) => skillId !== skill.id)
-                );
-              }}
-            />
-            <span>${skill.name}</span>
-          </label>
-        );
-      })}
-    </div>
-  );
-}
-
-function SkillChips({ labels }: { labels: string[] }) {
-  if (labels.length === 0) return null;
-  return (
-    <div className="skill-chip-row">
-      {labels.map((label) => (
-        <span className="skill-chip" key={label}>
-          ${label}
-        </span>
-      ))}
-    </div>
-  );
-}
-
 function emptyAgent(defaultModel: string): Agent {
   return {
     id: "",
@@ -1990,8 +2058,7 @@ function emptyAgent(defaultModel: string): Agent {
     description: "",
     model: defaultModel,
     instructions: "You are a focused coding agent. Complete the task, verify it, and summarize the result.",
-    enabled: true,
-    skill_ids: []
+    enabled: true
   };
 }
 
@@ -2004,11 +2071,6 @@ function emptySkill(): Skill {
     files: {},
     enabled: true
   };
-}
-
-function skillLabels(skills: Skill[], skillIds: string[]): string[] {
-  const byId = new Map(skills.map((skill) => [skill.id, skill.name]));
-  return skillIds.map((skillId) => byId.get(skillId)).filter((name): name is string => Boolean(name));
 }
 
 function normalizeFilesDraft(value: unknown): Record<string, string> {
@@ -2089,6 +2151,7 @@ function viewTitle(view: View): string {
     agents: "Agents",
     skills: "Skills",
     api: "API",
+    credentials: "Credentials",
     projects: "Projects",
     connectors: "Connectors"
   }[view];

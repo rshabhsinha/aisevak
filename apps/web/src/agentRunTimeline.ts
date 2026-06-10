@@ -50,6 +50,12 @@ type TimelineEntry =
     }
   | {
       id: string;
+      kind: "comment";
+      createdAt: string;
+      text: string;
+    }
+  | {
+      id: string;
       kind: "work";
       createdAt: string;
       entry: AgentRunWorkLogEntry;
@@ -62,6 +68,12 @@ export type AgentRunTimelineRow =
       createdAt: string;
       message: AgentRunChatMessage;
       durationStart: string;
+    }
+  | {
+      kind: "comment";
+      id: string;
+      createdAt: string;
+      text: string;
     }
   | {
       kind: "work";
@@ -112,6 +124,16 @@ export function deriveAgentRunTimelineRows(input: {
         groupedEntries
       });
       index = cursor - 1;
+      continue;
+    }
+
+    if (entry.kind === "comment") {
+      rows.push({
+        kind: "comment",
+        id: entry.id,
+        createdAt: entry.createdAt,
+        text: entry.text
+      });
       continue;
     }
 
@@ -201,6 +223,18 @@ function deriveTimelineEntries(
       stringValue(params?.item_id) ??
       `event:${event.id}`;
     const itemType = stringValue(item?.type);
+
+    if (event.event_type === "task.comment") {
+      const text = event.text ?? stringValue(normalized?.text);
+      if (!text?.trim()) continue;
+      entries.push({
+        id: `comment:${event.id}`,
+        kind: "comment",
+        createdAt: eventCreatedAt,
+        text
+      });
+      continue;
+    }
 
     if (event.event_type === "thread.message-sent") {
       const text = stringValue(normalized?.text) ?? event.text;
@@ -423,7 +457,9 @@ function compareTimelineEntries(left: TimelineEntry, right: TimelineEntry): numb
 }
 
 function lifecycleRank(kind: TimelineEntry["kind"]): number {
-  return kind === "message" ? 0 : 1;
+  if (kind === "message") return 0;
+  if (kind === "comment") return 1;
+  return 2;
 }
 
 function isActiveRunStatus(status: string): boolean {

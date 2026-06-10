@@ -62,7 +62,11 @@ CREATE TABLE IF NOT EXISTS invites (
 CREATE TABLE IF NOT EXISTS secrets (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   name text NOT NULL UNIQUE,
+  description text NOT NULL DEFAULT '',
   encrypted_value text NOT NULL,
+  agent_accessible boolean NOT NULL DEFAULT false,
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  last_used_at timestamptz,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
 );
@@ -138,7 +142,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   title text NOT NULL,
   body text NOT NULL DEFAULT '',
   status text NOT NULL DEFAULT 'open',
-  project_id uuid NOT NULL REFERENCES projects(id) ON DELETE RESTRICT,
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
   created_by uuid REFERENCES users(id) ON DELETE SET NULL,
   open_pr_on_success boolean NOT NULL DEFAULT false,
@@ -336,6 +340,13 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'ma
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
+ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
+ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
+ALTER TABLE secrets ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+ALTER TABLE tasks ALTER COLUMN project_id DROP NOT NULL;
+ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
+ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
 
 UPDATE agents
 SET kind = 'dispatcher', updated_at = now()

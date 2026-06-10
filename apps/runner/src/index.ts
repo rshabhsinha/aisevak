@@ -8,12 +8,15 @@ import {
   githubCloneEnv,
   githubHeaders,
   hashToken,
+  managedCodexHome,
   managedWorktreePath,
   newSessionToken,
+  normalizeCodexSkillSnapshots,
   normalizeCodexEvent,
   parseCodexJsonLine,
   redactSecrets,
   runMigrations,
+  serializeCodexSkillSnapshots,
   type CodexSkillSnapshot,
   type DbPool
 } from "@aisevak/core";
@@ -21,12 +24,12 @@ import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCodexAppServerTurn } from "./appServerClient.js";
 
 const env = {
-  managedRoot: process.env.MANAGED_ROOT ?? "/srv/aisevak",
+  managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: process.env.CODEX_BINARY ?? "codex",
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
@@ -233,7 +236,7 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
 
   const dispatcher = await getDispatcherAgent(pool);
   const context = await getDispatcherContext(pool);
-  const codexHome = join(env.managedRoot, "codex-homes", `dispatcher-heartbeat`);
+  const codexHome = managedCodexHome(env.managedRoot, "dispatcher-heartbeat");
   await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
@@ -247,7 +250,14 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
     `INSERT INTO dispatcher_runs
        (trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
      VALUES ('heartbeat', 'heartbeat', 'queued', $1, $2, $3, $4, $5, $6)`,
-    [env.managedRoot, codexHome, dispatcher.threadId ?? null, dispatcher.model, prompt, skillsSnapshot]
+    [
+      env.managedRoot,
+      codexHome,
+      dispatcher.threadId ?? null,
+      dispatcher.model,
+      prompt,
+      serializeCodexSkillSnapshots(skillsSnapshot)
+    ]
   );
 }
 
@@ -278,8 +288,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   try {
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
-    await materializeSkills(job.codex_home, job.skills_snapshot);
+    await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const apiKey = await readSecret(pool, "openai_api_key");
+    const credentialSecrets = await readAgentAccessibleSecrets(pool);
     await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
       role: "dispatcher",
@@ -303,7 +314,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
         ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
       },
-      secrets: [apiKey, toolToken],
+      secrets: [apiKey, toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         await pool.query(
@@ -408,8 +419,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     ]);
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
-    await materializeSkills(job.codex_home, job.skills_snapshot);
+    await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const apiKey = await readSecret(pool, "openai_api_key");
+    const credentialSecrets = await readAgentAccessibleSecrets(pool);
     await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
@@ -433,7 +445,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
         ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
       },
-      secrets: [apiKey, toolToken],
+      secrets: [apiKey, toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         await pool.query(
@@ -661,6 +673,31 @@ main().catch((error) => fail(error && error.message ? error.message : String(err
 async function main() {
   if (args.length === 0 || args[0] === "help" || args[0] === "--help") return help();
   if (args[0] === "context") return print(await request("/api/agent-tools/context"));
+  if (args[0] === "credential" || args[0] === "credentials") {
+    const credentialCommand = args[1] || "list";
+    if (credentialCommand === "list") {
+      return print(await request("/api/agent-tools/credentials"));
+    }
+    if (credentialCommand === "get") {
+      const name = args[2];
+      if (!name) return fail("Credential name is required");
+      return print(await request("/api/agent-tools/credentials/" + encodeURIComponent(name)));
+    }
+    if (credentialCommand === "add") {
+      const name = option("--name") || args[2];
+      if (!name || name.startsWith("--")) return fail("Credential name is required");
+      const value = args.includes("--value-stdin") ? await readStdin() : option("--value", true);
+      return print(await request("/api/agent-tools/credentials", {
+        method: "POST",
+        body: {
+          name,
+          description: option("--description"),
+          value
+        }
+      }));
+    }
+    return fail("Unknown credential command. Run: aisevak help");
+  }
   if (args[0] !== "task") return fail("Unknown command. Run: aisevak help");
   const command = args[1];
   if (command === "create") {
@@ -712,10 +749,11 @@ async function main() {
     return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
       method: "PATCH",
       body: {
-        title: option("--title"),
-        body: option("--body"),
-        status: option("--status"),
-        agentId: option("--agent-id")
+          title: option("--title"),
+          body: option("--body"),
+          status: option("--status"),
+          projectId: option("--project-id"),
+          agentId: option("--agent-id")
       }
     }));
   }
@@ -724,6 +762,7 @@ async function main() {
       method: "POST",
       body: {
         agent: option("--agent", true),
+        projectId: option("--project-id"),
         run: args.includes("--run")
       }
     }));
@@ -762,6 +801,14 @@ function restAfter(index) {
   return args.slice(index).join(" ").trim();
 }
 
+async function readStdin() {
+  let text = "";
+  for await (const chunk of process.stdin) {
+    text += String(chunk);
+  }
+  return text.replace(/\\r?\\n$/, "");
+}
+
 function print(value) {
   console.log(JSON.stringify(value, null, 2));
 }
@@ -769,12 +816,15 @@ function print(value) {
 function help() {
   console.log([
     "aisevak context",
-    "aisevak task create --title <title> [--body <body>] [--status needs_attention]",
-    "aisevak task assign TASK-1 --agent <agent-name> --run",
+    "aisevak credential list",
+    "aisevak credential get <name>",
+    "aisevak credential add <name> --value-stdin [--description <description>]",
+    "aisevak task create --title <title> [--body <body>] [--status needs_attention] [--project-id <project-id>]",
+    "aisevak task assign TASK-1 --agent <agent-name> [--project-id <project-id>] --run",
     "aisevak task attention TASK-1 <reason>",
     "aisevak task comment TASK-1 <note>",
     "aisevak task complete TASK-1 --summary <summary>",
-    "aisevak task update TASK-1 [--status open|needs_attention|completed]"
+    "aisevak task update TASK-1 [--status open|needs_attention|completed] [--project-id <project-id>]"
   ].join("\\n"));
 }
 
@@ -812,7 +862,7 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
   return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
 }
 
-async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
+async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<CodexSkillSnapshot[]> {
   const result = await pool.query<{
     id: string;
     name: string;
@@ -825,12 +875,9 @@ async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexS
             skills.description,
             skills.instructions,
             skills.files
-     FROM agent_skills
-     JOIN skills ON skills.id = agent_skills.skill_id
-     WHERE agent_skills.agent_id = $1
-       AND skills.enabled = true
-     ORDER BY skills.name ASC`,
-    [agentId]
+     FROM skills
+     WHERE skills.enabled = true
+     ORDER BY skills.name ASC`
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -838,7 +885,7 @@ async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexS
     description: row.description,
     instructions: row.instructions,
     files: normalizeSkillFiles(row.files),
-    sources: ["agent"]
+    sources: ["global"]
   }));
 }
 
@@ -869,7 +916,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             latest.status AS latest_worker_status,
             latest.id AS latest_worker_run_id
      FROM tasks
-     JOIN projects ON projects.id = tasks.project_id
+     LEFT JOIN projects ON projects.id = tasks.project_id
      JOIN agents ON agents.id = tasks.agent_id
      LEFT JOIN LATERAL (
        SELECT id, status
@@ -925,6 +972,13 @@ async function readSecret(pool: DbPool, name: string): Promise<string | undefine
   );
   const row = result.rows[0];
   return row ? decryptSecret(row.encrypted_value, env.secretKey) : undefined;
+}
+
+async function readAgentAccessibleSecrets(pool: DbPool): Promise<string[]> {
+  const result = await pool.query<{ encrypted_value: string }>(
+    "SELECT encrypted_value FROM secrets WHERE agent_accessible = true"
+  );
+  return result.rows.map((row) => decryptSecret(row.encrypted_value, env.secretKey));
 }
 
 async function readSecretById(pool: DbPool, id: string): Promise<string> {

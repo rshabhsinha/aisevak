@@ -24,6 +24,7 @@ pnpm dev
 ```
 
 Open `http://localhost:5173`. The API listens on `http://localhost:8787`.
+The default local `.env` stores managed workspaces and Codex homes under `.aisevak-managed/`.
 
 ## Host install
 
