@@ -28,12 +28,19 @@ import {
   Square,
   Terminal,
   Trash2,
-  UserCircle2,
   Wrench,
   X
-} from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+} from "./components/icons";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactElement, ReactNode } from "react";
+import { AnimatedIcon } from "./components/animated-icon";
+import { ThemeToggle } from "./components/theme-toggle";
+import { Badge } from "./components/ui/badge";
+import { Button } from "./components/ui/button";
+import { Input } from "./components/ui/input";
+import { NativeSelect } from "./components/ui/native-select";
+import { Switch } from "./components/ui/switch";
+import { Textarea } from "./components/ui/textarea";
 import {
   deriveAgentRunTimelineRows,
   formatElapsed,
@@ -201,6 +208,7 @@ export function App() {
   const [query, setQuery] = useState("");
   const [busyRunId, setBusyRunId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const selectedTask = useMemo(
     () => (selectedTaskId ? tasks.find((task) => task.id === selectedTaskId) : undefined),
@@ -250,6 +258,17 @@ export function App() {
 
   useEffect(() => {
     void boot();
+  }, []);
+
+  useEffect(() => {
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "k" || (!event.metaKey && !event.ctrlKey)) return;
+      event.preventDefault();
+      searchRef.current?.focus();
+      searchRef.current?.select();
+    };
+    window.addEventListener("keydown", handleSearchShortcut);
+    return () => window.removeEventListener("keydown", handleSearchShortcut);
   }, []);
 
   useEffect(() => {
@@ -461,19 +480,21 @@ export function App() {
       <aside className="sidebar">
         <div className="sidebar-brand">
           <span className="brand-mark">
-            <Terminal size={17} />
+            <Terminal size={17} weight="fill" />
           </span>
-          <div>
+          <div className="brand-copy">
             <strong>Aisevak</strong>
-            <small>{user.name}</small>
+            <small>Agent workspace</small>
           </div>
         </div>
 
         <nav className="sidebar-nav">
+          <span className="nav-label">Workspace</span>
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
           <NavButton icon={<Activity />} label="Agent Runs" active={view === "runs"} onClick={() => setView("runs")} />
           <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
+          <span className="nav-label nav-label-spaced">Manage</span>
           <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
           {user.role !== "member" ? (
             <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => setView("credentials")} />
@@ -484,19 +505,24 @@ export function App() {
 
         <div className="sidebar-footer">
           <div className="user-chip">
-            <UserCircle2 size={16} />
-            <span>{user.role}</span>
+            <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
+            <span className="user-details">
+              <strong>{user.name}</strong>
+              <small>{user.role}</small>
+            </span>
           </div>
-          <button
-            className="icon-button flat"
+          <Button
+            variant="ghost"
+            size="icon"
             title="Log out"
+            aria-label="Log out"
             onClick={async () => {
               await api("/api/logout", { method: "POST" });
               setUser(null);
             }}
           >
             <LogOut size={14} />
-          </button>
+          </Button>
         </div>
       </aside>
 
@@ -506,11 +532,13 @@ export function App() {
           <div className="header-actions">
             <div className="search-bar">
               <Search size={14} className="text-muted" />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search..." />
+              <Input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${viewTitle(view).toLowerCase()}`} />
+              <kbd>⌘K</kbd>
             </div>
-            <button className="icon-button flat" onClick={() => void reloadAll()} title="Refresh">
+            <ThemeToggle />
+            <Button variant="ghost" size="icon" onClick={() => void reloadAll()} title="Refresh" aria-label="Refresh">
               <RefreshCw size={14} />
-            </button>
+            </Button>
           </div>
         </header>
 
@@ -690,28 +718,28 @@ function TaskForm(props: {
       }}
     >
       <div className="inline-create">
-        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
-        <input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Details" />
-        <select value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+        <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="What needs to be done?" required />
+        <Input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Add a short brief" />
+        <NativeSelect value={projectId} onChange={(event) => setProjectId(event.target.value)}>
           <option value="">No project</option>
           {props.projects.map((project) => (
             <option value={project.id} key={project.id}>
               {project.name}
             </option>
           ))}
-        </select>
-        <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
+        </NativeSelect>
+        <NativeSelect value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
           <option value="auto">Auto-route</option>
           {workerAgents.map((agent) => (
             <option value={agent.id} key={agent.id}>
               {agent.name}
             </option>
           ))}
-        </select>
-        <button className="button primary" type="submit">
+        </NativeSelect>
+        <Button type="submit">
           <Plus size={15} />
-          Add
-        </button>
+          New task
+        </Button>
       </div>
     </form>
   );
@@ -760,9 +788,9 @@ function TaskDetail(props: {
       <div className="detail-header-flat">
         <div className="flex-between">
           <span className="task-key">TASK-{props.task.number}</span>
-          <button className="icon-button flat" onClick={props.onClose} title="Close task">
+          <Button variant="ghost" size="icon" onClick={props.onClose} title="Close task" aria-label="Close task">
             <X size={15} />
-          </button>
+          </Button>
         </div>
         <h2>{props.task.title}</h2>
         <p className="text-muted">{props.task.project_name ?? "No project"} / {props.task.agent_name}</p>
@@ -775,21 +803,20 @@ function TaskDetail(props: {
         {showRun || showStop ? (
           <div className="action-row">
             {showRun ? (
-              <button
-                className="button primary"
+              <Button
                 disabled={props.busyRunId === props.task.id || !canStartRun}
                 title={canStartRun ? "Run" : "Assign a project before starting a worker run"}
                 onClick={() => props.onRun(props.task!)}
               >
                 {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
                 Run
-              </button>
+              </Button>
             ) : null}
             {showStop ? (
-              <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
+              <Button variant="secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
                 <Square size={15} />
                 Stop
-              </button>
+              </Button>
             ) : null}
           </div>
         ) : null}
@@ -895,9 +922,9 @@ function AgentsView(props: {
       <aside className="master-list">
         <div className="master-header flex-between">
           <h3>Agents</h3>
-          <button className="icon-button flat" onClick={() => setEditing(emptyAgent(props.defaultModel))}>
+          <Button variant="ghost" size="icon" onClick={() => setEditing(emptyAgent(props.defaultModel))} aria-label="New agent">
             <Plus size={14} />
-          </button>
+          </Button>
         </div>
         <div className="list-scroll">
           {props.agents.map((agent) => (
@@ -957,26 +984,26 @@ function AgentEditor(props: {
       <div className="form-grid">
         <label>
           Name
-          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label>
           Model
-          <select value={draft.model || props.defaultModel} onChange={(event) => setDraft({ ...draft, model: event.target.value })}>
+          <NativeSelect value={draft.model || props.defaultModel} onChange={(event) => setDraft({ ...draft, model: event.target.value })}>
             {props.models.map((model) => (
               <option value={model.id} key={model.id}>
                 {model.label}{model.badge ? ` - ${model.badge}` : ""}
               </option>
             ))}
-          </select>
+          </NativeSelect>
         </label>
       </div>
       <label>
         Description
-        <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Prompt
-        <textarea
+        <Textarea
           style={{ minHeight: 300, fontFamily: "monospace", fontSize: 13 }}
           value={draft.instructions}
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
@@ -990,10 +1017,10 @@ function AgentEditor(props: {
         ))}
       </div>
       <div style={{ marginTop: 16 }}>
-        <button className="button primary" type="submit">
+        <Button type="submit">
           <CheckCircle2 size={15} />
           Save agent
-        </button>
+        </Button>
       </div>
     </form>
   );
@@ -1041,17 +1068,17 @@ function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void
             }
           }}
         >
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" required />
-          <input
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" required />
+          <Input
             value={expiresAt}
             onChange={(event) => setExpiresAt(event.target.value)}
             type="datetime-local"
             required
           />
-          <button className="button primary" type="submit">
+          <Button type="submit">
             <Plus size={15} />
             Create key
-          </button>
+          </Button>
         </form>
         {error ? <div className="notice error">{error}</div> : null}
         {createdSecret ? (
@@ -1082,16 +1109,18 @@ function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void
               <div className="row-actions">
                 <TaskStatus status={apiKeyStatus(key)} />
                 {!key.revoked_at ? (
-                  <button
-                    className="icon-button flat"
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     title="Revoke key"
+                    aria-label="Revoke key"
                     onClick={async () => {
                       await api(`/api/api-keys/${key.id}`, { method: "DELETE" });
                       await props.onSaved();
                     }}
                   >
                     <Trash2 size={14} />
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             </div>
@@ -1228,13 +1257,13 @@ function CredentialsView(props: { credentials: Credential[]; onSaved: () => Prom
             }
           }}
         >
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name, e.g. stripe_api_key" required />
-          <input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Service or purpose" />
-          <input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Secret value" type="password" required />
-          <button className="button primary" type="submit">
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name, e.g. stripe_api_key" required />
+          <Input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Service or purpose" />
+          <Input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Secret value" type="password" required />
+          <Button type="submit">
             <Plus size={15} />
             Add
-          </button>
+          </Button>
         </form>
         {error ? <div className="notice error">{error}</div> : null}
         <div className="api-key-list">
@@ -1254,16 +1283,18 @@ function CredentialsView(props: { credentials: Credential[]; onSaved: () => Prom
               </div>
               <div className="row-actions">
                 <TaskStatus status="active" />
-                <button
-                  className="icon-button flat"
+                <Button
+                  variant="ghost"
+                  size="icon"
                   title="Delete credential"
+                  aria-label="Delete credential"
                   onClick={async () => {
                     await api(`/api/credentials/${credential.id}`, { method: "DELETE" });
                     await props.onSaved();
                   }}
                 >
                   <Trash2 size={14} />
-                </button>
+                </Button>
               </div>
             </div>
           ))}
@@ -1308,9 +1339,9 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
       <aside className="master-list">
         <div className="master-header flex-between">
           <h3>Skills</h3>
-          <button className="icon-button flat" onClick={() => setEditing(emptySkill())} title="New skill">
+          <Button variant="ghost" size="icon" onClick={() => setEditing(emptySkill())} title="New skill" aria-label="New skill">
             <Plus size={14} />
-          </button>
+          </Button>
         </div>
         <div className="list-scroll">
           {props.skills.map((skill) => (
@@ -1385,24 +1416,23 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       <div className="form-grid">
         <label>
           Name
-          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label className="toggle-field">
           Enabled
-          <input
-            type="checkbox"
+          <Switch
             checked={draft.enabled}
-            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+            onCheckedChange={(checked) => setDraft({ ...draft, enabled: checked })}
           />
         </label>
       </div>
       <label>
         Description
-        <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Instructions
-        <textarea
+        <Textarea
           className="textarea-mono"
           style={{ minHeight: 260 }}
           value={draft.instructions}
@@ -1411,7 +1441,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </label>
       <label>
         Files JSON
-        <textarea
+        <Textarea
           className="textarea-mono"
           style={{ minHeight: 150 }}
           value={filesJson}
@@ -1420,10 +1450,10 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </label>
       {error ? <div className="notice error">{error}</div> : null}
       <div>
-        <button className="button primary" type="submit">
+        <Button type="submit">
           <CheckCircle2 size={15} />
           Save skill
-        </button>
+        </Button>
       </div>
     </form>
   );
@@ -1460,16 +1490,16 @@ function ProjectsView({
         }}
       >
         <div className="wide-form-row">
-          <input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
-          <input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
-          <select style={{ flex: 1 }} value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
+          <Input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
+          <Input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
+          <NativeSelect className="project-mode-select" value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
             <option value="direct">Direct folder</option>
             <option value="git_worktree">Git worktree</option>
-          </select>
-          <button className="button primary" type="submit" style={{ flex: "0 0 auto" }}>
+          </NativeSelect>
+          <Button type="submit" style={{ flex: "0 0 auto" }}>
             <Plus size={15} />
             Add
-          </button>
+          </Button>
         </div>
       </form>
       <div>
@@ -1521,15 +1551,15 @@ function ConnectorsView(props: {
               setToken("");
             }}
           >
-            <input value={name} onChange={(event) => setName(event.target.value)} />
-            <input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
+            <Input value={name} onChange={(event) => setName(event.target.value)} />
+            <Input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
             <div style={{ display: "flex", gap: 8 }}>
-              <button className="button primary" type="submit">
+              <Button type="submit">
                 <Github size={14} /> Connect
-              </button>
-              <button className="button secondary" type="button" onClick={props.onRefresh}>
+              </Button>
+              <Button variant="secondary" type="button" onClick={props.onRefresh}>
                 <RefreshCw size={14} /> Refresh
-              </button>
+              </Button>
             </div>
           </form>
         </div>
@@ -1549,9 +1579,9 @@ function ConnectorsView(props: {
                     <div className="data-subtitle">{repo.connection_name} / {repo.default_branch}</div>
                   </div>
                 </div>
-                <button className="button secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
+                <Button variant="secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
                   {repo.imported_project_id ? "Imported" : "Import"}
-                </button>
+                </Button>
               </div>
             ))}
             {props.repos.length === 0 ? <div className="empty-list">No repositories</div> : null}
@@ -1629,7 +1659,7 @@ function SessionComposer(props: {
       <div className="session-composer-frame">
         <div className="session-composer-box" data-chat-composer-surface="true">
           <div className="session-composer-editor">
-            <textarea
+            <Textarea
               value={message}
               disabled={sending || props.disabled}
               onChange={(event) => setMessage(event.target.value)}
@@ -1860,8 +1890,10 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
   return (
-    <button
+    <Button
       className="copy-button"
+      variant="ghost"
+      size="icon"
       type="button"
       title={copied ? "Copied" : label}
       onClick={async () => {
@@ -1871,7 +1903,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       }}
     >
       {copied ? <CheckCircle2 size={13} /> : <Copy size={13} />}
-    </button>
+    </Button>
   );
 }
 
@@ -1959,7 +1991,8 @@ function pushTextBlocks(
 
 function TaskStatus({ status }: { status?: string | null }) {
   const bucket = runBucket(status);
-  return <span className={`status ${bucket}`}>{statusLabel(status)}</span>;
+  const variant = bucket === "completed" ? "success" : bucket === "running" ? "warning" : bucket === "failed" ? "destructive" : "secondary";
+  return <Badge className={`status ${bucket}`} variant={variant}>{statusLabel(status)}</Badge>;
 }
 
 function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
@@ -1967,6 +2000,7 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
   const [error, setError] = useState<string | null>(null);
   return (
     <div className="auth-container">
+      <div className="auth-theme-toggle"><ThemeToggle /></div>
       <form
         className="auth-box"
         onSubmit={async (event) => {
@@ -1992,14 +2026,12 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
         <h1>Create workspace</h1>
         <p>Set up the first owner account.</p>
         <div className="stack">
-          <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Name" required />
-          <input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email" type="email" required />
-          <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password (8+ characters)" type="password" minLength={8} required />
-          <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key (optional)" type="password" />
+          <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Your name" required />
+          <Input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email address" type="email" required />
+          <Input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password · 8+ characters" type="password" minLength={8} required />
+          <Input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key · optional" type="password" />
           {error ? <div className="notice error">{friendlyError(error)}</div> : null}
-          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
-            Continue
-          </button>
+          <Button type="submit" size="lg" style={{ width: "100%" }}>Create workspace</Button>
         </div>
       </form>
     </div>
@@ -2011,6 +2043,7 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
   const [password, setPassword] = useState("");
   return (
     <div className="auth-container">
+      <div className="auth-theme-toggle"><ThemeToggle /></div>
       <form
         className="auth-box"
         onSubmit={async (event: FormEvent) => {
@@ -2022,11 +2055,9 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
         <h1>Sign in</h1>
         <p>Open the task board.</p>
         <div className="stack">
-          <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" type="email" required />
-          <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
-          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
-            Sign in
-          </button>
+          <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email address" type="email" required />
+          <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
+          <Button type="submit" size="lg" style={{ width: "100%" }}>Sign in</Button>
         </div>
       </form>
     </div>
@@ -2043,10 +2074,10 @@ function Splash() {
 
 function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: string; active: boolean; onClick: () => void }) {
   return (
-    <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>
-      {icon}
+    <Button variant="ghost" className={`nav-item ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} title={label} onClick={onClick}>
+      <AnimatedIcon icon={icon as ReactElement} active={active} />
       <span>{label}</span>
-    </button>
+    </Button>
   );
 }
 
