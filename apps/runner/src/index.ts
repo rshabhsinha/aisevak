@@ -15,6 +15,7 @@ import {
   normalizeCodexEvent,
   parseCodexJsonLine,
   redactSecrets,
+  resolveCodexBinary,
   runMigrations,
   serializeCodexSkillSnapshots,
   type CodexSkillSnapshot,
@@ -30,7 +31,7 @@ import { runCodexAppServerTurn } from "./appServerClient.js";
 
 const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
-  codexBinary: process.env.CODEX_BINARY ?? "codex",
+  codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
@@ -63,8 +64,10 @@ interface RunJob {
   id: string;
   task_id: string;
   task_session_id: string;
+  agent_thread_id: string | null;
   prompt: string;
   model: string;
+  model_options: Array<{ id: string; value: string | number | boolean }>;
   cwd: string;
   branch: string | null;
   codex_home: string;
@@ -76,9 +79,11 @@ interface RunJob {
 
 interface DispatcherJob {
   id: string;
+  agent_thread_id: string | null;
   task_id: string | null;
   prompt: string;
   model: string;
+  model_options: Array<{ id: string; value: string | number | boolean }>;
   cwd: string;
   codex_home: string;
   codex_thread_id: string | null;
@@ -97,7 +102,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
   });
 
-  console.log("Aisevak runner started");
+  console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
     try {
       await processOneImportJob(pool);
@@ -273,9 +278,19 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   const picked = result.rows[0];
   if (!picked) return;
   const detail = await pool.query<DispatcherJob>(
-    `SELECT id, task_id, prompt, model, cwd, codex_home, codex_thread_id, skills_snapshot
+    `SELECT dispatcher_runs.id,
+            dispatcher_runs.agent_thread_id,
+            dispatcher_runs.task_id,
+            dispatcher_runs.prompt,
+            dispatcher_runs.model,
+            dispatcher_runs.model_options,
+            dispatcher_runs.cwd,
+            dispatcher_runs.codex_home,
+            COALESCE(agent_threads.provider_thread_id, dispatcher_runs.codex_thread_id) AS codex_thread_id,
+            dispatcher_runs.skills_snapshot
      FROM dispatcher_runs
-     WHERE id = $1`,
+     LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     WHERE dispatcher_runs.id = $1`,
     [picked.id]
   );
   const job = mustRow(detail.rows[0]);
@@ -303,6 +318,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       cwd: job.cwd,
       codexHome: job.codex_home,
       model: job.model,
+      modelOptions: job.model_options,
       prompt: job.prompt,
       threadId: job.codex_thread_id,
       env: {
@@ -321,6 +337,14 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
           "UPDATE dispatcher_runs SET codex_thread_id = $2, updated_at = now() WHERE id = $1",
           [job.id, threadId]
         );
+        if (job.agent_thread_id) {
+          await pool.query(
+            `UPDATE agent_threads
+             SET provider_thread_id = $2, last_activity_at = now(), updated_at = now()
+             WHERE id = $1`,
+            [job.agent_thread_id, threadId]
+          );
+        }
       },
       shouldCancel: async () => {
         const current = await pool.query<{ status: string }>(
@@ -352,6 +376,12 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    if (job.agent_thread_id) {
+      await pool.query(
+        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [job.agent_thread_id]
+      );
+    }
   }
 }
 
@@ -388,17 +418,20 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     `SELECT task_runs.id,
             task_runs.task_id,
             task_runs.task_session_id,
+            task_runs.agent_thread_id,
             task_runs.prompt,
             task_runs.model,
+            task_runs.model_options,
             task_runs.cwd,
             task_runs.branch,
             task_sessions.codex_home,
-            task_sessions.codex_thread_id,
+            COALESCE(agent_threads.provider_thread_id, task_sessions.codex_thread_id) AS codex_thread_id,
             projects.workspace_mode,
             projects.source AS project_source,
             task_runs.skills_snapshot
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
+     LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
      JOIN tasks ON tasks.id = task_runs.task_id
      JOIN projects ON projects.id = tasks.project_id
      WHERE task_runs.id = $1`,
@@ -434,6 +467,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       cwd,
       codexHome: job.codex_home,
       model: job.model,
+      modelOptions: job.model_options,
       prompt: job.prompt,
       threadId: job.codex_thread_id,
       env: {
@@ -453,6 +487,14 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
           [job.task_session_id, threadId]
         );
         await pool.query("UPDATE task_runs SET codex_thread_id = $2 WHERE id = $1", [job.id, threadId]);
+        if (job.agent_thread_id) {
+          await pool.query(
+            `UPDATE agent_threads
+             SET provider_thread_id = $2, last_activity_at = now(), updated_at = now()
+             WHERE id = $1`,
+            [job.agent_thread_id, threadId]
+          );
+        }
       },
       shouldCancel: async () => {
         const current = await pool.query<{ status: string }>(
@@ -484,6 +526,12 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    if (job.agent_thread_id) {
+      await pool.query(
+        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [job.agent_thread_id]
+      );
+    }
     if (finalStatus === "succeeded") {
       await pool.query("UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1", [
         job.task_id

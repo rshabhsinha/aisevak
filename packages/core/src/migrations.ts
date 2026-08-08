@@ -1,10 +1,11 @@
 import type { Pool } from "pg";
+import { normalizeCodexModel } from "./models.js";
 
 const enumSql = `
 DO $$ BEGIN CREATE TYPE user_role AS ENUM ('owner', 'admin', 'member'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE TYPE project_source AS ENUM ('local_path', 'github'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE TYPE workspace_mode AS ENUM ('direct', 'git_worktree'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-DO $$ BEGIN CREATE TYPE run_status AS ENUM ('queued', 'running', 'cancel_requested', 'cancelled', 'succeeded', 'failed'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN CREATE TYPE run_status AS ENUM ('draft', 'queued', 'running', 'cancel_requested', 'cancelled', 'succeeded', 'failed'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE TYPE import_job_status AS ENUM ('queued', 'running', 'succeeded', 'failed'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 DO $$ BEGIN CREATE TYPE github_auth_mode AS ENUM ('app', 'pat'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 `;
@@ -92,7 +93,8 @@ CREATE TABLE IF NOT EXISTS agents (
   kind text NOT NULL DEFAULT 'worker',
   name text NOT NULL,
   description text NOT NULL DEFAULT '',
-  model text NOT NULL DEFAULT 'gpt-5.5',
+  model text NOT NULL DEFAULT 'gpt-5.6-sol',
+  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
   instructions text NOT NULL,
   enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -131,6 +133,7 @@ CREATE TABLE IF NOT EXISTS agent_versions (
   name text NOT NULL,
   description text NOT NULL DEFAULT '',
   model text NOT NULL,
+  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
   instructions text NOT NULL,
   created_by uuid REFERENCES users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now()
@@ -165,6 +168,39 @@ CREATE TABLE IF NOT EXISTS task_comments (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS provider_instances (
+  id text PRIMARY KEY,
+  driver text NOT NULL,
+  display_name text NOT NULL,
+  enabled boolean NOT NULL DEFAULT true,
+  config jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS agent_threads (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title text NOT NULL DEFAULT 'New thread',
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  task_id uuid REFERENCES tasks(id) ON DELETE CASCADE,
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
+  provider_instance_id text NOT NULL REFERENCES provider_instances(id) ON DELETE RESTRICT,
+  model text NOT NULL,
+  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  cwd text NOT NULL,
+  branch text,
+  runtime_home text NOT NULL,
+  provider_thread_id text,
+  last_activity_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_threads_task_unique
+ON agent_threads(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_threads_activity_idx
+ON agent_threads(last_activity_at DESC, id DESC);
+
 CREATE TABLE IF NOT EXISTS task_sessions (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   task_id uuid NOT NULL UNIQUE REFERENCES tasks(id) ON DELETE CASCADE,
@@ -183,12 +219,14 @@ CREATE TABLE IF NOT EXISTS task_runs (
   run_kind text NOT NULL DEFAULT 'worker',
   trigger text NOT NULL DEFAULT 'manual',
   parent_run_id uuid,
+  agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
   worktree_path text,
   codex_thread_id text,
   model text NOT NULL,
+  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
   prompt text NOT NULL,
   skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
@@ -209,11 +247,13 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
   trigger text NOT NULL DEFAULT 'heartbeat',
   scope text NOT NULL DEFAULT 'heartbeat',
+  agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   codex_home text NOT NULL,
   codex_thread_id text,
   model text NOT NULL,
+  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
   prompt text NOT NULL,
   skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
@@ -334,12 +374,20 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 `;
 
 const additiveSql = `
+ALTER TYPE run_status ADD VALUE IF NOT EXISTS 'draft' BEFORE 'queued';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agent_versions ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agents ALTER COLUMN model SET DEFAULT 'gpt-5.6-sol';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
@@ -358,15 +406,112 @@ SELECT
   'dispatcher',
   'Dispatcher',
   'Routes Todo and Needs attention tasks to the right worker agent.',
-  COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.5'),
+  COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.6-sol'),
   'You are the Aisevak Dispatcher. Review the task board, assign work to enabled worker agents, start worker runs with the aisevak CLI, and move ambiguous or blocked work to Needs attention with a precise comment.',
   true
 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher');
+
+INSERT INTO provider_instances (id, driver, display_name, enabled)
+VALUES ('codex-local', 'codex', 'Codex', true)
+ON CONFLICT (id) DO UPDATE
+SET driver = EXCLUDED.driver,
+    display_name = EXCLUDED.display_name,
+    enabled = true,
+    updated_at = now();
+
+INSERT INTO agent_threads
+  (title, agent_id, task_id, project_id, provider_instance_id, model, cwd, branch,
+   runtime_home, provider_thread_id, last_activity_at, created_at, updated_at)
+SELECT tasks.title,
+       tasks.agent_id,
+       tasks.id,
+       tasks.project_id,
+       'codex-local',
+       COALESCE(latest.model, agents.model),
+       COALESCE(latest.cwd, projects.local_path, current_setting('aisevak.managed_root', true), '/srv/aisevak'),
+       latest.branch,
+       task_sessions.codex_home,
+       task_sessions.codex_thread_id,
+       COALESCE(latest.activity_at, task_sessions.updated_at, task_sessions.created_at),
+       task_sessions.created_at,
+       now()
+FROM task_sessions
+JOIN tasks ON tasks.id = task_sessions.task_id
+JOIN agents ON agents.id = tasks.agent_id
+LEFT JOIN projects ON projects.id = tasks.project_id
+LEFT JOIN LATERAL (
+  SELECT task_runs.model,
+         task_runs.cwd,
+         task_runs.branch,
+         COALESCE(task_runs.finished_at, task_runs.started_at, task_runs.queued_at, task_runs.created_at) AS activity_at
+  FROM task_runs
+  WHERE task_runs.task_session_id = task_sessions.id
+  ORDER BY task_runs.created_at DESC
+  LIMIT 1
+) latest ON true
+WHERE NOT EXISTS (SELECT 1 FROM agent_threads WHERE agent_threads.task_id = tasks.id);
+
+UPDATE task_runs
+SET agent_thread_id = agent_threads.id
+FROM agent_threads
+WHERE task_runs.task_id = agent_threads.task_id
+  AND task_runs.agent_thread_id IS NULL;
+
+INSERT INTO agent_threads
+  (title, agent_id, provider_instance_id, model, cwd, runtime_home, provider_thread_id,
+   last_activity_at, created_at, updated_at)
+SELECT CASE
+         WHEN btrim(first_run.prompt) = '' THEN 'New thread'
+         ELSE left(split_part(btrim(first_run.prompt), E'\n', 1), 80)
+       END,
+       dispatcher.id,
+       'codex-local',
+       first_run.model,
+       first_run.cwd,
+       first_run.codex_home,
+       latest.provider_thread_id,
+       latest.activity_at,
+       first_run.created_at,
+       now()
+FROM (
+  SELECT DISTINCT ON (codex_home)
+         codex_home, prompt, model, cwd, created_at
+  FROM dispatcher_runs
+  WHERE trigger = 'manual' AND scope = 'thread'
+  ORDER BY codex_home, created_at ASC
+) first_run
+JOIN LATERAL (
+  SELECT dispatcher_runs.codex_thread_id AS provider_thread_id,
+         COALESCE(dispatcher_runs.finished_at, dispatcher_runs.started_at, dispatcher_runs.queued_at, dispatcher_runs.created_at) AS activity_at
+  FROM dispatcher_runs
+  WHERE dispatcher_runs.codex_home = first_run.codex_home
+    AND dispatcher_runs.trigger = 'manual'
+    AND dispatcher_runs.scope = 'thread'
+  ORDER BY dispatcher_runs.created_at DESC
+  LIMIT 1
+) latest ON true
+JOIN LATERAL (
+  SELECT id FROM agents WHERE kind = 'dispatcher' AND enabled = true ORDER BY created_at ASC LIMIT 1
+) dispatcher ON true
+WHERE NOT EXISTS (
+  SELECT 1 FROM agent_threads WHERE agent_threads.runtime_home = first_run.codex_home
+);
+
+UPDATE dispatcher_runs
+SET agent_thread_id = agent_threads.id
+FROM agent_threads
+WHERE dispatcher_runs.codex_home = agent_threads.runtime_home
+  AND dispatcher_runs.trigger = 'manual'
+  AND dispatcher_runs.scope = 'thread'
+  AND dispatcher_runs.agent_thread_id IS NULL;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
   await pool.query("SELECT set_config('aisevak.default_model', $1, false)", [
-    process.env.CODEX_DEFAULT_MODEL ?? "gpt-5.5"
+    normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL)
+  ]);
+  await pool.query("SELECT set_config('aisevak.managed_root', $1, false)", [
+    process.env.MANAGED_ROOT ?? "/srv/aisevak"
   ]);
   await pool.query(enumSql);
   await pool.query(tableSql);
