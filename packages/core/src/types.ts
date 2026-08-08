@@ -2,6 +2,7 @@ export type UserRole = "owner" | "admin" | "member";
 export type ProjectSource = "local_path" | "github";
 export type WorkspaceMode = "direct" | "git_worktree";
 export type RunStatus =
+  | "draft"
   | "queued"
   | "running"
   | "cancel_requested"
@@ -13,6 +14,19 @@ export type GithubAuthMode = "app" | "pat";
 export type AgentKind = "worker" | "dispatcher";
 export type RunKind = "worker" | "dispatcher";
 export type RunTrigger = "manual" | "heartbeat" | "auto_route" | "agent_tool";
+
+export type ProviderDriver = "codex";
+
+export interface ModelOptionSelection {
+  id: string;
+  value: string | number | boolean;
+}
+
+export interface ModelSelection {
+  providerInstanceId: string;
+  model: string;
+  options: ModelOptionSelection[];
+}
 
 export interface CodexSkillReference {
   name: string;

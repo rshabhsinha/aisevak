@@ -18,21 +18,39 @@ import {
   KeyRound,
   LayoutDashboard,
   Loader2,
-  LockOpen,
+  LockKeyhole,
   LogOut,
-  Play,
   Plus,
   RefreshCw,
   Search,
   Square,
   Terminal,
   Trash2,
-  UserCircle2,
-  Wrench,
-  X
-} from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+  Wrench
+} from "./components/icons";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { FormEvent, ReactElement, ReactNode } from "react";
+import { AnimatedIcon } from "./components/animated-icon";
+import { OpenAILogo } from "./components/openai-logo";
+import { ThemeToggle } from "./components/theme-toggle";
+import { Badge } from "./components/ui/badge";
+import { Button } from "./components/ui/button";
+import {
+  Command,
+  CommandEmpty,
+  CommandGroup,
+  CommandInput,
+  CommandItem,
+  CommandList
+} from "./components/ui/command";
+import { Input } from "./components/ui/input";
+import { NativeSelect } from "./components/ui/native-select";
+import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
+import { ScrollArea } from "./components/ui/scroll-area";
+import { Select, SelectContent, SelectGroup, SelectItem, SelectLabel, SelectTrigger, SelectValue } from "./components/ui/select";
+import { Switch } from "./components/ui/switch";
+import { Textarea } from "./components/ui/textarea";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import {
   deriveAgentRunTimelineRows,
   formatElapsed,
@@ -42,8 +60,9 @@ import {
   type AgentRunTimelineRow,
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
+import { mergeRefreshedAgentThreads } from "./agentThreads";
 
-type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api";
+type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api" | "credentials";
 
 interface User {
   id: string;
@@ -61,7 +80,6 @@ interface Project {
   github_owner?: string | null;
   github_repo?: string | null;
   default_branch?: string | null;
-  skill_ids?: string[];
 }
 
 interface Agent {
@@ -70,9 +88,9 @@ interface Agent {
   name: string;
   description: string;
   model: string;
+  model_options: ModelOptionSelection[];
   instructions: string;
   enabled: boolean;
-  skill_ids?: string[];
 }
 
 interface Skill {
@@ -89,6 +107,62 @@ interface CodexModel {
   label: string;
   description: string;
   badge?: string;
+  options?: CodexModelOption[];
+}
+
+interface CodexModelOption {
+  id: string;
+  label: string;
+  values: Array<{ id: string; label: string; description?: string }>;
+  defaultValue?: string;
+}
+
+interface ModelOptionSelection {
+  id: string;
+  value: string | number | boolean;
+}
+
+interface ModelSelection {
+  providerInstanceId: string;
+  model: string;
+  options: ModelOptionSelection[];
+}
+
+interface ProviderInstance {
+  id: string;
+  driver: "codex";
+  display_name: string;
+  enabled: boolean;
+  status: "ready" | "warning" | "error";
+  capabilities: { sessionModelSwitch: "in-session" | "unsupported" };
+  models: CodexModel[];
+  defaultModel: string;
+  modelSource: "live" | "fallback";
+}
+
+interface AgentThread {
+  id: string;
+  title: string;
+  agent_id: string;
+  agent_name: string;
+  agent_kind: "worker" | "dispatcher";
+  task_id: string | null;
+  task_number: number | null;
+  project_id: string | null;
+  project_name: string | null;
+  provider_instance_id: string;
+  provider_driver: "codex";
+  provider_name: string;
+  model: string;
+  model_options: ModelOptionSelection[];
+  cwd: string;
+  branch: string | null;
+  provider_thread_id: string | null;
+  last_activity_at: string;
+  latest_run_id: string | null;
+  latest_run_kind: "worker" | "dispatcher" | null;
+  latest_status: string | null;
+  latest_error: string | null;
 }
 
 interface Task {
@@ -97,17 +171,15 @@ interface Task {
   title: string;
   body: string;
   status: string;
-  project_id: string;
+  project_id: string | null;
   agent_id: string;
-  project_name: string;
+  project_name: string | null;
   agent_name: string;
   agent_kind: "worker" | "dispatcher";
   latest_run_status?: string | null;
   latest_run_id?: string | null;
   has_runs?: boolean;
   open_pr_on_success: boolean;
-  skill_ids?: string[];
-  resolved_skill_ids?: string[];
   updated_at?: string;
   created_at?: string;
 }
@@ -135,23 +207,7 @@ interface Run {
   kind?: "worker" | "dispatcher";
 }
 
-interface AgentRun {
-  id: string;
-  kind: "worker" | "dispatcher";
-  trigger: string;
-  status: string;
-  model: string;
-  task_id?: string | null;
-  task_number?: number | null;
-  task_title?: string | null;
-  project_name?: string | null;
-  agent_name: string;
-  prompt?: string | null;
-  queued_at: string;
-  started_at?: string | null;
-  finished_at?: string | null;
-  error?: string | null;
-}
+const SIDEBAR_THREAD_PAGE_SIZE = 10;
 
 interface ExternalApiKey {
   id: string;
@@ -161,6 +217,16 @@ interface ExternalApiKey {
   last_used_at?: string | null;
   revoked_at?: string | null;
   created_at: string;
+}
+
+interface Credential {
+  id: string;
+  name: string;
+  description: string;
+  agent_accessible: boolean;
+  last_used_at?: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 const BOARD_COLUMNS = [
@@ -178,26 +244,24 @@ export function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
-  const [defaultModel, setDefaultModel] = useState("gpt-5.5");
+  const [defaultModel, setDefaultModel] = useState("gpt-5.6-sol");
+  const [providerInstances, setProviderInstances] = useState<ProviderInstance[]>([]);
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
+  const [credentials, setCredentials] = useState<Credential[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
-  const [agentRuns, setAgentRuns] = useState<AgentRun[]>([]);
-  const [selectedRun, setSelectedRun] = useState<AgentRun | null>(null);
-  const [agentRunEvents, setAgentRunEvents] = useState<RunEvent[]>([]);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [selectedTaskRun, setSelectedTaskRun] = useState<AgentRunTimelineRun | null>(null);
-  const [events, setEvents] = useState<RunEvent[]>([]);
-  const [pendingTaskMessages, setPendingTaskMessages] = useState<Record<string, AgentRunChatMessage[]>>({});
-  const [pendingRunMessages, setPendingRunMessages] = useState<Record<string, AgentRunChatMessage[]>>({});
+  const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
+  const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
+  const [draftThread, setDraftThread] = useState(true);
+  const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
+  const [agentThreadEvents, setAgentThreadEvents] = useState<RunEvent[]>([]);
+  const [composerSelection, setComposerSelection] = useState<ModelSelection | null>(null);
+  const [pendingThreadMessages, setPendingThreadMessages] = useState<AgentRunChatMessage[]>([]);
   const [query, setQuery] = useState("");
-  const [busyRunId, setBusyRunId] = useState<string | null>(null);
+  const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
-
-  const selectedTask = useMemo(
-    () => (selectedTaskId ? tasks.find((task) => task.id === selectedTaskId) : undefined),
-    [selectedTaskId, tasks]
-  );
+  const searchRef = useRef<HTMLInputElement>(null);
 
   const filteredTasks = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -210,7 +274,10 @@ export function App() {
     );
   }, [query, tasks]);
 
-  const displayedAgentRuns = useMemo(() => collapseAgentRuns(agentRuns), [agentRuns]);
+  const selectedThread = useMemo(
+    () => agentThreads.find((thread) => thread.id === selectedThreadId) ?? null,
+    [agentThreads, selectedThreadId]
+  );
 
   const filteredSkills = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -220,28 +287,37 @@ export function App() {
     );
   }, [query, skills]);
 
-  const filteredRuns = useMemo(() => {
+  const filteredThreads = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return displayedAgentRuns;
-    return displayedAgentRuns.filter((run) =>
+    if (!needle) return agentThreads;
+    return agentThreads.filter((thread) =>
       [
-        run.kind,
-        run.trigger,
-        run.status,
-        run.model,
-        run.agent_name,
-        run.project_name ?? "",
-        run.task_title ?? "",
-        run.task_number ? `TASK-${run.task_number}` : ""
+        thread.title,
+        thread.agent_name,
+        thread.provider_name,
+        thread.model,
+        thread.project_name ?? "",
+        thread.task_number ? `TASK-${thread.task_number}` : ""
       ]
         .join(" ")
         .toLowerCase()
         .includes(needle)
     );
-  }, [displayedAgentRuns, query]);
+  }, [agentThreads, query]);
 
   useEffect(() => {
     void boot();
+  }, []);
+
+  useEffect(() => {
+    const handleSearchShortcut = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "k" || (!event.metaKey && !event.ctrlKey)) return;
+      event.preventDefault();
+      searchRef.current?.focus();
+      searchRef.current?.select();
+    };
+    window.addEventListener("keydown", handleSearchShortcut);
+    return () => window.removeEventListener("keydown", handleSearchShortcut);
   }, []);
 
   useEffect(() => {
@@ -249,35 +325,35 @@ export function App() {
   }, [user]);
 
   useEffect(() => {
-    if (!selectedTask) {
-      setEvents([]);
-      setSelectedTaskRun(null);
+    if (!selectedThreadId) {
+      setSelectedThreadRun(null);
+      setAgentThreadEvents([]);
       return;
     }
-    void loadTaskSession(selectedTask.id);
-    if (!isActiveRun(selectedTask.latest_run_status)) return;
-
+    void loadAgentThread(selectedThreadId);
+    if (!isActiveRun(selectedThread?.latest_status)) return;
     const timer = window.setInterval(() => {
-      void loadTaskSession(selectedTask.id);
-      void reloadTasks();
-      void reloadAgentRuns();
+      void loadAgentThread(selectedThreadId);
+      void reloadAgentThreads();
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [selectedTask?.id, selectedTask?.latest_run_id, selectedTask?.latest_run_status]);
+  }, [selectedThreadId, selectedThread?.latest_status]);
 
   useEffect(() => {
-    if (!selectedRun) {
-      setAgentRunEvents([]);
+    if (selectedThread) {
+      setComposerSelection({
+        providerInstanceId: selectedThread.provider_instance_id,
+        model: selectedThread.model,
+        options: normalizeComposerOptions(selectedThread.model_options)
+      });
       return;
     }
-    void loadAgentRunEvents(selectedRun);
-    if (!isActiveRun(selectedRun.status)) return;
-    const timer = window.setInterval(() => {
-      void loadAgentRunEvents(selectedRun);
-      void reloadAgentRuns();
-    }, 2000);
-    return () => window.clearInterval(timer);
-  }, [selectedRun?.id, selectedRun?.kind, selectedRun?.status]);
+    if (!draftThread || composerSelection) return;
+    const provider = providerInstances[0];
+    if (!provider) return;
+    const sticky = readStickyModelSelection(provider);
+    setComposerSelection(sticky);
+  }, [selectedThread?.id, selectedThread?.model, selectedThread?.model_options, draftThread, providerInstances]);
 
   async function boot() {
     const status = await api<{ hasAdmin: boolean }>("/api/onboarding/status");
@@ -292,9 +368,10 @@ export function App() {
       reloadAgents(),
       reloadSkills(),
       reloadApiKeys(),
+      reloadCredentials(),
       reloadTasks(),
-      reloadModels(),
-      reloadAgentRuns(),
+      reloadProviderInstances(),
+      reloadAgentThreads(),
       reloadRepos(false)
     ]);
   }
@@ -319,27 +396,44 @@ export function App() {
     setApiKeys(data.apiKeys);
   }
 
-  async function reloadModels() {
-    const data = await api<{ defaultModel: string; models: CodexModel[] }>("/api/codex/models");
-    setDefaultModel(data.defaultModel);
-    setModels(data.models);
+  async function reloadCredentials() {
+    if (!user || user.role === "member") {
+      setCredentials([]);
+      return;
+    }
+    const data = await api<{ credentials: Credential[] }>("/api/credentials");
+    setCredentials(data.credentials);
+  }
+
+  async function reloadProviderInstances() {
+    const data = await api<{ instances: ProviderInstance[] }>("/api/provider-instances");
+    setProviderInstances(data.instances);
+    const codex = data.instances.find((instance) => instance.driver === "codex");
+    if (codex) {
+      setDefaultModel(codex.defaultModel);
+      setModels(codex.models);
+    }
   }
 
   async function reloadTasks() {
     const data = await api<{ tasks: Task[] }>("/api/tasks");
     setTasks(data.tasks);
-    if (selectedTaskId && !data.tasks.some((task) => task.id === selectedTaskId)) {
-      setSelectedTaskId(null);
-    }
   }
 
-  async function reloadAgentRuns(): Promise<AgentRun[]> {
-    const data = await api<{ runs: AgentRun[] }>("/api/agent-runs");
-    setAgentRuns(data.runs);
-    if (selectedRun && !data.runs.some((run) => run.id === selectedRun.id && run.kind === selectedRun.kind)) {
-      setSelectedRun(null);
-    }
-    return data.runs;
+  async function reloadAgentThreads(cursor?: string): Promise<AgentThread[]> {
+    const suffix = cursor
+      ? `?limit=${SIDEBAR_THREAD_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`
+      : `?limit=${SIDEBAR_THREAD_PAGE_SIZE}`;
+    const data = await api<{ threads: AgentThread[]; nextCursor: string | null }>(
+      `/api/agent-threads${suffix}`
+    );
+    setAgentThreads((current) => {
+      if (!cursor) return mergeRefreshedAgentThreads(current, data.threads);
+      const seen = new Set(current.map((thread) => thread.id));
+      return [...current, ...data.threads.filter((thread) => !seen.has(thread.id))];
+    });
+    setNextThreadCursor(data.nextCursor);
+    return data.threads;
   }
 
   async function reloadRepos(refresh: boolean) {
@@ -350,88 +444,106 @@ export function App() {
     setRepos(data.repositories);
   }
 
-  async function loadTaskSession(taskId: string) {
-    const data = await api<{ run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
-      `/api/tasks/${taskId}/session`
+  async function loadAgentThread(threadId: string) {
+    const data = await api<{
+      thread: AgentThread;
+      run?: AgentRunTimelineRun | null;
+      events: RunEvent[];
+    }>(`/api/agent-threads/${threadId}`);
+    setAgentThreads((current) =>
+      current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
     );
-    setSelectedTaskRun(data.run ?? null);
-    setEvents(data.events);
+    setSelectedThreadRun(data.run ?? null);
+    setAgentThreadEvents(data.events);
   }
 
-  async function loadAgentRunEvents(run: AgentRun) {
-    const data = await api<{ run?: Partial<AgentRun> | null; events: RunEvent[] }>(
-      `/api/agent-runs/${run.kind}/${run.id}/events`
-    );
-    if (data.run) {
-      setSelectedRun((current) =>
-        current && isSameAgentRunConversation(current, run) ? { ...current, ...data.run } : current
-      );
-    }
-    setAgentRunEvents(data.events);
+  function createAgentThread() {
+    const provider = providerInstances[0];
+    setSelectedThreadId(null);
+    setDraftThread(true);
+    setSelectedThreadRun(null);
+    setAgentThreadEvents([]);
+    setPendingThreadMessages([]);
+    setComposerSelection(provider ? readStickyModelSelection(provider) : null);
+    setView("runs");
+    setMessage(null);
   }
 
-  async function runTask(task: Task) {
-    setBusyRunId(task.id);
+  async function loadOlderAgentThreads() {
+    if (!nextThreadCursor || loadingOlderThreads) return;
+    setLoadingOlderThreads(true);
     try {
-      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(`/api/tasks/${task.id}/runs`, {
+      await reloadAgentThreads(nextThreadCursor);
+    } finally {
+      setLoadingOlderThreads(false);
+    }
+  }
+
+  async function openTaskThread(task: Task) {
+    try {
+      const thread = (await api<{ thread: AgentThread }>(`/api/tasks/${task.id}/agent-thread`, {
         method: "POST"
-      });
-      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Run"} queued: ${shortId(data.run.id)}`);
-      setSelectedTaskId(task.id);
-      await Promise.all([reloadTasks(), reloadAgentRuns()]);
-    } finally {
-      setBusyRunId(null);
-    }
-  }
-
-  async function sendTaskMessage(task: Task, messageText: string) {
-    const optimistic = optimisticMessage(messageText);
-    setPendingTaskMessages((current) => appendPendingMessage(current, task.id, optimistic));
-    setBusyRunId(task.id);
-    try {
-      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(`/api/tasks/${task.id}/messages`, {
-        method: "POST",
-        body: JSON.stringify({ message: messageText })
-      });
-      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Turn"} queued: ${shortId(data.run.id)}`);
-      setSelectedTaskId(task.id);
-      await Promise.all([reloadTasks(), reloadAgentRuns(), loadTaskSession(task.id)]);
+      })).thread;
+      setAgentThreads((current) => [thread, ...current.filter((entry) => entry.id !== thread.id)]);
+      setDraftThread(false);
+      setSelectedThreadId(thread.id);
+      setPendingThreadMessages([]);
+      setQuery("");
+      setView("runs");
+      setMessage(null);
+      await loadAgentThread(thread.id);
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : "Failed to send message.");
-      throw error;
-    } finally {
-      setPendingTaskMessages((current) => removePendingMessage(current, task.id, optimistic.id));
-      setBusyRunId(null);
+      setMessage(error instanceof Error ? error.message : "Failed to open the agent thread.");
     }
   }
 
-  async function sendAgentRunMessage(run: AgentRun, messageText: string) {
-    const key = agentRunConversationKey(run);
+  async function sendAgentThreadMessage(messageText: string, selection: ModelSelection) {
     const optimistic = optimisticMessage(messageText);
-    setPendingRunMessages((current) => appendPendingMessage(current, key, optimistic));
+    setPendingThreadMessages((current) => [...current, optimistic]);
     try {
-      const data = await api<{ run: Run; kind: "worker" | "dispatcher" }>(
-        `/api/agent-runs/${run.kind}/${run.id}/messages`,
-        {
+      const payload = JSON.stringify({ message: messageText, modelSelection: selection });
+      if (draftThread || !selectedThreadId) {
+        const data = await api<{ thread: AgentThread; turn: Run }>("/api/agent-threads", {
           method: "POST",
-          body: JSON.stringify({ message: messageText })
-        }
-      );
-      setMessage(`${data.kind === "dispatcher" ? "Dispatcher" : "Turn"} queued: ${shortId(data.run.id)}`);
-      const [runs] = await Promise.all([reloadAgentRuns(), reloadTasks()]);
-      const nextRun = findUpdatedConversationRun(runs, run, data.run.id, data.kind);
-      if (nextRun) {
-        setSelectedRun(nextRun);
-        await loadAgentRunEvents(nextRun);
+          body: payload
+        });
+        setAgentThreads((current) => [data.thread, ...current.filter((thread) => thread.id !== data.thread.id)]);
+        setSelectedThreadId(data.thread.id);
+        setDraftThread(false);
+        setMessage(null);
+        writeStickyModelSelection(selection);
+        await loadAgentThread(data.thread.id);
       } else {
-        await loadAgentRunEvents(run);
+        const data = await api<{ thread: AgentThread; turn: Run }>(
+          `/api/agent-threads/${selectedThreadId}/messages`,
+          { method: "POST", body: payload }
+        );
+        setAgentThreads((current) =>
+          current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
+        );
+        setMessage(null);
+        writeStickyModelSelection(selection);
+        await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads(), reloadTasks()]);
       }
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Failed to send message.");
       throw error;
     } finally {
-      setPendingRunMessages((current) => removePendingMessage(current, key, optimistic.id));
+      setPendingThreadMessages((current) => current.filter((message) => message.id !== optimistic.id));
     }
+  }
+
+  async function selectComposerModel(selection: ModelSelection) {
+    setComposerSelection(selection);
+    writeStickyModelSelection(selection);
+    if (!selectedThreadId || draftThread) return;
+    const data = await api<{ thread: AgentThread }>(`/api/agent-threads/${selectedThreadId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ modelSelection: selection })
+    });
+    setAgentThreads((current) =>
+      current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
+    );
   }
 
   if (hasAdmin === null) return <Splash />;
@@ -439,59 +551,91 @@ export function App() {
   if (!user) return <Login onDone={boot} />;
 
   return (
+    <TooltipProvider delayDuration={220}>
     <div className="app-layout">
-      <aside className="sidebar">
+      <aside className={`sidebar ${view === "runs" ? "is-chat-sidebar" : ""}`}>
         <div className="sidebar-brand">
           <span className="brand-mark">
-            <Terminal size={17} />
+            <Terminal size={17} weight="fill" />
           </span>
-          <div>
+          <div className="brand-copy">
             <strong>Aisevak</strong>
-            <small>{user.name}</small>
+            <small>Agent workspace</small>
           </div>
         </div>
 
         <nav className="sidebar-nav">
+          <span className="nav-label">Workspace</span>
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
-          <NavButton icon={<Activity />} label="Agent Runs" active={view === "runs"} onClick={() => setView("runs")} />
-          <NavButton icon={<Bot />} label="Agents" active={view === "agents"} onClick={() => setView("agents")} />
+          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
+          <span className="nav-label nav-label-spaced">Manage</span>
           <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
+          {user.role !== "member" ? (
+            <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => setView("credentials")} />
+          ) : null}
           <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
+          <span className="nav-label nav-label-spaced">Agents</span>
+          <NavButton icon={<Activity />} label="Agents" active={view === "runs"} onClick={() => setView("runs")} />
         </nav>
 
         <div className="sidebar-footer">
           <div className="user-chip">
-            <UserCircle2 size={16} />
-            <span>{user.role}</span>
+            <span className="avatar">{user.name.slice(0, 1).toUpperCase()}</span>
+            <span className="user-details">
+              <strong>{user.name}</strong>
+              <small>{user.role}</small>
+            </span>
           </div>
-          <button
-            className="icon-button flat"
+          <Button
+            variant="ghost"
+            size="icon"
             title="Log out"
+            aria-label="Log out"
             onClick={async () => {
               await api("/api/logout", { method: "POST" });
               setUser(null);
             }}
           >
             <LogOut size={14} />
-          </button>
+          </Button>
         </div>
       </aside>
 
-      <div className="main-content">
-        <header className="top-header">
+      {view === "runs" ? (
+        <AgentThreadSidebar
+          draft={draftThread}
+          threads={filteredThreads}
+          selectedThreadId={selectedThreadId}
+          query={query}
+          hasMore={Boolean(nextThreadCursor) && !query.trim()}
+          loadingMore={loadingOlderThreads}
+          onQueryChange={setQuery}
+          onNewThread={createAgentThread}
+          onLoadMore={() => void loadOlderAgentThreads()}
+          onSelectThread={(threadId) => {
+            setDraftThread(false);
+            setSelectedThreadId(threadId);
+          }}
+        />
+      ) : null}
+
+      <div className={`main-content ${view === "runs" ? "agent-chat-mode" : ""}`}>
+        {view !== "runs" ? <header className="top-header">
           <div className="header-title">{viewTitle(view)}</div>
           <div className="header-actions">
             <div className="search-bar">
               <Search size={14} className="text-muted" />
-              <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search..." />
+              <Input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${viewTitle(view).toLowerCase()}`} />
+              <kbd>⌘K</kbd>
             </div>
-            <button className="icon-button flat" onClick={() => void reloadAll()} title="Refresh">
+            <ThemeToggle />
+            <Button variant="ghost" size="icon" onClick={() => void reloadAll()} title="Refresh" aria-label="Refresh">
               <RefreshCw size={14} />
-            </button>
+            </Button>
           </div>
-        </header>
+        </header> : null}
 
         {message ? <div className="notice">{message}</div> : null}
 
@@ -500,13 +644,7 @@ export function App() {
             <TasksView
               tasks={filteredTasks}
               agents={agents}
-              skills={skills}
               projects={projects}
-              selectedTask={selectedTask}
-              selectedTaskRun={selectedTaskRun}
-              events={events}
-              pendingMessages={selectedTask ? (pendingTaskMessages[selectedTask.id] ?? []) : []}
-              busyRunId={busyRunId}
               onCreate={async (payload) => {
                 await api<{ task: Task }>("/api/tasks", {
                   method: "POST",
@@ -514,40 +652,40 @@ export function App() {
                 });
                 await reloadTasks();
               }}
-              onSelect={setSelectedTaskId}
-              onClose={() => setSelectedTaskId(null)}
-              onRun={runTask}
-              onSendMessage={sendTaskMessage}
-              onCancel={async (runId) => {
-                await api(`/api/runs/${runId}/cancel`, { method: "POST" });
-                await Promise.all([reloadTasks(), reloadAgentRuns()]);
-              }}
+              onSelect={(task) => void openTaskThread(task)}
             />
           ) : null}
 
           {view === "runs" ? (
-            <AgentRunsView
-              runs={filteredRuns}
-              selectedRun={selectedRun}
-              events={agentRunEvents}
-              pendingMessages={selectedRun ? (pendingRunMessages[agentRunConversationKey(selectedRun)] ?? []) : []}
-              onSelect={(run) => {
-                setSelectedRun(run);
-                void loadAgentRunEvents(run);
+            <AgentChatsView
+              thread={selectedThread}
+              draft={draftThread}
+              run={selectedThreadRun}
+              events={agentThreadEvents}
+              pendingMessages={pendingThreadMessages}
+              providers={providerInstances}
+              selection={composerSelection}
+              onSelectionChange={selectComposerModel}
+              onSendMessage={sendAgentThreadMessage}
+              onCancel={async () => {
+                if (!selectedThreadId) return;
+                await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
+                await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
               }}
-              onSendMessage={sendAgentRunMessage}
             />
           ) : null}
 
           {view === "agents" ? (
-            <AgentsView agents={agents} skills={skills} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
+            <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
           ) : null}
 
           {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
 
           {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
 
-          {view === "projects" ? <ProjectsView projects={projects} skills={skills} onSaved={reloadProjects} /> : null}
+          {view === "credentials" ? <CredentialsView credentials={credentials} onSaved={reloadCredentials} /> : null}
+
+          {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
 
           {view === "connectors" ? (
             <ConnectorsView
@@ -566,6 +704,7 @@ export function App() {
         </main>
       </div>
     </div>
+    </TooltipProvider>
   );
 }
 
@@ -573,24 +712,14 @@ function TasksView(props: {
   tasks: Task[];
   projects: Project[];
   agents: Agent[];
-  skills: Skill[];
-  selectedTask?: Task;
-  selectedTaskRun: AgentRunTimelineRun | null;
-  events: RunEvent[];
-  pendingMessages: AgentRunChatMessage[];
-  busyRunId: string | null;
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
-  onSelect: (id: string) => void;
-  onClose: () => void;
-  onRun: (task: Task) => Promise<void>;
-  onSendMessage: (task: Task, message: string) => Promise<void>;
-  onCancel: (runId: string) => Promise<void>;
+  onSelect: (task: Task) => void;
 }) {
   return (
-    <div className={`board-layout ${props.selectedTask ? "has-detail" : ""}`}>
+    <div className="board-layout">
       <div className="board-main">
         <div className="board-toolbar">
-          <TaskForm projects={props.projects} agents={props.agents} skills={props.skills} onCreate={props.onCreate} />
+          <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
         </div>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
@@ -606,16 +735,16 @@ function TasksView(props: {
                 <div className="kanban-cards">
                   {tasks.map((task) => (
                     <button
-                      className={`kanban-card ${props.selectedTask?.id === task.id ? "selected" : ""}`}
+                      className="kanban-card"
                       key={task.id}
-                      onClick={() => props.onSelect(task.id)}
+                      onClick={() => props.onSelect(task)}
                     >
                       <div className="card-top">
                         <span className="task-key">TASK-{task.number}</span>
                         <TaskStatus status={task.latest_run_status ?? task.status} />
                       </div>
                       <div className="card-title">{task.title}</div>
-                      <div className="card-desc">{task.project_name}</div>
+                      <div className="card-desc">{task.project_name ?? "No project"}</div>
                     </button>
                   ))}
                 </div>
@@ -624,20 +753,6 @@ function TasksView(props: {
           })}
         </div>
       </div>
-      {props.selectedTask ? (
-        <TaskDetail
-          task={props.selectedTask}
-          skills={props.skills}
-          run={props.selectedTaskRun}
-          events={props.events}
-          pendingMessages={props.pendingMessages}
-          busyRunId={props.busyRunId}
-          onClose={props.onClose}
-          onRun={props.onRun}
-          onSendMessage={props.onSendMessage}
-          onCancel={props.onCancel}
-        />
-      ) : null}
     </div>
   );
 }
@@ -645,19 +760,13 @@ function TasksView(props: {
 function TaskForm(props: {
   projects: Project[];
   agents: Agent[];
-  skills: Skill[];
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [title, setTitle] = useState("");
   const [body, setBody] = useState("");
   const [projectId, setProjectId] = useState("");
   const [agentId, setAgentId] = useState("auto");
-  const [skillIds, setSkillIds] = useState<string[]>([]);
   const workerAgents = props.agents.filter((agent) => agent.kind !== "dispatcher");
-
-  useEffect(() => {
-    if (!projectId && props.projects[0]) setProjectId(props.projects[0].id);
-  }, [props.projects, projectId]);
 
   return (
     <form
@@ -667,210 +776,412 @@ function TaskForm(props: {
         await props.onCreate({
           title,
           body,
-          projectId,
-          ...(agentId === "auto" ? {} : { agentId }),
-          skillIds
+          ...(projectId ? { projectId } : {}),
+          ...(agentId === "auto" ? {} : { agentId })
         });
         setTitle("");
         setBody("");
         setAgentId("auto");
-        setSkillIds([]);
       }}
     >
       <div className="inline-create">
-        <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="New task" required />
-        <input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Details" />
-        <select value={projectId} onChange={(event) => setProjectId(event.target.value)} required>
+        <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="What needs to be done?" required />
+        <Input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Add a short brief" />
+        <NativeSelect value={projectId} onChange={(event) => setProjectId(event.target.value)}>
+          <option value="">No project</option>
           {props.projects.map((project) => (
             <option value={project.id} key={project.id}>
               {project.name}
             </option>
           ))}
-        </select>
-        <select value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
+        </NativeSelect>
+        <NativeSelect value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
           <option value="auto">Auto-route</option>
           {workerAgents.map((agent) => (
             <option value={agent.id} key={agent.id}>
               {agent.name}
             </option>
           ))}
-        </select>
-        <button className="button primary" type="submit">
+        </NativeSelect>
+        <Button type="submit">
           <Plus size={15} />
-          Add
-        </button>
+          New task
+        </Button>
       </div>
-      <SkillPicker skills={props.skills} value={skillIds} onChange={setSkillIds} compact />
     </form>
   );
 }
 
-function TaskDetail(props: {
-  task?: Task;
-  skills: Skill[];
-  run: AgentRunTimelineRun | null;
-  events: RunEvent[];
-  pendingMessages: AgentRunChatMessage[];
-  busyRunId: string | null;
-  onClose: () => void;
-  onRun: (task: Task) => Promise<void>;
-  onSendMessage: (task: Task, message: string) => Promise<void>;
-  onCancel: (runId: string) => Promise<void>;
+function AgentThreadSidebar(props: {
+  draft: boolean;
+  threads: AgentThread[];
+  selectedThreadId: string | null;
+  query: string;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onQueryChange: (query: string) => void;
+  onNewThread: () => void;
+  onLoadMore: () => void;
+  onSelectThread: (threadId: string) => void;
 }) {
-  if (!props.task) {
-    return (
-      <aside className="side-panel">
-        <div className="empty-state">Select a task</div>
-      </aside>
-    );
-  }
-
-  const active = isActiveRun(props.task.latest_run_status);
-  const hasRun = Boolean(props.task.has_runs || props.task.latest_run_id || props.task.latest_run_status);
-  const showRun = !hasRun;
-  const showStop = active && Boolean(props.task.latest_run_id);
-  const resolvedSkills = skillLabels(props.skills, props.task.resolved_skill_ids ?? props.task.skill_ids ?? []);
-  const taskRun =
-    props.run ??
-    (props.task.latest_run_id || props.events.length > 0
-      ? {
-          id: props.task.latest_run_id ?? props.task.id,
-          kind: "worker" as const,
-          status: props.task.latest_run_status ?? props.task.status,
-          agent_name: props.task.agent_name,
-          prompt: props.task.body || props.task.title,
-          queued_at: props.task.created_at ?? props.task.updated_at ?? null,
-          started_at: props.task.updated_at ?? null,
-          finished_at: active ? null : props.task.updated_at ?? null
-        }
-      : null);
   return (
-    <aside className="side-panel">
-      <div className="detail-header-flat">
-        <div className="flex-between">
-          <span className="task-key">TASK-{props.task.number}</span>
-          <button className="icon-button flat" onClick={props.onClose} title="Close task">
-            <X size={15} />
-          </button>
+    <aside className="agent-thread-sidebar" aria-label="Agent tasks">
+      <div className="agent-thread-sidebar-header">
+        <div>
+          <h2>Agents</h2>
+          <p>Codex tasks</p>
         </div>
-        <h2>{props.task.title}</h2>
-        <p className="text-muted">{props.task.project_name} / {props.task.agent_name}</p>
-        <div className="mt-2">
-          <TaskStatus status={props.task.latest_run_status ?? props.task.status} />
-        </div>
-        {resolvedSkills.length > 0 ? <SkillChips labels={resolvedSkills} /> : null}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              variant="secondary"
+              size="icon"
+              className="agent-thread-new"
+              aria-label="New agent task"
+              onClick={props.onNewThread}
+            >
+              <Plus size={14} weight="bold" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="right">New task</TooltipContent>
+        </Tooltip>
       </div>
-      <div className="detail-body">
-        <div className="task-body-text">{props.task.body || "No description."}</div>
-        {showRun || showStop ? (
-          <div className="action-row">
-            {showRun ? (
-              <button
-                className="button primary"
-                disabled={props.busyRunId === props.task.id}
-                onClick={() => props.onRun(props.task!)}
-              >
-                {props.busyRunId === props.task.id ? <Loader2 className="spin" size={15} /> : <Play size={15} />}
-                Run
-              </button>
-            ) : null}
-            {showStop ? (
-              <button className="button secondary" onClick={() => props.onCancel(props.task!.latest_run_id!)}>
-                <Square size={15} />
-                Stop
-              </button>
-            ) : null}
-          </div>
-        ) : null}
-      </div>
-      <div className="detail-chat">
-        <CodexSessionTimeline run={taskRun} events={props.events} pendingMessages={props.pendingMessages} />
-        <SessionComposer
-          disabled={props.busyRunId === props.task.id}
-          modelLabel={taskRun?.model}
-          onSend={(message) => props.onSendMessage(props.task!, message)}
-          placeholder="Message this Codex session"
+
+      <div className="agent-thread-search">
+        <Search size={13} />
+        <input
+          value={props.query}
+          placeholder="Search tasks"
+          aria-label="Search agent tasks"
+          onChange={(event) => props.onQueryChange(event.target.value)}
         />
       </div>
+
+      <div className="agent-thread-list-label">Recent</div>
+      <ScrollArea className="agent-thread-scroll">
+        <div className="agent-thread-list">
+          {props.draft ? (
+            <button type="button" className="agent-thread-item selected" onClick={props.onNewThread}>
+              <span className="thread-item-icon is-draft"><Plus size={13} weight="bold" /></span>
+              <span className="sidebar-run-copy">
+                <span className="sidebar-run-title">New task</span>
+                <span className="sidebar-run-meta">Codex · Draft</span>
+              </span>
+            </button>
+          ) : null}
+
+          {props.threads.map((thread) => (
+            <button
+              type="button"
+              className={`agent-thread-item ${props.selectedThreadId === thread.id ? "selected" : ""}`}
+              key={thread.id}
+              onClick={() => props.onSelectThread(thread.id)}
+            >
+              <span className={`thread-item-icon status-${runBucket(thread.latest_status ?? "succeeded")}`}>
+                <OpenAILogo size={13} />
+              </span>
+              <span className="sidebar-run-copy">
+                <span className="sidebar-run-title">{thread.title}</span>
+                <span className="sidebar-run-meta">
+                  {formatSidebarRunTime(thread.last_activity_at)} · {thread.model}
+                </span>
+              </span>
+              {isActiveRun(thread.latest_status) ? <Loader2 className="spin thread-running" size={12} /> : null}
+            </button>
+          ))}
+
+          {props.threads.length === 0 && !props.draft ? (
+            <div className="agent-thread-empty">
+              <OpenAILogo size={18} />
+              <span>{props.query ? "No matching tasks" : "No tasks yet"}</span>
+            </div>
+          ) : null}
+
+          {props.hasMore ? (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="agent-thread-load-more"
+              disabled={props.loadingMore}
+              onClick={props.onLoadMore}
+            >
+              {props.loadingMore ? <Loader2 className="spin" size={12} /> : <ChevronDown size={12} />}
+              Load older tasks
+            </Button>
+          ) : null}
+        </div>
+      </ScrollArea>
     </aside>
   );
 }
 
-function AgentRunsView(props: {
-  runs: AgentRun[];
-  selectedRun: AgentRun | null;
+function AgentChatsView(props: {
+  thread: AgentThread | null;
+  draft: boolean;
+  run: AgentRunTimelineRun | null;
   events: RunEvent[];
   pendingMessages: AgentRunChatMessage[];
-  onSelect: (run: AgentRun) => void;
-  onSendMessage: (run: AgentRun, message: string) => Promise<void>;
+  providers: ProviderInstance[];
+  selection: ModelSelection | null;
+  onSelectionChange: (selection: ModelSelection) => Promise<void>;
+  onSendMessage: (message: string, selection: ModelSelection) => Promise<void>;
+  onCancel: () => Promise<void>;
 }) {
+  const active = isActiveRun(props.thread?.latest_status);
+  const title = props.draft ? "New thread" : (props.thread?.title ?? "Agent thread");
+  const agentName = props.thread?.agent_name ?? "Dispatcher";
+  const projectName = props.thread?.project_name ?? "Aisevak workspace";
+  const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
+
   return (
-    <div className="master-detail">
-      <aside className="master-list">
-        <div className="master-header flex-between">
-          <h3>Agent Runs</h3>
-          <span className="count-badge">{props.runs.length}</span>
+    <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
+      <header className="agent-chat-header">
+        <div className="agent-chat-heading">
+          <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
+          <div className="agent-chat-title-group">
+            <div className="agent-chat-breadcrumb">{projectName} <span>/</span> {agentName}</div>
+            <h1>{title}</h1>
+          </div>
         </div>
-        <div className="list-scroll">
-          {props.runs.map((run) => (
-            <button
-              className={`list-item ${isSameAgentRunConversation(props.selectedRun, run) ? "selected" : ""}`}
-              key={`${run.kind}-${run.id}`}
-              onClick={() => props.onSelect(run)}
-            >
-              <div className="list-item-icon">
-                {run.kind === "dispatcher" ? <Activity size={15} /> : <Bot size={15} />}
-              </div>
-              <div className="list-item-main">
-                <span className="list-item-title">{runTitle(run)}</span>
-                <span className="list-item-desc">{run.agent_name} / {run.trigger}</span>
-              </div>
-              <div>
-                <TaskStatus status={run.status} />
-              </div>
-            </button>
-          ))}
-          {props.runs.length === 0 ? <div className="empty-list">No agent runs</div> : null}
+        <div className="agent-chat-header-actions">
+          {!props.draft && props.thread?.latest_status ? <TaskStatus status={props.thread.latest_status} /> : null}
+          {active ? (
+            <Button variant="secondary" size="sm" onClick={() => void props.onCancel()}>
+              <Square size={13} /> Stop
+            </Button>
+          ) : null}
+          <ThemeToggle />
         </div>
-      </aside>
-      <main className="detail-view">
-        {props.selectedRun ? (
-          <div className="detail-scroll">
-            <div className="detail-header-flat">
-              <span className="meta-badge">{props.selectedRun.kind}</span>
-              <h2>{runTitle(props.selectedRun)}</h2>
-              <p className="text-muted">
-                {props.selectedRun.agent_name} / {props.selectedRun.model} / {props.selectedRun.trigger}
-              </p>
-              <div className="mt-2">
-                <TaskStatus status={props.selectedRun.status} />
-              </div>
-            </div>
-            {props.selectedRun.error ? <div className="notice error">{props.selectedRun.error}</div> : null}
-            <div className="detail-chat">
-              <CodexSessionTimeline
-                run={props.selectedRun}
-                events={props.events}
-                pendingMessages={props.pendingMessages}
-              />
-              <SessionComposer
-                modelLabel={props.selectedRun.model}
-                onSend={(message) => props.onSendMessage(props.selectedRun!, message)}
-                placeholder="Message this Codex session"
-              />
-            </div>
+      </header>
+
+      <div className="agent-chat-stage">
+        {props.draft && props.events.length === 0 && props.pendingMessages.length === 0 ? (
+          <div className="agent-chat-hero">
+            <div className="hero-mark"><OpenAILogo size={20} /></div>
+            <h2>What should Codex work on?</h2>
+            <p>Start a durable thread. You can switch models before sending or between turns.</p>
           </div>
         ) : (
-          <div className="empty-state">Select a run</div>
+          <div className="agent-chat-timeline-wrap">
+            <CodexSessionTimeline
+              run={props.run}
+              events={props.events}
+              pendingMessages={props.pendingMessages}
+            />
+            {latestError ? (
+              <div className="agent-run-failure" role="status">
+                <span className="agent-run-failure-icon"><CircleAlert size={15} weight="fill" /></span>
+                <span>
+                  <strong>Codex could not start this turn</strong>
+                  <small>{latestError}</small>
+                </span>
+              </div>
+            ) : null}
+          </div>
         )}
-      </main>
+
+        <div className="agent-chat-composer-wrap">
+          <AgentChatComposer
+            active={active}
+            providers={props.providers}
+            selection={props.selection}
+            onSelectionChange={props.onSelectionChange}
+            onSend={props.onSendMessage}
+            onCancel={props.onCancel}
+          />
+        </div>
+      </div>
     </div>
+  );
+}
+
+function AgentChatComposer(props: {
+  active: boolean;
+  providers: ProviderInstance[];
+  selection: ModelSelection | null;
+  onSelectionChange: (selection: ModelSelection) => Promise<void>;
+  onSend: (message: string, selection: ModelSelection) => Promise<void>;
+  onCancel: () => Promise<void>;
+}) {
+  const [message, setMessage] = useState("");
+  const [sending, setSending] = useState(false);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const [modelQuery, setModelQuery] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const selection = props.selection;
+  const provider =
+    props.providers.find((entry) => entry.id === selection?.providerInstanceId) ?? props.providers[0];
+  const model = provider?.models.find((entry) => entry.id === selection?.model) ?? provider?.models[0];
+  const reasoningOption = model?.options?.find((option) => option.id === "reasoningEffort");
+  const reasoningValue =
+    selection?.options.find((option) => option.id === "reasoningEffort")?.value ??
+    reasoningOption?.defaultValue ??
+    "";
+
+  async function submit() {
+    const trimmed = message.trim();
+    if (!trimmed || !selection || sending || props.active) return;
+    setSending(true);
+    setError(null);
+    try {
+      await props.onSend(trimmed, selection);
+      setMessage("");
+    } catch (sendError) {
+      setError(sendError instanceof Error ? friendlyError(sendError.message) : "Failed to send message.");
+    } finally {
+      setSending(false);
+    }
+  }
+
+  return (
+    <form
+      className="agent-composer"
+      onSubmit={(event) => {
+        event.preventDefault();
+        void submit();
+      }}
+    >
+      <div className="agent-composer-surface">
+        <Textarea
+          value={message}
+          disabled={sending || props.active}
+          rows={2}
+          placeholder={props.active ? "Codex is working…" : "Ask Codex to build, inspect, or change something"}
+          onChange={(event) => setMessage(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.shiftKey) return;
+            event.preventDefault();
+            void submit();
+          }}
+        />
+        <div className="agent-composer-footer">
+          <div className="agent-composer-controls">
+            <Popover
+              open={pickerOpen}
+              onOpenChange={(open) => {
+                setPickerOpen(open);
+                if (!open) setModelQuery("");
+              }}
+            >
+              <PopoverTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="agent-model-trigger"
+                  type="button"
+                  disabled={!provider}
+                >
+                  <OpenAILogo size={14} />
+                  <span>{model?.label ?? selection?.model ?? "Choose model"}</span>
+                  <ChevronDown size={11} />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                className="agent-model-popover"
+                side="top"
+                align="start"
+                sideOffset={9}
+                aria-label="Choose a Codex model"
+              >
+                <div className="model-picker-heading">
+                  <span className="model-harness-mark"><OpenAILogo size={14} /></span>
+                  <div>
+                    <strong>{provider?.display_name ?? "Codex"} models</strong>
+                    <span className={`model-catalog-source is-${provider?.modelSource ?? "fallback"}`}>
+                      <Circle size={6} weight="fill" />
+                      {provider?.modelSource === "live" ? "Live catalog" : "Offline catalog"}
+                    </span>
+                  </div>
+                </div>
+                <Command>
+                  <CommandInput
+                    autoFocus
+                    value={modelQuery}
+                    placeholder="Search models…"
+                    onValueChange={setModelQuery}
+                  />
+                  <CommandList>
+                    <CommandEmpty>No matching models.</CommandEmpty>
+                    <CommandGroup heading="Models">
+                      {(provider?.models ?? []).map((entry) => (
+                        <CommandItem
+                          value={`${entry.label} ${entry.id} ${entry.description}`}
+                          className={entry.id === selection?.model ? "is-selected" : ""}
+                          key={entry.id}
+                          onSelect={() => {
+                            if (!provider) return;
+                            void props.onSelectionChange(selectionForModel(provider, entry, selection));
+                            setPickerOpen(false);
+                            setModelQuery("");
+                          }}
+                        >
+                          <span className="model-row-copy">
+                            <strong>{entry.label}</strong>
+                            <small>{entry.description}</small>
+                          </span>
+                          {entry.badge ? <span className="model-badge">{entry.badge}</span> : null}
+                          {entry.id === selection?.model ? <CheckCircle2 size={15} weight="fill" /> : null}
+                        </CommandItem>
+                      ))}
+                    </CommandGroup>
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
+
+            {reasoningOption && selection ? (
+              <Select
+                value={String(reasoningValue)}
+                onValueChange={(value) => {
+                    const options = [
+                      ...selection.options.filter((option) => option.id !== reasoningOption.id),
+                      { id: reasoningOption.id, value }
+                    ];
+                    void props.onSelectionChange({ ...selection, options });
+                }}
+              >
+                <SelectTrigger className="reasoning-control" aria-label={reasoningOption.label}>
+                  <span className="reasoning-label">Reasoning</span>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent side="top" align="start">
+                  <SelectGroup>
+                    <SelectLabel>{reasoningOption.label}</SelectLabel>
+                    {reasoningOption.values.map((value) => (
+                      <SelectItem key={value.id} value={value.id}>{value.label}</SelectItem>
+                    ))}
+                  </SelectGroup>
+                </SelectContent>
+              </Select>
+            ) : null}
+          </div>
+
+          <div className="agent-composer-actions">
+            <span>Enter to send · Shift Enter for newline</span>
+            {props.active ? (
+              <button className="agent-send-button stop" type="button" onClick={() => void props.onCancel()} aria-label="Stop Codex">
+                <Square size={15} weight="fill" />
+              </button>
+            ) : (
+              <button
+                className="agent-send-button"
+                type="submit"
+                disabled={!message.trim() || !selection || sending}
+                aria-label={sending ? "Sending" : "Send message"}
+              >
+                {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} weight="bold" />}
+              </button>
+            )}
+          </div>
+        </div>
+      </div>
+      {error ? <div className="composer-error">{error}</div> : null}
+    </form>
   );
 }
 
 function AgentsView(props: {
   agents: Agent[];
-  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -885,9 +1196,14 @@ function AgentsView(props: {
       <aside className="master-list">
         <div className="master-header flex-between">
           <h3>Agents</h3>
-          <button className="icon-button flat" onClick={() => setEditing(emptyAgent(props.defaultModel))}>
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setEditing(emptyAgent(props.defaultModel, props.models))}
+            aria-label="New agent"
+          >
             <Plus size={14} />
-          </button>
+          </Button>
         </div>
         <div className="list-scroll">
           {props.agents.map((agent) => (
@@ -901,7 +1217,7 @@ function AgentsView(props: {
               </div>
               <div className="list-item-main">
                 <span className="list-item-title">{agent.name}</span>
-                <span className="list-item-desc">{agent.kind} / {agent.model}</span>
+                <span className="list-item-desc">{agentSummary(agent, props.models)}</span>
               </div>
             </button>
           ))}
@@ -912,7 +1228,6 @@ function AgentsView(props: {
           <div className="form-view">
             <AgentEditor
               agent={editing}
-              skills={props.skills}
               models={props.models}
               defaultModel={props.defaultModel}
               onSaved={props.onSaved}
@@ -928,13 +1243,18 @@ function AgentsView(props: {
 
 function AgentEditor(props: {
   agent: Agent;
-  skills: Skill[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(props.agent);
   useEffect(() => setDraft(props.agent), [props.agent]);
+  const selectedModel = props.models.find((model) => model.id === (draft.model || props.defaultModel));
+  const resolvedModelOptions = selectedModel
+    ? optionsForModel(selectedModel, normalizeComposerOptions(draft.model_options))
+    : normalizeComposerOptions(draft.model_options);
+  const reasoningOption = selectedModel?.options?.find((option) => option.id === "reasoningEffort");
+  const reasoningValue = resolvedModelOptions.find((option) => option.id === "reasoningEffort")?.value;
 
   return (
     <form
@@ -942,46 +1262,85 @@ function AgentEditor(props: {
       onSubmit={async (event) => {
         event.preventDefault();
         const path = draft.id ? `/api/agents/${draft.id}` : "/api/agents";
-        await api(path, { method: draft.id ? "PATCH" : "POST", body: JSON.stringify(draft) });
+        await api(path, {
+          method: draft.id ? "PATCH" : "POST",
+          body: JSON.stringify({ ...draft, modelOptions: resolvedModelOptions })
+        });
         await props.onSaved();
       }}
     >
-      <div className="form-grid">
+      <div className="agent-settings-grid">
         <label>
           Name
-          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label>
           Model
-          <select value={draft.model || props.defaultModel} onChange={(event) => setDraft({ ...draft, model: event.target.value })}>
+          <NativeSelect
+            value={draft.model || props.defaultModel}
+            onChange={(event) => {
+              const model = props.models.find((entry) => entry.id === event.target.value);
+              setDraft({
+                ...draft,
+                model: event.target.value,
+                model_options: model ? optionsForModel(model, resolvedModelOptions) : []
+              });
+            }}
+          >
+            {draft.model && !selectedModel ? (
+              <option value={draft.model}>{draft.model} - unavailable</option>
+            ) : null}
             {props.models.map((model) => (
               <option value={model.id} key={model.id}>
                 {model.label}{model.badge ? ` - ${model.badge}` : ""}
               </option>
             ))}
-          </select>
+          </NativeSelect>
+        </label>
+        <label>
+          Reasoning
+          {reasoningOption ? (
+            <Select
+              value={String(reasoningValue ?? reasoningOption.defaultValue ?? reasoningOption.values[0]?.id ?? "")}
+              onValueChange={(value) => {
+                setDraft({
+                  ...draft,
+                  model_options: [
+                    ...resolvedModelOptions.filter((option) => option.id !== reasoningOption.id),
+                    { id: reasoningOption.id, value }
+                  ]
+                });
+              }}
+            >
+              <SelectTrigger className="agent-setting-select" aria-label={reasoningOption.label}>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent align="start">
+                <SelectGroup>
+                  <SelectLabel>{reasoningOption.label}</SelectLabel>
+                  {reasoningOption.values.map((value) => (
+                    <SelectItem key={value.id} value={value.id}>{value.label}</SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+          ) : (
+            <Input value="Model default" disabled />
+          )}
         </label>
       </div>
       <label>
         Description
-        <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Prompt
-        <textarea
+        <Textarea
           style={{ minHeight: 300, fontFamily: "monospace", fontSize: 13 }}
           value={draft.instructions}
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
       </label>
-      <div className="field-block">
-        <div className="field-label">Skills</div>
-        <SkillPicker
-          skills={props.skills}
-          value={draft.skill_ids ?? []}
-          onChange={(skillIds) => setDraft({ ...draft, skill_ids: skillIds })}
-        />
-      </div>
       <div className="model-list">
         {props.models.map((model) => (
           <span className="model-pill" key={model.id}>
@@ -990,10 +1349,10 @@ function AgentEditor(props: {
         ))}
       </div>
       <div style={{ marginTop: 16 }}>
-        <button className="button primary" type="submit">
+        <Button type="submit">
           <CheckCircle2 size={15} />
           Save agent
-        </button>
+        </Button>
       </div>
     </form>
   );
@@ -1041,17 +1400,17 @@ function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void
             }
           }}
         >
-          <input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" required />
-          <input
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Key name" required />
+          <Input
             value={expiresAt}
             onChange={(event) => setExpiresAt(event.target.value)}
             type="datetime-local"
             required
           />
-          <button className="button primary" type="submit">
+          <Button type="submit">
             <Plus size={15} />
             Create key
-          </button>
+          </Button>
         </form>
         {error ? <div className="notice error">{error}</div> : null}
         {createdSecret ? (
@@ -1082,16 +1441,18 @@ function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void
               <div className="row-actions">
                 <TaskStatus status={apiKeyStatus(key)} />
                 {!key.revoked_at ? (
-                  <button
-                    className="icon-button flat"
+                  <Button
+                    variant="ghost"
+                    size="icon"
                     title="Revoke key"
+                    aria-label="Revoke key"
                     onClick={async () => {
                       await api(`/api/api-keys/${key.id}`, { method: "DELETE" });
                       await props.onSaved();
                     }}
                   >
                     <Trash2 size={14} />
-                  </button>
+                  </Button>
                 ) : null}
               </div>
             </div>
@@ -1150,14 +1511,12 @@ curl -H "Authorization: Bearer $AISEVAK_API_KEY" \\
   ${baseUrl}/api/skills`,
     createTask: `curl -X POST ${baseUrl}/api/tasks \\
   -H "Authorization: Bearer $AISEVAK_API_KEY" \\
-  -H "Content-Type: application/json" \\
-  -d '{
-    "title": "Add regression test",
-    "body": "Use the existing test style.",
-    "projectId": "PROJECT_UUID",
-    "agentId": "AGENT_UUID",
-    "skillIds": ["SKILL_UUID"]
-  }'`,
+	  -H "Content-Type: application/json" \\
+	  -d '{
+	    "title": "Add regression test",
+	    "body": "Use the existing test style.",
+	    "agentId": "AGENT_UUID"
+	  }'`,
     startRun: `curl -X POST ${baseUrl}/api/tasks/TASK_UUID/runs \\
   -H "Authorization: Bearer $AISEVAK_API_KEY"`
   };
@@ -1188,6 +1547,119 @@ function apiDocsText(baseUrl: string): string {
   ].join("\n");
 }
 
+function CredentialsView(props: { credentials: Credential[]; onSaved: () => Promise<void> }) {
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [value, setValue] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  return (
+    <div className="flat-list-view api-view">
+      <div className="flat-header">
+        <h3>Credentials</h3>
+      </div>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>Agent Credentials</h4>
+            <p>Store service API keys and secrets that agents can fetch by name only when needed.</p>
+          </div>
+        </div>
+        <form
+          className="credential-form"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            setError(null);
+            try {
+              await api("/api/credentials", {
+                method: "POST",
+                body: JSON.stringify({
+                  name,
+                  description,
+                  value
+                })
+              });
+              setName("");
+              setDescription("");
+              setValue("");
+              await props.onSaved();
+            } catch (createError) {
+              setError(friendlyError(createError instanceof Error ? createError.message : "Could not save credential."));
+            }
+          }}
+        >
+          <Input value={name} onChange={(event) => setName(event.target.value)} placeholder="Name, e.g. stripe_api_key" required />
+          <Input value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Service or purpose" />
+          <Input value={value} onChange={(event) => setValue(event.target.value)} placeholder="Secret value" type="password" required />
+          <Button type="submit">
+            <Plus size={15} />
+            Add
+          </Button>
+        </form>
+        {error ? <div className="notice error">{error}</div> : null}
+        <div className="api-key-list">
+          {props.credentials.map((credential) => (
+            <div className="data-row" key={credential.id}>
+              <div className="data-row-main">
+                <div className="data-icon">
+                  <LockKeyhole size={16} />
+                </div>
+                <div>
+                  <div className="data-title">{credential.name}</div>
+                  <div className="data-subtitle">
+                    {credential.description || "No description"}
+                    {credential.last_used_at ? ` / used ${formatDateTime(credential.last_used_at)}` : ""}
+                  </div>
+                </div>
+              </div>
+              <div className="row-actions">
+                <TaskStatus status="active" />
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  title="Delete credential"
+                  aria-label="Delete credential"
+                  onClick={async () => {
+                    await api(`/api/credentials/${credential.id}`, { method: "DELETE" });
+                    await props.onSaved();
+                  }}
+                >
+                  <Trash2 size={14} />
+                </Button>
+              </div>
+            </div>
+          ))}
+          {props.credentials.length === 0 ? <div className="empty-list">No credentials</div> : null}
+        </div>
+      </section>
+
+      <section className="api-section">
+        <div className="section-title-row">
+          <div>
+            <h4>Agent Access</h4>
+            <p>Agents use the injected Aisevak CLI. Values are redacted from stored transcripts when echoed.</p>
+          </div>
+          <CopyButton text={credentialDocsText()} label="Copy credential docs" />
+        </div>
+        <CodeBlock language="bash" code={credentialDocsText()} />
+      </section>
+    </div>
+  );
+}
+
+function credentialDocsText(): string {
+  return [
+    "aisevak credential list",
+    "aisevak credential get <name>",
+    "printf %s \"$SECRET_VALUE\" | aisevak credential add <name> --value-stdin",
+    "",
+    "Example:",
+    "aisevak credential get stripe_api_key",
+    "printf %s \"$STRIPE_API_KEY\" | aisevak credential add stripe_api_key --value-stdin --description \"Stripe API key\""
+  ].join("\n");
+}
+
 function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
   const [editing, setEditing] = useState<Skill | null>(props.skills[0] ?? null);
   useEffect(() => {
@@ -1199,9 +1671,9 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
       <aside className="master-list">
         <div className="master-header flex-between">
           <h3>Skills</h3>
-          <button className="icon-button flat" onClick={() => setEditing(emptySkill())} title="New skill">
+          <Button variant="ghost" size="icon" onClick={() => setEditing(emptySkill())} title="New skill" aria-label="New skill">
             <Plus size={14} />
-          </button>
+          </Button>
         </div>
         <div className="list-scroll">
           {props.skills.map((skill) => (
@@ -1276,24 +1748,23 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       <div className="form-grid">
         <label>
           Name
-          <input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label className="toggle-field">
           Enabled
-          <input
-            type="checkbox"
+          <Switch
             checked={draft.enabled}
-            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+            onCheckedChange={(checked) => setDraft({ ...draft, enabled: checked })}
           />
         </label>
       </div>
       <label>
         Description
-        <input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Instructions
-        <textarea
+        <Textarea
           className="textarea-mono"
           style={{ minHeight: 260 }}
           value={draft.instructions}
@@ -1302,7 +1773,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </label>
       <label>
         Files JSON
-        <textarea
+        <Textarea
           className="textarea-mono"
           style={{ minHeight: 150 }}
           value={filesJson}
@@ -1311,10 +1782,10 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </label>
       {error ? <div className="notice error">{error}</div> : null}
       <div>
-        <button className="button primary" type="submit">
+        <Button type="submit">
           <CheckCircle2 size={15} />
           Save skill
-        </button>
+        </Button>
       </div>
     </form>
   );
@@ -1322,17 +1793,14 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
 
 function ProjectsView({
   projects,
-  skills,
   onSaved
 }: {
   projects: Project[];
-  skills: Skill[];
   onSaved: () => Promise<void>;
 }) {
   const [name, setName] = useState("");
   const [localPath, setLocalPath] = useState("");
   const [workspaceMode, setWorkspaceMode] = useState<"direct" | "git_worktree">("direct");
-  const [skillIds, setSkillIds] = useState<string[]>([]);
 
   return (
     <div className="flat-list-view">
@@ -1346,38 +1814,35 @@ function ProjectsView({
           event.preventDefault();
           await api("/api/projects", {
             method: "POST",
-            body: JSON.stringify({ name, localPath, workspaceMode, skillIds })
+            body: JSON.stringify({ name, localPath, workspaceMode })
           });
           setName("");
           setLocalPath("");
-          setSkillIds([]);
           await onSaved();
         }}
       >
         <div className="wide-form-row">
-          <input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
-          <input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
-          <select style={{ flex: 1 }} value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
+          <Input style={{ flex: 1 }} value={name} onChange={(event) => setName(event.target.value)} placeholder="Project name" required />
+          <Input style={{ flex: 2 }} value={localPath} onChange={(event) => setLocalPath(event.target.value)} placeholder="/absolute/path/to/repo" required />
+          <NativeSelect className="project-mode-select" value={workspaceMode} onChange={(event) => setWorkspaceMode(event.target.value as "direct" | "git_worktree")}>
             <option value="direct">Direct folder</option>
             <option value="git_worktree">Git worktree</option>
-          </select>
-          <button className="button primary" type="submit" style={{ flex: "0 0 auto" }}>
+          </NativeSelect>
+          <Button type="submit" style={{ flex: "0 0 auto" }}>
             <Plus size={15} />
             Add
-          </button>
+          </Button>
         </div>
-        <SkillPicker skills={skills} value={skillIds} onChange={setSkillIds} compact />
       </form>
       <div>
         {projects.map((project) => (
           <div className="data-row" key={project.id}>
             <div className="data-row-main">
               <div className="data-icon"><FolderGit2 size={16}/></div>
-              <div>
-                <div className="data-title">{project.name}</div>
-                <div className="data-subtitle">{project.local_path}</div>
-                <SkillChips labels={skillLabels(skills, project.skill_ids ?? [])} />
-              </div>
+                <div>
+                  <div className="data-title">{project.name}</div>
+                  <div className="data-subtitle">{project.local_path}</div>
+                </div>
             </div>
             <div className="data-subtitle" style={{ textTransform: "capitalize" }}>{project.source}</div>
           </div>
@@ -1418,15 +1883,15 @@ function ConnectorsView(props: {
               setToken("");
             }}
           >
-            <input value={name} onChange={(event) => setName(event.target.value)} />
-            <input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
+            <Input value={name} onChange={(event) => setName(event.target.value)} />
+            <Input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
             <div style={{ display: "flex", gap: 8 }}>
-              <button className="button primary" type="submit">
+              <Button type="submit">
                 <Github size={14} /> Connect
-              </button>
-              <button className="button secondary" type="button" onClick={props.onRefresh}>
+              </Button>
+              <Button variant="secondary" type="button" onClick={props.onRefresh}>
                 <RefreshCw size={14} /> Refresh
-              </button>
+              </Button>
             </div>
           </form>
         </div>
@@ -1446,9 +1911,9 @@ function ConnectorsView(props: {
                     <div className="data-subtitle">{repo.connection_name} / {repo.default_branch}</div>
                   </div>
                 </div>
-                <button className="button secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
+                <Button variant="secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
                   {repo.imported_project_id ? "Imported" : "Import"}
-                </button>
+                </Button>
               </div>
             ))}
             {props.repos.length === 0 ? <div className="empty-list">No repositories</div> : null}
@@ -1491,92 +1956,25 @@ function CodexSessionTimeline({
   );
 }
 
-function SessionComposer(props: {
-  disabled?: boolean;
-  modelLabel?: string | null;
-  placeholder: string;
-  onSend: (message: string) => Promise<void>;
-}) {
-  const [message, setMessage] = useState("");
-  const [sending, setSending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const trimmed = message.trim();
-  async function submitMessage() {
-    if (!trimmed || sending || props.disabled) return;
-    setError(null);
-    setSending(true);
-    try {
-      await props.onSend(trimmed);
-      setMessage("");
-    } catch (sendError) {
-      setError(sendError instanceof Error ? sendError.message : "Failed to send message.");
-    } finally {
-      setSending(false);
-    }
-  }
-  return (
-    <form
-      className="session-composer"
-      data-chat-composer-form="true"
-      onSubmit={async (event) => {
-        event.preventDefault();
-        await submitMessage();
-      }}
-    >
-      <div className="session-composer-frame">
-        <div className="session-composer-box" data-chat-composer-surface="true">
-          <div className="session-composer-editor">
-            <textarea
-              value={message}
-              disabled={sending || props.disabled}
-              onChange={(event) => setMessage(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key !== "Enter" || event.shiftKey) return;
-                event.preventDefault();
-                void submitMessage();
-              }}
-              placeholder={props.placeholder}
-              rows={3}
-            />
-          </div>
-          <div className="session-composer-footer" data-chat-composer-footer="true">
-            <div className="composer-left-actions">
-              <span className="composer-chip">
-                <Bot size={14} />
-                Build
-              </span>
-              <span className="composer-chip">
-                <LockOpen size={14} />
-                Full access
-              </span>
-              {props.modelLabel ? <span className="composer-chip">{props.modelLabel}</span> : null}
-            </div>
-            <div className="composer-right-actions" data-chat-composer-actions="right">
-              <span className="composer-shortcut">Shift Enter</span>
-              <button
-                className="composer-send-button"
-                type="submit"
-                disabled={!trimmed || sending || props.disabled}
-                aria-label={sending ? "Sending" : "Send message"}
-                title={sending ? "Sending" : "Send message"}
-              >
-                {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} />}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-      {error ? <div className="composer-error">{error}</div> : null}
-    </form>
-  );
-}
-
 function TimelineRow({ row }: { row: AgentRunTimelineRow }) {
+  if (row.kind === "comment") return <TaskCommentTimelineRow row={row} />;
   if (row.kind === "work") return <WorkGroupSection groupedEntries={row.groupedEntries} />;
   if (row.kind === "working") return <WorkingTimelineRow row={row} />;
   if (row.message.role === "user") return <UserTimelineRow row={row} />;
   if (row.message.role === "assistant") return <AssistantTimelineRow row={row} />;
   return <SystemTimelineRow row={row} />;
+}
+
+function TaskCommentTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "comment" }> }) {
+  return (
+    <div className="task-comment-row">
+      <div className="task-comment-bubble">
+        <div className="task-comment-label">Task comment</div>
+        <BasicMarkdown text={row.text} plain />
+        <TimelineMeta createdAt={row.createdAt} />
+      </div>
+    </div>
+  );
 }
 
 function UserTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
@@ -1744,8 +2142,10 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
 function CopyButton({ text, label }: { text: string; label: string }) {
   const [copied, setCopied] = useState(false);
   return (
-    <button
+    <Button
       className="copy-button"
+      variant="ghost"
+      size="icon"
       type="button"
       title={copied ? "Copied" : label}
       onClick={async () => {
@@ -1755,7 +2155,7 @@ function CopyButton({ text, label }: { text: string; label: string }) {
       }}
     >
       {copied ? <CheckCircle2 size={13} /> : <Copy size={13} />}
-    </button>
+    </Button>
   );
 }
 
@@ -1843,7 +2243,8 @@ function pushTextBlocks(
 
 function TaskStatus({ status }: { status?: string | null }) {
   const bucket = runBucket(status);
-  return <span className={`status ${bucket}`}>{statusLabel(status)}</span>;
+  const variant = bucket === "completed" ? "success" : bucket === "running" ? "warning" : bucket === "failed" ? "destructive" : "secondary";
+  return <Badge className={`status ${bucket}`} variant={variant}>{statusLabel(status)}</Badge>;
 }
 
 function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
@@ -1851,6 +2252,7 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
   const [error, setError] = useState<string | null>(null);
   return (
     <div className="auth-container">
+      <div className="auth-theme-toggle"><ThemeToggle /></div>
       <form
         className="auth-box"
         onSubmit={async (event) => {
@@ -1876,14 +2278,12 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
         <h1>Create workspace</h1>
         <p>Set up the first owner account.</p>
         <div className="stack">
-          <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Name" required />
-          <input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email" type="email" required />
-          <input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password (8+ characters)" type="password" minLength={8} required />
-          <input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key (optional)" type="password" />
+          <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Your name" required />
+          <Input value={form.email} onChange={(event) => setForm({ ...form, email: event.target.value })} placeholder="Email address" type="email" required />
+          <Input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password · 8+ characters" type="password" minLength={8} required />
+          <Input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key · optional" type="password" />
           {error ? <div className="notice error">{friendlyError(error)}</div> : null}
-          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
-            Continue
-          </button>
+          <Button type="submit" size="lg" style={{ width: "100%" }}>Create workspace</Button>
         </div>
       </form>
     </div>
@@ -1895,6 +2295,7 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
   const [password, setPassword] = useState("");
   return (
     <div className="auth-container">
+      <div className="auth-theme-toggle"><ThemeToggle /></div>
       <form
         className="auth-box"
         onSubmit={async (event: FormEvent) => {
@@ -1906,11 +2307,9 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
         <h1>Sign in</h1>
         <p>Open the task board.</p>
         <div className="stack">
-          <input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email" type="email" required />
-          <input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
-          <button className="button primary" type="submit" style={{ width: "100%", height: 38 }}>
-            Sign in
-          </button>
+          <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email address" type="email" required />
+          <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
+          <Button type="submit" size="lg" style={{ width: "100%" }}>Sign in</Button>
         </div>
       </form>
     </div>
@@ -1927,71 +2326,29 @@ function Splash() {
 
 function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: string; active: boolean; onClick: () => void }) {
   return (
-    <button className={`nav-item ${active ? "active" : ""}`} onClick={onClick}>
-      {icon}
-      <span>{label}</span>
-    </button>
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <Button variant="ghost" className={`nav-item ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={onClick}>
+          <AnimatedIcon icon={icon as ReactElement} active={active} />
+          <span>{label}</span>
+        </Button>
+      </TooltipTrigger>
+      <TooltipContent side="right">{label}</TooltipContent>
+    </Tooltip>
   );
 }
 
-function SkillPicker(props: {
-  skills: Skill[];
-  value: string[];
-  onChange: (skillIds: string[]) => void;
-  compact?: boolean;
-}) {
-  const enabledSkills = props.skills.filter((skill) => skill.enabled);
-  if (enabledSkills.length === 0) {
-    return props.compact ? null : <div className="empty-list compact">No enabled skills</div>;
-  }
-  return (
-    <div className={`skill-picker ${props.compact ? "compact" : ""}`}>
-      {enabledSkills.map((skill) => {
-        const checked = props.value.includes(skill.id);
-        return (
-          <label className="skill-option" key={skill.id} title={skill.description}>
-            <input
-              type="checkbox"
-              checked={checked}
-              onChange={(event) => {
-                props.onChange(
-                  event.target.checked
-                    ? [...props.value, skill.id]
-                    : props.value.filter((skillId) => skillId !== skill.id)
-                );
-              }}
-            />
-            <span>${skill.name}</span>
-          </label>
-        );
-      })}
-    </div>
-  );
-}
-
-function SkillChips({ labels }: { labels: string[] }) {
-  if (labels.length === 0) return null;
-  return (
-    <div className="skill-chip-row">
-      {labels.map((label) => (
-        <span className="skill-chip" key={label}>
-          ${label}
-        </span>
-      ))}
-    </div>
-  );
-}
-
-function emptyAgent(defaultModel: string): Agent {
+function emptyAgent(defaultModel: string, models: CodexModel[]): Agent {
+  const model = models.find((entry) => entry.id === defaultModel) ?? models[0];
   return {
     id: "",
     kind: "worker",
     name: "New Agent",
     description: "",
-    model: defaultModel,
+    model: model?.id ?? defaultModel,
+    model_options: model ? optionsForModel(model) : [],
     instructions: "You are a focused coding agent. Complete the task, verify it, and summarize the result.",
-    enabled: true,
-    skill_ids: []
+    enabled: true
   };
 }
 
@@ -2004,11 +2361,6 @@ function emptySkill(): Skill {
     files: {},
     enabled: true
   };
-}
-
-function skillLabels(skills: Skill[], skillIds: string[]): string[] {
-  const byId = new Map(skills.map((skill) => [skill.id, skill.name]));
-  return skillIds.map((skillId) => byId.get(skillId)).filter((name): name is string => Boolean(name));
 }
 
 function normalizeFilesDraft(value: unknown): Record<string, string> {
@@ -2085,76 +2437,94 @@ function apiKeyStatus(key: ExternalApiKey): string {
 function viewTitle(view: View): string {
   return {
     tasks: "Tasks",
-    runs: "Agent Runs",
+    runs: "Agents",
     agents: "Agents",
     skills: "Skills",
     api: "API",
+    credentials: "Credentials",
     projects: "Projects",
     connectors: "Connectors"
   }[view];
 }
 
-function runTitle(run: AgentRun): string {
-  if (run.kind === "dispatcher") {
-    return run.task_number ? `Dispatch TASK-${run.task_number}` : "Heartbeat dispatch";
+function formatSidebarRunTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const today = new Date();
+  if (date.toDateString() === today.toDateString()) {
+    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   }
-  return run.task_number ? `TASK-${run.task_number} ${run.task_title ?? ""}` : "Worker run";
+  return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-function shortId(id: string): string {
-  return id.slice(0, 8);
+function selectionForModel(
+  provider: ProviderInstance,
+  model: CodexModel,
+  previous?: ModelSelection | null
+): ModelSelection {
+  return {
+    providerInstanceId: provider.id,
+    model: model.id,
+    options: optionsForModel(model, previous?.options)
+  };
 }
 
-type AgentRunRef = Pick<AgentRun, "kind" | "id"> & { task_id?: string | null };
+function optionsForModel(
+  model: CodexModel,
+  previous: ModelOptionSelection[] = []
+): ModelOptionSelection[] {
+  return (model.options ?? []).flatMap((option): ModelOptionSelection[] => {
+      const previousValue = previous.find((entry) => entry.id === option.id)?.value;
+      const canReusePrevious = option.values.some((value) => value.id === String(previousValue));
+      const value = canReusePrevious ? previousValue : (option.defaultValue ?? option.values[0]?.id);
+      return value ? [{ id: option.id, value }] : [];
+  });
+}
 
-function collapseAgentRuns(runs: AgentRun[]): AgentRun[] {
-  const workerRunsByTask = new Map<string, AgentRun>();
-  const ungroupedRuns: AgentRun[] = [];
+function agentSummary(agent: Agent, models: CodexModel[]): string {
+  const model = models.find((entry) => entry.id === agent.model);
+  const reasoningOption = model?.options?.find((option) => option.id === "reasoningEffort");
+  const reasoning = normalizeComposerOptions(agent.model_options)
+    .find((option) => option.id === "reasoningEffort")?.value ?? reasoningOption?.defaultValue;
+  return [agent.kind, agent.model, reasoning ? String(reasoning) : null].filter(Boolean).join(" / ");
+}
 
-  for (const run of runs) {
-    if (run.kind !== "worker" || !run.task_id) {
-      ungroupedRuns.push(run);
-      continue;
+function normalizeComposerOptions(value: unknown): ModelOptionSelection[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item): ModelOptionSelection[] => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const entry = item as Record<string, unknown>;
+    if (typeof entry.id !== "string") return [];
+    if (!["string", "number", "boolean"].includes(typeof entry.value)) return [];
+    return [{ id: entry.id, value: entry.value as string | number | boolean }];
+  });
+}
+
+function readStickyModelSelection(provider: ProviderInstance): ModelSelection {
+  try {
+    const raw = window.localStorage.getItem("aisevak.agent-model-selection");
+    if (raw) {
+      const parsed = JSON.parse(raw) as ModelSelection;
+      const selectedProvider = parsed.providerInstanceId === provider.id ? provider : null;
+      if (selectedProvider?.models.some((model) => model.id === parsed.model)) {
+        return { ...parsed, options: normalizeComposerOptions(parsed.options) };
+      }
     }
-    const current = workerRunsByTask.get(run.task_id);
-    if (!current || compareRunRecency(run, current) > 0) {
-      workerRunsByTask.set(run.task_id, run);
-    }
+  } catch {
+    // Ignore corrupt local preferences and use the live provider default.
   }
-
-  return [...workerRunsByTask.values(), ...ungroupedRuns].sort((left, right) =>
-    compareRunRecency(right, left)
-  );
+  const model = provider.models.find((entry) => entry.id === provider.defaultModel) ?? provider.models[0];
+  return model
+    ? selectionForModel(provider, model)
+    : { providerInstanceId: provider.id, model: provider.defaultModel, options: [] };
 }
 
-function findUpdatedConversationRun(
-  runs: AgentRun[],
-  previousRun: AgentRun,
-  queuedRunId: string,
-  queuedRunKind: "worker" | "dispatcher"
-): AgentRun | undefined {
-  if (previousRun.kind === "worker" && previousRun.task_id) {
-    return collapseAgentRuns(runs).find((run) => isSameAgentRunConversation(run, previousRun));
+function writeStickyModelSelection(selection: ModelSelection): void {
+  try {
+    window.localStorage.setItem("aisevak.agent-model-selection", JSON.stringify(selection));
+  } catch {
+    // Local preferences are optional; server-backed thread state remains authoritative.
   }
-  return runs.find((run) => run.kind === queuedRunKind && run.id === queuedRunId);
-}
-
-function isSameAgentRunConversation(left: AgentRunRef | null | undefined, right: AgentRunRef | null | undefined): boolean {
-  if (!left || !right) return false;
-  return agentRunConversationKey(left) === agentRunConversationKey(right);
-}
-
-function agentRunConversationKey(run: AgentRunRef): string {
-  if (run.kind === "worker" && run.task_id) return `task:${run.task_id}`;
-  return `${run.kind}:${run.id}`;
-}
-
-function compareRunRecency(left: AgentRun, right: AgentRun): number {
-  return runTime(left).localeCompare(runTime(right)) || left.id.localeCompare(right.id);
-}
-
-function runTime(run: AgentRun): string {
-  return run.queued_at ?? run.started_at ?? run.finished_at ?? "";
 }
 
 function optimisticMessage(text: string): AgentRunChatMessage {
@@ -2167,34 +2537,10 @@ function optimisticMessage(text: string): AgentRunChatMessage {
   };
 }
 
-function appendPendingMessage(
-  current: Record<string, AgentRunChatMessage[]>,
-  key: string,
-  message: AgentRunChatMessage
-): Record<string, AgentRunChatMessage[]> {
-  return {
-    ...current,
-    [key]: [...(current[key] ?? []), message]
-  };
-}
-
-function removePendingMessage(
-  current: Record<string, AgentRunChatMessage[]>,
-  key: string,
-  messageId: string
-): Record<string, AgentRunChatMessage[]> {
-  const nextMessages = (current[key] ?? []).filter((message) => message.id !== messageId);
-  if (nextMessages.length === (current[key] ?? []).length) return current;
-  const next = { ...current };
-  if (nextMessages.length === 0) {
-    delete next[key];
-  } else {
-    next[key] = nextMessages;
-  }
-  return next;
-}
-
 function friendlyError(message: string): string {
+  if (/spawn\s+codex\s+ENOENT/i.test(message)) {
+    return "The Codex executable was not found. Restart Aisevak after updating its Codex binary setting.";
+  }
   try {
     const payload = JSON.parse(message) as { message?: unknown; error?: unknown };
     if (typeof payload.message === "string") return payload.message;

@@ -22,6 +22,7 @@ export interface AppServerTurnOptions {
   cwd: string;
   codexHome: string;
   model: string;
+  modelOptions?: Array<{ id: string; value: string | number | boolean }>;
   prompt: string;
   threadId?: string | null;
   env: NodeJS.ProcessEnv;
@@ -248,6 +249,9 @@ export async function runCodexAppServerTurn(options: AppServerTurnOptions): Prom
       input: [{ type: "text", text: options.prompt, text_elements: [] }],
       cwd: options.cwd,
       model: explicitModel(options.model),
+      ...(stringModelOption(options.modelOptions, "reasoningEffort")
+        ? { effort: stringModelOption(options.modelOptions, "reasoningEffort") }
+        : {}),
       approvalPolicy: "never",
       sandboxPolicy: { type: "dangerFullAccess" }
     });
@@ -343,6 +347,14 @@ function explicitModel(model: string | null | undefined): string | null {
   return model && !["default", "auto", "codex-default"].includes(model.trim().toLowerCase())
     ? model
     : null;
+}
+
+function stringModelOption(
+  options: AppServerTurnOptions["modelOptions"],
+  id: string
+): string | undefined {
+  const value = options?.find((option) => option.id === id)?.value;
+  return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
 function redactText(text: string, secrets: Array<string | null | undefined>): string {

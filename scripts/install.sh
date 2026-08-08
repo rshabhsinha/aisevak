@@ -157,6 +157,7 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   cp "${RELEASE_DIR}/.env.example" "${ENV_FILE}"
   sed -i "s#replace-with-32-byte-base64-key#${SECRET_KEY}#g" "${ENV_FILE}"
   sed -i "s#replace-with-at-least-32-random-bytes#${COOKIE_SECRET}#g" "${ENV_FILE}"
+  sed -i "s#^MANAGED_ROOT=.*#MANAGED_ROOT=${WORKSPACE_DIR}#g" "${ENV_FILE}"
   chmod 0600 "${ENV_FILE}"
 fi
 

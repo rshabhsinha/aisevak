@@ -10,7 +10,7 @@
   "packageManager": "pnpm@9.15.0",
   "scripts": {
     "build": "pnpm -r build",
-    "dev": "pnpm --parallel --filter @aisevak/api --filter @aisevak/web dev",
+    "dev": "pnpm --parallel --filter @aisevak/api --filter @aisevak/runner --filter @aisevak/web dev",
     "dev:api": "pnpm --filter @aisevak/api dev",
     "dev:runner": "pnpm --filter @aisevak/runner dev",
     "dev:web": "pnpm --filter @aisevak/web dev",

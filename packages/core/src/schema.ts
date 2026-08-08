@@ -15,6 +15,7 @@ export const userRoleEnum = pgEnum("user_role", ["owner", "admin", "member"]);
 export const projectSourceEnum = pgEnum("project_source", ["local_path", "github"]);
 export const workspaceModeEnum = pgEnum("workspace_mode", ["direct", "git_worktree"]);
 export const runStatusEnum = pgEnum("run_status", [
+  "draft",
   "queued",
   "running",
   "cancel_requested",
@@ -93,7 +94,11 @@ export const secrets = pgTable(
   {
     id,
     name: text("name").notNull(),
+    description: text("description").notNull().default(""),
     encryptedValue: text("encrypted_value").notNull(),
+    agentAccessible: boolean("agent_accessible").notNull().default(false),
+    createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+    lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     createdAt,
     updatedAt
   },
@@ -123,7 +128,8 @@ export const agents = pgTable("agents", {
   kind: text("kind").notNull().default("worker"),
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
-  model: text("model").notNull().default("gpt-5.5"),
+  model: text("model").notNull().default("gpt-5.6-sol"),
+  modelOptions: jsonb("model_options").notNull().default([]),
   instructions: text("instructions").notNull(),
   enabled: boolean("enabled").notNull().default(true),
   createdAt,
@@ -178,6 +184,7 @@ export const agentVersions = pgTable("agent_versions", {
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
   model: text("model").notNull(),
+  modelOptions: jsonb("model_options").notNull().default([]),
   instructions: text("instructions").notNull(),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   createdAt
@@ -189,7 +196,7 @@ export const tasks = pgTable("tasks", {
   title: text("title").notNull(),
   body: text("body").notNull().default(""),
   status: text("status").notNull().default("open"),
-  projectId: uuid("project_id").notNull().references(() => projects.id, { onDelete: "restrict" }),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   openPrOnSuccess: boolean("open_pr_on_success").notNull().default(false),
@@ -216,6 +223,42 @@ export const taskComments = pgTable("task_comments", {
   body: text("body").notNull(),
   createdAt
 });
+
+export const providerInstances = pgTable("provider_instances", {
+  id: text("id").primaryKey(),
+  driver: text("driver").notNull(),
+  displayName: text("display_name").notNull(),
+  enabled: boolean("enabled").notNull().default(true),
+  config: jsonb("config").notNull().default({}),
+  createdAt,
+  updatedAt
+});
+
+export const agentThreads = pgTable(
+  "agent_threads",
+  {
+    id,
+    title: text("title").notNull().default("New thread"),
+    agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+    taskId: uuid("task_id").references(() => tasks.id, { onDelete: "cascade" }),
+    projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+    providerInstanceId: text("provider_instance_id").notNull().references(() => providerInstances.id, {
+      onDelete: "restrict"
+    }),
+    model: text("model").notNull(),
+    modelOptions: jsonb("model_options").notNull().default([]),
+    cwd: text("cwd").notNull(),
+    branch: text("branch"),
+    runtimeHome: text("runtime_home").notNull(),
+    providerThreadId: text("provider_thread_id"),
+    lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    taskUnique: uniqueIndex("agent_threads_task_unique").on(table.taskId)
+  })
+);
 
 export const taskSessions = pgTable(
   "task_sessions",
@@ -245,12 +288,14 @@ export const taskRuns = pgTable("task_runs", {
   runKind: text("run_kind").notNull().default("worker"),
   trigger: text("trigger").notNull().default("manual"),
   parentRunId: uuid("parent_run_id"),
+  agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   branch: text("branch"),
   worktreePath: text("worktree_path"),
   codexThreadId: text("codex_thread_id"),
   model: text("model").notNull(),
+  modelOptions: jsonb("model_options").notNull().default([]),
   prompt: text("prompt").notNull(),
   skillsSnapshot: jsonb("skills_snapshot").notNull().default([]),
   rawStdout: text("raw_stdout").notNull().default(""),
@@ -269,11 +314,13 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
   taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
   trigger: text("trigger").notNull().default("heartbeat"),
   scope: text("scope").notNull().default("heartbeat"),
+  agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   codexHome: text("codex_home").notNull(),
   codexThreadId: text("codex_thread_id"),
   model: text("model").notNull(),
+  modelOptions: jsonb("model_options").notNull().default([]),
   prompt: text("prompt").notNull(),
   skillsSnapshot: jsonb("skills_snapshot").notNull().default([]),
   rawStdout: text("raw_stdout").notNull().default(""),
