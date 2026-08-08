@@ -28,6 +28,7 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { runCodexAppServerTurn } from "./appServerClient.js";
+import { skillMarkdown } from "./skillMarkdown.js";
 
 const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
@@ -603,18 +604,6 @@ function safeSkillDirectoryName(name: string): string {
     throw new Error(`Invalid skill name: ${name}`);
   }
   return name;
-}
-
-function skillMarkdown(skill: CodexSkillSnapshot): string {
-  return [
-    "---",
-    `name: ${skill.name}`,
-    `description: ${skill.description.replace(/\s+/g, " ").trim()}`,
-    "---",
-    "",
-    skill.instructions.trim(),
-    ""
-  ].join("\n");
 }
 
 function safeSkillFilePath(skillDir: string, relativePath: string): string {
