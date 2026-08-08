@@ -60,6 +60,7 @@ import {
   type AgentRunTimelineRow,
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
+import { mergeRefreshedAgentThreads } from "./agentThreads";
 
 type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api" | "credentials";
 
@@ -427,7 +428,7 @@ export function App() {
       `/api/agent-threads${suffix}`
     );
     setAgentThreads((current) => {
-      if (!cursor) return data.threads;
+      if (!cursor) return mergeRefreshedAgentThreads(current, data.threads);
       const seen = new Set(current.map((thread) => thread.id));
       return [...current, ...data.threads.filter((thread) => !seen.has(thread.id))];
     });
