@@ -36,7 +36,7 @@ The installer creates app directories under `/opt/aisevak` and managed workspace
 
 ## Host updates
 
-Keep a checkout of this repository on the EC2 host, then update from the deploy branch:
+Keep a checkout of this repository on the deployment host, then update from the deploy branch:
 
 ```bash
 ./scripts/update.sh main
@@ -45,6 +45,8 @@ Keep a checkout of this repository on the EC2 host, then update from the deploy 
 The update script fast-forwards the checkout and runs the installer with sudo. Each install is staged under `/opt/aisevak/releases`, built before activation, then switched into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak` workspaces, and the Compose Postgres volume are preserved.
 
 When an active Postgres container exists, the installer writes a compressed backup to `/opt/aisevak/backups` before restarting services. Set `AISEVAK_REQUIRE_BACKUP=1` to abort updates if a backup cannot be created, or `AISEVAK_SKIP_BACKUP=1` to skip backups intentionally.
+
+The sanitized Azure deployment runbook, which keeps host-specific values outside the repository, is documented in [docs/AZURE_DEPLOYMENT.md](docs/AZURE_DEPLOYMENT.md).
 
 ## Security model
 
