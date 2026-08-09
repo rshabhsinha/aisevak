@@ -13,6 +13,7 @@ import { randomUUID } from "node:crypto";
 const DEFAULT_CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const DEFAULT_CODEX_AUTH_BASE_URL = "https://auth.openai.com";
 const LOGIN_TTL_MS = 15 * 60 * 1000;
+const AUTH_REQUEST_TIMEOUT_MS = 15_000;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -51,6 +52,7 @@ export class CodexAuthManager {
   private readonly clientId: string;
   private readonly authBaseUrl: string;
   private readonly fetchImpl: typeof fetch;
+  private readonly requestTimeoutMs: number;
 
   constructor(
     private readonly pool: DbPool,
@@ -59,11 +61,13 @@ export class CodexAuthManager {
       clientId?: string;
       authBaseUrl?: string;
       fetchImpl?: typeof fetch;
+      requestTimeoutMs?: number;
     } = {}
   ) {
     this.clientId = options.clientId ?? process.env.CODEX_OAUTH_CLIENT_ID ?? DEFAULT_CODEX_CLIENT_ID;
     this.authBaseUrl = options.authBaseUrl ?? DEFAULT_CODEX_AUTH_BASE_URL;
     this.fetchImpl = options.fetchImpl ?? fetch;
+    this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? AUTH_REQUEST_TIMEOUT_MS);
   }
 
   async getStatus(): Promise<CodexAuthStatus> {
@@ -243,14 +247,29 @@ export class CodexAuthManager {
     url: string,
     init: RequestInit
   ): Promise<{ response: Response; body: JsonRecord | null }> {
-    const response = await this.fetchImpl(url, init);
-    const text = await response.text();
-    if (!text) return { response, body: null };
+    const controller = new AbortController();
+    const upstreamSignal = init.signal;
+    const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+    if (upstreamSignal?.aborted) abortFromUpstream();
+    else upstreamSignal?.addEventListener("abort", abortFromUpstream, { once: true });
+    const timeout = setTimeout(() => {
+      const error = new Error(`ChatGPT authentication request timed out after ${this.requestTimeoutMs}ms`);
+      error.name = "TimeoutError";
+      controller.abort(error);
+    }, this.requestTimeoutMs);
     try {
-      const parsed: unknown = JSON.parse(text);
-      return { response, body: isRecord(parsed) ? parsed : null };
-    } catch {
-      return { response, body: null };
+      const response = await this.fetchImpl(url, { ...init, signal: controller.signal });
+      const text = await response.text();
+      if (!text) return { response, body: null };
+      try {
+        const parsed: unknown = JSON.parse(text);
+        return { response, body: isRecord(parsed) ? parsed : null };
+      } catch {
+        return { response, body: null };
+      }
+    } finally {
+      clearTimeout(timeout);
+      upstreamSignal?.removeEventListener("abort", abortFromUpstream);
     }
   }
 
