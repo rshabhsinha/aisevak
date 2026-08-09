@@ -1000,9 +1000,9 @@ async function persistDispatcherCodexLine(
   );
 }
 
-async function finishMessageDelivery(
+export async function finishMessageDelivery(
   pool: DbPool,
-  job: DispatcherJob,
+  job: Pick<DispatcherJob, "id" | "message_delivery_id">,
   status: "succeeded" | "failed" | "cancelled",
   error: string
 ): Promise<void> {
@@ -1023,22 +1023,24 @@ async function finishMessageDelivery(
   );
   const attempts = delivery.rows[0]?.attempt_count ?? 3;
   if (status === "failed" && attempts < 3) {
-    await pool.query(
-      `UPDATE message_deliveries
-       SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
-           error = NULLIF($3, ''), updated_at = now()
-       WHERE id = $1`,
-      [job.message_delivery_id, attempts, error]
-    );
-    await pool.query(
-      `INSERT INTO dispatcher_runs
-         (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
-          codex_thread_id, model, model_options, prompt, skills_snapshot)
-       SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
-              codex_thread_id, model, model_options, prompt, skills_snapshot
-       FROM dispatcher_runs WHERE id = $1`,
-      [job.id]
-    );
+    await withTransaction(pool, async (client) => {
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
+             error = NULLIF($3, ''), updated_at = now()
+         WHERE id = $1`,
+        [job.message_delivery_id, attempts, error]
+      );
+      await client.query(
+        `INSERT INTO dispatcher_runs
+           (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+            codex_thread_id, model, model_options, prompt, skills_snapshot)
+         SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
+                codex_thread_id, model, model_options, prompt, skills_snapshot
+         FROM dispatcher_runs WHERE id = $1`,
+        [job.id]
+      );
+    });
     return;
   }
   await pool.query(
