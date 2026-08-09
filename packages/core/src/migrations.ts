@@ -430,6 +430,25 @@ ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS status text NOT NULL DEF
 ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS account_login text;
 ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS error text;
 ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_connections legacy
+SET status = 'replaced', updated_at = now()
+FROM canonical_github_connection canonical
+WHERE legacy.auth_mode = 'pat'
+  AND legacy.status <> 'replaced'
+  AND legacy.id <> canonical.id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS github_connections_single_pat_identity
+ON github_connections ((auth_mode))
+WHERE auth_mode = 'pat' AND status <> 'replaced';
+
 ALTER TABLE tasks ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
 ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
