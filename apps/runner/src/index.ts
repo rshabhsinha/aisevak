@@ -734,7 +734,37 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
-    await pool.query(
+    await finalizeWorkerRunState(pool, {
+      runId: job.id,
+      taskId: job.task_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id,
+      finalStatus,
+      stdout,
+      stderr,
+      exitCode
+    });
+    await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
+  }
+}
+
+export async function finalizeWorkerRunState(
+  pool: DbPool,
+  input: {
+    runId: string;
+    taskId: string;
+    agentThreadId: string | null;
+    coordinationThreadId: string | null;
+    finalStatus: "succeeded" | "failed" | "cancelled";
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+  }
+): Promise<void> {
+  const taskStatus = input.finalStatus === "succeeded" ? "completed" : "needs_attention";
+  const threadStatus = input.finalStatus === "succeeded" ? "completed" : "blocked";
+  await withTransaction(pool, async (client) => {
+    await client.query(
       `UPDATE task_runs
        SET status = $2::run_status,
            raw_stdout = $3,
@@ -744,25 +774,29 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
        WHERE id = $1`,
-      [job.id, finalStatus, stdout, stderr, exitCode]
+      [input.runId, input.finalStatus, input.stdout, input.stderr, input.exitCode]
     );
-    await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
-    if (job.agent_thread_id) {
-      await pool.query(
-        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
-        [job.agent_thread_id]
+    await client.query(
+      "UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1",
+      [input.taskId, taskStatus]
+    );
+    if (input.coordinationThreadId) {
+      await client.query(
+        `UPDATE coordination_threads
+         SET status = $2,
+             last_activity_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [input.coordinationThreadId, threadStatus]
       );
     }
-    if (finalStatus === "succeeded") {
-      await pool.query("UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1", [
-        job.task_id
-      ]);
-    } else if (finalStatus === "failed" || finalStatus === "cancelled") {
-      await pool.query("UPDATE tasks SET status = 'needs_attention', updated_at = now() WHERE id = $1", [
-        job.task_id
-      ]);
+    if (input.agentThreadId) {
+      await client.query(
+        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [input.agentThreadId]
+      );
     }
-  }
+  });
 }
 
 interface MaterializedCodexAuth {
