@@ -2967,6 +2967,11 @@ async function resolveSelectedSkills(
      JOIN (
        SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
        UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+       UNION ALL
+         SELECT skills.id, 'instruction'
+         FROM skills
+         JOIN agents ON agents.id = $1
+         WHERE position('@skill(' || skills.name || ')' in agents.instructions) > 0
        UNION ALL SELECT skill_id, 'project' FROM project_skills WHERE project_id = $2
        UNION ALL SELECT skill_id, 'task' FROM task_skills WHERE task_id = $3
      ) selected ON selected.skill_id = skills.id

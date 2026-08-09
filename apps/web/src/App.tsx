@@ -3,6 +3,7 @@ import {
   ArrowUp,
   BookOpen,
   Bot,
+  Calendar,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -20,6 +21,8 @@ import {
   Loader2,
   LockKeyhole,
   LogOut,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
   Search,
@@ -32,6 +35,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
 import { OpenAILogo } from "./components/openai-logo";
+import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
@@ -70,6 +74,7 @@ type View =
   | "connectors"
   | "runs"
   | "skills"
+  | "schedules"
   | "api"
   | "credentials"
   | "codex";
@@ -196,6 +201,26 @@ interface Task {
   created_at?: string;
 }
 
+interface Schedule {
+  id: string;
+  title: string;
+  prompt: string;
+  agent_id: string;
+  agent_name: string;
+  agent_kind: "worker" | "dispatcher";
+  schedule_kind: "once" | "interval";
+  next_run_at: string;
+  interval_seconds: number | null;
+  enabled: boolean;
+  last_run_at: string | null;
+  last_agent_thread_id: string | null;
+  last_thread_title: string | null;
+  last_run_status: string | null;
+  run_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
 interface GithubRepository {
   id: string;
   full_name: string;
@@ -283,6 +308,7 @@ export function App() {
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
@@ -338,6 +364,17 @@ export function App() {
         .includes(needle)
     );
   }, [agentThreads, query]);
+
+  const filteredSchedules = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return schedules;
+    return schedules.filter((schedule) =>
+      [schedule.title, schedule.prompt, schedule.agent_name, schedule.schedule_kind]
+        .join(" ")
+        .toLowerCase()
+        .includes(needle)
+    );
+  }, [query, schedules]);
 
   useEffect(() => {
     void boot();
@@ -404,6 +441,7 @@ export function App() {
       reloadApiKeys(),
       reloadCredentials(),
       reloadTasks(),
+      reloadSchedules(),
       reloadProviderInstances(),
       reloadAgentThreads(),
       reloadRepos(false)
@@ -452,6 +490,11 @@ export function App() {
   async function reloadTasks() {
     const data = await api<{ tasks: Task[] }>("/api/tasks");
     setTasks(data.tasks);
+  }
+
+  async function reloadSchedules() {
+    const data = await api<{ schedules: Schedule[] }>("/api/schedules");
+    setSchedules(data.schedules);
   }
 
   async function reloadAgentThreads(cursor?: string): Promise<AgentThread[]> {
@@ -603,6 +646,7 @@ export function App() {
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
           <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
+          <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => setView("schedules")} />
           <span className="nav-label nav-label-spaced">Manage</span>
           {user.role !== "member" ? (
             <NavButton icon={<OpenAILogo />} label="ChatGPT" active={view === "codex"} onClick={() => setView("codex")} />
@@ -713,7 +757,40 @@ export function App() {
           ) : null}
 
           {view === "agents" ? (
-            <AgentsView agents={agents} models={models} defaultModel={defaultModel} onSaved={reloadAgents} />
+            <AgentsView
+              agents={agents}
+              skills={skills}
+              tasks={tasks}
+              models={models}
+              defaultModel={defaultModel}
+              onSaved={reloadAgents}
+            />
+          ) : null}
+
+          {view === "schedules" ? (
+            <SchedulesView
+              schedules={filteredSchedules}
+              agents={agents}
+              skills={skills}
+              tasks={tasks}
+              onSaved={reloadSchedules}
+              onOpenThread={async (threadId) => {
+                const data = await api<{ thread: AgentThread; run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
+                  `/api/agent-threads/${threadId}`
+                );
+                setAgentThreads((current) => [
+                  data.thread,
+                  ...current.filter((thread) => thread.id !== data.thread.id)
+                ]);
+                setSelectedThreadId(data.thread.id);
+                setSelectedThreadRun(data.run ?? null);
+                setAgentThreadEvents(data.events);
+                setPendingThreadMessages([]);
+                setDraftThread(false);
+                setQuery("");
+                setView("runs");
+              }}
+            />
           ) : null}
 
           {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
@@ -848,6 +925,251 @@ function TaskForm(props: {
         </Button>
       </div>
     </form>
+  );
+}
+
+function SchedulesView(props: {
+  schedules: Schedule[];
+  agents: Agent[];
+  skills: Skill[];
+  tasks: Task[];
+  onSaved: () => Promise<void>;
+  onOpenThread: (threadId: string) => Promise<void>;
+}) {
+  const enabledAgents = props.agents.filter((agent) => agent.enabled);
+  const [title, setTitle] = useState("");
+  const [prompt, setPrompt] = useState("");
+  const [agentId, setAgentId] = useState(enabledAgents[0]?.id ?? "");
+  const [scheduleKind, setScheduleKind] = useState<"once" | "interval">("once");
+  const [nextRunAt, setNextRunAt] = useState(() => defaultScheduleDateTime());
+  const [intervalValue, setIntervalValue] = useState(1);
+  const [intervalUnit, setIntervalUnit] = useState<"minutes" | "hours" | "days">("hours");
+  const [busy, setBusy] = useState(false);
+  const [deleteArmed, setDeleteArmed] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabledAgents.some((agent) => agent.id === agentId)) {
+      setAgentId(enabledAgents[0]?.id ?? "");
+    }
+  }, [props.agents, agentId]);
+
+  async function updateSchedule(id: string, payload: Record<string, unknown>) {
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/schedules/${id}`, { method: "PATCH", body: JSON.stringify(payload) });
+      await props.onSaved();
+    } catch (updateError) {
+      setError(friendlyError(updateError instanceof Error ? updateError.message : "Could not update schedule."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="schedule-layout">
+      <section className="schedule-create-card">
+        <div className="section-heading">
+          <div>
+            <h2>Schedule an agent</h2>
+            <p>A fresh agent task is created for every run, with its result preserved in Threads.</p>
+          </div>
+          <span className="schedule-heading-icon"><Calendar size={20} /></span>
+        </div>
+        <form
+          className="schedule-form stack"
+          onSubmit={async (event) => {
+            event.preventDefault();
+            if (!agentId) return;
+            setBusy(true);
+            setError(null);
+            const unitSeconds = intervalUnit === "minutes" ? 60 : intervalUnit === "hours" ? 3600 : 86_400;
+            try {
+              await api("/api/schedules", {
+                method: "POST",
+                body: JSON.stringify({
+                  title,
+                  prompt,
+                  agentId,
+                  scheduleKind,
+                  nextRunAt: new Date(nextRunAt).toISOString(),
+                  intervalSeconds: scheduleKind === "interval" ? intervalValue * unitSeconds : null
+                })
+              });
+              setTitle("");
+              setPrompt("");
+              setNextRunAt(defaultScheduleDateTime());
+              await props.onSaved();
+            } catch (createError) {
+              setError(friendlyError(createError instanceof Error ? createError.message : "Could not create schedule."));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <div className="schedule-form-grid">
+            <label>
+              Title
+              <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Daily workspace brief" required />
+            </label>
+            <label>
+              Agent
+              <NativeSelect value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
+                {enabledAgents.map((agent) => (
+                  <option value={agent.id} key={agent.id}>{agent.name}</option>
+                ))}
+              </NativeSelect>
+            </label>
+            <label>
+              Frequency
+              <NativeSelect value={scheduleKind} onChange={(event) => setScheduleKind(event.target.value as "once" | "interval")}>
+                <option value="once">One time</option>
+                <option value="interval">Repeating interval</option>
+              </NativeSelect>
+            </label>
+            <label>
+              {scheduleKind === "once" ? "Run at" : "First run"}
+              <Input
+                type="datetime-local"
+                value={nextRunAt}
+                min={defaultScheduleDateTime(1)}
+                onChange={(event) => setNextRunAt(event.target.value)}
+                required
+              />
+            </label>
+          </div>
+          {scheduleKind === "interval" ? (
+            <label className="schedule-interval-field">
+              Repeat every
+              <span className="schedule-interval-inputs">
+                <Input
+                  type="number"
+                  min={1}
+                  max={10_000}
+                  value={intervalValue}
+                  onChange={(event) => setIntervalValue(Math.max(1, Number(event.target.value)))}
+                  required
+                />
+                <NativeSelect value={intervalUnit} onChange={(event) => setIntervalUnit(event.target.value as typeof intervalUnit)}>
+                  <option value="minutes">Minutes</option>
+                  <option value="hours">Hours</option>
+                  <option value="days">Days</option>
+                </NativeSelect>
+              </span>
+            </label>
+          ) : null}
+          <div className="field-group">
+            <span>Prompt</span>
+            <PromptComposer
+              value={prompt}
+              onChange={setPrompt}
+              agents={props.agents}
+              skills={props.skills}
+              tasks={props.tasks}
+              minHeight={220}
+              ariaLabel="Scheduled prompt"
+              placeholder="What should the agent do? Type / to attach a skill or reference an agent or task."
+              disabled={busy}
+            />
+          </div>
+          {error ? <div className="notice error">{error}</div> : null}
+          <div className="schedule-form-actions">
+            <span>Times use your local timezone.</span>
+            <Button type="submit" disabled={busy || !agentId || !title.trim() || !prompt.trim()}>
+              <Calendar size={15} />
+              Create schedule
+            </Button>
+          </div>
+        </form>
+      </section>
+
+      <section className="schedule-list-section">
+        <div className="schedule-list-heading">
+          <div>
+            <h3>Schedules</h3>
+            <p>{props.schedules.length} configured</p>
+          </div>
+        </div>
+        <div className="schedule-list">
+          {props.schedules.length === 0 ? (
+            <div className="empty-state schedule-empty">No schedules yet</div>
+          ) : props.schedules.map((schedule) => {
+            const completedOnce = schedule.schedule_kind === "once" && Boolean(schedule.last_run_at);
+            return (
+              <article className="schedule-card" key={schedule.id}>
+                <div className="schedule-card-top">
+                  <span className="schedule-agent-avatar">{schedule.agent_name.slice(0, 1).toUpperCase()}</span>
+                  <div className="schedule-card-title">
+                    <strong>{schedule.title}</strong>
+                    <span>{schedule.agent_name} · {formatScheduleCadence(schedule)}</span>
+                  </div>
+                  <Badge variant={schedule.enabled ? "success" : completedOnce ? "secondary" : "warning"}>
+                    {schedule.enabled ? "Scheduled" : completedOnce ? "Completed" : "Paused"}
+                  </Badge>
+                </div>
+                <p className="schedule-prompt-preview">{schedule.prompt}</p>
+                <div className="schedule-card-meta">
+                  <span>{schedule.enabled ? "Next" : "Last"}: {formatDateTime(schedule.enabled ? schedule.next_run_at : schedule.last_run_at ?? schedule.next_run_at)}</span>
+                  <span>{schedule.run_count} run{schedule.run_count === 1 ? "" : "s"}</span>
+                  {schedule.last_run_status ? <TaskStatus status={schedule.last_run_status} /> : null}
+                </div>
+                <div className="schedule-card-actions">
+                  {schedule.last_agent_thread_id ? (
+                    <Button type="button" variant="secondary" size="sm" onClick={() => void props.onOpenThread(schedule.last_agent_thread_id!)}>
+                      <Activity size={14} />
+                      Open latest task
+                    </Button>
+                  ) : null}
+                  {!completedOnce ? (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => void updateSchedule(schedule.id, { enabled: !schedule.enabled })}
+                    >
+                      {schedule.enabled ? <Pause size={13} /> : <Play size={13} />}
+                      {schedule.enabled ? "Pause" : "Resume"}
+                    </Button>
+                  ) : null}
+                  {deleteArmed === schedule.id ? (
+                    <>
+                      <Button type="button" variant="ghost" size="sm" onClick={() => setDeleteArmed(null)}>Cancel</Button>
+                      <Button
+                        type="button"
+                        variant="destructive"
+                        size="sm"
+                        disabled={busy}
+                        onClick={async () => {
+                          setBusy(true);
+                          setError(null);
+                          try {
+                            await api(`/api/schedules/${schedule.id}`, { method: "DELETE" });
+                            setDeleteArmed(null);
+                            await props.onSaved();
+                          } catch (deleteError) {
+                            setError(friendlyError(deleteError instanceof Error ? deleteError.message : "Could not delete schedule."));
+                          } finally {
+                            setBusy(false);
+                          }
+                        }}
+                      >
+                        Confirm delete
+                      </Button>
+                    </>
+                  ) : (
+                    <Button type="button" variant="ghost" size="icon" aria-label={`Delete ${schedule.title}`} onClick={() => setDeleteArmed(schedule.id)}>
+                      <Trash2 size={14} />
+                    </Button>
+                  )}
+                </div>
+              </article>
+            );
+          })}
+        </div>
+      </section>
+    </div>
   );
 }
 
@@ -1221,6 +1543,8 @@ function AgentChatComposer(props: {
 
 function AgentsView(props: {
   agents: Agent[];
+  skills: Skill[];
+  tasks: Task[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: () => Promise<void>;
@@ -1267,6 +1591,9 @@ function AgentsView(props: {
           <div className="form-view">
             <AgentEditor
               agent={editing}
+              agents={props.agents}
+              skills={props.skills}
+              tasks={props.tasks}
               models={props.models}
               defaultModel={props.defaultModel}
               onSaved={async (agent) => {
@@ -1289,6 +1616,9 @@ function AgentsView(props: {
 
 function AgentEditor(props: {
   agent: Agent;
+  agents: Agent[];
+  skills: Skill[];
+  tasks: Task[];
   models: CodexModel[];
   defaultModel: string;
   onSaved: (agent: Agent) => Promise<void>;
@@ -1397,10 +1727,15 @@ function AgentEditor(props: {
       </label>
       <label>
         Prompt
-        <Textarea
-          style={{ minHeight: 300, fontFamily: "monospace", fontSize: 13 }}
+        <PromptComposer
           value={draft.instructions}
-          onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
+          onChange={(instructions) => setDraft({ ...draft, instructions })}
+          agents={props.agents}
+          skills={props.skills}
+          tasks={props.tasks}
+          minHeight={300}
+          ariaLabel="Agent prompt"
+          placeholder="Describe how this agent should work. Type / to reference skills, agents, or tasks."
         />
       </label>
       <div className="model-list">
@@ -2735,6 +3070,27 @@ function localDateTimeInput(date: Date): string {
   return new Date(date.getTime() - offsetMs).toISOString().slice(0, 16);
 }
 
+function defaultScheduleDateTime(minutesFromNow = 5): string {
+  const date = new Date(Date.now() + minutesFromNow * 60_000);
+  date.setSeconds(0, 0);
+  return localDateTimeInput(date);
+}
+
+function formatScheduleCadence(schedule: Schedule): string {
+  if (schedule.schedule_kind === "once" || !schedule.interval_seconds) return "One time";
+  const seconds = schedule.interval_seconds;
+  if (seconds % 86_400 === 0) {
+    const days = seconds / 86_400;
+    return `Every ${days} day${days === 1 ? "" : "s"}`;
+  }
+  if (seconds % 3600 === 0) {
+    const hours = seconds / 3600;
+    return `Every ${hours} hour${hours === 1 ? "" : "s"}`;
+  }
+  const minutes = seconds / 60;
+  return `Every ${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
 function apiKeyStatus(key: ExternalApiKey): string {
   if (key.revoked_at) return "revoked";
   if (new Date(key.expires_at).getTime() <= Date.now()) return "expired";
@@ -2747,6 +3103,7 @@ function viewTitle(view: View): string {
     runs: "Threads",
     agents: "Agents",
     skills: "Skills",
+    schedules: "Schedule",
     codex: "ChatGPT",
     api: "API",
     credentials: "Credentials",
