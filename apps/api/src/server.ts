@@ -1595,7 +1595,6 @@ async function createAgentChatThread(
     model_options: dispatcher.model_options
   });
   const runtimeHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(runtimeHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const title = input.title ?? threadTitleFromMessage(input.message);
 
@@ -1965,7 +1964,6 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
   );
   const latest = latestResult.rows[0];
   const runtimeHome = latest?.runtime_home ?? managedCodexHome(env.managedRoot, task.id);
-  await mkdir(runtimeHome, { recursive: true });
   const created = await pool.query<{ id: string }>(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
@@ -2124,7 +2122,6 @@ async function queueWorkerRun(
 
   const branch = projectSource === "github" ? taskBranchName(task.number, task.title) : null;
   const codexHome = managedCodexHome(env.managedRoot, task.id);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveTaskSkills(pool, task);
   const skillRefs = skillsSnapshot.map((skill) => ({
     name: skill.name,
@@ -2193,7 +2190,6 @@ async function queueWorkerRun(
 async function createDispatcherThread(pool: DbPool): Promise<Record<string, unknown>> {
   const dispatcher = await getDispatcherAgent(pool);
   const codexHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
@@ -2300,7 +2296,6 @@ async function queueDispatcherMessage(
     normalizeRunPath(previous?.codex_home) ??
     normalizeRunPath(thread?.runtime_home) ??
     managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = previous
     ? normalizeCodexSkillSnapshots(previous.skills_snapshot)
     : dispatcher
@@ -2348,7 +2343,6 @@ async function queueDispatcherRun(
   const targetTaskNumber = typeof targetTask?.number === "number" ? targetTask.number : null;
   const thread = options.taskId ? await ensureTaskNavigationThread(pool, options.taskId) : null;
   const codexHome = thread?.runtime_home ?? managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
     dispatcherInstructions: dispatcher.instructions,

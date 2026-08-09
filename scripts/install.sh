@@ -59,6 +59,9 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/workspaces/github" \
   "${WORKSPACE_DIR}/codex-homes" \
   "${WORKSPACE_DIR}/worktrees"
+# Older API releases created Codex homes as root from inside the container.
+# The host-native runner is the only process that writes their runtime files.
+chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/codex-homes"
 
 require_command docker "Docker is not installed. Install Docker Engine first: https://docs.docker.com/engine/install/ubuntu/"
 require_command rsync "rsync is required to stage releases."
