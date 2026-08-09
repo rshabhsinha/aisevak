@@ -109,6 +109,8 @@ interface Skill {
   instructions: string;
   files: Record<string, string>;
   enabled: boolean;
+  bundled: boolean;
+  default_for_agents: boolean;
 }
 
 interface CodexModel {
@@ -1923,7 +1925,7 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
                 <span className="list-item-title">${skill.name}</span>
                 <span className="list-item-desc">{skill.description}</span>
               </div>
-              <TaskStatus status={skill.enabled ? "enabled" : "disabled"} />
+              <TaskStatus status={skill.enabled ? (skill.default_for_agents ? "default" : "enabled") : "disabled"} />
             </button>
           ))}
           {props.skills.length === 0 ? <div className="empty-list">No skills</div> : null}
@@ -1959,19 +1961,21 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       onSubmit={async (event) => {
         event.preventDefault();
         setError(null);
-        let files: Record<string, string>;
-        try {
-          const parsed = JSON.parse(filesJson || "{}") as unknown;
-          files = normalizeFilesDraft(parsed);
-        } catch (parseError) {
-          setError(parseError instanceof Error ? parseError.message : "Files must be valid JSON.");
-          return;
+        let files = draft.files;
+        if (!draft.bundled) {
+          try {
+            const parsed = JSON.parse(filesJson || "{}") as unknown;
+            files = normalizeFilesDraft(parsed);
+          } catch (parseError) {
+            setError(parseError instanceof Error ? parseError.message : "Files must be valid JSON.");
+            return;
+          }
         }
         const path = draft.id ? `/api/skills/${draft.id}` : "/api/skills";
         try {
           await api(path, {
             method: draft.id ? "PATCH" : "POST",
-            body: JSON.stringify({ ...draft, files })
+            body: JSON.stringify(draft.bundled ? { enabled: draft.enabled } : { ...draft, files })
           });
           await props.onSaved();
         } catch (saveError) {
@@ -1979,10 +1983,15 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         }
       }}
     >
+      {draft.bundled ? (
+        <div className="notice">
+          This skill is bundled with Aisevak{draft.default_for_agents ? " and available to every agent by default" : ""}. Its content is updated with application releases.
+        </div>
+      ) : null}
       <div className="form-grid">
         <label>
           Name
-          <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input disabled={draft.bundled} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label className="toggle-field">
           Enabled
@@ -1994,13 +2003,14 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </div>
       <label>
         Description
-        <Input value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input disabled={draft.bundled} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Instructions
         <Textarea
           className="textarea-mono"
           style={{ minHeight: 260 }}
+          disabled={draft.bundled}
           value={draft.instructions}
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
@@ -2010,6 +2020,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         <Textarea
           className="textarea-mono"
           style={{ minHeight: 150 }}
+          disabled={draft.bundled}
           value={filesJson}
           onChange={(event) => setFilesJson(event.target.value)}
         />
@@ -2018,7 +2029,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       <div>
         <Button type="submit">
           <CheckCircle2 size={15} />
-          Save skill
+          {draft.bundled ? "Save availability" : "Save skill"}
         </Button>
       </div>
     </form>
@@ -2593,7 +2604,9 @@ function emptySkill(): Skill {
     description: "Use when this repeatable workflow is relevant.",
     instructions: "Describe the workflow Codex should follow when this skill is used.",
     files: {},
-    enabled: true
+    enabled: true,
+    bundled: false,
+    default_for_agents: false
   };
 }
 
