@@ -68,7 +68,7 @@ import {
 } from "./agentRunTimeline";
 import { mergeRefreshedAgentThreads } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
-import { isThreadScrollNearBottom } from "./threadScroll";
+import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
 
 type View =
   | "tasks"
@@ -1332,18 +1332,22 @@ function AgentChatsView(props: {
   const threadKey = props.thread?.id ?? (props.draft ? "draft" : "loading");
 
   useLayoutEffect(() => {
-    const timeline = timelineRef.current;
-    if (!timeline) return;
     if (previousThreadRef.current !== threadKey) {
       previousThreadRef.current = threadKey;
       pinnedToBottomRef.current = true;
+      setShowScrollDown(false);
+    }
+    const timeline = timelineRef.current;
+    if (!timeline) {
+      setShowScrollDown(false);
+      return;
     }
     if (pinnedToBottomRef.current) {
       timeline.scrollTop = timeline.scrollHeight;
       setShowScrollDown(false);
       return;
     }
-    setShowScrollDown(!isThreadScrollNearBottom(timeline));
+    setShowScrollDown(shouldShowThreadScrollDown(timeline, pinnedToBottomRef.current));
   }, [threadKey, props.run, props.events, props.pendingMessages, latestError]);
 
   function scrollToLatest() {
