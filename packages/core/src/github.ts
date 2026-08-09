@@ -1,5 +1,4 @@
-import { join, resolve } from "node:path";
-import { createSign } from "node:crypto";
+import { resolve } from "node:path";
 
 export interface GithubRepositoryRecord {
   owner: string;
@@ -39,68 +38,6 @@ export function managedWorktreePath(managedRoot: string, taskId: string, branch:
   return resolve(managedRoot, "worktrees", taskId, slugify(branch));
 }
 
-export function githubHeaders(token: string): Record<string, string> {
-  return {
-    Accept: "application/vnd.github+json",
-    Authorization: `Bearer ${token}`,
-    "X-GitHub-Api-Version": "2022-11-28"
-  };
-}
-
-export function createGithubAppJwt(appId: string, privateKey: string, now = Math.floor(Date.now() / 1000)): string {
-  const header = base64UrlJson({ alg: "RS256", typ: "JWT" });
-  const payload = base64UrlJson({
-    iat: now - 60,
-    exp: now + 9 * 60,
-    iss: appId
-  });
-  const signingInput = `${header}.${payload}`;
-  const signature = createSign("RSA-SHA256").update(signingInput).sign(privateKey, "base64url");
-  return `${signingInput}.${signature}`;
-}
-
-export async function fetchGithubInstallationToken(options: {
-  apiUrl: string;
-  appId: string;
-  privateKey: string;
-  installationId: string;
-}): Promise<string> {
-  const jwt = createGithubAppJwt(options.appId, options.privateKey);
-  const response = await fetch(
-    `${options.apiUrl}/app/installations/${options.installationId}/access_tokens`,
-    {
-      method: "POST",
-      headers: {
-        Accept: "application/vnd.github+json",
-        Authorization: `Bearer ${jwt}`,
-        "X-GitHub-Api-Version": "2022-11-28"
-      }
-    }
-  );
-  if (!response.ok) {
-    throw new Error(`GitHub installation token failed: ${response.status} ${await response.text()}`);
-  }
-  const payload = (await response.json()) as { token?: string };
-  if (!payload.token) {
-    throw new Error("GitHub installation token response did not include token");
-  }
-  return payload.token;
-}
-
-export function githubCloneEnv(token: string, username = "x-access-token"): NodeJS.ProcessEnv {
-  return {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_ASKPASS: join(process.cwd(), "scripts", "git-askpass.js"),
-    GIT_USERNAME: username,
-    GIT_PASSWORD: token
-  };
-}
-
-export function sanitizeRemoteUrl(url: string): string {
-  return url.replace(/https:\/\/[^:@/]+:[^@/]+@/g, "https://");
-}
-
 export function normalizeGithubRepo(input: Record<string, unknown>): GithubRepositoryRecord {
   const fullName = stringField(input, "full_name");
   const [owner, name] = fullName.split("/");
@@ -122,8 +59,4 @@ function stringField(input: Record<string, unknown>, key: string): string {
     throw new Error(`Missing GitHub repository field: ${key}`);
   }
   return value;
-}
-
-function base64UrlJson(value: unknown): string {
-  return Buffer.from(JSON.stringify(value)).toString("base64url");
 }

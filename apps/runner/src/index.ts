@@ -9,12 +9,10 @@ import {
   encryptSecret,
   extractPromptSkillNames,
   extractThreadId,
-  fetchGithubInstallationToken,
-  githubCloneEnv,
-  githubHeaders,
   hashToken,
   installedSkillsRoot,
   managedCodexHome,
+  managedGithubRepoPath,
   managedWorktreePath,
   newSessionToken,
   nextScheduleRunAt,
@@ -33,7 +31,6 @@ import {
   type DbPool
 } from "@aisevak/core";
 import { agentToolScript } from "@aisevak/cli";
-import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -45,7 +42,14 @@ import {
   runCodexAppServerTurn,
   type AppServerTurnInput
 } from "./appServerClient.js";
-import { agentGithubEnvironment, safeChildEnvironment } from "./githubCli.js";
+import {
+  agentGithubEnvironment,
+  authenticateGithubCli,
+  discoverGithubRepositories,
+  resetGithubCliStorage,
+  runGitCommand,
+  safeChildEnvironment
+} from "./githubCli.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 
 const env = {
@@ -57,7 +61,8 @@ const env = {
   dispatcherHeartbeatMs: Number(process.env.DISPATCHER_HEARTBEAT_MS ?? "300000"),
   apiUrl: process.env.API_URL ?? "http://localhost:8787",
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-  githubApiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com"
+  githubBinary: process.env.GITHUB_CLI ?? "gh",
+  githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
 
 let shuttingDown = false;
@@ -72,11 +77,12 @@ interface ImportJob {
   clone_url: string;
   default_branch: string;
   connection_id: string;
-  auth_mode: "pat" | "app";
+}
+
+interface GithubConnectionJob {
+  id: string;
+  status: "pending" | "sync_requested" | "disconnect_requested";
   pat_secret_id: string | null;
-  app_id: string | null;
-  private_key_secret_id: string | null;
-  installation_value: string | null;
 }
 
 interface RunJob {
@@ -133,6 +139,7 @@ async function main(): Promise<void> {
   console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
     try {
+      await processOneGithubConnection(pool);
       await processOneImportJob(pool);
       await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
@@ -253,13 +260,128 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
   });
 }
 
+async function processOneGithubConnection(pool: DbPool): Promise<void> {
+  const job = await withTransaction(pool, async (client) => {
+    const result = await client.query<GithubConnectionJob>(
+      `SELECT id, status, pat_secret_id
+       FROM github_connections
+       WHERE auth_mode = 'pat'
+         AND status IN ('pending', 'sync_requested', 'disconnect_requested')
+       ORDER BY updated_at DESC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED`
+    );
+    const selected = result.rows[0];
+    if (!selected) return null;
+    await client.query(
+      `UPDATE github_connections
+       SET status = $2, error = NULL, updated_at = now()
+       WHERE id = $1`,
+      [selected.id, selected.status === "disconnect_requested" ? "disconnecting" : "syncing"]
+    );
+    return selected;
+  });
+  if (!job) return;
+
+  try {
+    if (job.status === "disconnect_requested") {
+      await resetGithubCliStorage(env.managedRoot);
+      if (job.pat_secret_id) await pool.query("DELETE FROM secrets WHERE id = $1", [job.pat_secret_id]);
+      await pool.query(
+        `DELETE FROM github_repositories
+         WHERE connection_id = $1 AND imported_project_id IS NULL`,
+        [job.id]
+      );
+      await pool.query(
+        `UPDATE github_connections
+         SET status = 'disconnected', account_login = NULL, error = NULL,
+             pat_secret_id = NULL, updated_at = now()
+         WHERE id = $1`,
+        [job.id]
+      );
+      return;
+    }
+
+    let accountLogin: string | null = null;
+    if (job.status === "pending") {
+      if (!job.pat_secret_id) throw new Error("Reconnect GitHub with an authentication token");
+      const token = await readSecretById(pool, job.pat_secret_id);
+      accountLogin = await authenticateGithubCli(token, {
+        managedRoot: env.managedRoot,
+        binary: env.githubBinary,
+        hostname: env.githubHost
+      });
+      await pool.query("DELETE FROM secrets WHERE id = $1", [job.pat_secret_id]);
+      await pool.query(
+        `UPDATE projects SET workspace_mode = 'git_worktree', updated_at = now()
+         WHERE source = 'github' AND workspace_mode = 'direct'`
+      );
+    }
+
+    await syncGithubRepositories(pool, job.id);
+    await pool.query(
+      `UPDATE github_connections
+       SET status = 'ready',
+           account_login = COALESCE($2, account_login),
+           error = NULL,
+           last_synced_at = now(),
+           pat_secret_id = NULL,
+           updated_at = now()
+       WHERE id = $1`,
+      [job.id, accountLogin]
+    );
+  } catch (error) {
+    await pool.query(
+      `UPDATE github_connections
+       SET status = 'failed', error = $2, updated_at = now()
+       WHERE id = $1`,
+      [job.id, String(error instanceof Error ? error.message : error).slice(0, 2000)]
+    );
+  }
+}
+
+async function syncGithubRepositories(pool: DbPool, connectionId: string): Promise<void> {
+  const repositories = await discoverGithubRepositories({
+    managedRoot: env.managedRoot,
+    binary: env.githubBinary,
+    hostname: env.githubHost
+  });
+  await withTransaction(pool, async (client) => {
+    for (const repo of repositories) {
+      await client.query(
+        `INSERT INTO github_repositories
+           (connection_id, owner, name, full_name, clone_url, default_branch)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (connection_id, full_name) DO UPDATE
+         SET owner = excluded.owner,
+             name = excluded.name,
+             clone_url = excluded.clone_url,
+             default_branch = excluded.default_branch,
+             updated_at = now()`,
+        [connectionId, repo.owner, repo.name, repo.fullName, repo.cloneUrl, repo.defaultBranch]
+      );
+    }
+    await client.query(
+      `DELETE FROM github_repositories
+       WHERE connection_id = $1
+         AND imported_project_id IS NULL
+         AND NOT (full_name = ANY($2::text[]))`,
+      [connectionId, repositories.map((repo) => repo.fullName)]
+    );
+  });
+}
+
 async function processOneImportJob(pool: DbPool): Promise<void> {
   const result = await pool.query<{ id: string }>(
     `UPDATE repo_import_jobs
      SET status = 'running', started_at = now(), updated_at = now()
      WHERE id = (
-       SELECT id FROM repo_import_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1
-     )
+       SELECT id FROM repo_import_jobs
+       WHERE status = 'queued'
+       ORDER BY created_at ASC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED
+     ) AND status = 'queued'
      RETURNING id`
   );
   const job = result.rows[0];
@@ -273,31 +395,23 @@ async function processOneImportJob(pool: DbPool): Promise<void> {
               github_repositories.full_name,
               github_repositories.clone_url,
               github_repositories.default_branch,
-              github_repositories.connection_id,
-              github_connections.auth_mode,
-              github_connections.pat_secret_id,
-              github_connections.app_id,
-              github_connections.private_key_secret_id,
-              github_installations.installation_id AS installation_value
+              github_repositories.connection_id
        FROM repo_import_jobs
        JOIN github_repositories ON github_repositories.id = repo_import_jobs.github_repository_id
        JOIN github_connections ON github_connections.id = github_repositories.connection_id
-       LEFT JOIN github_installations ON github_installations.id = github_repositories.installation_id
-       WHERE repo_import_jobs.id = $1`,
+       WHERE repo_import_jobs.id = $1 AND github_connections.status = 'ready'`,
       [job.id]
     );
     const full = mustRow(detail.rows[0]);
-    const token = await tokenForGithubRepo(pool, full);
-    const localPath =
-      full.local_path ?? join(env.managedRoot, "workspaces", "github", full.owner, full.name);
+    const localPath = full.local_path ?? managedGithubRepoPath(env.managedRoot, full.owner, full.name);
     await mkdir(dirname(localPath), { recursive: true });
 
     if (existsSync(join(localPath, ".git"))) {
-      await git(["fetch", "--prune", "origin"], localPath, token);
-      await git(["checkout", full.default_branch], localPath, token);
-      await git(["pull", "--ff-only", "origin", full.default_branch], localPath, token);
+      await git(["fetch", "--prune", "origin"], localPath);
+      await git(["checkout", full.default_branch], localPath);
+      await git(["pull", "--ff-only", "origin", full.default_branch], localPath);
     } else {
-      await git(["clone", full.clone_url, localPath], undefined, token);
+      await git(["clone", full.clone_url, localPath]);
     }
 
     const existingProject = await pool.query<{ id: string }>(
@@ -310,7 +424,7 @@ async function processOneImportJob(pool: DbPool): Promise<void> {
         await pool.query<{ id: string }>(
           `INSERT INTO projects
            (name, source, local_path, workspace_mode, github_owner, github_repo, default_branch, remote_url, github_repository_id)
-           VALUES ($1, 'github', $2, 'direct', $3, $4, $5, $6, $7)
+           VALUES ($1, 'github', $2, 'git_worktree', $3, $4, $5, $6, $7)
            RETURNING id`,
           [
             full.full_name,
@@ -323,6 +437,23 @@ async function processOneImportJob(pool: DbPool): Promise<void> {
           ]
         )
       ).rows[0]?.id;
+    if (!projectId) throw new Error("Could not create the imported GitHub project");
+    await pool.query(
+      `UPDATE projects
+       SET name = $2, local_path = $3, workspace_mode = 'git_worktree',
+           github_owner = $4, github_repo = $5, default_branch = $6,
+           remote_url = $7, updated_at = now()
+       WHERE id = $1`,
+      [
+        projectId,
+        full.full_name,
+        localPath,
+        full.owner,
+        full.name,
+        full.default_branch,
+        full.clone_url
+      ]
+    );
 
     await pool.query("UPDATE github_repositories SET imported_project_id = $1 WHERE id = $2", [
       projectId,
@@ -915,7 +1046,7 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
   if (currentBranches.stdout.trim()) {
     await git(["checkout", job.branch], job.cwd);
   } else {
-    await git(["checkout", "-B", job.branch], job.cwd);
+    await git(["checkout", "-B", job.branch, `origin/${await defaultBranch(job.cwd)}`], job.cwd);
   }
   return job.cwd;
 }
@@ -1299,23 +1430,6 @@ async function getDispatcherContext(pool: DbPool): Promise<{
   return { tasks: tasks.rows, agents: agents.rows, projects: projects.rows };
 }
 
-async function tokenForGithubRepo(pool: DbPool, job: ImportJob): Promise<string> {
-  if (job.auth_mode === "pat") {
-    if (!job.pat_secret_id) throw new Error("PAT GitHub connection is missing a secret");
-    return readSecretById(pool, job.pat_secret_id);
-  }
-  if (!job.app_id || !job.private_key_secret_id || !job.installation_value) {
-    throw new Error("GitHub App connection is missing app id, private key, or installation id");
-  }
-  const privateKey = await readSecretById(pool, job.private_key_secret_id);
-  return fetchGithubInstallationToken({
-    apiUrl: env.githubApiUrl,
-    appId: job.app_id,
-    privateKey,
-    installationId: job.installation_value
-  });
-}
-
 async function readSecret(pool: DbPool, name: string): Promise<string | undefined> {
   const result = await pool.query<{ encrypted_value: string }>(
     "SELECT encrypted_value FROM secrets WHERE name = $1",
@@ -1340,30 +1454,8 @@ async function readSecretById(pool: DbPool, id: string): Promise<string> {
   return decryptSecret(mustRow(result.rows[0]).encrypted_value, env.secretKey);
 }
 
-async function git(args: string[], cwd?: string, token?: string): Promise<{ stdout: string; stderr: string }> {
-  return new Promise((resolve, reject) => {
-    const child = spawn("git", args, {
-      cwd,
-      env: token ? githubCloneEnv(token) : process.env,
-      stdio: ["ignore", "pipe", "pipe"]
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => {
-      stdout += redactSecrets(String(chunk), [token]);
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += redactSecrets(String(chunk), [token]);
-    });
-    child.on("error", reject);
-    child.on("close", (code) => {
-      if (code === 0) {
-        resolve({ stdout, stderr });
-      } else {
-        reject(new Error(`git ${args.join(" ")} failed: ${stderr}`));
-      }
-    });
-  });
+async function git(args: string[], cwd?: string): Promise<{ stdout: string; stderr: string }> {
+  return runGitCommand(args, cwd, { managedRoot: env.managedRoot });
 }
 
 async function defaultBranch(cwd: string): Promise<string> {

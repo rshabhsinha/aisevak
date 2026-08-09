@@ -309,6 +309,10 @@ CREATE TABLE IF NOT EXISTS github_connections (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   auth_mode github_auth_mode NOT NULL,
   name text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  account_login text,
+  error text,
+  last_synced_at timestamptz,
   app_id text,
   client_id text,
   private_key_secret_id uuid REFERENCES secrets(id) ON DELETE SET NULL,
@@ -422,6 +426,10 @@ ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending';
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS account_login text;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS error text;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
 ALTER TABLE tasks ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
 ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;

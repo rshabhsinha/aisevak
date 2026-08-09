@@ -580,6 +580,10 @@ export const githubConnections = pgTable("github_connections", {
   id,
   authMode: githubAuthModeEnum("auth_mode").notNull(),
   name: text("name").notNull(),
+  status: text("status").notNull().default("pending"),
+  accountLogin: text("account_login"),
+  error: text("error"),
+  lastSyncedAt: timestamp("last_synced_at", { withTimezone: true }),
   appId: text("app_id"),
   clientId: text("client_id"),
   privateKeySecretId: uuid("private_key_secret_id").references(() => secrets.id, {
