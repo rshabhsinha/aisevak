@@ -13,10 +13,12 @@ import {
   githubHeaders,
   hashPassword,
   hashToken,
+  installedSkillsRoot,
   managedCodexHome,
   managedGithubRepoPath,
   newSessionToken,
   resolveCodexBinary,
+  removeInstalledSkill,
   normalizeCodexSkillSnapshots,
   normalizeCodexModel,
   applyCodexModelDefaults,
@@ -25,8 +27,10 @@ import {
   defaultCodexModelOptions,
   runMigrations,
   serializeCodexSkillSnapshots,
+  synchronizeInstalledSkills,
   taskBranchName,
   verifyPassword,
+  writeInstalledSkill,
   withTransaction,
   type CodexSkillSnapshot,
   type DbPool,
@@ -71,6 +75,7 @@ const env = {
   codexDefaultModel: normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL),
   githubApiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com"
 };
+const skillsRoot = installedSkillsRoot(env.managedRoot);
 
 let codexModelCache:
   | { expiresAt: number; models: typeof CODEX_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
@@ -406,39 +411,72 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/skills", async (request) => {
     requireUser(request);
-    const result = await pool.query("SELECT * FROM skills ORDER BY enabled DESC, name ASC");
-    return { skills: result.rows };
+    const scan = await synchronizeInstalledSkills(pool, skillsRoot);
+    const result = await pool.query(
+      `SELECT id, name, description, instructions, files, enabled, platform_managed,
+              default_for_agents, created_by, created_at, updated_at
+       FROM skills
+       ORDER BY enabled DESC, name ASC`
+    );
+    return { skills: result.rows, root: skillsRoot, errors: scan.errors };
   });
 
   app.post("/api/skills", async (request) => {
     const user = requireAdmin(request);
     const body = skillSchema.parse(request.body);
     validateSkillFiles(body.files ?? {});
+    await writeInstalledSkill(skillsRoot, {
+      name: body.name,
+      description: body.description,
+      instructions: body.instructions,
+      files: body.files ?? {}
+    });
+    await synchronizeInstalledSkills(pool, skillsRoot);
     const result = await pool.query(
-      `INSERT INTO skills (name, description, instructions, files, enabled, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [
-        body.name,
-        body.description,
-        body.instructions,
-        body.files ?? {},
-        body.enabled ?? true,
-        user.id
-      ]
+      `UPDATE skills
+       SET enabled = $2, created_by = COALESCE(created_by, $3), updated_at = now()
+       WHERE name = $1
+       RETURNING id, name, description, instructions, files, enabled, platform_managed,
+                 default_for_agents, created_by, created_at, updated_at`,
+      [body.name, body.enabled ?? true, user.id]
     );
-    return { skill: result.rows[0] };
+    return { skill: mustRow(result.rows[0]) };
   });
 
   app.patch("/api/skills/:id", async (request) => {
     requireAdmin(request);
     const { id } = idParams.parse(request.params);
     const body = skillPatchSchema.parse(request.body);
-    const current = await pool.query<{ bundled: boolean }>("SELECT bundled FROM skills WHERE id = $1", [id]);
-    if (current.rows[0]?.bundled && Object.keys(body).some((key) => key !== "enabled")) {
-      throwBadRequest("Bundled skill content is managed by Aisevak releases; only enabled can be changed");
+    const currentResult = await pool.query<{
+      name: string;
+      description: string;
+      instructions: string;
+      files: Record<string, string>;
+      platform_managed: boolean;
+    }>(
+      `SELECT name, description, instructions, files, platform_managed
+       FROM skills WHERE id = $1`,
+      [id]
+    );
+    const current = mustRow(currentResult.rows[0]);
+    if (current.platform_managed && Object.keys(body).some((key) => key !== "enabled")) {
+      throwBadRequest("This skill is maintained by Aisevak releases; only availability can be changed");
     }
     if (body.files) validateSkillFiles(body.files);
+    const nextName = body.name ?? current.name;
+    const contentChanged = ["name", "description", "instructions", "files"].some((key) => key in body);
+    if (contentChanged) {
+      await writeInstalledSkill(
+        skillsRoot,
+        {
+          name: nextName,
+          description: body.description ?? current.description,
+          instructions: body.instructions ?? current.instructions,
+          files: body.files ?? normalizeSkillFiles(current.files)
+        },
+        { overwrite: nextName === current.name }
+      );
+    }
     const result = await pool.query(
       `UPDATE skills
        SET name = COALESCE($2, name),
@@ -458,6 +496,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.enabled ?? null
       ]
     );
+    if (contentChanged && nextName !== current.name) {
+      await removeInstalledSkill(skillsRoot, current.name);
+    }
     return { skill: mustRow(result.rows[0]) };
   });
 

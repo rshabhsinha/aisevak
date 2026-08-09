@@ -2185,6 +2185,23 @@ select:disabled {
   text-transform: uppercase;
 }
 
+.skill-catalog-path,
+.skill-catalog-errors {
+  margin: -4px 12px 8px;
+  overflow: hidden;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  line-height: 1.4;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.skill-catalog-errors {
+  color: var(--destructive);
+  font-family: inherit;
+}
+
 .list-scroll {
   min-height: 0;
   flex: 1;

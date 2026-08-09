@@ -116,8 +116,13 @@ interface Skill {
   instructions: string;
   files: Record<string, string>;
   enabled: boolean;
-  bundled: boolean;
+  platform_managed: boolean;
   default_for_agents: boolean;
+}
+
+interface SkillCatalogError {
+  directory: string;
+  message: string;
 }
 
 interface CodexModel {
@@ -303,6 +308,8 @@ export function App() {
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
+  const [skillsRoot, setSkillsRoot] = useState("");
+  const [skillCatalogErrors, setSkillCatalogErrors] = useState<SkillCatalogError[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
   const [defaultModel, setDefaultModel] = useState(DEFAULT_AGENT_MODEL);
   const [providerInstances, setProviderInstances] = useState<ProviderInstance[]>([]);
@@ -460,8 +467,10 @@ export function App() {
   }
 
   async function reloadSkills() {
-    const data = await api<{ skills: Skill[] }>("/api/skills");
+    const data = await api<{ skills: Skill[]; root: string; errors: SkillCatalogError[] }>("/api/skills");
     setSkills(data.skills);
+    setSkillsRoot(data.root);
+    setSkillCatalogErrors(data.errors);
   }
 
   async function reloadApiKeys() {
@@ -807,7 +816,14 @@ export function App() {
             />
           ) : null}
 
-          {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
+          {view === "skills" ? (
+            <SkillsView
+              skills={filteredSkills}
+              root={skillsRoot}
+              errors={skillCatalogErrors}
+              onSaved={reloadSkills}
+            />
+          ) : null}
 
           {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
 
@@ -2304,11 +2320,21 @@ function credentialDocsText(): string {
   ].join("\n");
 }
 
-function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
+function SkillsView(props: {
+  skills: Skill[];
+  root: string;
+  errors: SkillCatalogError[];
+  onSaved: () => Promise<void>;
+}) {
   const [editing, setEditing] = useState<Skill | null>(props.skills[0] ?? null);
   useEffect(() => {
-    if (!editing && props.skills[0]) setEditing(props.skills[0]);
-  }, [props.skills, editing]);
+    if (!editing) {
+      if (props.skills[0]) setEditing(props.skills[0]);
+      return;
+    }
+    if (!editing.id) return;
+    setEditing(props.skills.find((skill) => skill.id === editing.id) ?? props.skills[0] ?? null);
+  }, [props.skills]);
 
   return (
     <div className="master-detail">
@@ -2319,6 +2345,12 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
             <Plus size={14} />
           </Button>
         </div>
+        {props.root ? <div className="skill-catalog-path" title={props.root}>{props.root}</div> : null}
+        {props.errors.length > 0 ? (
+          <div className="skill-catalog-errors" title={props.errors.map((error) => `${error.directory}: ${error.message}`).join("\n")}>
+            {props.errors.length} invalid skill {props.errors.length === 1 ? "directory" : "directories"}
+          </div>
+        ) : null}
         <div className="list-scroll">
           {props.skills.map((skill) => (
             <button
@@ -2342,7 +2374,7 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
       <main className="detail-view">
         {editing ? (
           <div className="form-view">
-            <SkillEditor skill={editing} onSaved={props.onSaved} />
+            <SkillEditor skill={editing} root={props.root} onSaved={props.onSaved} />
           </div>
         ) : (
           <div className="empty-state">Select a skill</div>
@@ -2352,7 +2384,7 @@ function SkillsView(props: { skills: Skill[]; onSaved: () => Promise<void> }) {
   );
 }
 
-function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
+function SkillEditor(props: { skill: Skill; root: string; onSaved: () => Promise<void> }) {
   const [draft, setDraft] = useState(props.skill);
   const [filesJson, setFilesJson] = useState(() => JSON.stringify(props.skill.files ?? {}, null, 2));
   const [error, setError] = useState<string | null>(null);
@@ -2370,7 +2402,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         event.preventDefault();
         setError(null);
         let files = draft.files;
-        if (!draft.bundled) {
+        if (!draft.platform_managed) {
           try {
             const parsed = JSON.parse(filesJson || "{}") as unknown;
             files = normalizeFilesDraft(parsed);
@@ -2383,7 +2415,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         try {
           await api(path, {
             method: draft.id ? "PATCH" : "POST",
-            body: JSON.stringify(draft.bundled ? { enabled: draft.enabled } : { ...draft, files })
+            body: JSON.stringify(draft.platform_managed ? { enabled: draft.enabled } : { ...draft, files })
           });
           await props.onSaved();
         } catch (saveError) {
@@ -2391,15 +2423,21 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         }
       }}
     >
-      {draft.bundled ? (
+      {props.root ? (
         <div className="notice">
-          This skill is bundled with Aisevak{draft.default_for_agents ? " and available to every agent by default" : ""}. Its content is updated with application releases.
+          Installed at <code>{props.root}/{draft.name}</code>.
+          {draft.platform_managed ? " Aisevak updates this skill with application releases." : " Changes here are written back to the installed-skill directory."}
+        </div>
+      ) : null}
+      {draft.platform_managed ? (
+        <div className="notice">
+          This skill is available to every agent by default. Only its availability can be changed.
         </div>
       ) : null}
       <div className="form-grid">
         <label>
           Name
-          <Input disabled={draft.bundled} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
+          <Input disabled={draft.platform_managed} value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label className="toggle-field">
           Enabled
@@ -2411,14 +2449,14 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       </div>
       <label>
         Description
-        <Input disabled={draft.bundled} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
+        <Input disabled={draft.platform_managed} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} />
       </label>
       <label>
         Instructions
         <Textarea
           className="textarea-mono"
           style={{ minHeight: 260 }}
-          disabled={draft.bundled}
+          disabled={draft.platform_managed}
           value={draft.instructions}
           onChange={(event) => setDraft({ ...draft, instructions: event.target.value })}
         />
@@ -2428,7 +2466,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
         <Textarea
           className="textarea-mono"
           style={{ minHeight: 150 }}
-          disabled={draft.bundled}
+          disabled={draft.platform_managed}
           value={filesJson}
           onChange={(event) => setFilesJson(event.target.value)}
         />
@@ -2437,7 +2475,7 @@ function SkillEditor(props: { skill: Skill; onSaved: () => Promise<void> }) {
       <div>
         <Button type="submit">
           <CheckCircle2 size={15} />
-          {draft.bundled ? "Save availability" : "Save skill"}
+          {draft.platform_managed ? "Save availability" : "Save skill"}
         </Button>
       </div>
     </form>
@@ -2967,7 +3005,7 @@ function emptySkill(): Skill {
     instructions: "Describe the workflow Codex should follow when this skill is used.",
     files: {},
     enabled: true,
-    bundled: false,
+    platform_managed: false,
     default_for_agents: false
   };
 }
