@@ -814,7 +814,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const { id } = idParams.parse(request.params);
     const result = await pool.query(
       `UPDATE task_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = $1 AND status IN ('queued', 'running')
        RETURNING *`,
@@ -2093,13 +2096,19 @@ async function cancelAgentThread(
        LIMIT 1
      ), updated_worker AS (
        UPDATE task_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = (SELECT id FROM latest WHERE kind = 'worker')
        RETURNING id, 'worker'::text AS kind, status::text
      ), updated_dispatcher AS (
        UPDATE dispatcher_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = (SELECT id FROM latest WHERE kind = 'dispatcher')
        RETURNING id, 'dispatcher'::text AS kind, status::text

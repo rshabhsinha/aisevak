@@ -1,7 +1,10 @@
 export function agentToolScript(): string {
   return `#!/usr/bin/env node
 const apiUrl = process.env.AISEVAK_API_URL || "http://localhost:8787";
-const token = process.env.AISEVAK_AGENT_TOKEN;
+const tokenFile = process.env.AISEVAK_AGENT_TOKEN_FILE;
+const token = process.env.AISEVAK_AGENT_TOKEN || (tokenFile
+  ? process.getBuiltinModule("node:fs").readFileSync(tokenFile, "utf8").trim()
+  : undefined);
 const args = process.argv.slice(2);
 if (!token) fail("AISEVAK_AGENT_TOKEN is missing", "AUTH_MISSING");
 main().catch((error) => fail(error && error.message ? error.message : String(error), error && error.code));

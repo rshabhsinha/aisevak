@@ -750,8 +750,12 @@ export function App() {
               onSendMessage={sendAgentThreadMessage}
               onCancel={async () => {
                 if (!selectedThreadId) return;
-                await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
-                await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
+                try {
+                  await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
+                  await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
+                } catch (error) {
+                  setMessage(error instanceof Error ? error.message : "Failed to stop the active turn.");
+                }
               }}
             />
           ) : null}

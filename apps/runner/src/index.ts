@@ -39,7 +39,11 @@ import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promise
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCodexAppServerTurn } from "./appServerClient.js";
+import {
+  closeAllCodexAppServers,
+  runCodexAppServerTurn,
+  type AppServerTurnInput
+} from "./appServerClient.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 
 const env = {
@@ -118,12 +122,12 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
 
-  process.on("SIGINT", () => {
+  const beginShutdown = () => {
     shuttingDown = true;
-  });
-  process.on("SIGTERM", () => {
-    shuttingDown = true;
-  });
+    void closeAllCodexAppServers();
+  };
+  process.on("SIGINT", beginShutdown);
+  process.on("SIGTERM", beginShutdown);
 
   console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
@@ -138,6 +142,7 @@ async function main(): Promise<void> {
     }
     await sleep(env.pollMs);
   }
+  await closeAllCodexAppServers();
   await pool.end();
 }
 
@@ -485,7 +490,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       agentThreadId: job.agent_thread_id,
       coordinationThreadId: job.coordination_thread_id
     });
-    const toolBin = await writeAgentTool(job.codex_home);
+    const agentTool = await writeAgentTool(job.codex_home, toolToken);
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
@@ -507,8 +512,8 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
-        AISEVAK_AGENT_TOKEN: toolToken,
-        PATH: `${toolBin}:${process.env.PATH ?? ""}`,
+        AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
@@ -660,7 +665,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       agentThreadId: job.agent_thread_id,
       coordinationThreadId: job.coordination_thread_id
     });
-    const toolBin = await writeAgentTool(job.codex_home);
+    const agentTool = await writeAgentTool(job.codex_home, toolToken);
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd,
@@ -674,8 +679,8 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
-        AISEVAK_AGENT_TOKEN: toolToken,
-        PATH: `${toolBin}:${process.env.PATH ?? ""}`,
+        AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
@@ -1029,13 +1034,80 @@ async function createAgentToolToken(
   return token;
 }
 
-async function writeAgentTool(codexHome: string): Promise<string> {
+async function writeAgentTool(
+  codexHome: string,
+  token: string
+): Promise<{ binDir: string; tokenFile: string }> {
   const binDir = join(codexHome, "bin");
   await mkdir(binDir, { recursive: true });
   const toolPath = join(binDir, "aisevak");
+  const tokenFile = join(codexHome, "agent-tool-token");
   await writeFile(toolPath, agentToolScript(), "utf8");
   await chmod(toolPath, 0o700);
-  return binDir;
+  await writeFile(tokenFile, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(tokenFile, 0o600);
+  return { binDir, tokenFile };
+}
+
+async function claimAgentTurnInput(
+  pool: DbPool,
+  kind: "worker" | "dispatcher",
+  runId: string
+): Promise<AppServerTurnInput | null> {
+  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  const result = await pool.query<AppServerTurnInput>(
+    `UPDATE agent_turn_inputs
+     SET status = 'delivering', updated_at = now()
+     WHERE id = (
+       SELECT id
+       FROM agent_turn_inputs
+       WHERE ${runColumn} = $1 AND status = 'queued'
+       ORDER BY created_at ASC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, message`,
+    [runId]
+  );
+  return result.rows[0] ?? null;
+}
+
+async function finishAgentTurnInput(
+  pool: DbPool,
+  input: AppServerTurnInput,
+  error?: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE agent_turn_inputs
+     SET status = $2,
+         error = $3,
+         delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END,
+         updated_at = now()
+     WHERE id = $1`,
+    [input.id, error ? "failed" : "delivered", error ?? null]
+  );
+}
+
+async function failPendingAgentTurnInputs(
+  pool: DbPool,
+  kind: "worker" | "dispatcher",
+  runId: string,
+  finalStatus: "succeeded" | "failed" | "cancelled"
+): Promise<void> {
+  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  await pool.query(
+    `UPDATE agent_turn_inputs
+     SET status = 'failed',
+         error = $2,
+         updated_at = now()
+     WHERE ${runColumn} = $1 AND status IN ('queued', 'delivering')`,
+    [
+      runId,
+      finalStatus === "cancelled"
+        ? "The turn was stopped before this message could be delivered"
+        : "The turn finished before this message could be delivered"
+    ]
+  );
 }
 
 async function getDispatcherAgent(pool: DbPool): Promise<{

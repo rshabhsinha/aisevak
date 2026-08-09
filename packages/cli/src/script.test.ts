@@ -57,6 +57,36 @@ describe("embedded aisevak CLI", () => {
     expect(result.stdout).toContain("schedules");
   });
 
+  it("reads rotating agent credentials from a token file", async () => {
+    let authorization: string | undefined;
+    const server = createServer((request, response) => {
+      authorization = request.headers.authorization;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ agent: { name: "Builder" } }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    const tokenPath = join(directory, "agent-token");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    await writeFile(tokenPath, "rotated-token\n", { mode: 0o600 });
+    await execFileAsync(process.execPath, [cliPath, "whoami"], {
+      env: {
+        ...process.env,
+        AISEVAK_API_URL: `http://127.0.0.1:${address.port}`,
+        AISEVAK_AGENT_TOKEN: "",
+        AISEVAK_AGENT_TOKEN_FILE: tokenPath
+      }
+    });
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    expect(authorization).toBe("Bearer rotated-token");
+  });
+
   it("creates schedules with stable prompt and timing options", async () => {
     let requestPath = "";
     let requestBody: Record<string, unknown> = {};
