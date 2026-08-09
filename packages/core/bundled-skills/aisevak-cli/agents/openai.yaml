@@ -1,0 +1,4 @@
+interface:
+  display_name: "Aisevak CLI"
+  short_description: "Coordinate agents and work through Aisevak"
+  default_prompt: "Use $aisevak-cli to inspect context and coordinate this work."

@@ -146,6 +146,8 @@ export const skills = pgTable(
     instructions: text("instructions").notNull(),
     files: jsonb("files").notNull().default({}),
     enabled: boolean("enabled").notNull().default(true),
+    bundled: boolean("bundled").notNull().default(false),
+    defaultForAgents: boolean("default_for_agents").notNull().default(false),
     createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
     createdAt,
     updatedAt

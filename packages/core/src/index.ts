@@ -1,4 +1,5 @@
 export * from "./auth.js";
+export * from "./bundledSkills.js";
 export * from "./codex.js";
 export * from "./codexAuth.js";
 export * from "./codexBinary.js";
