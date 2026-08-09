@@ -62,9 +62,13 @@ describe("installed skills", () => {
     expect(scan.skills[0]?.files).toEqual({ "references/tmux.md": "Use a named session." });
   });
 
-  it.each(["../notes", "SKILL.md"])(
-    "rejects invalid supporting path %s before creating the skill directory",
-    async (relativePath) => {
+  it.each([
+    { label: "traversal", relativePath: "../notes" },
+    { label: "reserved SKILL.md", relativePath: "SKILL.md" },
+    { label: "embedded NUL", relativePath: "references/notes\0.md" }
+  ])(
+    "rejects $label supporting paths before creating the skill directory",
+    async ({ relativePath }) => {
       const root = await mkdtemp(join(tmpdir(), "aisevak-installed-skills-"));
       cleanup.push(root);
 

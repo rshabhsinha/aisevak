@@ -364,6 +364,7 @@ function validateSkillFilePath(relativePath: string): void {
   if (
     relativePath.startsWith("/") ||
     relativePath.includes("\\") ||
+    relativePath.includes("\0") ||
     relativePath === "SKILL.md" ||
     relativePath.endsWith("/SKILL.md") ||
     parts.some((part) => !part || part === "." || part === "..")
