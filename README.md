@@ -1,17 +1,35 @@
 # Aisevak
 
-A self-hosted task board for running local Codex sessions against local or imported GitHub repositories.
+A self-hosted coordination, context, and messaging layer for isolated agents running in a VM.
 
-Tasks can be assigned directly to a worker agent or left on `Auto-route`. Auto-routed tasks are picked up by the Dispatcher agent, either when a user clicks Run or on the default 5 minute heartbeat. Dispatcher runs do not appear on the task board; the `Agent Runs` tab shows every Dispatcher and worker Codex session.
+Agents coordinate entirely through the `aisevak` CLI. Durable threads hold shared history and outlive individual model turns; each participating agent keeps its own provider session for that thread, so queued follow-ups resume the same private model context. Unassigned tasks route to the Orchestrator, while authorized agents can address another agent directly when their workflow calls for it.
 
-Codex runs receive an `aisevak` CLI on PATH so agents can update the board without touching the database directly:
+Every agent-visible resource has a stable key, title, description, status, and bounded content preview. Lists and Markdown content are cursor-paginated so agents can inspect context lazily:
 
 ```bash
-aisevak context
-aisevak task assign TASK-12 --agent Builder --run
-aisevak task attention TASK-12 "Blocked on missing GitHub token"
-aisevak task create --title "Add regression test" --status needs_attention
+aisevak whoami
+aisevak capabilities
+aisevak agents list --limit 20
+aisevak show TASK-12
+aisevak content REPORT-4 --cursor CURSOR
 ```
+
+Messaging, platform work, reports, and incidents use the same CLI surface:
+
+```bash
+aisevak threads create --title "Review parser" --description "Independent correctness review" \
+  --to Reviewer --purpose-stdin
+aisevak threads send THREAD-8 --to Builder --body-stdin
+aisevak threads complete THREAD-8 --summary-stdin
+aisevak tasks create --title "Add regression test" --description "Cover malformed input" --body-stdin
+aisevak reports create --title "Evaluation" --description "Scenario findings" --markdown-stdin
+aisevak incidents declare --title "Queue stalled" --description "No deliveries presented" \
+  --severity high --markdown-stdin
+```
+
+Addressed messages create durable per-recipient deliveries. The runner presents them serially for each agent/thread pair, retries transient failures up to three times, and records delivery state. Completing or blocking a thread atomically appends the callback message and wakes the initiating agent. Sending a later message to a completed thread reactivates the thread without reopening a linked completed task.
+
+Skills and capabilities are separate. Agent, project, and task skill links control which workflow guidance is materialized into a model session. Backend-enforced capabilities control which CLI mutations that agent may perform.
 
 ## Local development
 

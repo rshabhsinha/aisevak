@@ -611,7 +611,7 @@ export function App() {
           <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
           <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
           <span className="nav-label nav-label-spaced">Agents</span>
-          <NavButton icon={<Activity />} label="Agents" active={view === "runs"} onClick={() => setView("runs")} />
+          <NavButton icon={<Activity />} label="Threads" active={view === "runs"} onClick={() => setView("runs")} />
         </nav>
 
         <div className="sidebar-footer">
@@ -929,7 +929,7 @@ function AgentThreadSidebar(props: {
           {props.threads.length === 0 && !props.draft ? (
             <div className="agent-thread-empty">
               <OpenAILogo size={18} />
-              <span>{props.query ? "No matching tasks" : "No tasks yet"}</span>
+              <span>{props.query ? "No matching threads" : "No threads yet"}</span>
             </div>
           ) : null}
 
@@ -942,7 +942,7 @@ function AgentThreadSidebar(props: {
               onClick={props.onLoadMore}
             >
               {props.loadingMore ? <Loader2 className="spin" size={12} /> : <ChevronDown size={12} />}
-              Load older tasks
+              Load older threads
             </Button>
           ) : null}
         </div>
@@ -965,7 +965,7 @@ function AgentChatsView(props: {
 }) {
   const active = isActiveRun(props.thread?.latest_status);
   const title = props.draft ? "New thread" : (props.thread?.title ?? "Agent thread");
-  const agentName = props.thread?.agent_name ?? "Dispatcher";
+  const agentName = props.thread?.agent_name ?? "Orchestrator";
   const projectName = props.thread?.project_name ?? "Aisevak workspace";
   const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
 
@@ -1509,7 +1509,7 @@ function CodexConnectionView() {
           <div>
             <span className="eyebrow">Codex authentication</span>
             <h4>Connect ChatGPT to Aisevak</h4>
-            <p>One browser sign-in powers every Dispatcher and worker run. The shared credential is encrypted in Aisevak’s database.</p>
+            <p>One browser sign-in powers every Orchestrator and worker thread. The shared credential is encrypted in Aisevak’s database.</p>
           </div>
         </div>
         <Badge variant={status.connected ? "success" : "warning"}>{connectionLabel}</Badge>
@@ -2671,7 +2671,7 @@ function apiKeyStatus(key: ExternalApiKey): string {
 function viewTitle(view: View): string {
   return {
     tasks: "Tasks",
-    runs: "Agents",
+    runs: "Threads",
     agents: "Agents",
     skills: "Skills",
     codex: "ChatGPT",
