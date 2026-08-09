@@ -511,6 +511,49 @@ WHERE repository.connection_id = legacy_connection.id
   AND legacy_connection.auth_mode = 'pat'
   AND legacy_connection.id <> canonical_connection.id;
 
+CREATE TEMP TABLE aisevak_replaced_github_pat_secrets ON COMMIT DROP AS
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+SELECT DISTINCT legacy_connection.pat_secret_id AS secret_id
+FROM canonical_github_connection canonical_connection
+JOIN github_connections legacy_connection
+  ON legacy_connection.auth_mode = 'pat'
+ AND legacy_connection.id <> canonical_connection.id
+WHERE legacy_connection.pat_secret_id IS NOT NULL;
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_connections legacy_connection
+SET pat_secret_id = NULL,
+    updated_at = now()
+FROM canonical_github_connection canonical_connection
+WHERE legacy_connection.auth_mode = 'pat'
+  AND legacy_connection.id <> canonical_connection.id
+  AND legacy_connection.pat_secret_id IS NOT NULL;
+
+DELETE FROM secrets candidate_secret
+USING aisevak_replaced_github_pat_secrets candidate
+WHERE candidate_secret.id = candidate.secret_id
+  AND NOT EXISTS (
+    SELECT 1
+    FROM github_connections github_connection
+    WHERE candidate_secret.id IN (
+      github_connection.pat_secret_id,
+      github_connection.private_key_secret_id,
+      github_connection.webhook_secret_id
+    )
+  );
+
 WITH canonical_github_connection AS (
   SELECT id
   FROM github_connections
