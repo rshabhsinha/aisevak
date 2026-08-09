@@ -67,7 +67,7 @@ HTTP and HTTPS remain public for the web application. Database and API service p
 
 ## Deploy an update
 
-The VM does not need GitHub credentials. Updates are copied from the local checkout while repository metadata, secrets, build output, and local application state are excluded.
+The deployment copy does not include GitHub credentials. After deployment, an owner can connect a GitHub account from **Manage → Connectors**; the host runner keeps that `gh`/Git credential separate from release files.
 
 First inspect exactly what will be deployed:
 

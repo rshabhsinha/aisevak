@@ -75,6 +75,14 @@ require_command docker "Docker is not installed. Install Docker Engine first: ht
 require_command rsync "rsync is required to stage releases."
 require_command node "Node.js is required to build the host runner and generate secrets."
 
+if ! command_exists git || ! command_exists gh; then
+  log "Installing Git and GitHub CLI for repository projects"
+  apt-get update
+  DEBIAN_FRONTEND=noninteractive apt-get install -y git gh
+fi
+require_command git "Git is required for project workspaces."
+require_command gh "GitHub CLI is required for GitHub authentication and project imports."
+
 if ! docker compose version >/dev/null 2>&1; then
   fail "Docker Compose plugin is not installed. Install it first: https://docs.docker.com/compose/install/linux/"
 fi

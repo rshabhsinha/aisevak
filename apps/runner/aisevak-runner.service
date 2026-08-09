@@ -12,6 +12,8 @@ Restart=always
 RestartSec=5
 User=aisevak
 Group=aisevak
+UMask=0077
+NoNewPrivileges=true
 
 [Install]
 WantedBy=multi-user.target

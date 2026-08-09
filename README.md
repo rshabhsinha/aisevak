@@ -46,13 +46,19 @@ The default local `.env` stores managed workspaces and Codex homes under `.aisev
 
 After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
 
+## GitHub projects
+
+Open **Manage → Connectors** and connect a GitHub account with a classic personal access token carrying the `repo`, `read:org`, and `gist` scopes. The token is handed once to the host runner, which signs in `gh`, configures Git to use the GitHub CLI credential helper, and then removes the submitted token from PostgreSQL. The resulting runner-owned CLI configuration is shared intentionally with agent processes, so their own `gh` and `git` commands use the connected account without embedding credentials in repository remotes.
+
+Repository discovery runs through `gh api --paginate`. Importing a repository creates a Project backed by a managed clone and task-specific Git worktrees, keeping one task's branch from becoming the base of another task.
+
 ## Host install
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-The installer creates app directories under `/opt/aisevak` and managed workspaces under `/srv/aisevak`, starts Docker Compose services, and installs a host-native runner service so Codex can access imported repositories on disk.
+The installer creates app directories under `/opt/aisevak` and managed workspaces under `/srv/aisevak`, installs Git and GitHub CLI when needed, starts Docker Compose services, and installs a host-native runner service so Codex can access imported repositories on disk.
 
 ## Host updates
 
