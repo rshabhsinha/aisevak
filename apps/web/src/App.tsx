@@ -61,6 +61,7 @@ import {
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
 import { mergeRefreshedAgentThreads } from "./agentThreads";
+import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 
 type View =
   | "tasks"
@@ -277,7 +278,7 @@ export function App() {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
   const [models, setModels] = useState<CodexModel[]>([]);
-  const [defaultModel, setDefaultModel] = useState("gpt-5.6-sol");
+  const [defaultModel, setDefaultModel] = useState(DEFAULT_AGENT_MODEL);
   const [providerInstances, setProviderInstances] = useState<ProviderInstance[]>([]);
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
@@ -1226,8 +1227,8 @@ function AgentsView(props: {
 }) {
   const [editing, setEditing] = useState<Agent | null>(props.agents[0] ?? null);
   useEffect(() => {
-    if (!editing && props.agents[0]) setEditing(props.agents[0]);
-  }, [props.agents, editing]);
+    setEditing((selected) => reconcileSelectedAgent(selected, props.agents));
+  }, [props.agents]);
 
   return (
     <div className="master-detail">
@@ -1268,7 +1269,10 @@ function AgentsView(props: {
               agent={editing}
               models={props.models}
               defaultModel={props.defaultModel}
-              onSaved={props.onSaved}
+              onSaved={async (agent) => {
+                setEditing(agent);
+                await props.onSaved();
+              }}
             />
           </div>
         ) : (
@@ -1283,7 +1287,7 @@ function AgentEditor(props: {
   agent: Agent;
   models: CodexModel[];
   defaultModel: string;
-  onSaved: () => Promise<void>;
+  onSaved: (agent: Agent) => Promise<void>;
 }) {
   const [draft, setDraft] = useState(props.agent);
   useEffect(() => setDraft(props.agent), [props.agent]);
@@ -1300,11 +1304,11 @@ function AgentEditor(props: {
       onSubmit={async (event) => {
         event.preventDefault();
         const path = draft.id ? `/api/agents/${draft.id}` : "/api/agents";
-        await api(path, {
+        const result = await api<{ agent: Agent }>(path, {
           method: draft.id ? "PATCH" : "POST",
           body: JSON.stringify({ ...draft, modelOptions: resolvedModelOptions })
         });
-        await props.onSaved();
+        await props.onSaved(result.agent);
       }}
     >
       <div className="agent-settings-grid">
@@ -1321,7 +1325,7 @@ function AgentEditor(props: {
               setDraft({
                 ...draft,
                 model: event.target.value,
-                model_options: model ? optionsForModel(model, resolvedModelOptions) : []
+                model_options: model ? optionsForModel(model) : []
               });
             }}
           >
