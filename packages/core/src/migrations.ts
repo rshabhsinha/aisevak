@@ -431,6 +431,86 @@ ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS account_login text;
 ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS error text;
 ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
 
+CREATE TEMP TABLE aisevak_github_repository_rehomes ON COMMIT DROP AS
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+), ranked_repositories AS (
+  SELECT repository.id AS source_repository_id,
+         repository.imported_project_id AS source_imported_project_id,
+         repository.updated_at AS source_updated_at,
+         first_value(repository.id) OVER (
+           PARTITION BY repository.full_name
+           ORDER BY (repository.connection_id = canonical_connection.id) DESC,
+                    repository.updated_at DESC,
+                    repository.created_at DESC,
+                    repository.id DESC
+         ) AS target_repository_id,
+         canonical_connection.id AS canonical_connection_id
+  FROM canonical_github_connection canonical_connection
+  JOIN github_connections connection ON connection.auth_mode = 'pat'
+  JOIN github_repositories repository ON repository.connection_id = connection.id
+)
+SELECT source_repository_id,
+       source_imported_project_id,
+       source_updated_at,
+       target_repository_id,
+       canonical_connection_id
+FROM ranked_repositories
+WHERE source_repository_id <> target_repository_id;
+
+WITH legacy_imports AS (
+  SELECT DISTINCT ON (target_repository_id)
+         target_repository_id,
+         source_imported_project_id
+  FROM aisevak_github_repository_rehomes
+  WHERE source_imported_project_id IS NOT NULL
+  ORDER BY target_repository_id, source_updated_at DESC, source_repository_id DESC
+)
+UPDATE github_repositories target_repository
+SET imported_project_id = COALESCE(
+      target_repository.imported_project_id,
+      legacy_imports.source_imported_project_id
+    ),
+    updated_at = now()
+FROM legacy_imports
+WHERE target_repository.id = legacy_imports.target_repository_id;
+
+UPDATE projects
+SET github_repository_id = rehome.target_repository_id,
+    updated_at = now()
+FROM aisevak_github_repository_rehomes rehome
+WHERE projects.github_repository_id = rehome.source_repository_id;
+
+UPDATE repo_import_jobs
+SET github_repository_id = rehome.target_repository_id,
+    updated_at = now()
+FROM aisevak_github_repository_rehomes rehome
+WHERE repo_import_jobs.github_repository_id = rehome.source_repository_id;
+
+DELETE FROM github_repositories source_repository
+USING aisevak_github_repository_rehomes rehome
+WHERE source_repository.id = rehome.source_repository_id;
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_repositories repository
+SET connection_id = canonical_connection.id,
+    updated_at = now()
+FROM canonical_github_connection canonical_connection,
+     github_connections legacy_connection
+WHERE repository.connection_id = legacy_connection.id
+  AND legacy_connection.auth_mode = 'pat'
+  AND legacy_connection.id <> canonical_connection.id;
+
 WITH canonical_github_connection AS (
   SELECT id
   FROM github_connections
