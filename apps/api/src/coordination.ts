@@ -16,6 +16,8 @@ import { z } from "zod";
 
 const DEFAULT_WORKER_CAPABILITIES = [
   "agents:read",
+  "credentials:read",
+  "projects:read",
   "threads:read",
   "threads:create",
   "threads:send",
@@ -32,12 +34,13 @@ const DEFAULT_WORKER_CAPABILITIES = [
 
 const ORCHESTRATOR_CAPABILITIES = [
   ...DEFAULT_WORKER_CAPABILITIES,
+  "credentials:write",
   "tasks:assign",
   "schedules:write",
   "orchestration:route"
 ] as const;
 
-interface AgentContext {
+export interface AgentContext {
   agentId: string;
   agentThreadId: string | null;
   coordinationThreadId: string | null;
@@ -885,7 +888,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
   });
 }
 
-async function requireAgent(pool: DbPool, request: FastifyRequest): Promise<AgentContext> {
+export async function requireAgent(pool: DbPool, request: FastifyRequest): Promise<AgentContext> {
   const authorization = request.headers.authorization;
   const token = authorization?.startsWith("Bearer ") ? authorization.slice(7) : undefined;
   if (!token) unauthorized("Agent tool token required");
@@ -934,7 +937,7 @@ function effectiveCapabilities(kind: string, value: unknown): string[] {
   if (Array.isArray(value) && value.every((item) => typeof item === "string") && value.length > 0) return [...new Set(value)];
   return [...(kind === "dispatcher" ? ORCHESTRATOR_CAPABILITIES : DEFAULT_WORKER_CAPABILITIES)];
 }
-function requireCapability(context: AgentContext, capability: string): void {
+export function requireCapability(context: AgentContext, capability: string): void {
   if (!context.capabilities.includes(capability)) forbidden(`Agent ${context.name} does not have ${capability}`);
 }
 

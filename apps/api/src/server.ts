@@ -44,7 +44,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
-import { registerCoordinationRoutes } from "./coordination.js";
+import { registerCoordinationRoutes, requireAgent, requireCapability, type AgentContext } from "./coordination.js";
 import { agentDeletionBlockReason } from "./agents.js";
 
 interface AuthUser {
@@ -1045,12 +1045,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/agent-tools/context", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "agents:read", "projects:read", "tasks:read");
     return getDispatcherContext(pool);
   });
 
   app.get("/api/agent-tools/credentials", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:read");
     const result = await pool.query(
       `SELECT name, description, last_used_at
        FROM secrets
@@ -1061,7 +1061,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/agent-tools/credentials/:name", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:read");
     const params = credentialNameParams.parse(request.params);
     const name = credentialNameSchema.parse(params.name);
     const result = await pool.query<{ id: string; name: string; description: string; encrypted_value: string }>(
@@ -1083,7 +1083,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/credentials", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:write");
     const body = credentialSchema.parse(request.body);
     const existing = await pool.query<{ id: string }>("SELECT id FROM secrets WHERE name = $1 LIMIT 1", [
       body.name
@@ -1102,7 +1102,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks", async (request) => {
-    const context = await requireAgentTool(pool, request);
+    const context = await requireLegacyAgentCapabilities(pool, request, "tasks:create");
     const body = agentToolCreateTaskSchema.parse(request.body);
     const projectId = body.projectId ?? context.taskProjectId ?? null;
     const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
@@ -1126,7 +1126,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.patch("/api/agent-tools/tasks/:key", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "tasks:update");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolPatchTaskSchema.parse(request.body);
@@ -1155,7 +1155,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks/:key/comment", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "tasks:update");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolCommentSchema.parse(request.body);
@@ -1169,10 +1169,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks/:key/assign-run", async (request) => {
-    const context = await requireAgentTool(pool, request);
-    if (context.role !== "dispatcher") {
-      throw app.httpErrors.forbidden("Only Orchestrator can start worker runs");
-    }
+    await requireLegacyAgentCapabilities(pool, request, "tasks:assign");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolAssignSchema.parse(request.body);
@@ -1625,12 +1622,6 @@ const scheduleSelectSql = `
     ORDER BY schedule_runs.scheduled_for DESC
     LIMIT 1
   ) latest ON true`;
-
-interface AgentToolContext {
-  role: "worker" | "dispatcher";
-  taskId: string | null;
-  taskProjectId: string | null;
-}
 
 function requireUser(request: FastifyRequest): AuthUser {
   if (!request.user) {
@@ -3263,36 +3254,14 @@ async function getDispatcherContext(pool: DbPool): Promise<{
   return { tasks: tasks.rows, agents: agents.rows, projects: projects.rows };
 }
 
-async function requireAgentTool(pool: DbPool, request: FastifyRequest): Promise<AgentToolContext> {
-  const authorization = request.headers.authorization;
-  const token = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-  if (!token) {
-    const error = new Error("Agent tool token required") as Error & { statusCode: number };
-    error.statusCode = 401;
-    throw error;
-  }
-  const result = await pool.query<{
-    role: "worker" | "dispatcher";
-    task_id: string | null;
-    task_project_id: string | null;
-  }>(
-    `SELECT agent_tool_tokens.role,
-            agent_tool_tokens.task_id,
-            tasks.project_id AS task_project_id
-     FROM agent_tool_tokens
-     LEFT JOIN tasks ON tasks.id = agent_tool_tokens.task_id
-     WHERE agent_tool_tokens.token_hash = $1
-       AND agent_tool_tokens.expires_at > now()
-     LIMIT 1`,
-    [hashToken(token)]
-  );
-  const row = result.rows[0];
-  if (!row) {
-    const error = new Error("Invalid agent tool token") as Error & { statusCode: number };
-    error.statusCode = 401;
-    throw error;
-  }
-  return { role: row.role, taskId: row.task_id, taskProjectId: row.task_project_id };
+async function requireLegacyAgentCapabilities(
+  pool: DbPool,
+  request: FastifyRequest,
+  ...capabilities: string[]
+): Promise<AgentContext> {
+  const context = await requireAgent(pool, request);
+  for (const capability of capabilities) requireCapability(context, capability);
+  return context;
 }
 
 async function getTaskByKey(pool: DbPool, key: string): Promise<{ id: string; number: number }> {
