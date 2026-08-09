@@ -540,7 +540,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
           [job.id]
         );
         return current.rows[0]?.status === "cancel_requested";
-      }
+      },
+      nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
+      onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
@@ -573,6 +575,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
     if (job.agent_thread_id) {
       await pool.query(
         "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
@@ -708,7 +711,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
           [job.id]
         );
         return current.rows[0]?.status === "cancel_requested";
-      }
+      },
+      nextInput: () => claimAgentTurnInput(pool, "worker", job.id),
+      onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
@@ -741,6 +746,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
     if (job.agent_thread_id) {
       await pool.query(
         "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",

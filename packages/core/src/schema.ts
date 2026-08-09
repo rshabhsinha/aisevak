@@ -404,6 +404,23 @@ export const runEvents = pgTable("run_events", {
   createdAt
 });
 
+export const agentTurnInputs = pgTable("agent_turn_inputs", {
+  id,
+  agentThreadId: uuid("agent_thread_id").notNull().references(() => agentThreads.id, {
+    onDelete: "cascade"
+  }),
+  taskRunId: uuid("task_run_id").references(() => taskRuns.id, { onDelete: "cascade" }),
+  dispatcherRunId: uuid("dispatcher_run_id").references(() => dispatcherRuns.id, {
+    onDelete: "cascade"
+  }),
+  message: text("message").notNull(),
+  status: text("status").notNull().default("queued"),
+  error: text("error"),
+  deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+  createdAt,
+  updatedAt
+});
+
 export const agentToolTokens = pgTable(
   "agent_tool_tokens",
   {

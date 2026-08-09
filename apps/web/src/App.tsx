@@ -590,6 +590,15 @@ export function App() {
         setMessage(null);
         writeStickyModelSelection(selection);
         await loadAgentThread(data.thread.id);
+      } else if (selectedThread?.latest_status === "running") {
+        await api(`/api/agent-threads/${selectedThreadId}/steer`, {
+          method: "POST",
+          body: payload
+        });
+        setMessage(null);
+        await loadAgentThread(selectedThreadId);
+      } else if (selectedThread?.latest_status === "cancel_requested") {
+        throw new Error("This turn is stopping. Wait for it to finish before sending another message.");
       } else {
         const data = await api<{ thread: AgentThread; turn: Run }>(
           `/api/agent-threads/${selectedThreadId}/messages`,
@@ -1385,7 +1394,7 @@ function AgentChatComposer(props: {
 
   async function submit() {
     const trimmed = message.trim();
-    if (!trimmed || !selection || sending || props.active) return;
+    if (!trimmed || !selection || sending) return;
     setSending(true);
     setError(null);
     try {
@@ -1409,9 +1418,9 @@ function AgentChatComposer(props: {
       <div className="agent-composer-surface">
         <Textarea
           value={message}
-          disabled={sending || props.active}
+          disabled={sending}
           rows={2}
-          placeholder={props.active ? "Codex is working…" : "Ask Codex to build, inspect, or change something"}
+          placeholder={props.active ? "Send guidance to the active turn…" : "Ask Codex to build, inspect, or change something"}
           onChange={(event) => setMessage(event.target.value)}
           onKeyDown={(event) => {
             if (event.key !== "Enter" || event.shiftKey) return;
@@ -1522,21 +1531,20 @@ function AgentChatComposer(props: {
           </div>
 
           <div className="agent-composer-actions">
-            <span>Enter to send · Shift Enter for newline</span>
+            <span>{props.active ? "Message the active turn" : "Enter to send"} · Shift Enter for newline</span>
             {props.active ? (
               <button className="agent-send-button stop" type="button" onClick={() => void props.onCancel()} aria-label="Stop Codex">
                 <Square size={15} weight="fill" />
               </button>
-            ) : (
-              <button
-                className="agent-send-button"
-                type="submit"
-                disabled={!message.trim() || !selection || sending}
-                aria-label={sending ? "Sending" : "Send message"}
-              >
-                {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} weight="bold" />}
-              </button>
-            )}
+            ) : null}
+            <button
+              className="agent-send-button"
+              type="submit"
+              disabled={!message.trim() || !selection || sending}
+              aria-label={sending ? "Sending" : props.active ? "Send guidance" : "Send message"}
+            >
+              {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} weight="bold" />}
+            </button>
           </div>
         </div>
       </div>

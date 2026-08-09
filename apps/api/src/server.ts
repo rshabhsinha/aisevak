@@ -901,6 +901,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return queueAgentThreadMessage(pool, id, body);
   });
 
+  app.post("/api/agent-threads/:id/steer", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const body = threadMessageSchema.parse(request.body);
+    return queueAgentTurnInput(pool, id, body.message);
+  });
+
   app.post("/api/agent-threads/:id/cancel", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
@@ -2121,6 +2128,39 @@ async function cancelAgentThread(
   return { turn: result.rows[0] ?? null };
 }
 
+async function queueAgentTurnInput(
+  pool: DbPool,
+  threadId: string,
+  message: string
+): Promise<{ input: Record<string, unknown> }> {
+  await getAgentThread(pool, threadId);
+  const active = await pool.query<{ id: string; kind: "worker" | "dispatcher" }>(
+    `SELECT id, kind
+     FROM (
+       SELECT id, 'worker'::text AS kind, started_at
+       FROM task_runs
+       WHERE agent_thread_id = $1 AND status = 'running'
+       UNION ALL
+       SELECT id, 'dispatcher'::text AS kind, started_at
+       FROM dispatcher_runs
+       WHERE agent_thread_id = $1 AND status = 'running'
+     ) active_turns
+     ORDER BY started_at DESC NULLS LAST
+     LIMIT 1`,
+    [threadId]
+  );
+  const turn = active.rows[0];
+  if (!turn) throwBadRequest("This thread does not have an active turn to steer");
+  const result = await pool.query(
+    `INSERT INTO agent_turn_inputs
+       (agent_thread_id, task_run_id, dispatcher_run_id, message)
+     VALUES ($1, $2, $3, $4)
+     RETURNING *`,
+    [threadId, turn.kind === "worker" ? turn.id : null, turn.kind === "dispatcher" ? turn.id : null, message]
+  );
+  return { input: mustRow(result.rows[0]) };
+}
+
 async function resolveModelSelection(
   pool: DbPool,
   input: ModelSelectionInput | undefined,
@@ -2173,11 +2213,42 @@ async function getDispatcherThreadTimeline(pool: DbPool, threadId: string): Prom
       [threadId]
     ),
     pool.query<TimelineEventRow>(
-      `SELECT dispatcher_run_events.*
-       FROM dispatcher_run_events
-       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-       WHERE dispatcher_runs.agent_thread_id = $1
-       ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.created_at ASC, dispatcher_run_events.seq ASC`,
+      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
+       FROM (
+         SELECT dispatcher_run_events.id,
+                NULL::uuid AS run_id,
+                dispatcher_run_events.dispatcher_run_id,
+                dispatcher_run_events.seq,
+                dispatcher_run_events.event_type,
+                dispatcher_run_events.text,
+                dispatcher_run_events.payload,
+                dispatcher_run_events.created_at,
+                dispatcher_runs.queued_at
+         FROM dispatcher_run_events
+         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+         WHERE dispatcher_runs.agent_thread_id = $1
+         UNION ALL
+         SELECT agent_turn_inputs.id,
+                NULL::uuid AS run_id,
+                agent_turn_inputs.dispatcher_run_id,
+                0 AS seq,
+                'thread.message-sent' AS event_type,
+                agent_turn_inputs.message AS text,
+                jsonb_build_object(
+                  'type', 'thread.message-sent',
+                  'role', 'user',
+                  'text', agent_turn_inputs.message,
+                  'steer', true,
+                  'deliveryStatus', agent_turn_inputs.status,
+                  'error', agent_turn_inputs.error
+                ) AS payload,
+                agent_turn_inputs.created_at,
+                dispatcher_runs.queued_at
+         FROM agent_turn_inputs
+         JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+         WHERE agent_turn_inputs.agent_thread_id = $1
+       ) thread_events
+       ORDER BY queued_at ASC, created_at ASC, seq ASC`,
       [threadId]
     )
   ]);
@@ -2851,6 +2922,27 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          FROM dispatcher_run_events
          JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
          WHERE dispatcher_runs.task_id = $1
+         UNION ALL
+         SELECT agent_turn_inputs.id,
+                agent_turn_inputs.task_run_id AS run_id,
+                agent_turn_inputs.dispatcher_run_id,
+                0 AS seq,
+                'thread.message-sent' AS event_type,
+                agent_turn_inputs.message AS text,
+                jsonb_build_object(
+                  'type', 'thread.message-sent',
+                  'role', 'user',
+                  'text', agent_turn_inputs.message,
+                  'steer', true,
+                  'deliveryStatus', agent_turn_inputs.status,
+                  'error', agent_turn_inputs.error
+                ) AS payload,
+                agent_turn_inputs.created_at,
+                COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
+         FROM agent_turn_inputs
+         LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
+         LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+         WHERE task_runs.task_id = $1 OR dispatcher_runs.task_id = $1
        ) task_events
        ORDER BY queued_at ASC, created_at ASC, seq ASC`,
       [taskId]

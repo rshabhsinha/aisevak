@@ -582,6 +582,25 @@ CREATE TABLE IF NOT EXISTS schedule_runs (
 CREATE INDEX IF NOT EXISTS schedule_runs_schedule_idx
 ON schedule_runs(schedule_id, scheduled_for DESC);
 
+CREATE TABLE IF NOT EXISTS agent_turn_inputs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  agent_thread_id uuid NOT NULL REFERENCES agent_threads(id) ON DELETE CASCADE,
+  task_run_id uuid REFERENCES task_runs(id) ON DELETE CASCADE,
+  dispatcher_run_id uuid REFERENCES dispatcher_runs(id) ON DELETE CASCADE,
+  message text NOT NULL,
+  status text NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'delivering', 'delivered', 'failed')),
+  error text,
+  delivered_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK ((task_run_id IS NOT NULL)::integer + (dispatcher_run_id IS NOT NULL)::integer = 1)
+);
+
+CREATE INDEX IF NOT EXISTS agent_turn_inputs_task_run_idx
+ON agent_turn_inputs(task_run_id, status, created_at) WHERE task_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_turn_inputs_dispatcher_run_idx
+ON agent_turn_inputs(dispatcher_run_id, status, created_at) WHERE dispatcher_run_id IS NOT NULL;
+
 DO $$ BEGIN
   ALTER TABLE tasks ADD CONSTRAINT tasks_coordination_thread_id_fkey
     FOREIGN KEY (coordination_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;
