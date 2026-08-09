@@ -364,9 +364,14 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
-    if (codexAuth.chatGptAuth) {
+    if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
       try {
-        await persistRefreshedCodexAuth(pool, job.codex_home, codexAuth.chatGptAuth);
+        await persistRefreshedCodexAuth(
+          pool,
+          job.codex_home,
+          codexAuth.chatGptAuth,
+          codexAuth.chatGptAuthRevision
+        );
       } catch (error) {
         stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
           error instanceof Error ? error.message : error
@@ -524,9 +529,14 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
-    if (codexAuth.chatGptAuth) {
+    if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
       try {
-        await persistRefreshedCodexAuth(pool, job.codex_home, codexAuth.chatGptAuth);
+        await persistRefreshedCodexAuth(
+          pool,
+          job.codex_home,
+          codexAuth.chatGptAuth,
+          codexAuth.chatGptAuthRevision
+        );
       } catch (error) {
         stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
           error instanceof Error ? error.message : error
@@ -574,17 +584,22 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
 interface MaterializedCodexAuth {
   apiKey?: string;
   chatGptAuth?: CodexChatGptAuthFile;
+  chatGptAuthRevision?: string;
   redactionSecrets: string[];
 }
 
 async function materializeCodexAuth(pool: DbPool, codexHome: string): Promise<MaterializedCodexAuth> {
   const authPath = join(codexHome, "auth.json");
-  const storedChatGptAuth = await readSecret(pool, CODEX_CHATGPT_AUTH_SECRET_NAME);
+  const storedChatGptAuth = await readSecretSnapshot(pool, CODEX_CHATGPT_AUTH_SECRET_NAME);
   if (storedChatGptAuth) {
-    const auth = parseCodexChatGptAuthFile(storedChatGptAuth);
+    const auth = parseCodexChatGptAuthFile(storedChatGptAuth.value);
     await writeFile(authPath, serializeCodexChatGptAuthFile(auth), { encoding: "utf8", mode: 0o600 });
     await chmod(authPath, 0o600);
-    return { chatGptAuth: auth, redactionSecrets: codexChatGptAuthSecrets(auth) };
+    return {
+      chatGptAuth: auth,
+      chatGptAuthRevision: storedChatGptAuth.encryptedValue,
+      redactionSecrets: codexChatGptAuthSecrets(auth)
+    };
   }
 
   const apiKey = await readSecret(pool, "openai_api_key");
@@ -604,30 +619,33 @@ async function materializeCodexAuth(pool: DbPool, codexHome: string): Promise<Ma
   );
 }
 
-async function persistRefreshedCodexAuth(
+export async function persistRefreshedCodexAuth(
   pool: DbPool,
   codexHome: string,
-  original: CodexChatGptAuthFile
-): Promise<void> {
+  original: CodexChatGptAuthFile,
+  originalEncryptedValue: string
+): Promise<boolean> {
   const refreshed = parseCodexChatGptAuthFile(await readFile(join(codexHome, "auth.json"), "utf8"));
   if (refreshed.tokens.account_id !== original.tokens.account_id) {
     throw new Error("Codex changed to a different ChatGPT account during the run");
   }
   const encrypted = encryptSecret(serializeCodexChatGptAuthFile(refreshed), env.secretKey);
-  await pool.query(
-    `INSERT INTO secrets (name, description, encrypted_value, agent_accessible)
-     VALUES ($1, $2, $3, false)
-     ON CONFLICT (name) DO UPDATE
-     SET description = excluded.description,
-         encrypted_value = excluded.encrypted_value,
+  const result = await pool.query<{ id: string }>(
+    `UPDATE secrets
+     SET description = $2,
+         encrypted_value = $3,
          agent_accessible = false,
-         updated_at = now()`,
+         updated_at = now()
+     WHERE name = $1 AND encrypted_value = $4
+     RETURNING id`,
     [
       CODEX_CHATGPT_AUTH_SECRET_NAME,
       "Internal ChatGPT authentication used by the Codex runner",
-      encrypted
+      encrypted,
+      originalEncryptedValue
     ]
   );
+  return Boolean(result.rows[0]);
 }
 
 function codexProcessEnv(): NodeJS.ProcessEnv {
@@ -1104,12 +1122,25 @@ async function tokenForGithubRepo(pool: DbPool, job: ImportJob): Promise<string>
 }
 
 async function readSecret(pool: DbPool, name: string): Promise<string | undefined> {
+  const snapshot = await readSecretSnapshot(pool, name);
+  return snapshot?.value;
+}
+
+async function readSecretSnapshot(
+  pool: DbPool,
+  name: string
+): Promise<{ value: string; encryptedValue: string } | undefined> {
   const result = await pool.query<{ encrypted_value: string }>(
     "SELECT encrypted_value FROM secrets WHERE name = $1",
     [name]
   );
   const row = result.rows[0];
-  return row ? decryptSecret(row.encrypted_value, env.secretKey) : undefined;
+  return row
+    ? {
+        value: decryptSecret(row.encrypted_value, env.secretKey),
+        encryptedValue: row.encrypted_value
+      }
+    : undefined;
 }
 
 async function readAgentAccessibleSecrets(pool: DbPool): Promise<string[]> {
