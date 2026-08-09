@@ -1273,6 +1273,10 @@ function AgentsView(props: {
                 setEditing(agent);
                 await props.onSaved();
               }}
+              onDeleted={async () => {
+                setEditing(null);
+                await props.onSaved();
+              }}
             />
           </div>
         ) : (
@@ -1288,9 +1292,17 @@ function AgentEditor(props: {
   models: CodexModel[];
   defaultModel: string;
   onSaved: (agent: Agent) => Promise<void>;
+  onDeleted: () => Promise<void>;
 }) {
   const [draft, setDraft] = useState(props.agent);
-  useEffect(() => setDraft(props.agent), [props.agent]);
+  const [busy, setBusy] = useState(false);
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    setDraft(props.agent);
+    setDeleteArmed(false);
+    setError(null);
+  }, [props.agent]);
   const selectedModel = props.models.find((model) => model.id === (draft.model || props.defaultModel));
   const resolvedModelOptions = selectedModel
     ? optionsForModel(selectedModel, normalizeComposerOptions(draft.model_options))
@@ -1303,12 +1315,20 @@ function AgentEditor(props: {
       className="stack"
       onSubmit={async (event) => {
         event.preventDefault();
+        setBusy(true);
+        setError(null);
         const path = draft.id ? `/api/agents/${draft.id}` : "/api/agents";
-        const result = await api<{ agent: Agent }>(path, {
-          method: draft.id ? "PATCH" : "POST",
-          body: JSON.stringify({ ...draft, modelOptions: resolvedModelOptions })
-        });
-        await props.onSaved(result.agent);
+        try {
+          const result = await api<{ agent: Agent }>(path, {
+            method: draft.id ? "PATCH" : "POST",
+            body: JSON.stringify({ ...draft, modelOptions: resolvedModelOptions })
+          });
+          await props.onSaved(result.agent);
+        } catch (saveError) {
+          setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save agent."));
+        } finally {
+          setBusy(false);
+        }
       }}
     >
       <div className="agent-settings-grid">
@@ -1390,11 +1410,47 @@ function AgentEditor(props: {
           </span>
         ))}
       </div>
-      <div style={{ marginTop: 16 }}>
-        <Button type="submit">
+      {error ? <div className="notice error">{error}</div> : null}
+      <div style={{ marginTop: 16, display: "flex", gap: 8, alignItems: "center" }}>
+        <Button type="submit" disabled={busy}>
           <CheckCircle2 size={15} />
           Save agent
         </Button>
+        {draft.id ? (
+          deleteArmed ? (
+            <>
+              <Button type="button" variant="secondary" disabled={busy} onClick={() => setDeleteArmed(false)}>
+                Cancel
+              </Button>
+              <Button
+                type="button"
+                variant="destructive"
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    await api(`/api/agents/${draft.id}`, { method: "DELETE" });
+                    await props.onDeleted();
+                  } catch (deleteError) {
+                    setError(friendlyError(deleteError instanceof Error ? deleteError.message : "Could not delete agent."));
+                    setDeleteArmed(false);
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                <Trash2 size={15} />
+                Confirm delete
+              </Button>
+            </>
+          ) : (
+            <Button type="button" variant="destructive" disabled={busy} onClick={() => setDeleteArmed(true)}>
+              <Trash2 size={15} />
+              Delete agent
+            </Button>
+          )
+        ) : null}
       </div>
     </form>
   );

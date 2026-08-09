@@ -45,6 +45,7 @@ import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 import { registerCoordinationRoutes } from "./coordination.js";
+import { agentDeletionBlockReason } from "./agents.js";
 
 interface AuthUser {
   id: string;
@@ -524,6 +525,42 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     if (body.skillIds) await replaceAgentSkills(pool, agent.id, body.skillIds);
     await insertAgentVersion(pool, agent, user.id);
     return { agent };
+  });
+
+  app.delete("/api/agents/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    return withTransaction(pool, async (client) => {
+      const agentResult = await client.query<{ id: string; kind: string; name: string }>(
+        "SELECT id, kind, name FROM agents WHERE id = $1 FOR UPDATE",
+        [id]
+      );
+      const agent = agentResult.rows[0];
+      if (!agent) throw app.httpErrors.notFound("Agent not found");
+
+      const usageResult = await client.query<{
+        task_count: string;
+        thread_count: string;
+        other_enabled_dispatcher_count: string;
+      }>(
+        `SELECT
+           (SELECT count(*) FROM tasks WHERE agent_id = $1) AS task_count,
+           (SELECT count(*) FROM agent_threads WHERE agent_id = $1) AS thread_count,
+           (SELECT count(*) FROM agents WHERE kind = 'dispatcher' AND enabled = true AND id <> $1)
+             AS other_enabled_dispatcher_count`,
+        [id]
+      );
+      const usage = mustRow(usageResult.rows[0]);
+      const blocked = agentDeletionBlockReason(agent, {
+        taskCount: Number(usage.task_count),
+        threadCount: Number(usage.thread_count),
+        otherEnabledDispatcherCount: Number(usage.other_enabled_dispatcher_count)
+      });
+      if (blocked) throw app.httpErrors.conflict(blocked);
+
+      await client.query("DELETE FROM agents WHERE id = $1", [id]);
+      return { deleted: true, agent: { id: agent.id, name: agent.name } };
+    });
   });
 
   app.get("/api/tasks", async (request) => {
