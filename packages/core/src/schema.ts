@@ -130,6 +130,7 @@ export const agents = pgTable("agents", {
   description: text("description").notNull().default(""),
   model: text("model").notNull().default("gpt-5.6-sol"),
   modelOptions: jsonb("model_options").notNull().default([]),
+  capabilities: jsonb("capabilities").notNull().default([]),
   instructions: text("instructions").notNull(),
   enabled: boolean("enabled").notNull().default(true),
   createdAt,
@@ -194,12 +195,14 @@ export const tasks = pgTable("tasks", {
   id,
   number: integer("number").notNull().generatedAlwaysAsIdentity(),
   title: text("title").notNull(),
+  description: text("description").notNull().default(""),
   body: text("body").notNull().default(""),
   status: text("status").notNull().default("open"),
   projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
   openPrOnSuccess: boolean("open_pr_on_success").notNull().default(false),
+  coordinationThreadId: uuid("coordination_thread_id"),
   createdAt,
   updatedAt
 });
@@ -251,6 +254,7 @@ export const agentThreads = pgTable(
     branch: text("branch"),
     runtimeHome: text("runtime_home").notNull(),
     providerThreadId: text("provider_thread_id"),
+    coordinationThreadId: uuid("coordination_thread_id"),
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
     createdAt,
     updatedAt
@@ -315,6 +319,7 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
   trigger: text("trigger").notNull().default("heartbeat"),
   scope: text("scope").notNull().default("heartbeat"),
   agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
+  messageDeliveryId: uuid("message_delivery_id"),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   codexHome: text("codex_home").notNull(),
@@ -366,6 +371,9 @@ export const agentToolTokens = pgTable(
       onDelete: "cascade"
     }),
     taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+    agentId: uuid("agent_id").references(() => agents.id, { onDelete: "cascade" }),
+    agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "cascade" }),
+    coordinationThreadId: uuid("coordination_thread_id"),
     role: text("role").notNull().default("worker"),
     expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
     createdAt
@@ -374,6 +382,139 @@ export const agentToolTokens = pgTable(
     tokenUnique: uniqueIndex("agent_tool_tokens_token_hash_unique").on(table.tokenHash)
   })
 );
+
+export const coordinationThreads = pgTable("coordination_threads", {
+  id,
+  number: integer("number").notNull().generatedAlwaysAsIdentity(),
+  title: text("title").notNull(),
+  description: text("description").notNull().default(""),
+  purpose: text("purpose").notNull().default(""),
+  status: text("status").notNull().default("active"),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+  taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
+  createdByUserId: uuid("created_by_user_id").references(() => users.id, { onDelete: "set null" }),
+  createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  primaryAgentId: uuid("primary_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  callbackAgentId: uuid("callback_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  originThreadId: uuid("origin_thread_id"),
+  originMessageId: uuid("origin_message_id"),
+  completionInstructions: text("completion_instructions").notNull().default(""),
+  lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
+  createdAt,
+  updatedAt
+});
+
+export const threadParticipants = pgTable(
+  "thread_participants",
+  {
+    threadId: uuid("thread_id").notNull().references(() => coordinationThreads.id, { onDelete: "cascade" }),
+    agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+    role: text("role").notNull().default("participant"),
+    createdAt
+  },
+  (table) => ({
+    pk: primaryKey({ columns: [table.threadId, table.agentId] })
+  })
+);
+
+export const threadMessages = pgTable(
+  "thread_messages",
+  {
+    id,
+    number: integer("number").notNull().generatedAlwaysAsIdentity(),
+    threadId: uuid("thread_id").notNull().references(() => coordinationThreads.id, { onDelete: "cascade" }),
+    senderAgentId: uuid("sender_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    senderUserId: uuid("sender_user_id").references(() => users.id, { onDelete: "set null" }),
+    recipientAgentId: uuid("recipient_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    parentMessageId: uuid("parent_message_id"),
+    messageType: text("message_type").notNull().default("message"),
+    body: text("body").notNull(),
+    idempotencyKey: text("idempotency_key"),
+    createdAt
+  },
+  (table) => ({
+    idempotencyUnique: uniqueIndex("thread_messages_sender_idempotency_unique").on(
+      table.senderAgentId,
+      table.idempotencyKey
+    )
+  })
+);
+
+export const messageDeliveries = pgTable(
+  "message_deliveries",
+  {
+    id,
+    messageId: uuid("message_id").notNull().references(() => threadMessages.id, { onDelete: "cascade" }),
+    recipientAgentId: uuid("recipient_agent_id").notNull().references(() => agents.id, { onDelete: "cascade" }),
+    status: text("status").notNull().default("queued"),
+    attemptCount: integer("attempt_count").notNull().default(0),
+    availableAt: timestamp("available_at", { withTimezone: true }).notNull().defaultNow(),
+    presentedAt: timestamp("presented_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+    error: text("error"),
+    createdAt,
+    updatedAt
+  },
+  (table) => ({
+    recipientUnique: uniqueIndex("message_deliveries_message_recipient_unique").on(
+      table.messageId,
+      table.recipientAgentId
+    )
+  })
+);
+
+export const reports = pgTable("reports", {
+  id,
+  number: integer("number").notNull().generatedAlwaysAsIdentity(),
+  title: text("title").notNull(),
+  description: text("description").notNull().default(""),
+  status: text("status").notNull().default("draft"),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+  threadId: uuid("thread_id").references(() => coordinationThreads.id, { onDelete: "set null" }),
+  authorAgentId: uuid("author_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  currentRevision: integer("current_revision").notNull().default(1),
+  createdAt,
+  updatedAt
+});
+
+export const reportVersions = pgTable(
+  "report_versions",
+  {
+    id,
+    reportId: uuid("report_id").notNull().references(() => reports.id, { onDelete: "cascade" }),
+    revision: integer("revision").notNull(),
+    markdown: text("markdown").notNull(),
+    createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+    createdAt
+  },
+  (table) => ({
+    revisionUnique: uniqueIndex("report_versions_report_revision_unique").on(table.reportId, table.revision)
+  })
+);
+
+export const incidents = pgTable("incidents", {
+  id,
+  number: integer("number").notNull().generatedAlwaysAsIdentity(),
+  title: text("title").notNull(),
+  description: text("description").notNull().default(""),
+  status: text("status").notNull().default("open"),
+  severity: text("severity").notNull().default("medium"),
+  projectId: uuid("project_id").references(() => projects.id, { onDelete: "set null" }),
+  threadId: uuid("thread_id").references(() => coordinationThreads.id, { onDelete: "set null" }),
+  commanderAgentId: uuid("commander_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  resolvedAt: timestamp("resolved_at", { withTimezone: true }),
+  createdAt,
+  updatedAt
+});
+
+export const incidentUpdates = pgTable("incident_updates", {
+  id,
+  incidentId: uuid("incident_id").notNull().references(() => incidents.id, { onDelete: "cascade" }),
+  authorAgentId: uuid("author_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  markdown: text("markdown").notNull(),
+  createdAt
+});
 
 export const githubConnections = pgTable("github_connections", {
   id,

@@ -377,8 +377,12 @@ const additiveSql = `
 ALTER TYPE run_status ADD VALUE IF NOT EXISTS 'draft' BEFORE 'queued';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS capabilities jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE agent_versions ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE agents ALTER COLUMN model SET DEFAULT 'gpt-5.6-sol';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
@@ -388,6 +392,10 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFA
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
+ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
+ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
@@ -395,6 +403,158 @@ ALTER TABLE secrets ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
 ALTER TABLE tasks ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
 ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;
+
+UPDATE tasks
+SET description = left(COALESCE(NULLIF(btrim(regexp_replace(split_part(body, E'\n\n', 1), '\\s+', ' ', 'g')), ''), title), 280)
+WHERE btrim(description) = '';
+
+CREATE TABLE IF NOT EXISTS coordination_threads (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
+  title text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  purpose text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'active',
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
+  task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  created_by_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  primary_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  callback_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  origin_thread_id uuid,
+  origin_message_id uuid,
+  completion_instructions text NOT NULL DEFAULT '',
+  last_activity_at timestamptz NOT NULL DEFAULT now(),
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS coordination_threads_task_unique
+ON coordination_threads(task_id) WHERE task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS coordination_threads_activity_idx
+ON coordination_threads(last_activity_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS thread_participants (
+  thread_id uuid NOT NULL REFERENCES coordination_threads(id) ON DELETE CASCADE,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  role text NOT NULL DEFAULT 'participant',
+  created_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (thread_id, agent_id)
+);
+
+CREATE TABLE IF NOT EXISTS thread_messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
+  thread_id uuid NOT NULL REFERENCES coordination_threads(id) ON DELETE CASCADE,
+  sender_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  sender_user_id uuid REFERENCES users(id) ON DELETE SET NULL,
+  recipient_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  parent_message_id uuid REFERENCES thread_messages(id) ON DELETE SET NULL,
+  message_type text NOT NULL DEFAULT 'message',
+  body text NOT NULL,
+  idempotency_key text,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS thread_messages_sender_idempotency_unique
+ON thread_messages(sender_agent_id, idempotency_key)
+WHERE sender_agent_id IS NOT NULL AND idempotency_key IS NOT NULL;
+CREATE INDEX IF NOT EXISTS thread_messages_thread_page_idx
+ON thread_messages(thread_id, created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS message_deliveries (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  message_id uuid NOT NULL REFERENCES thread_messages(id) ON DELETE CASCADE,
+  recipient_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  status text NOT NULL DEFAULT 'queued',
+  attempt_count integer NOT NULL DEFAULT 0,
+  available_at timestamptz NOT NULL DEFAULT now(),
+  presented_at timestamptz,
+  completed_at timestamptz,
+  error text,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (message_id, recipient_agent_id)
+);
+
+CREATE INDEX IF NOT EXISTS message_deliveries_status_idx
+ON message_deliveries(status, available_at, created_at);
+
+CREATE TABLE IF NOT EXISTS reports (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
+  title text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'draft',
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
+  thread_id uuid REFERENCES coordination_threads(id) ON DELETE SET NULL,
+  author_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  current_revision integer NOT NULL DEFAULT 1,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS report_versions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  report_id uuid NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+  revision integer NOT NULL,
+  markdown text NOT NULL,
+  created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (report_id, revision)
+);
+
+CREATE TABLE IF NOT EXISTS incidents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
+  title text NOT NULL,
+  description text NOT NULL DEFAULT '',
+  status text NOT NULL DEFAULT 'open',
+  severity text NOT NULL DEFAULT 'medium',
+  project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
+  thread_id uuid REFERENCES coordination_threads(id) ON DELETE SET NULL,
+  commander_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  resolved_at timestamptz,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS incident_updates (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  incident_id uuid NOT NULL REFERENCES incidents(id) ON DELETE CASCADE,
+  author_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  markdown text NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+
+DO $$ BEGIN
+  ALTER TABLE tasks ADD CONSTRAINT tasks_coordination_thread_id_fkey
+    FOREIGN KEY (coordination_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE agent_threads ADD CONSTRAINT agent_threads_coordination_thread_id_fkey
+    FOREIGN KEY (coordination_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE dispatcher_runs ADD CONSTRAINT dispatcher_runs_message_delivery_id_fkey
+    FOREIGN KEY (message_delivery_id) REFERENCES message_deliveries(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE agent_tool_tokens ADD CONSTRAINT agent_tool_tokens_coordination_thread_id_fkey
+    FOREIGN KEY (coordination_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE coordination_threads ADD CONSTRAINT coordination_threads_origin_thread_id_fkey
+    FOREIGN KEY (origin_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE coordination_threads ADD CONSTRAINT coordination_threads_origin_message_id_fkey
+    FOREIGN KEY (origin_message_id) REFERENCES thread_messages(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS agent_threads_coordination_agent_unique
+ON agent_threads(coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL;
 
 UPDATE agents
 SET kind = 'dispatcher', updated_at = now()
@@ -404,12 +564,60 @@ WHERE lower(name) IN ('dispatcher', 'orchestrator')
 INSERT INTO agents (kind, name, description, model, instructions, enabled)
 SELECT
   'dispatcher',
-  'Dispatcher',
-  'Routes Todo and Needs attention tasks to the right worker agent.',
+  'Orchestrator',
+  'Routes unassigned work and coordinates specialized agents across durable threads.',
   COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.6-sol'),
-  'You are the Aisevak Dispatcher. Review the task board, assign work to enabled worker agents, start worker runs with the aisevak CLI, and move ambiguous or blocked work to Needs attention with a precise comment.',
+  'You are the Aisevak Orchestrator. Use the aisevak CLI to inspect work, route tasks, coordinate agents through durable threads, and request precise follow-up when work is ambiguous or blocked.',
   true
 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher');
+
+UPDATE agents
+SET name = 'Orchestrator',
+    description = 'Routes unassigned work and coordinates specialized agents across durable threads.',
+    updated_at = now()
+WHERE kind = 'dispatcher' AND lower(name) = 'dispatcher';
+
+INSERT INTO coordination_threads
+  (title, description, purpose, status, project_id, task_id, primary_agent_id, completion_instructions,
+   last_activity_at, created_at, updated_at)
+SELECT tasks.title,
+       tasks.description,
+       tasks.body,
+       CASE WHEN tasks.status = 'completed' THEN 'completed' ELSE 'active' END,
+       tasks.project_id,
+       tasks.id,
+       tasks.agent_id,
+       'When work is complete, run: aisevak threads complete THREAD-<number> --summary-stdin',
+       tasks.updated_at,
+       tasks.created_at,
+       now()
+FROM tasks
+WHERE NOT EXISTS (
+  SELECT 1 FROM coordination_threads WHERE coordination_threads.task_id = tasks.id
+);
+
+UPDATE coordination_threads
+SET completion_instructions = 'When work is complete, run: aisevak threads complete THREAD-' || number || ' --summary-stdin'
+WHERE task_id IS NOT NULL
+  AND completion_instructions LIKE '%THREAD-<number>%';
+
+UPDATE tasks
+SET coordination_thread_id = coordination_threads.id
+FROM coordination_threads
+WHERE coordination_threads.task_id = tasks.id
+  AND tasks.coordination_thread_id IS NULL;
+
+UPDATE agent_threads
+SET coordination_thread_id = tasks.coordination_thread_id
+FROM tasks
+WHERE agent_threads.task_id = tasks.id
+  AND agent_threads.coordination_thread_id IS NULL;
+
+INSERT INTO thread_participants (thread_id, agent_id, role)
+SELECT coordination_threads.id, coordination_threads.primary_agent_id, 'assignee'
+FROM coordination_threads
+WHERE coordination_threads.primary_agent_id IS NOT NULL
+ON CONFLICT (thread_id, agent_id) DO NOTHING;
 
 INSERT INTO provider_instances (id, driver, display_name, enabled)
 VALUES ('codex-local', 'codex', 'Codex', true)
@@ -504,6 +712,12 @@ WHERE dispatcher_runs.codex_home = agent_threads.runtime_home
   AND dispatcher_runs.trigger = 'manual'
   AND dispatcher_runs.scope = 'thread'
   AND dispatcher_runs.agent_thread_id IS NULL;
+
+UPDATE agent_threads
+SET coordination_thread_id = tasks.coordination_thread_id
+FROM tasks
+WHERE agent_threads.task_id = tasks.id
+  AND agent_threads.coordination_thread_id IS NULL;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
