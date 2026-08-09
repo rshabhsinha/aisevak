@@ -2,6 +2,7 @@ import { chmod, chown, lstat, mkdir, readFile, readdir, rm, writeFile } from "no
 import { fileURLToPath } from "node:url";
 import { join, resolve } from "node:path";
 import type { Pool } from "pg";
+import { parse as parseYaml } from "yaml";
 
 export interface InstalledSkillDefinition {
   name: string;
@@ -182,10 +183,29 @@ export async function synchronizeInstalledSkills(pool: Pool, root: string): Prom
     );
   }
 
+  const userPresentNames = scan.presentNames.filter(
+    (name) => !scan.skills.some((skill) => skill.name === name && skill.platformManaged)
+  );
+  const existingUserSkills = await pool.query<{ name: string }>(
+    "SELECT name FROM skills WHERE platform_managed = false ORDER BY name"
+  );
+  if (userPresentNames.length === 0 && existingUserSkills.rows.length > 0) {
+    scan.errors.push({
+      directory: "(catalog)",
+      message: "Only platform skills were found; existing installed skills were preserved in case the skills directory is unavailable"
+    });
+    return scan;
+  }
+
   await pool.query(
-    `DELETE FROM skills
-     WHERE NOT (name = ANY($1::text[]))`,
-    [scan.presentNames]
+    `UPDATE skills
+     SET enabled = false,
+         updated_at = now()
+     WHERE platform_managed = false
+       AND enabled = true
+       AND name ~ '^[a-z0-9][a-z0-9._-]*$'
+       AND NOT (name = ANY($1::text[]))`,
+    [userPresentNames]
   );
   return scan;
 }
@@ -237,20 +257,26 @@ function parseSkillMarkdown(
   if (!match) throw new Error("SKILL.md must contain YAML frontmatter");
   const frontmatter = match[1] ?? "";
   const instructions = (match[2] ?? "").trim();
-  const name = frontmatterField(frontmatter, "name");
-  const description = frontmatterField(frontmatter, "description");
+  let metadata: unknown;
+  try {
+    metadata = parseYaml(frontmatter);
+  } catch (error) {
+    throw new Error(`SKILL.md contains invalid YAML: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    throw new Error("SKILL.md frontmatter must be a YAML mapping");
+  }
+  const name = frontmatterField(metadata as Record<string, unknown>, "name");
+  const description = frontmatterField(metadata as Record<string, unknown>, "description");
   validateSkillName(name);
   if (!instructions) throw new Error(`Installed skill ${name} has no instructions`);
   return { name, description, instructions };
 }
 
-function frontmatterField(frontmatter: string, field: string): string {
-  const match = frontmatter.match(new RegExp(`^${field}:\\s*(.+)$`, "m"));
-  const value = match?.[1]?.trim();
-  if (!value) throw new Error(`SKILL.md is missing ${field}`);
-  if (value.startsWith('"') && value.endsWith('"')) return JSON.parse(value) as string;
-  if (value.startsWith("'") && value.endsWith("'")) return value.slice(1, -1).replace(/''/g, "'");
-  return value;
+function frontmatterField(frontmatter: Record<string, unknown>, field: string): string {
+  const value = frontmatter[field];
+  if (typeof value !== "string" || !value.trim()) throw new Error(`SKILL.md is missing ${field}`);
+  return value.trim();
 }
 
 async function readSkillFiles(skillDirectory: string): Promise<Record<string, string>> {
