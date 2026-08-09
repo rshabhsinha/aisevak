@@ -1,5 +1,4 @@
 export * from "./auth.js";
-export * from "./bundledSkills.js";
 export * from "./codex.js";
 export * from "./codexAuth.js";
 export * from "./codexBinary.js";
@@ -7,6 +6,7 @@ export * from "./codexModels.js";
 export * from "./crypto.js";
 export * from "./db.js";
 export * from "./github.js";
+export * from "./installedSkills.js";
 export * from "./migrations.js";
 export * from "./models.js";
 export * from "./resources.js";

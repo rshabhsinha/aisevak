@@ -9,9 +9,11 @@ aisevak whoami
 aisevak capabilities
 aisevak agents list [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak agents show AGENT
+aisevak skills path
 ```
 
 `capabilities` also lists the skills resolved for the current agent, project, and task.
+`skills path` returns the persistent directory where a reusable skill can be installed for discovery by the Skills tab.
 
 ## Generic resources
 

@@ -1,5 +1,5 @@
 import type { Pool } from "pg";
-import { loadBundledSkills } from "./bundledSkills.js";
+import { installedSkillsRoot, migrateAndSynchronizeInstalledSkills } from "./installedSkills.js";
 import { normalizeCodexModel } from "./models.js";
 
 const enumSql = `
@@ -109,7 +109,7 @@ CREATE TABLE IF NOT EXISTS skills (
   instructions text NOT NULL,
   files jsonb NOT NULL DEFAULT '{}'::jsonb,
   enabled boolean NOT NULL DEFAULT true,
-  bundled boolean NOT NULL DEFAULT false,
+  platform_managed boolean NOT NULL DEFAULT false,
   default_for_agents boolean NOT NULL DEFAULT false,
   created_by uuid REFERENCES users(id) ON DELETE SET NULL,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -381,7 +381,23 @@ ALTER TYPE run_status ADD VALUE IF NOT EXISTS 'draft' BEFORE 'queued';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS capabilities jsonb NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE skills ADD COLUMN IF NOT EXISTS bundled boolean NOT NULL DEFAULT false;
+DO $$ BEGIN
+  IF EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'skills' AND column_name = 'bundled'
+  ) THEN
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = current_schema() AND table_name = 'skills' AND column_name = 'platform_managed'
+    ) THEN
+      UPDATE skills SET platform_managed = platform_managed OR bundled;
+      ALTER TABLE skills DROP COLUMN bundled;
+    ELSE
+      ALTER TABLE skills RENAME COLUMN bundled TO platform_managed;
+    END IF;
+  END IF;
+END $$;
+ALTER TABLE skills ADD COLUMN IF NOT EXISTS platform_managed boolean NOT NULL DEFAULT false;
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS default_for_agents boolean NOT NULL DEFAULT false;
 ALTER TABLE agent_versions ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE agents ALTER COLUMN model SET DEFAULT 'gpt-5.6-luna';
@@ -914,29 +930,8 @@ export async function runMigrations(pool: Pool): Promise<void> {
   await pool.query(enumSql);
   await pool.query(tableSql);
   await pool.query(additiveSql);
-  await installBundledSkills(pool);
-}
-
-async function installBundledSkills(pool: Pool): Promise<void> {
-  for (const skill of await loadBundledSkills()) {
-    await pool.query(
-      `INSERT INTO skills
-         (name, description, instructions, files, enabled, bundled, default_for_agents)
-       VALUES ($1, $2, $3, $4, true, true, $5)
-       ON CONFLICT (name) DO UPDATE
-       SET description = EXCLUDED.description,
-           instructions = EXCLUDED.instructions,
-           files = EXCLUDED.files,
-           bundled = true,
-           default_for_agents = EXCLUDED.default_for_agents,
-           updated_at = CASE
-             WHEN (skills.description, skills.instructions, skills.files, skills.bundled, skills.default_for_agents)
-               IS DISTINCT FROM
-                  (EXCLUDED.description, EXCLUDED.instructions, EXCLUDED.files, true, EXCLUDED.default_for_agents)
-             THEN now()
-             ELSE skills.updated_at
-           END`,
-      [skill.name, skill.description, skill.instructions, skill.files, skill.defaultForAgents]
-    );
-  }
+  await migrateAndSynchronizeInstalledSkills(
+    pool,
+    installedSkillsRoot(process.env.MANAGED_ROOT ?? "/srv/aisevak")
+  );
 }

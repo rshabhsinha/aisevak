@@ -1,6 +1,6 @@
 ---
 name: aisevak-cli
-description: Use the Aisevak CLI when an isolated agent needs platform context or must coordinate through durable threads, tasks, schedules, reports, or incidents. Apply it to discover available agents and capabilities, inspect paginated resources lazily, delegate or route tracked work, schedule explicit future work, message another agent, and report completion or blockers back to the initiating thread.
+description: Use the Aisevak CLI when an isolated agent needs platform context, must coordinate through durable threads, tasks, schedules, reports, or incidents, or needs the persistent location for installing a reusable skill. Apply it to discover available agents and capabilities, inspect paginated resources lazily, delegate or route tracked work, schedule explicit future work, message another agent, and report completion or blockers back to the initiating thread.
 ---
 
 # Aisevak CLI
@@ -14,6 +14,12 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 - Run `aisevak whoami` when identity or current task/thread context is unclear. Run `aisevak capabilities` before an uncertain mutation or to see installed skills.
 - Treat CLI output as structured JSON. Preserve stable references such as `AGENT-Builder`, `THREAD-12`, `TASK-34`, `SCHEDULE-3`, `REPORT-5`, and `INC-2` in follow-up actions.
 - Check command help or [references/commands.md](references/commands.md) when exact syntax is uncertain.
+
+## Install reusable skills
+
+- Run `aisevak skills path` to discover the persistent installed-skill catalog. Aisevak also exposes it as `$AISEVAK_SKILLS_DIR`.
+- Create a reusable skill at `$AISEVAK_SKILLS_DIR/<skill-name>/SKILL.md`; the Skills tab discovers valid skill directories there.
+- Do not install persistent skills under `$CODEX_HOME`. That home and its `.agents/skills` directory are isolated, generated views for the current thread.
 
 ## Choose the coordination primitive
 
