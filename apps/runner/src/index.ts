@@ -741,7 +741,7 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
   return job.cwd;
 }
 
-async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
+export async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
   const skillsRoot = join(codexHome, ".agents", "skills");
   await rm(skillsRoot, { recursive: true, force: true });
   await mkdir(skillsRoot, { recursive: true });
@@ -946,26 +946,40 @@ async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexS
     description: string;
     instructions: string;
     files: unknown;
+    source: string;
   }>(
     `SELECT skills.id,
             skills.name,
             skills.description,
             skills.instructions,
-            skills.files
+            skills.files,
+            selected.source
      FROM skills
-     JOIN agent_skills ON agent_skills.skill_id = skills.id
-     WHERE skills.enabled = true AND agent_skills.agent_id = $1
+     JOIN (
+       SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
+       UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+     ) selected ON selected.skill_id = skills.id
+     WHERE skills.enabled = true
      ORDER BY skills.name ASC`
     , [agentId]
   );
-  return result.rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    instructions: row.instructions,
-    files: normalizeSkillFiles(row.files),
-    sources: ["agent"]
-  }));
+  const byId = new Map<string, CodexSkillSnapshot>();
+  for (const row of result.rows) {
+    const existing = byId.get(row.id);
+    if (existing) {
+      if (!existing.sources.includes(row.source)) existing.sources.push(row.source);
+      continue;
+    }
+    byId.set(row.id, {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      instructions: row.instructions,
+      files: normalizeSkillFiles(row.files),
+      sources: [row.source]
+    });
+  }
+  return [...byId.values()];
 }
 
 function normalizeSkillFiles(value: unknown): Record<string, string> {

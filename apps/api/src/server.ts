@@ -433,6 +433,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     requireAdmin(request);
     const { id } = idParams.parse(request.params);
     const body = skillPatchSchema.parse(request.body);
+    const current = await pool.query<{ bundled: boolean }>("SELECT bundled FROM skills WHERE id = $1", [id]);
+    if (current.rows[0]?.bundled && Object.keys(body).some((key) => key !== "enabled")) {
+      throwBadRequest("Bundled skill content is managed by Aisevak releases; only enabled can be changed");
+    }
     if (body.files) validateSkillFiles(body.files);
     const result = await pool.query(
       `UPDATE skills
@@ -2737,7 +2741,8 @@ async function resolveSelectedSkills(
             selected.source
      FROM skills
      JOIN (
-       SELECT skill_id, 'agent'::text AS source FROM agent_skills WHERE agent_id = $1
+       SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
+       UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
        UNION ALL SELECT skill_id, 'project' FROM project_skills WHERE project_id = $2
        UNION ALL SELECT skill_id, 'task' FROM task_skills WHERE task_id = $3
      ) selected ON selected.skill_id = skills.id

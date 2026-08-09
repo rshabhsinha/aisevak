@@ -787,8 +787,12 @@ async function getAgent(queryable: Queryable, ref: string): Promise<any> {
   const row = result.rows[0] ?? notFound("Agent");
   const skills = await queryable.query(
     `SELECT skills.name, skills.description
-     FROM agent_skills JOIN skills ON skills.id = agent_skills.skill_id
-     WHERE agent_skills.agent_id = $1 AND skills.enabled = true ORDER BY skills.name`,
+     FROM skills
+     WHERE skills.enabled = true
+       AND (skills.default_for_agents = true OR EXISTS (
+         SELECT 1 FROM agent_skills WHERE agent_skills.skill_id = skills.id AND agent_skills.agent_id = $1
+       ))
+     ORDER BY skills.name`,
     [row.id]
   );
   return {
@@ -989,7 +993,8 @@ async function resolveAgentSkills(queryable: Queryable, agentId: string, project
   }>(
     `SELECT skills.id, skills.name, skills.description, skills.instructions, skills.files, source
      FROM skills JOIN (
-       SELECT skill_id, 'agent'::text AS source FROM agent_skills WHERE agent_id = $1
+       SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
+       UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
        UNION ALL SELECT skill_id, 'project' FROM project_skills WHERE project_id = $2
        UNION ALL SELECT skill_id, 'task' FROM task_skills WHERE task_id = $3
      ) selected ON selected.skill_id = skills.id WHERE skills.enabled = true ORDER BY skills.name`,
