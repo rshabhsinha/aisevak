@@ -9,7 +9,9 @@ services:
     ports:
       - "127.0.0.1:5432:5432"
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # PostgreSQL 18 stores PGDATA under /var/lib/postgresql/18/docker.
+      # scripts/install.sh migrates existing legacy-mounted clusters before this remount.
+      - postgres-data:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U aisevak -d aisevak"]
       interval: 5s

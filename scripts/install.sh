@@ -15,6 +15,12 @@ GIT_SHA="$(git -C "${SOURCE_DIR}" rev-parse --short HEAD 2>/dev/null || echo man
 RELEASE_DIR="${RELEASES_DIR}/${TIMESTAMP}-${GIT_SHA}"
 COMPOSE_PROJECT_NAME="${AISEVAK_COMPOSE_PROJECT_NAME:-current}"
 RELEASES_TO_KEEP="${AISEVAK_RELEASES_TO_KEEP:-5}"
+POSTGRES_IMAGE="postgres:18"
+POSTGRES_LEGACY_MOUNT="/var/lib/postgresql/data"
+POSTGRES_PARENT_MOUNT="/var/lib/postgresql"
+POSTGRES_DATA_DIR="/var/lib/postgresql/18/docker"
+POSTGRES_MIGRATION_MARKER=".aisevak-postgres-layout-v18"
+DATABASE_BACKUP_FILE=""
 
 if [[ "${EUID}" -ne 0 ]]; then
   echo "Run this installer with sudo."
@@ -78,8 +84,18 @@ compose_current() {
   docker compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${CURRENT_DIR}/docker-compose.yml" "$@"
 }
 
+compose_release() {
+  docker compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${RELEASE_DIR}/docker-compose.yml" "$@"
+}
+
 backup_database() {
+  local required="${1:-${AISEVAK_REQUIRE_BACKUP:-0}}"
+
   if [[ "${AISEVAK_SKIP_BACKUP:-0}" == "1" ]]; then
+    if [[ "${required}" == "1" ]]; then
+      echo "Error: A required database backup cannot be skipped." >&2
+      return 1
+    fi
     log "Skipping database backup because AISEVAK_SKIP_BACKUP=1"
     return
   fi
@@ -92,34 +108,351 @@ backup_database() {
   local postgres_container
   postgres_container="$(compose_current ps -q postgres 2>/dev/null || true)"
   if [[ -z "${postgres_container}" ]]; then
-    if [[ "${AISEVAK_REQUIRE_BACKUP:-0}" == "1" ]]; then
-      fail "Postgres is not running, so a required backup could not be created."
+    if [[ "${required}" == "1" ]]; then
+      echo "Error: Postgres is not running, so a required backup could not be created." >&2
+      return 1
     fi
     log "Postgres is not running; skipping database backup"
     return
   fi
 
   if ! docker inspect -f '{{.State.Running}}' "${postgres_container}" 2>/dev/null | grep -q true; then
-    if [[ "${AISEVAK_REQUIRE_BACKUP:-0}" == "1" ]]; then
-      fail "Postgres container exists but is not running, so a required backup could not be created."
+    if [[ "${required}" == "1" ]]; then
+      echo "Error: Postgres container exists but is not running, so a required backup could not be created." >&2
+      return 1
     fi
     log "Postgres container is not running; skipping database backup"
     return
   fi
 
-  require_command gzip "gzip is required to create compressed database backups."
+  if ! command_exists gzip; then
+    echo "Error: gzip is required to create compressed database backups." >&2
+    return 1
+  fi
 
-  local backup_file="${BACKUP_DIR}/postgres-${TIMESTAMP}.sql.gz"
-  log "Backing up Postgres to ${backup_file}"
-  if compose_current exec -T postgres pg_dump -U aisevak -d aisevak | gzip > "${backup_file}"; then
-    chmod 0600 "${backup_file}"
+  DATABASE_BACKUP_FILE="${BACKUP_DIR}/postgres-${TIMESTAMP}.sql.gz"
+  log "Backing up Postgres to ${DATABASE_BACKUP_FILE}"
+  if compose_current exec -T postgres pg_dump -U aisevak -d aisevak | gzip > "${DATABASE_BACKUP_FILE}"; then
+    chmod 0600 "${DATABASE_BACKUP_FILE}"
   else
-    rm -f "${backup_file}"
-    if [[ "${AISEVAK_REQUIRE_BACKUP:-0}" == "1" ]]; then
-      fail "Database backup failed."
+    rm -f "${DATABASE_BACKUP_FILE}"
+    DATABASE_BACKUP_FILE=""
+    if [[ "${required}" == "1" ]]; then
+      echo "Error: Database backup failed." >&2
+      return 1
     fi
     log "Database backup failed; continuing because AISEVAK_REQUIRE_BACKUP is not set"
   fi
+}
+
+container_volume_name_at() {
+  local container="$1"
+  local destination="$2"
+
+  docker inspect --format "{{range .Mounts}}{{if eq .Destination \"${destination}\"}}{{if eq .Type \"volume\"}}{{.Name}}{{end}}{{end}}{{end}}" "${container}"
+}
+
+container_is_running() {
+  local container="$1"
+
+  [[ -n "${container}" ]] && docker inspect -f '{{.State.Running}}' "${container}" 2>/dev/null | grep -q true
+}
+
+compose_service_is_running() {
+  local service="$1"
+  local container
+
+  container="$(compose_current ps -a -q "${service}" 2>/dev/null || true)"
+  container_is_running "${container}"
+}
+
+target_volume_has_migration_marker() {
+  local volume_name="$1"
+
+  docker run --rm \
+    --mount "type=volume,source=${volume_name},target=/target,readonly" \
+    --entrypoint bash \
+    "${POSTGRES_IMAGE}" \
+    -ceu 'test -s "/target/$1"' -- "${POSTGRES_MIGRATION_MARKER}"
+}
+
+target_volume_is_empty() {
+  local volume_name="$1"
+
+  docker run --rm \
+    --mount "type=volume,source=${volume_name},target=/target,readonly" \
+    --entrypoint bash \
+    "${POSTGRES_IMAGE}" \
+    -ceu 'test -z "$(find /target -mindepth 1 -maxdepth 1 -print -quit)"'
+}
+
+volume_cluster_info_at() {
+  local volume_name="$1"
+  local relative_path="$2"
+
+  docker run --rm \
+    --mount "type=volume,source=${volume_name},target=/target,readonly" \
+    --entrypoint bash \
+    "${POSTGRES_IMAGE}" \
+    -ceu '
+      data_dir="/target/$1"
+      test -s "$data_dir/PG_VERSION"
+      system_identifier="$(pg_controldata "$data_dir" | sed -n "s/^Database system identifier:[[:space:]]*//p")"
+      test -n "$system_identifier"
+      printf "%s|%s" "$(cat "$data_dir/PG_VERSION")" "$system_identifier"
+    ' -- "${relative_path}"
+}
+
+mark_existing_structured_volume() {
+  local volume_name="$1"
+  local postgres_container="$2"
+
+  docker run --rm \
+    --mount "type=volume,source=${volume_name},target=/target" \
+    --entrypoint bash \
+    "${POSTGRES_IMAGE}" \
+    -ceu '
+      data_dir="/target/18/docker"
+      marker="/target/$1"
+      test "$(cat "$data_dir/PG_VERSION")" = "18"
+      pg_controldata "$data_dir" | grep -Eq "Database cluster state:[[:space:]]+shut down"
+      printf "postgres-major=18\nsource-container=%s\nbackup=%s\n" "$2" "$3" > "$marker"
+    ' -- "${POSTGRES_MIGRATION_MARKER}" "${postgres_container}" "$(basename "${DATABASE_BACKUP_FILE}")"
+}
+
+restore_quiesced_services() {
+  local postgres_was_running="$1"
+  local api_was_running="$2"
+  local web_was_running="$3"
+  local runner_was_running="$4"
+
+  log "Restoring services after the aborted Postgres migration"
+  if [[ "${postgres_was_running}" == "1" ]]; then
+    compose_current start postgres || true
+  fi
+  if [[ "${api_was_running}" == "1" ]]; then
+    compose_current start api || true
+  fi
+  if [[ "${web_was_running}" == "1" ]]; then
+    compose_current start web || true
+  fi
+  if [[ "${runner_was_running}" == "1" ]]; then
+    systemctl start aisevak-runner.service || true
+  fi
+}
+
+wait_for_release_postgres() {
+  local postgres_container
+  local status
+  local attempt
+
+  for ((attempt = 1; attempt <= 60; attempt += 1)); do
+    postgres_container="$(compose_release ps -a -q postgres 2>/dev/null || true)"
+    if [[ -n "${postgres_container}" ]]; then
+      status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "${postgres_container}" 2>/dev/null || true)"
+      if [[ "${status}" == "healthy" ]]; then
+        return 0
+      fi
+      if [[ "${status}" == "exited" || "${status}" == "dead" ]]; then
+        return 1
+      fi
+    fi
+    sleep 2
+  done
+
+  return 1
+}
+
+migrate_postgres_volume_layout() {
+  local postgres_container="$1"
+  local target_volume="$2"
+  local source_pgdata
+  local source_major
+  local source_system_identifier
+  local target_cluster_info
+  local target_major
+  local target_system_identifier
+  local target_layout="copy"
+  local source_control_checksum
+  local target_control_checksum
+  local postgres_was_running=0
+  local api_was_running=0
+  local web_was_running=0
+  local runner_was_running=0
+
+  if ! container_is_running "${postgres_container}"; then
+    fail "The legacy Postgres container is not running. Start it and retry so its data can be migrated safely."
+  fi
+
+  source_pgdata="$(docker exec "${postgres_container}" sh -ceu 'printf "%s" "$PGDATA"')"
+  source_major="$(docker exec "${postgres_container}" sh -ceu 'cat "$PGDATA/PG_VERSION"')"
+  source_system_identifier="$(docker exec "${postgres_container}" sh -ceu 'pg_controldata "$PGDATA" | sed -n "s/^Database system identifier:[[:space:]]*//p"')"
+  if [[ "${source_pgdata}" != "${POSTGRES_DATA_DIR}" || "${source_major}" != "18" ]]; then
+    fail "Expected a PostgreSQL 18 cluster at ${POSTGRES_DATA_DIR}; found PGDATA=${source_pgdata}, PG_VERSION=${source_major}. Migrate this cluster manually before retrying."
+  fi
+  if [[ -z "${source_system_identifier}" ]]; then
+    fail "Could not read the legacy PostgreSQL cluster identifier. Refusing to migrate an unverified data directory."
+  fi
+
+  if target_volume_has_migration_marker "${target_volume}"; then
+    fail "The target Postgres volume already contains an Aisevak migration marker while the legacy container is still mounted. Refusing to overwrite either copy; inspect both clusters before retrying."
+  fi
+  target_cluster_info="$(volume_cluster_info_at "${target_volume}" "18/docker" 2>/dev/null || true)"
+  if [[ -n "${target_cluster_info}" ]]; then
+    target_major="${target_cluster_info%%|*}"
+    target_system_identifier="${target_cluster_info#*|}"
+    if [[ "${target_major}" != "18" || "${target_system_identifier}" != "${source_system_identifier}" ]]; then
+      fail "The target Postgres volume contains a different cluster at 18/docker. Refusing to overwrite it."
+    fi
+    target_layout="structured"
+  elif ! target_volume_is_empty "${target_volume}"; then
+    fail "The target Postgres volume is not empty and does not contain the live cluster at 18/docker. Refusing to overwrite existing data during the mount migration."
+  fi
+
+  if compose_service_is_running postgres; then
+    postgres_was_running=1
+  fi
+  if compose_service_is_running api; then
+    api_was_running=1
+  fi
+  if compose_service_is_running web; then
+    web_was_running=1
+  fi
+  if systemctl is-active --quiet aisevak-runner.service; then
+    runner_was_running=1
+  fi
+
+  log "Quiescing database writers for the Postgres volume migration"
+  if [[ "${runner_was_running}" == "1" ]]; then
+    if ! systemctl stop aisevak-runner.service; then
+      fail "Could not stop the host runner before the Postgres migration; the release was not activated."
+    fi
+  fi
+  if ! compose_current stop api web; then
+    restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+    fail "Could not stop the API and web services before the Postgres migration; the release was not activated."
+  fi
+
+  if ! backup_database 1; then
+    restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+    fail "The required pre-migration database backup failed; the release was not activated."
+  fi
+
+  if ! compose_current stop postgres; then
+    restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+    fail "Could not stop Postgres for a consistent volume migration; the release was not activated."
+  fi
+
+  if [[ "${target_layout}" == "structured" ]]; then
+    log "Validating the existing PostgreSQL 18 cluster in the version-aware volume layout"
+    if ! source_control_checksum="$(docker run --rm \
+      --volumes-from "${postgres_container}" \
+      --entrypoint sha256sum \
+      "${POSTGRES_IMAGE}" \
+      "${source_pgdata}/global/pg_control" | sed 's/[[:space:]].*//')"; then
+      restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+      fail "Could not checksum the stopped source cluster; the legacy services were restarted and the release was not activated."
+    fi
+    if ! target_control_checksum="$(docker run --rm \
+      --mount "type=volume,source=${target_volume},target=/target,readonly" \
+      --entrypoint sha256sum \
+      "${POSTGRES_IMAGE}" \
+      /target/18/docker/global/pg_control | sed 's/[[:space:]].*//')"; then
+      restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+      fail "Could not checksum the target cluster; the legacy services were restarted and the release was not activated."
+    fi
+    if [[ -z "${source_control_checksum}" || "${source_control_checksum}" != "${target_control_checksum}" ]]; then
+      restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+      fail "The source and target Postgres control files differ after shutdown. Refusing to switch to a stale or unrelated target cluster."
+    fi
+    if ! mark_existing_structured_volume "${target_volume}" "${postgres_container}"; then
+      restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+      fail "The existing version-aware Postgres cluster failed validation; the legacy services were restarted and the release was not activated."
+    fi
+  else
+    log "Copying the stopped PostgreSQL 18 cluster into ${POSTGRES_DATA_DIR} on volume ${target_volume}"
+    if ! docker run --rm \
+      --volumes-from "${postgres_container}" \
+      --entrypoint tar \
+      "${POSTGRES_IMAGE}" \
+      -C "${source_pgdata}" -cf - . \
+      | docker run --rm -i \
+      --mount "type=volume,source=${target_volume},target=/target" \
+      --entrypoint bash \
+      "${POSTGRES_IMAGE}" \
+      -ceu '
+        target_dir="/target/18/docker"
+        stage_dir="/target/18/.aisevak-migrating-$1"
+        marker="/target/$2"
+        cleanup() {
+          rm -rf -- "$stage_dir"
+          rmdir /target/18 2>/dev/null || true
+        }
+        trap cleanup EXIT
+
+        test -z "$(find /target -mindepth 1 -maxdepth 1 -print -quit)"
+        test ! -e "$target_dir"
+        mkdir -p "$(dirname "$stage_dir")" "$stage_dir"
+        tar -C "$stage_dir" -xf -
+        test -s "$stage_dir/PG_VERSION"
+        test "$(cat "$stage_dir/PG_VERSION")" = "18"
+        pg_controldata "$stage_dir" | grep -Eq "Database cluster state:[[:space:]]+shut down"
+        mv "$stage_dir" "$target_dir"
+        printf "postgres-major=18\nsource-container=%s\nbackup=%s\n" "$3" "$4" > "$marker"
+        trap - EXIT
+      ' -- "${TIMESTAMP}" "${POSTGRES_MIGRATION_MARKER}" "${postgres_container}" "$(basename "${DATABASE_BACKUP_FILE}")"; then
+      restore_quiesced_services "${postgres_was_running}" "${api_was_running}" "${web_was_running}" "${runner_was_running}"
+      fail "Postgres volume migration failed; the legacy services were restarted and the release was not activated."
+    fi
+  fi
+
+  log "Starting PostgreSQL with the version-aware volume layout"
+  if ! compose_release up -d postgres; then
+    fail "The data migration completed, but Postgres could not be recreated with the new mount. The release was not activated; the backup is ${DATABASE_BACKUP_FILE}."
+  fi
+  if ! wait_for_release_postgres; then
+    fail "The migrated Postgres container did not become healthy. The release was not activated; the backup is ${DATABASE_BACKUP_FILE}."
+  fi
+  if ! compose_release exec -T postgres psql -v ON_ERROR_STOP=1 -U aisevak -d aisevak -Atqc 'SELECT 1' | grep -qx 1; then
+    fail "The migrated database failed its verification query. The release was not activated; the backup is ${DATABASE_BACKUP_FILE}."
+  fi
+
+  log "Postgres volume migration completed successfully"
+}
+
+migrate_postgres_volume_if_needed() {
+  local postgres_container
+  local legacy_volume
+  local parent_volume
+
+  if [[ ! -f "${CURRENT_DIR}/docker-compose.yml" ]]; then
+    return
+  fi
+  if ! grep -Eq 'postgres-data:/var/lib/postgresql/data([[:space:]]|$)' "${CURRENT_DIR}/docker-compose.yml"; then
+    return
+  fi
+  if ! grep -Eq 'postgres-data:/var/lib/postgresql([[:space:]]|$)' "${RELEASE_DIR}/docker-compose.yml"; then
+    return
+  fi
+
+  postgres_container="$(compose_current ps -a -q postgres 2>/dev/null || true)"
+  if [[ -z "${postgres_container}" ]]; then
+    fail "The active release uses the legacy Postgres mount, but its container could not be found. Refusing to activate the new mount without migrating the existing data."
+  fi
+
+  legacy_volume="$(container_volume_name_at "${postgres_container}" "${POSTGRES_LEGACY_MOUNT}")"
+  parent_volume="$(container_volume_name_at "${postgres_container}" "${POSTGRES_PARENT_MOUNT}")"
+  if [[ -n "${legacy_volume}" ]]; then
+    migrate_postgres_volume_layout "${postgres_container}" "${legacy_volume}"
+    return
+  fi
+
+  if [[ -n "${parent_volume}" ]] && target_volume_has_migration_marker "${parent_volume}"; then
+    log "Postgres already uses the migrated version-aware volume layout"
+    return
+  fi
+
+  fail "The active release uses the legacy Postgres mount, but the container's data mounts are unexpected. Refusing to activate the new mount automatically."
 }
 
 prune_releases() {
@@ -170,7 +503,12 @@ pnpm install --frozen-lockfile=false
 log "Building release"
 pnpm build
 
-backup_database
+migrate_postgres_volume_if_needed
+if [[ -z "${DATABASE_BACKUP_FILE}" ]]; then
+  if ! backup_database; then
+    fail "Database backup failed."
+  fi
+fi
 
 if [[ -e "${CURRENT_DIR}" && ! -L "${CURRENT_DIR}" ]]; then
   log "Archiving legacy current directory"
