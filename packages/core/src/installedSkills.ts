@@ -114,6 +114,9 @@ export async function writeInstalledSkill(
   options: { overwrite?: boolean } = {}
 ): Promise<void> {
   validateSkillName(skill.name);
+  const filePaths = Object.keys(skill.files);
+  for (const relativePath of filePaths) validateSkillFilePath(relativePath);
+
   const skillDirectory = join(root, skill.name);
   await ensureSafeDirectory(root, []);
   const exists = await pathExists(skillDirectory);
@@ -122,8 +125,7 @@ export async function writeInstalledSkill(
   }
   await ensureSafeDirectory(root, [skill.name]);
 
-  const expectedFiles = new Set(["SKILL.md", ...Object.keys(skill.files)]);
-  for (const relativePath of Object.keys(skill.files)) validateSkillFilePath(relativePath);
+  const expectedFiles = new Set(["SKILL.md", ...filePaths]);
   if (options.overwrite) await removeUnexpectedFiles(skillDirectory, expectedFiles);
 
   for (const [relativePath, content] of Object.entries(skill.files)) {

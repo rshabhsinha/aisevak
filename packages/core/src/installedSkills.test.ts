@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Pool } from "pg";
@@ -61,6 +61,23 @@ describe("installed skills", () => {
     });
     expect(scan.skills[0]?.files).toEqual({ "references/tmux.md": "Use a named session." });
   });
+
+  it.each(["../notes", "SKILL.md"])(
+    "rejects invalid supporting path %s before creating the skill directory",
+    async (relativePath) => {
+      const root = await mkdtemp(join(tmpdir(), "aisevak-installed-skills-"));
+      cleanup.push(root);
+
+      await expect(writeInstalledSkill(root, {
+        name: "background-terminals",
+        description: "Use for persistent background commands.",
+        instructions: "Run long-lived commands in detached tmux sessions.",
+        files: { [relativePath]: "invalid" }
+      })).rejects.toThrow(`Invalid installed skill file path: ${relativePath}`);
+
+      await expect(lstat(join(root, "background-terminals"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  );
 
   it("keeps an incomplete directory present without treating it as a valid skill", async () => {
     const root = await mkdtemp(join(tmpdir(), "aisevak-installed-skills-"));
