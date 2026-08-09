@@ -288,9 +288,16 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
      WHERE id = (
        SELECT candidate.id
        FROM dispatcher_runs candidate
-       LEFT JOIN message_deliveries ON message_deliveries.id = candidate.message_delivery_id
        WHERE candidate.status = 'queued'
-         AND (candidate.message_delivery_id IS NULL OR message_deliveries.available_at <= now())
+         AND (
+           candidate.message_delivery_id IS NULL
+           OR EXISTS (
+             SELECT 1
+             FROM message_deliveries delivery
+             WHERE delivery.id = candidate.message_delivery_id
+               AND delivery.available_at <= now()
+           )
+         )
          AND (
            candidate.scope <> 'coordination'
            OR NOT EXISTS (
