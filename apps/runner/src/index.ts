@@ -1026,24 +1026,38 @@ export async function finishMessageDelivery(
   );
   const attempts = delivery.rows[0]?.attempt_count ?? 3;
   if (status === "failed" && attempts < 3) {
-    await withTransaction(pool, async (client) => {
-      await client.query(
+    try {
+      await withTransaction(pool, async (client) => {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
+               error = NULLIF($3, ''), updated_at = now()
+           WHERE id = $1`,
+          [job.message_delivery_id, attempts, error]
+        );
+        await client.query(
+          `INSERT INTO dispatcher_runs
+             (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+              codex_thread_id, model, model_options, prompt, skills_snapshot)
+           SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
+                  codex_thread_id, model, model_options, prompt, skills_snapshot
+           FROM dispatcher_runs WHERE id = $1`,
+          [job.id]
+        );
+      });
+    } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+      await pool.query(
         `UPDATE message_deliveries
-         SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
-             error = NULLIF($3, ''), updated_at = now()
-         WHERE id = $1`,
-        [job.message_delivery_id, attempts, error]
+         SET status = 'failed', completed_at = now(),
+             error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [
+          job.message_delivery_id,
+          `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`
+        ]
       );
-      await client.query(
-        `INSERT INTO dispatcher_runs
-           (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
-            codex_thread_id, model, model_options, prompt, skills_snapshot)
-         SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
-                codex_thread_id, model, model_options, prompt, skills_snapshot
-         FROM dispatcher_runs WHERE id = $1`,
-        [job.id]
-      );
-    });
+    }
     return;
   }
   await pool.query(

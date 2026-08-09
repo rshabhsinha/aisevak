@@ -21,7 +21,7 @@ function retryPool(options: { failInsert?: boolean } = {}): {
     pool: {
       async query(sql: string, params?: unknown[]) {
         queries.push({ sql, params });
-        return { rows: [{ attempt_count: 1 }] };
+        return { rows: sql.includes("SELECT attempt_count") ? [{ attempt_count: 1 }] : [] };
       },
       async connect() {
         return client;
@@ -51,18 +51,22 @@ describe("message delivery retry", () => {
     ]);
   });
 
-  it("rolls back the delivery update when replacement enqueueing fails", async () => {
+  it("marks the delivery failed after a replacement enqueue rollback", async () => {
     const { pool, queries } = retryPool({ failInsert: true });
 
-    await expect(
-      finishMessageDelivery(
-        pool,
-        { id: "dispatcher-run", message_delivery_id: "delivery" },
-        "failed",
-        "temporary failure"
-      )
-    ).rejects.toThrow("injected insert failure");
+    await finishMessageDelivery(
+      pool,
+      { id: "dispatcher-run", message_delivery_id: "delivery" },
+      "failed",
+      "temporary failure"
+    );
 
-    expect(queries.at(-1)?.sql).toBe("ROLLBACK");
+    expect(queries.at(-2)?.sql).toBe("ROLLBACK");
+    expect(queries.at(-1)?.sql).toContain("SET status = 'failed'");
+    expect(queries.at(-1)?.sql).toContain("status = 'running'");
+    expect(queries.at(-1)?.params).toEqual([
+      "delivery",
+      "Could not enqueue delivery retry: injected insert failure. Original error: temporary failure"
+    ]);
   });
 });
