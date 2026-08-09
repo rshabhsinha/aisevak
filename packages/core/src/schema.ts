@@ -343,6 +343,7 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
 
 export const schedules = pgTable("schedules", {
   id,
+  number: integer("number").notNull().generatedAlwaysAsIdentity(),
   title: text("title").notNull(),
   prompt: text("prompt").notNull(),
   agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
@@ -355,6 +356,8 @@ export const schedules = pgTable("schedules", {
     onDelete: "set null"
   }),
   createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),
+  idempotencyKey: text("idempotency_key"),
   createdAt,
   updatedAt
 });

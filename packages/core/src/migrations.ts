@@ -536,6 +536,7 @@ CREATE TABLE IF NOT EXISTS incident_updates (
 
 CREATE TABLE IF NOT EXISTS schedules (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
   title text NOT NULL,
   prompt text NOT NULL,
   agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
@@ -546,6 +547,8 @@ CREATE TABLE IF NOT EXISTS schedules (
   last_run_at timestamptz,
   last_agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
   created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  idempotency_key text,
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK (
@@ -554,9 +557,17 @@ CREATE TABLE IF NOT EXISTS schedules (
   )
 );
 
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS number integer GENERATED ALWAYS AS IDENTITY;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS idempotency_key text;
+
 CREATE INDEX IF NOT EXISTS schedules_due_idx
 ON schedules(enabled, next_run_at) WHERE enabled = true;
 CREATE INDEX IF NOT EXISTS schedules_agent_idx ON schedules(agent_id);
+CREATE UNIQUE INDEX IF NOT EXISTS schedules_number_unique ON schedules(number);
+CREATE UNIQUE INDEX IF NOT EXISTS schedules_agent_idempotency_unique
+ON schedules(created_by_agent_id, idempotency_key)
+WHERE created_by_agent_id IS NOT NULL AND idempotency_key IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS schedule_runs (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),

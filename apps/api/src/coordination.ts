@@ -23,6 +23,7 @@ const DEFAULT_WORKER_CAPABILITIES = [
   "tasks:read",
   "tasks:create",
   "tasks:update",
+  "schedules:read",
   "reports:read",
   "reports:write",
   "incidents:read",
@@ -32,6 +33,7 @@ const DEFAULT_WORKER_CAPABILITIES = [
 const ORCHESTRATOR_CAPABILITIES = [
   ...DEFAULT_WORKER_CAPABILITIES,
   "tasks:assign",
+  "schedules:write",
   "orchestration:route"
 ] as const;
 
@@ -108,6 +110,14 @@ const incidentCreateSchema = z.object({
   to: z.string().optional()
 });
 const optionalMarkdownSchema = z.object({ markdown: z.string().optional() });
+const scheduleCreateSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+  prompt: z.string().trim().min(1).max(50_000),
+  agent: z.string().min(1),
+  at: z.string().datetime(),
+  intervalSeconds: z.coerce.number().int().min(60).max(31_536_000).optional(),
+  idempotencyKey: z.string().trim().min(1).max(200).optional()
+});
 
 export async function registerCoordinationRoutes(
   app: FastifyInstance,
@@ -556,6 +566,7 @@ export async function registerCoordinationRoutes(
 
   registerReportRoutes(app, pool);
   registerIncidentRoutes(app, pool, options.managedRoot);
+  registerScheduleRoutes(app, pool);
 
   app.get("/api/agent-tools/v1/resources/:ref", async (request) => {
     const context = await requireAgent(pool, request);
@@ -577,6 +588,139 @@ export async function registerCoordinationRoutes(
     } catch (error) {
       badRequest(error instanceof Error ? error.message : "Invalid cursor");
     }
+  });
+}
+
+function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
+  app.get("/api/agent-tools/v1/schedules", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:read");
+    const query = pageSchema.parse(request.query);
+    const cursor = parseCursor(query.cursor);
+    const limit = pageLimit(query.limit);
+    const result = await pool.query(
+      `SELECT schedules.*,
+              agents.name AS agent_name,
+              creator.name AS created_by_agent_name,
+              agent_threads.title AS last_thread_title,
+              latest.status AS last_run_status,
+              left(schedules.prompt, 1000) AS content_preview,
+              octet_length(schedules.prompt) AS content_total_bytes,
+              CASE
+                WHEN schedules.enabled THEN 'scheduled'
+                WHEN schedules.schedule_kind = 'once' AND schedules.last_run_at IS NOT NULL THEN 'completed'
+                ELSE 'paused'
+              END AS status
+       FROM schedules
+       JOIN agents ON agents.id = schedules.agent_id
+       LEFT JOIN agents creator ON creator.id = schedules.created_by_agent_id
+       LEFT JOIN agent_threads ON agent_threads.id = schedules.last_agent_thread_id
+       LEFT JOIN LATERAL (
+         SELECT dispatcher_runs.status
+         FROM schedule_runs
+         JOIN dispatcher_runs ON dispatcher_runs.id = schedule_runs.dispatcher_run_id
+         WHERE schedule_runs.schedule_id = schedules.id
+         ORDER BY schedule_runs.scheduled_for DESC
+         LIMIT 1
+       ) latest ON true
+       WHERE ($1::text IS NULL OR CASE
+                WHEN schedules.enabled THEN 'scheduled'
+                WHEN schedules.schedule_kind = 'once' AND schedules.last_run_at IS NOT NULL THEN 'completed'
+                ELSE 'paused'
+              END = $1)
+         AND ($2::text IS NULL OR schedules.title ILIKE '%' || $2 || '%' OR schedules.prompt ILIKE '%' || $2 || '%' OR agents.name ILIKE '%' || $2 || '%')
+         AND ($3::timestamptz IS NULL OR (schedules.updated_at, schedules.id) < ($3, $4::uuid))
+       ORDER BY schedules.updated_at DESC, schedules.id DESC
+       LIMIT $5`,
+      [query.status || null, query.query || null, cursor?.at ?? null, cursor?.id ?? null, limit + 1]
+    );
+    return listResponse(result.rows, limit, "updated_at", scheduleResource);
+  });
+
+  app.post("/api/agent-tools/v1/schedules", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:write");
+    const body = scheduleCreateSchema.parse(request.body);
+    const agent = await getAgent(pool, body.agent);
+    if (!agent.enabled) badRequest(`Agent ${agent.name} is disabled`);
+    const runAt = new Date(body.at);
+    if (runAt.getTime() <= Date.now()) badRequest("Schedule time must be in the future");
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO schedules
+         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds,
+          created_by_agent_id, idempotency_key)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (created_by_agent_id, idempotency_key)
+       WHERE created_by_agent_id IS NOT NULL AND idempotency_key IS NOT NULL
+       DO UPDATE SET updated_at = schedules.updated_at
+       RETURNING id`,
+      [
+        body.title,
+        body.prompt,
+        agent.id,
+        body.intervalSeconds ? "interval" : "once",
+        runAt,
+        body.intervalSeconds ?? null,
+        context.agentId,
+        body.idempotencyKey ?? null
+      ]
+    );
+    return { schedule: await showSchedule(pool, result.rows[0]!.id) };
+  });
+
+  app.get("/api/agent-tools/v1/schedules/:ref", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:read");
+    const id = await resolveResourceId(pool, "schedules", "SCHEDULE", refParams.parse(request.params).ref);
+    return { schedule: await showSchedule(pool, id) };
+  });
+
+  app.post("/api/agent-tools/v1/schedules/:ref/pause", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:write");
+    const id = await resolveResourceId(pool, "schedules", "SCHEDULE", refParams.parse(request.params).ref);
+    await pool.query("UPDATE schedules SET enabled = false, updated_at = now() WHERE id = $1", [id]);
+    return { schedule: await showSchedule(pool, id) };
+  });
+
+  app.post("/api/agent-tools/v1/schedules/:ref/resume", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:write");
+    const id = await resolveResourceId(pool, "schedules", "SCHEDULE", refParams.parse(request.params).ref);
+    await withTransaction(pool, async (client) => {
+      const result = await client.query<{
+        schedule_kind: "once" | "interval";
+        interval_seconds: number | null;
+        next_run_at: Date;
+        last_run_at: Date | null;
+      }>("SELECT schedule_kind, interval_seconds, next_run_at, last_run_at FROM schedules WHERE id = $1 FOR UPDATE", [id]);
+      const schedule = result.rows[0] ?? notFound("Schedule");
+      if (schedule.schedule_kind === "once" && schedule.last_run_at) {
+        badRequest("A completed one-time schedule cannot be resumed; create a new schedule");
+      }
+      let nextRunAt = schedule.next_run_at;
+      if (nextRunAt.getTime() <= Date.now()) {
+        if (schedule.schedule_kind === "once") badRequest("A one-time schedule needs a new future time");
+        nextRunAt = new Date(Date.now() + Number(schedule.interval_seconds) * 1000);
+      }
+      await client.query(
+        "UPDATE schedules SET enabled = true, next_run_at = $2, updated_at = now() WHERE id = $1",
+        [id, nextRunAt]
+      );
+    });
+    return { schedule: await showSchedule(pool, id) };
+  });
+
+  app.delete("/api/agent-tools/v1/schedules/:ref", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:write");
+    const id = await resolveResourceId(pool, "schedules", "SCHEDULE", refParams.parse(request.params).ref);
+    const result = await pool.query<{ number: number; title: string }>(
+      "DELETE FROM schedules WHERE id = $1 RETURNING number, title",
+      [id]
+    );
+    const schedule = result.rows[0] ?? notFound("Schedule");
+    return { deleted: true, schedule: { key: `SCHEDULE-${schedule.number}`, title: schedule.title } };
   });
 }
 
@@ -797,7 +941,7 @@ function requireCapability(context: AgentContext, capability: string): void {
 async function getAgent(queryable: Queryable, ref: string): Promise<any> {
   const normalized = ref.replace(/^AGENT-/i, "");
   const result = await queryable.query(
-    `SELECT id, kind, name, description, model, model_options, capabilities, enabled, created_at, updated_at
+    `SELECT id, kind, name, description, model, model_options, capabilities, instructions, enabled, created_at, updated_at
      FROM agents WHERE id::text = $1 OR lower(name) = lower($1) LIMIT 1`,
     [normalized]
   );
@@ -808,12 +952,13 @@ async function getAgent(queryable: Queryable, ref: string): Promise<any> {
      WHERE skills.enabled = true
        AND (skills.default_for_agents = true OR EXISTS (
          SELECT 1 FROM agent_skills WHERE agent_skills.skill_id = skills.id AND agent_skills.agent_id = $1
-       ))
+       ) OR position('@skill(' || skills.name || ')' in COALESCE($2, '')) > 0)
      ORDER BY skills.name`,
-    [row.id]
+    [row.id, row.instructions]
   );
+  const { instructions: _instructions, ...publicRow } = row;
   return {
-    ...row,
+    ...publicRow,
     key: `AGENT-${row.name}`,
     capabilities: effectiveCapabilities(row.kind, row.capabilities),
     skills: skills.rows
@@ -831,7 +976,7 @@ async function agentForTask(queryable: Queryable, taskId: string | null): Promis
 }
 
 async function resolveResourceId(queryable: Queryable, table: string, prefix: string, ref: string): Promise<string> {
-  const allowed = new Set(["coordination_threads", "tasks", "thread_messages", "reports", "incidents"]);
+  const allowed = new Set(["coordination_threads", "tasks", "thread_messages", "reports", "incidents", "schedules"]);
   if (!allowed.has(table)) throw new Error("Unsupported resource table");
   const number = ref.match(new RegExp(`^(?:${prefix}-)?(\\d+)$`, "i"));
   const result = number
@@ -891,6 +1036,39 @@ async function showIncident(queryable: Queryable, id: string, includeContent = f
      LEFT JOIN LATERAL (SELECT markdown FROM incident_updates WHERE incident_id = incidents.id ORDER BY created_at DESC, id DESC LIMIT 1) latest ON true
      WHERE incidents.id = $1`, [id]);
   return incidentResource(result.rows[0] ?? notFound("Incident"), includeContent);
+}
+
+async function showSchedule(queryable: Queryable, id: string, includeContent = false): Promise<any> {
+  const result = await queryable.query(
+    `SELECT schedules.*,
+            agents.name AS agent_name,
+            creator.name AS created_by_agent_name,
+            agent_threads.title AS last_thread_title,
+            latest.status AS last_run_status,
+            (SELECT count(*)::int FROM schedule_runs WHERE schedule_runs.schedule_id = schedules.id) AS run_count,
+            left(schedules.prompt, 1000) AS content_preview,
+            octet_length(schedules.prompt) AS content_total_bytes,
+            CASE
+              WHEN schedules.enabled THEN 'scheduled'
+              WHEN schedules.schedule_kind = 'once' AND schedules.last_run_at IS NOT NULL THEN 'completed'
+              ELSE 'paused'
+            END AS status
+     FROM schedules
+     JOIN agents ON agents.id = schedules.agent_id
+     LEFT JOIN agents creator ON creator.id = schedules.created_by_agent_id
+     LEFT JOIN agent_threads ON agent_threads.id = schedules.last_agent_thread_id
+     LEFT JOIN LATERAL (
+       SELECT dispatcher_runs.status
+       FROM schedule_runs
+       JOIN dispatcher_runs ON dispatcher_runs.id = schedule_runs.dispatcher_run_id
+       WHERE schedule_runs.schedule_id = schedules.id
+       ORDER BY schedule_runs.scheduled_for DESC
+       LIMIT 1
+     ) latest ON true
+     WHERE schedules.id = $1`,
+    [id]
+  );
+  return scheduleResource(result.rows[0] ?? notFound("Schedule"), includeContent);
 }
 
 async function lockThread(client: PoolClient, id: string): Promise<any> {
@@ -1025,6 +1203,11 @@ async function resolveAgentSkills(queryable: Queryable, agentId: string, project
      FROM skills JOIN (
        SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
        UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+       UNION ALL
+         SELECT skills.id, 'instruction'
+         FROM skills
+         JOIN agents ON agents.id = $1
+         WHERE position('@skill(' || skills.name || ')' in agents.instructions) > 0
        UNION ALL SELECT skill_id, 'project' FROM project_skills WHERE project_id = $2
        UNION ALL SELECT skill_id, 'task' FROM task_skills WHERE task_id = $3
      ) selected ON selected.skill_id = skills.id WHERE skills.enabled = true ORDER BY skills.name`,
@@ -1090,21 +1273,24 @@ async function showResource(pool: DbPool, context: AgentContext, ref: string): P
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); return showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref)); }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); return showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref)); }
   if (/^INC-/i.test(ref)) { requireCapability(context, "incidents:read"); return showIncident(pool, await resolveResourceId(pool, "incidents", "INC", ref)); }
+  if (/^SCHEDULE-/i.test(ref)) { requireCapability(context, "schedules:read"); return showSchedule(pool, await resolveResourceId(pool, "schedules", "SCHEDULE", ref)); }
   if (/^AGENT-/i.test(ref)) { requireCapability(context, "agents:read"); return getAgent(pool, ref); }
-  badRequest("Use a typed resource reference such as TASK-12 or THREAD-8");
+  badRequest("Use a typed resource reference such as TASK-12, THREAD-8, or SCHEDULE-3");
 }
 async function contentResource(pool: DbPool, context: AgentContext, ref: string): Promise<{ ref: string; title: string; content: string; revision: string }> {
   if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); const row = await showThread(pool, await resolveResourceId(pool, "coordination_threads", "THREAD", ref), true); return { ref: row.key, title: row.title, content: row.purpose, revision: iso(row.updated_at) }; }
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); const row = await showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref), true); return { ref: row.key, title: row.title, content: row.body, revision: iso(row.updated_at) }; }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); const row = await showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref), true); return { ref: row.key, title: row.title, content: row.markdown, revision: String(row.current_revision) }; }
   if (/^INC-/i.test(ref)) { requireCapability(context, "incidents:read"); const row = await showIncident(pool, await resolveResourceId(pool, "incidents", "INC", ref), true); return { ref: row.key, title: row.title, content: row.markdown ?? row.description, revision: iso(row.updated_at) }; }
-  badRequest("Content is available for TASK, THREAD, REPORT, and INC references");
+  if (/^SCHEDULE-/i.test(ref)) { requireCapability(context, "schedules:read"); const row = await showSchedule(pool, await resolveResourceId(pool, "schedules", "SCHEDULE", ref), true); return { ref: row.key, title: row.title, content: row.prompt, revision: iso(row.updated_at) }; }
+  badRequest("Content is available for TASK, THREAD, SCHEDULE, REPORT, and INC references");
 }
 
 function threadResource(row: any, includeContent = false) { const { purpose, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { purpose } : {}), key: `THREAD-${row.number}` }); }
 function taskResource(row: any, includeContent = false) { const { body, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { body } : {}), key: `TASK-${row.number}` }); }
 function reportResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `REPORT-${row.number}` }); }
 function incidentResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `INC-${row.number}` }); }
+function scheduleResource(row: any, includeContent = false) { const { prompt, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { prompt } : {}), key: `SCHEDULE-${row.number}` }); }
 function messageResource(row: any, includeContent = false) { const { body, ...rest } = row; return { ...rest, ...(includeContent ? { body } : {}), key: `MESSAGE-${row.number}`, bodyPreview: previewText(body), bodyTotalBytes: Buffer.byteLength(body ?? ""), bodyTruncated: Buffer.byteLength(body ?? "") > 1000 }; }
 function resourcePreview(row: any) {
   const { content_preview, content_total_bytes, ...rest } = row;

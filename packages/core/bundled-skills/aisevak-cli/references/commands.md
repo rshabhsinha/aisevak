@@ -55,6 +55,20 @@ aisevak tasks attention TASK --reason-stdin
 
 Creating a task without `--agent` assigns it to the Orchestrator for routing. Each created task gets a linked coordination thread and a callback to the creating agent.
 
+## Schedules
+
+```text
+aisevak schedules list [--status scheduled|paused|completed] [--query TEXT] [--limit N] [--cursor CURSOR]
+aisevak schedules show SCHEDULE
+aisevak schedules create --title TITLE --agent AGENT --at ISO-8601 --prompt-stdin \
+  [--interval-seconds N] [--idempotency-key KEY]
+aisevak schedules pause SCHEDULE
+aisevak schedules resume SCHEDULE
+aisevak schedules delete SCHEDULE
+```
+
+Omit `--interval-seconds` for a one-time run. A repeating schedule advances from the current time after downtime instead of replaying every missed interval. Creating, pausing, resuming, or deleting schedules requires `schedules:write`, which is available to the Orchestrator by default; other agents can inspect schedules.
+
 ## Reports
 
 ```text

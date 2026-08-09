@@ -20,6 +20,7 @@ async function main() {
   if (["agent", "agents"].includes(root)) return agents();
   if (["thread", "threads"].includes(root)) return threads();
   if (["task", "tasks"].includes(root)) return tasks();
+  if (["schedule", "schedules"].includes(root)) return schedules();
   if (["report", "reports"].includes(root)) return reports();
   if (["incident", "incidents"].includes(root)) return incidents();
   if (["credential", "credentials"].includes(root)) return credentials();
@@ -85,6 +86,21 @@ async function tasks() {
     return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(ref) + "/comment", { method: "POST", body: { body } }));
   }
   fail("Usage: aisevak tasks list|show|create|update|assign|complete|reopen", "USAGE");
+}
+
+async function schedules() {
+  const command = args[1] || "list";
+  if (command === "list") return print(await request("/api/agent-tools/v1/schedules" + listQuery()));
+  if (command === "create") return print(await request("/api/agent-tools/v1/schedules", { method: "POST", body: compact({
+    title: option("--title", true), prompt: await markdown("--prompt"), agent: option("--agent", true),
+    at: option("--at", true), intervalSeconds: option("--interval-seconds"),
+    idempotencyKey: option("--idempotency-key")
+  }) }));
+  const ref = required(args[2], "Schedule reference");
+  if (command === "show") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref)));
+  if (command === "pause" || command === "resume") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref) + "/" + command, { method: "POST" }));
+  if (command === "delete") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref), { method: "DELETE" }));
+  fail("Usage: aisevak schedules list|show|create|pause|resume|delete", "USAGE");
 }
 
 async function reports() {
@@ -158,6 +174,7 @@ function help() { console.log([
   "aisevak agents list | agents show AGENT",
   "aisevak threads list | show | messages | create | send | complete | block",
   "aisevak tasks list | show | create | update | assign | complete | reopen",
+  "aisevak schedules list | show | create | pause | resume | delete",
   "aisevak reports list | show | create | revise | publish",
   "aisevak incidents list | show | declare | update | resolve",
   "",
