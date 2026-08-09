@@ -59,6 +59,39 @@ describe("persistent Codex app-server", () => {
 
     expect(result.status).toBe("interrupted");
   });
+
+  it("redacts secrets from earlier turns throughout the persistent session", async () => {
+    const fixture = await fakeAppServerFixture();
+    const oldSecret = "old-secret-value";
+    const firstOptions = turnOptions(fixture, "first");
+    firstOptions.env.FAKE_OLD_SECRET = oldSecret;
+    firstOptions.secrets = [oldSecret];
+    const first = await runCodexAppServerTurn(firstOptions);
+    const captured: string[] = [];
+    const secondOptions = turnOptions(fixture, "emit-old-secret", first.threadId);
+    secondOptions.env.FAKE_OLD_SECRET = oldSecret;
+    secondOptions.secrets = ["new-secret-value"];
+    secondOptions.onLine = async (line) => {
+      captured.push(line);
+    };
+
+    const second = await runCodexAppServerTurn(secondOptions);
+
+    expect(second.status).toBe("completed");
+    expect(second.rawStdout).not.toContain(oldSecret);
+    expect(captured.join("\n")).not.toContain(oldSecret);
+    expect(second.rawStdout).toContain("[REDACTED]");
+  });
+
+  it("replaces a persistent session after its process exits", async () => {
+    const fixture = await fakeAppServerFixture();
+    const first = await runCodexAppServerTurn(turnOptions(fixture, "exit-after-turn"));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    const second = await runCodexAppServerTurn(turnOptions(fixture, "second", first.threadId));
+
+    expect(second.status).toBe("completed");
+    expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
+  });
 });
 
 interface FakeFixture {
@@ -89,11 +122,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method === "turn/start") {
     const turnId = "turn-" + (++turn);
+    const prompt = message.params.input[0].text;
     send({ id: message.id, result: { turn: { id: turnId } } });
     send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id: turnId } } });
-    if (message.params.input[0].text !== "wait-for-steer") {
+    if (prompt === "emit-old-secret") {
+      send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId, delta: process.env.FAKE_OLD_SECRET } });
+    }
+    if (prompt !== "wait-for-steer") {
       setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } }), 10);
     }
+    if (prompt === "exit-after-turn") setTimeout(() => process.exit(0), 20);
     return;
   }
   if (message.method === "turn/steer") {

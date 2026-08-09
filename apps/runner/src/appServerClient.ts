@@ -139,7 +139,11 @@ class PersistentAppServer {
   }
 
   matches(options: AppServerTurnOptions): boolean {
-    return !this.closed && this.connectionKey === appServerConnectionKey(options);
+    return !this.closed &&
+      this.child.exitCode === null &&
+      this.child.signalCode === null &&
+      this.child.stdin.writable &&
+      this.connectionKey === appServerConnectionKey(options);
   }
 
   async runTurn(options: AppServerTurnOptions): Promise<AppServerTurnResult> {
@@ -148,6 +152,7 @@ class PersistentAppServer {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
     this.addSecrets(options.secrets);
+    this.rawStderr = "";
 
     let resolveCompleted: () => void = () => {};
     const completedPromise = new Promise<void>((resolve) => {
@@ -159,7 +164,7 @@ class PersistentAppServer {
       turnId: null,
       seq: 0,
       rawStdout: "",
-      stderrStart: this.rawStderr.length,
+      stderrStart: 0,
       completed: false,
       finalStatus: null,
       finalError: null,
@@ -261,6 +266,9 @@ class PersistentAppServer {
     } finally {
       if (monitor) clearInterval(monitor);
       await monitorTask.catch(() => undefined);
+      if (state.turnId && this.turnStates.get(state.turnId) === state) {
+        this.turnStates.delete(state.turnId);
+      }
       if (this.activeTurn === state) this.activeTurn = null;
       this.scheduleIdleCheck(idleSessionMs);
     }
@@ -273,6 +281,11 @@ class PersistentAppServer {
     this.idleTimer = null;
     this.rejectPending(new Error("app-server session closed"));
     await stopChild(this.child, this.closePromise.then(({ code }) => code));
+    this.turnStates.clear();
+    this.loadedThreads.clear();
+    this.redactionSecrets.clear();
+    this.stdoutBuffer = "";
+    this.rawStderr = "";
   }
 
   private async initialize(): Promise<void> {
@@ -369,7 +382,7 @@ class PersistentAppServer {
   }
 
   private captureLine(state: TurnState, line: string): void {
-    const redacted = redactText(line, state.options.secrets);
+    const redacted = redactText(line, [...this.redactionSecrets]);
     state.rawStdout += `${redacted}\n`;
     const seq = state.seq++;
     state.eventChain = state.eventChain.then(() => state.options.onLine(redacted, seq));
