@@ -46,6 +46,7 @@ import {
   agentGithubEnvironment,
   authenticateGithubCli,
   discoverGithubRepositories,
+  githubAccountLogin,
   resetGithubCliStorage,
   runGitCommand,
   safeChildEnvironment
@@ -129,6 +130,7 @@ async function main(): Promise<void> {
   const pool = createPool(env.databaseUrl);
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
+  await recoverInterruptedGithubJobs(pool);
 
   const beginShutdown = () => {
     shuttingDown = true;
@@ -152,6 +154,24 @@ async function main(): Promise<void> {
   }
   await closeAllCodexAppServers();
   await pool.end();
+}
+
+async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
+  await pool.query(
+    `UPDATE github_connections
+     SET status = CASE
+           WHEN status = 'disconnecting' THEN 'disconnect_requested'
+           WHEN pat_secret_id IS NOT NULL THEN 'pending'
+           ELSE 'sync_requested'
+         END,
+         updated_at = now()
+     WHERE auth_mode = 'pat' AND status IN ('syncing', 'disconnecting')`
+  );
+  await pool.query(
+    `UPDATE repo_import_jobs
+     SET status = 'queued', started_at = NULL, updated_at = now()
+     WHERE status = 'running'`
+  );
 }
 
 interface DueSchedule {
@@ -316,6 +336,12 @@ async function processOneGithubConnection(pool: DbPool): Promise<void> {
         `UPDATE projects SET workspace_mode = 'git_worktree', updated_at = now()
          WHERE source = 'github' AND workspace_mode = 'direct'`
       );
+    } else {
+      accountLogin = await githubAccountLogin({
+        managedRoot: env.managedRoot,
+        binary: env.githubBinary,
+        hostname: env.githubHost
+      });
     }
 
     await syncGithubRepositories(pool, job.id);

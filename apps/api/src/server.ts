@@ -1240,12 +1240,20 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/github/connect", async (request) => {
     const user = requireAdmin(request);
     const body = githubConnectSchema.parse(request.body);
-    const secretId = await upsertSecret(pool, "github_cli_auth_token", body.token.trim());
-    const existing = await pool.query<{ id: string }>(
-      `SELECT id FROM github_connections
+    const existing = await pool.query<{ id: string; status: string }>(
+      `SELECT id, status FROM github_connections
        WHERE auth_mode = 'pat' AND status <> 'replaced'
        ORDER BY updated_at DESC LIMIT 1`
     );
+    if (
+      existing.rows[0] &&
+      ["pending", "sync_requested", "syncing", "disconnect_requested", "disconnecting"].includes(
+        existing.rows[0].status
+      )
+    ) {
+      throw app.httpErrors.conflict("Wait for the current GitHub operation to finish");
+    }
+    const secretId = await upsertSecret(pool, "github_cli_auth_token", body.token.trim());
     const connection = existing.rows[0]
       ? await pool.query(
           `UPDATE github_connections
@@ -1293,7 +1301,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
        SET status = 'disconnect_requested', error = NULL, updated_at = now()
        WHERE id = (
          SELECT id FROM github_connections
-         WHERE auth_mode = 'pat' AND status <> 'replaced'
+         WHERE auth_mode = 'pat' AND status IN ('ready', 'failed', 'disconnected')
          ORDER BY updated_at DESC LIMIT 1
        )
        RETURNING id, name, status, account_login, error, last_synced_at, created_at, updated_at`

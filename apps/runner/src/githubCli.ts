@@ -112,12 +112,17 @@ export async function authenticateGithubCli(
     { env, stdin: `${token.trim()}\n`, secrets: [token.trim()] }
   );
   await runCommand(binary, ["auth", "setup-git", "--hostname", hostname], { env });
-  const account = await runCommand(binary, ["api", "user", "--jq", ".login"], { env });
-
   const hostsFile = resolve(paths.configDir, "hosts.yml");
   if (existsSync(hostsFile)) await chmod(hostsFile, 0o600);
   if (existsSync(paths.gitConfig)) await chmod(paths.gitConfig, 0o600);
-  const login = account.stdout.trim();
+  return githubAccountLogin(options);
+}
+
+export async function githubAccountLogin(options: GithubCliOptions): Promise<string> {
+  const result = await runCommand(options.binary ?? "gh", ["api", "user", "--jq", ".login"], {
+    env: githubCredentialEnvironment(options.managedRoot, options.sourceEnv)
+  });
+  const login = result.stdout.trim();
   if (!login) throw new Error("GitHub CLI did not return the authenticated account login");
   return login;
 }
