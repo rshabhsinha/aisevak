@@ -1762,6 +1762,22 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
   ];
 
   for (const agent of defaults) {
+    const existingResult = await pool.query<Record<string, unknown>>(
+      `SELECT * FROM agents
+       WHERE kind = $1 AND lower(name) = lower($2)
+       ORDER BY created_at ASC
+       LIMIT 1`,
+      [agent.kind, agent.name]
+    );
+    const existing = existingResult.rows[0];
+    if (existing) {
+      const version = await pool.query<{ exists: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM agent_versions WHERE agent_id = $1) AS exists",
+        [existing.id]
+      );
+      if (!version.rows[0]?.exists) await insertAgentVersion(pool, existing, userId);
+      continue;
+    }
     const result = await pool.query(
       `INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
        VALUES ($1, $2, $3, $4, $5, $6, true)
