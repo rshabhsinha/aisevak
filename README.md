@@ -42,7 +42,7 @@ Keep a checkout of this repository on the deployment host, then update from the 
 ./scripts/update.sh main
 ```
 
-The update script fast-forwards the checkout and runs the installer with sudo. Each install is staged under `/opt/aisevak/releases`, built before activation, then switched into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak` workspaces, and the Compose Postgres volume are preserved.
+The update script fast-forwards the checkout and runs the installer with sudo. Each install is staged under `/opt/aisevak/releases`, built before activation, then switched into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak` workspaces, and the Compose Postgres volume are preserved. Volume preservation alone does not make PostgreSQL layouts compatible: when upgrading an existing Aisevak deployment to the PostgreSQL 18 parent mount, the installer stops database writers, requires a backup, places or verifies the stopped cluster in PostgreSQL 18's `18/docker` subdirectory, validates it, and aborts before activation if migration fails.
 
 When an active Postgres container exists, the installer writes a compressed backup to `/opt/aisevak/backups` before restarting services. Set `AISEVAK_REQUIRE_BACKUP=1` to abort updates if a backup cannot be created, or `AISEVAK_SKIP_BACKUP=1` to skip backups intentionally.
 

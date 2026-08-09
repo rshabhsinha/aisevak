@@ -101,7 +101,7 @@ ssh -i "$AISEVAK_SSH_KEY" \
   "cd '$AISEVAK_REMOTE_SOURCE' && sudo ./scripts/install.sh"
 ```
 
-The installer builds before activation, preserves the production environment, persistent data, and the PostgreSQL volume, and retains the configured number of releases. When PostgreSQL is running, it creates a compressed backup before restarting services.
+The installer builds before activation, preserves the production environment, persistent data, and the PostgreSQL volume, and retains the configured number of releases. Preserving a PostgreSQL volume does not by itself make data-directory layouts compatible. On the first update from the legacy mount to PostgreSQL 18's parent mount, the installer quiesces database writers, requires a compressed backup, places or verifies the stopped cluster under `18/docker`, validates it, and aborts before activation if the migration fails.
 
 ## Update Caddy
 
