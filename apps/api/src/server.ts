@@ -42,6 +42,7 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 
 interface AuthUser {
   id: string;
@@ -75,6 +76,7 @@ let codexModelCache:
 
 export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
+  const codexAuth = new CodexAuthManager(pool, env.secretKey);
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
   await app.register(cors, {
@@ -205,6 +207,35 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       [id]
     );
     return { credential: result.rows[0] ?? null };
+  });
+
+  app.get("/api/codex-auth", async (request) => {
+    requireAdmin(request);
+    return codexAuth.getStatus();
+  });
+
+  app.post("/api/codex-auth/login", async (request) => {
+    const user = requireAdmin(request);
+    try {
+      return await codexAuth.startDeviceLogin(user.id);
+    } catch (error) {
+      throw app.httpErrors.badGateway(sanitizeCodexAuthError(error));
+    }
+  });
+
+  app.get("/api/codex-auth/login/:id", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    try {
+      return await codexAuth.pollDeviceLogin(id, user.id);
+    } catch (error) {
+      throw app.httpErrors.badRequest(sanitizeCodexAuthError(error));
+    }
+  });
+
+  app.delete("/api/codex-auth", async (request) => {
+    requireAdmin(request);
+    return codexAuth.disconnect();
   });
 
   app.get("/api/codex/models", async (request) => {
@@ -1107,6 +1138,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 }
 
 const idParams = z.object({ id: z.string().uuid() });
+const codexLoginParams = z.object({ id: z.string().uuid() });
 const taskKeyParams = z.object({ key: z.string().min(1) });
 const credentialNameParams = z.object({ name: z.string().min(1) });
 const runEventsParams = z.object({
@@ -1595,7 +1627,6 @@ async function createAgentChatThread(
     model_options: dispatcher.model_options
   });
   const runtimeHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(runtimeHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const title = input.title ?? threadTitleFromMessage(input.message);
 
@@ -1965,7 +1996,6 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
   );
   const latest = latestResult.rows[0];
   const runtimeHome = latest?.runtime_home ?? managedCodexHome(env.managedRoot, task.id);
-  await mkdir(runtimeHome, { recursive: true });
   const created = await pool.query<{ id: string }>(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
@@ -2124,7 +2154,6 @@ async function queueWorkerRun(
 
   const branch = projectSource === "github" ? taskBranchName(task.number, task.title) : null;
   const codexHome = managedCodexHome(env.managedRoot, task.id);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveTaskSkills(pool, task);
   const skillRefs = skillsSnapshot.map((skill) => ({
     name: skill.name,
@@ -2193,7 +2222,6 @@ async function queueWorkerRun(
 async function createDispatcherThread(pool: DbPool): Promise<Record<string, unknown>> {
   const dispatcher = await getDispatcherAgent(pool);
   const codexHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
@@ -2300,7 +2328,6 @@ async function queueDispatcherMessage(
     normalizeRunPath(previous?.codex_home) ??
     normalizeRunPath(thread?.runtime_home) ??
     managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = previous
     ? normalizeCodexSkillSnapshots(previous.skills_snapshot)
     : dispatcher
@@ -2348,7 +2375,6 @@ async function queueDispatcherRun(
   const targetTaskNumber = typeof targetTask?.number === "number" ? targetTask.number : null;
   const thread = options.taskId ? await ensureTaskNavigationThread(pool, options.taskId) : null;
   const codexHome = thread?.runtime_home ?? managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
-  await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
     dispatcherInstructions: dispatcher.instructions,

@@ -125,6 +125,8 @@ curl -fsS "$AISEVAK_APP_URL/api/health"
 
 The expected response is `{"ok":true}`.
 
+After the first deployment, sign in as an owner and open **Manage → ChatGPT**. Select **Connect ChatGPT**, finish the device-code flow in the browser, and wait for Aisevak to show the connection as ready. The encrypted connection is shared by the host-native runner; no Codex login file or OpenAI token needs to be copied to the VM manually.
+
 ## Common operations
 
 View container state:

@@ -18,6 +18,7 @@ describe("codex helpers", () => {
     const config = buildCodexConfigToml("gpt-5.5");
     expect(config).toContain('approval_policy = "never"');
     expect(config).toContain('sandbox_mode = "danger-full-access"');
+    expect(config).toContain('cli_auth_credentials_store = "file"');
     expect(config).toContain('persistence = "save-all"');
   });
 

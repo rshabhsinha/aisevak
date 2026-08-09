@@ -26,6 +26,8 @@ pnpm dev
 Open `http://localhost:5173`. The API listens on `http://localhost:8787`.
 The default local `.env` stores managed workspaces and Codex homes under `.aisevak-managed/`.
 
+After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
+
 ## Host install
 
 ```bash

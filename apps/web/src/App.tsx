@@ -62,7 +62,16 @@ import {
 } from "./agentRunTimeline";
 import { mergeRefreshedAgentThreads } from "./agentThreads";
 
-type View = "tasks" | "agents" | "projects" | "connectors" | "runs" | "skills" | "api" | "credentials";
+type View =
+  | "tasks"
+  | "agents"
+  | "projects"
+  | "connectors"
+  | "runs"
+  | "skills"
+  | "api"
+  | "credentials"
+  | "codex";
 
 interface User {
   id: string;
@@ -227,6 +236,28 @@ interface Credential {
   last_used_at?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+interface CodexAuthStatus {
+  connected: boolean;
+  activeMethod: "chatgpt" | "api_key" | null;
+  chatgptConnected: boolean;
+  apiKeyConfigured: boolean;
+  email: string | null;
+  name: string | null;
+  accountIdSuffix: string | null;
+  expiresAt: number | null;
+  lastRefresh: string | null;
+  needsLogin: boolean;
+  lastError: string | null;
+}
+
+interface CodexDeviceLogin {
+  loginId: string;
+  verificationUrl: string;
+  userCode: string;
+  intervalSeconds: number;
+  expiresAt: number;
 }
 
 const BOARD_COLUMNS = [
@@ -570,6 +601,9 @@ export function App() {
           <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => setView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
           <span className="nav-label nav-label-spaced">Manage</span>
+          {user.role !== "member" ? (
+            <NavButton icon={<OpenAILogo />} label="ChatGPT" active={view === "codex"} onClick={() => setView("codex")} />
+          ) : null}
           <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
           {user.role !== "member" ? (
             <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => setView("credentials")} />
@@ -682,6 +716,8 @@ export function App() {
           {view === "skills" ? <SkillsView skills={filteredSkills} onSaved={reloadSkills} /> : null}
 
           {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
+
+          {view === "codex" ? <CodexConnectionView /> : null}
 
           {view === "credentials" ? <CredentialsView credentials={credentials} onSaved={reloadCredentials} /> : null}
 
@@ -1355,6 +1391,204 @@ function AgentEditor(props: {
         </Button>
       </div>
     </form>
+  );
+}
+
+function CodexConnectionView() {
+  const [status, setStatus] = useState<CodexAuthStatus>({
+    connected: false,
+    activeMethod: null,
+    chatgptConnected: false,
+    apiKeyConfigured: false,
+    email: null,
+    name: null,
+    accountIdSuffix: null,
+    expiresAt: null,
+    lastRefresh: null,
+    needsLogin: true,
+    lastError: null
+  });
+  const [login, setLogin] = useState<CodexDeviceLogin | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!login) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (login.expiresAt <= Date.now()) {
+        setError("The authorization code expired. Start a new login.");
+        setLogin(null);
+        return;
+      }
+      try {
+        const result = await api<{ status: "pending" | "connected"; auth: CodexAuthStatus }>(
+          `/api/codex-auth/login/${encodeURIComponent(login.loginId)}`
+        );
+        if (stopped) return;
+        setStatus(result.auth);
+        if (result.status === "connected") {
+          setLogin(null);
+          setError(null);
+          return;
+        }
+        timer = window.setTimeout(poll, Math.max(2000, login.intervalSeconds * 1000));
+      } catch (pollError) {
+        if (stopped) return;
+        setError(friendlyError(pollError instanceof Error ? pollError.message : "ChatGPT authorization failed."));
+        setLogin(null);
+      }
+    };
+    timer = window.setTimeout(poll, Math.max(1000, login.intervalSeconds * 1000));
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [login?.loginId]);
+
+  async function loadStatus() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api<CodexAuthStatus>("/api/codex-auth"));
+    } catch (statusError) {
+      setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read ChatGPT status."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startLogin() {
+    setBusy(true);
+    setError(null);
+    window.open("https://auth.openai.com/codex/device", "_blank", "noopener,noreferrer");
+    try {
+      setLogin(await api<CodexDeviceLogin>("/api/codex-auth/login", { method: "POST" }));
+    } catch (loginError) {
+      setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start ChatGPT login."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api<CodexAuthStatus>("/api/codex-auth", { method: "DELETE" }));
+      setLogin(null);
+    } catch (disconnectError) {
+      setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect ChatGPT."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const accountLabel =
+    status.email ?? status.name ?? (status.accountIdSuffix ? `Account •••${status.accountIdSuffix}` : "Not connected");
+  const connectionLabel = status.chatgptConnected
+    ? "ChatGPT connected"
+    : status.apiKeyConfigured
+      ? "API key active"
+      : "Login required";
+
+  return (
+    <div className="flat-list-view api-view codex-connection-view">
+      <div className="flat-header">
+        <h3>ChatGPT</h3>
+      </div>
+
+      <section className="codex-connection-hero">
+        <div className="codex-connection-heading">
+          <div className="codex-connection-mark"><OpenAILogo size={25} /></div>
+          <div>
+            <span className="eyebrow">Codex authentication</span>
+            <h4>Connect ChatGPT to Aisevak</h4>
+            <p>One browser sign-in powers every Dispatcher and worker run. The shared credential is encrypted in Aisevak’s database.</p>
+          </div>
+        </div>
+        <Badge variant={status.connected ? "success" : "warning"}>{connectionLabel}</Badge>
+      </section>
+
+      <section className="codex-connection-grid">
+        <div>
+          <span>Active method</span>
+          <strong>{status.activeMethod === "chatgpt" ? "ChatGPT subscription" : status.activeMethod === "api_key" ? "OpenAI API key" : "None"}</strong>
+        </div>
+        <div>
+          <span>Account</span>
+          <strong>{accountLabel}</strong>
+        </div>
+        <div>
+          <span>Last refresh</span>
+          <strong>{status.lastRefresh ? formatDateTime(status.lastRefresh) : "—"}</strong>
+        </div>
+      </section>
+
+      {login ? (
+        <section className="codex-login-panel">
+          <div>
+            <span className="eyebrow">Finish in ChatGPT</span>
+            <h4>Enter this one-time code</h4>
+            <p>The page will detect authorization automatically. The refresh token never enters browser storage.</p>
+          </div>
+          <button
+            type="button"
+            className="codex-device-code"
+            title="Copy authorization code"
+            onClick={() => void navigator.clipboard.writeText(login.userCode)}
+          >
+            {login.userCode}
+            <Copy size={14} />
+          </button>
+          <div className="codex-login-actions">
+            <a href={login.verificationUrl} target="_blank" rel="noopener noreferrer" className="codex-auth-link">
+              Open ChatGPT authorization <ArrowUp size={14} />
+            </a>
+            <span><Loader2 className="spin" size={13} /> Waiting for authorization…</span>
+          </div>
+        </section>
+      ) : null}
+
+      <section className="api-section codex-connection-actions">
+        <div className="section-title-row">
+          <div>
+            <h4>{status.chatgptConnected ? "Connection is ready" : "Connect your ChatGPT subscription"}</h4>
+            <p>
+              {status.chatgptConnected
+                ? "Codex refreshes this session automatically, and Aisevak carries the refreshed login into future runs."
+                : "Aisevak uses OpenAI’s device-code flow so authentication can finish in your browser while the runner stays on Azure."}
+            </p>
+          </div>
+          <div className="row-actions">
+            {status.chatgptConnected ? (
+              <>
+                <Button variant="outline" disabled={busy} onClick={() => void loadStatus()}>
+                  <RefreshCw className={busy ? "spin" : ""} size={14} /> Refresh
+                </Button>
+                <Button variant="destructive" disabled={busy} onClick={() => void disconnect()}>
+                  Disconnect
+                </Button>
+              </>
+            ) : (
+              <Button disabled={busy || Boolean(login)} onClick={() => void startLogin()}>
+                {busy ? <Loader2 className="spin" size={14} /> : <OpenAILogo size={14} />}
+                {busy ? "Starting…" : "Connect ChatGPT"}
+              </Button>
+            )}
+          </div>
+        </div>
+        {status.apiKeyConfigured && !status.chatgptConnected ? (
+          <div className="notice codex-inline-notice">An API key is currently configured as the fallback authentication method.</div>
+        ) : null}
+        {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
+      </section>
+    </div>
   );
 }
 
@@ -2440,6 +2674,7 @@ function viewTitle(view: View): string {
     runs: "Agents",
     agents: "Agents",
     skills: "Skills",
+    codex: "ChatGPT",
     api: "API",
     credentials: "Credentials",
     projects: "Projects",
