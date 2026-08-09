@@ -636,12 +636,13 @@ WHERE lower(name) IN ('dispatcher', 'orchestrator')
 
 DELETE FROM agents duplicate
 WHERE duplicate.kind = 'dispatcher'
-  AND lower(duplicate.name) = 'orchestrator'
+  AND lower(duplicate.name) IN ('dispatcher', 'orchestrator')
   AND duplicate.id <> (
     SELECT canonical.id
     FROM agents canonical
-    WHERE canonical.kind = 'dispatcher' AND lower(canonical.name) = 'orchestrator'
-    ORDER BY canonical.created_at ASC, canonical.id ASC
+    WHERE canonical.kind = 'dispatcher'
+      AND lower(canonical.name) IN ('dispatcher', 'orchestrator')
+    ORDER BY canonical.enabled DESC, canonical.created_at ASC, canonical.id ASC
     LIMIT 1
   )
   AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.agent_id = duplicate.id)
@@ -669,6 +670,38 @@ WHERE duplicate.kind = 'dispatcher'
   )
   AND NOT EXISTS (SELECT 1 FROM agent_tool_tokens WHERE agent_tool_tokens.agent_id = duplicate.id);
 
+WITH canonical AS (
+  SELECT id
+  FROM agents
+  WHERE kind = 'dispatcher'
+    AND lower(name) IN ('dispatcher', 'orchestrator')
+  ORDER BY enabled DESC, created_at ASC, id ASC
+  LIMIT 1
+)
+UPDATE agents duplicate
+SET name = 'Legacy Orchestrator ' || left(duplicate.id::text, 8),
+    description = 'Disabled duplicate retained for historical references.',
+    enabled = false,
+    updated_at = now()
+FROM canonical
+WHERE duplicate.kind = 'dispatcher'
+  AND lower(duplicate.name) IN ('dispatcher', 'orchestrator')
+  AND duplicate.id <> canonical.id;
+
+UPDATE agents
+SET name = 'Orchestrator',
+    description = 'Routes unassigned work and coordinates specialized agents across durable threads.',
+    enabled = true,
+    updated_at = now()
+WHERE id = (
+  SELECT canonical.id
+  FROM agents canonical
+  WHERE canonical.kind = 'dispatcher'
+    AND lower(canonical.name) IN ('dispatcher', 'orchestrator')
+  ORDER BY canonical.enabled DESC, canonical.created_at ASC, canonical.id ASC
+  LIMIT 1
+);
+
 INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
 SELECT
   'dispatcher',
@@ -682,13 +715,7 @@ SELECT
   END,
   'You are the Aisevak Orchestrator. Use the aisevak CLI to inspect work, route tasks, coordinate agents through durable threads, and request precise follow-up when work is ambiguous or blocked.',
   true
-WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher');
-
-UPDATE agents
-SET name = 'Orchestrator',
-    description = 'Routes unassigned work and coordinates specialized agents across durable threads.',
-    updated_at = now()
-WHERE kind = 'dispatcher' AND lower(name) = 'dispatcher';
+WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher' AND enabled = true);
 
 CREATE TABLE IF NOT EXISTS app_migrations (
   name text PRIMARY KEY,
