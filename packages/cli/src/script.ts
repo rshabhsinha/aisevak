@@ -38,7 +38,53 @@ async function skills() {
     if (!path) fail("AISEVAK_SKILLS_DIR is missing", "CONFIG_MISSING");
     return print({ path });
   }
-  fail("Usage: aisevak skills path", "USAGE");
+  if (command === "install") {
+    const directory = required(args[2], "Skill directory");
+    return print(await request("/api/agent-tools/v1/skills", {
+      method: "POST",
+      body: readSkillDirectory(directory)
+    }));
+  }
+  fail("Usage: aisevak skills path|install DIRECTORY", "USAGE");
+}
+
+function readSkillDirectory(directory) {
+  const fs = process.getBuiltinModule("node:fs");
+  const pathModule = process.getBuiltinModule("node:path");
+  const root = pathModule.resolve(directory);
+  const rootInfo = fs.lstatSync(root);
+  if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
+    fail("Skill path must be a directory, not a symbolic link", "SKILL_INVALID");
+  }
+  const markdownPath = pathModule.join(root, "SKILL.md");
+  if (!fs.existsSync(markdownPath) || !fs.lstatSync(markdownPath).isFile()) {
+    fail("Skill directory must contain SKILL.md", "SKILL_INVALID");
+  }
+  const markdown = fs.readFileSync(markdownPath, "utf8");
+  const files = {};
+  let totalBytes = Buffer.byteLength(markdown);
+  function visit(current, prefix) {
+    for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+      const relative = prefix ? prefix + "/" + entry.name : entry.name;
+      const fullPath = pathModule.join(current, entry.name);
+      const info = fs.lstatSync(fullPath);
+      if (info.isSymbolicLink()) fail("Symbolic links are not allowed in skills: " + relative, "SKILL_INVALID");
+      if (info.isDirectory()) {
+        visit(fullPath, relative);
+      } else if (info.isFile() && relative !== "SKILL.md") {
+        const data = fs.readFileSync(fullPath);
+        if (data.includes(0)) fail("Skill files must contain text: " + relative, "SKILL_INVALID");
+        const content = data.toString("utf8");
+        if (!Buffer.from(content, "utf8").equals(data)) fail("Skill files must be valid UTF-8: " + relative, "SKILL_INVALID");
+        files[relative] = content;
+        totalBytes += Buffer.byteLength(relative) + data.length;
+      }
+    }
+  }
+  visit(root, "");
+  if (Object.keys(files).length > 64) fail("A skill may contain at most 64 supporting files", "SKILL_INVALID");
+  if (totalBytes > 500000) fail("Installed skill content may not exceed 500 KB", "SKILL_INVALID");
+  return { markdown, files };
 }
 
 async function agents() {
@@ -186,7 +232,7 @@ function fail(message, code = "CLI_ERROR") { console.error(JSON.stringify({ erro
 function help() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT",
-  "aisevak skills path",
+  "aisevak skills path | skills install DIRECTORY",
   "aisevak threads list | show | messages | create | send | complete | block",
   "aisevak tasks list | show | create | update | assign | complete | reopen",
   "aisevak schedules list | show | create | pause | resume | delete",

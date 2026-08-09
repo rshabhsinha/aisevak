@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { loadPlatformSkills } from "@aisevak/core";
-import { materializeSkills } from "./index.js";
+import { materializedSkillsRoot, materializeSkills } from "./index.js";
 
 const cleanup: string[] = [];
 
@@ -12,6 +12,11 @@ afterEach(async () => {
 });
 
 describe("skill materialization", () => {
+  it("uses an isolated skill view under the thread's Codex home", () => {
+    expect(materializedSkillsRoot("/srv/aisevak/codex-homes/thread-1"))
+      .toBe("/srv/aisevak/codex-homes/thread-1/.agents/skills");
+  });
+
   it("materializes an installed Aisevak CLI skill into an isolated Codex home", async () => {
     const codexHome = await mkdtemp(join(tmpdir(), "aisevak-skill-home-"));
     cleanup.push(codexHome);

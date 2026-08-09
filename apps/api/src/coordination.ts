@@ -3,10 +3,14 @@ import {
   decodePageCursor,
   encodeCursor,
   hashToken,
+  installedSkillsRoot,
   managedCodexHome,
   pageLimit,
+  parseSkillMarkdown,
   serializeCodexSkillSnapshots,
+  synchronizeInstalledSkills,
   withTransaction,
+  writeInstalledSkill,
   type CodexSkillSnapshot,
   type DbPool
 } from "@aisevak/core";
@@ -35,6 +39,7 @@ const DEFAULT_WORKER_CAPABILITIES = [
 const ORCHESTRATOR_CAPABILITIES = [
   ...DEFAULT_WORKER_CAPABILITIES,
   "credentials:write",
+  "skills:write",
   "tasks:assign",
   "schedules:write",
   "orchestration:route"
@@ -121,6 +126,22 @@ const scheduleCreateSchema = z.object({
   intervalSeconds: z.coerce.number().int().min(60).max(31_536_000).optional(),
   idempotencyKey: z.string().trim().min(1).max(200).optional()
 });
+const skillInstallSchema = z.object({
+  markdown: z.string().min(1).max(100_000),
+  files: z.record(z.string().max(100_000)).default({})
+}).superRefine((body, context) => {
+  const entries = Object.entries(body.files);
+  if (entries.length > 64) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "A skill may contain at most 64 supporting files" });
+  }
+  const totalBytes = Buffer.byteLength(body.markdown) + entries.reduce(
+    (sum, [path, content]) => sum + Buffer.byteLength(path) + Buffer.byteLength(content),
+    0
+  );
+  if (totalBytes > 500_000) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: "Installed skill content may not exceed 500 KB" });
+  }
+});
 
 export async function registerCoordinationRoutes(
   app: FastifyInstance,
@@ -140,6 +161,37 @@ export async function registerCoordinationRoutes(
       capabilities: context.capabilities,
       skills: skills.map(({ name, description, sources }) => ({ name, description, sources }))
     };
+  });
+
+  app.post("/api/agent-tools/v1/skills", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "skills:write");
+    const body = skillInstallSchema.parse(request.body);
+    let skill: ReturnType<typeof parseSkillMarkdown>;
+    try {
+      skill = parseSkillMarkdown(body.markdown);
+    } catch (error) {
+      badRequest(error instanceof Error ? error.message : String(error));
+    }
+    const root = installedSkillsRoot(options.managedRoot);
+    try {
+      await writeInstalledSkill(root, { ...skill, files: body.files });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (message.startsWith("Installed skill directory already exists:")) {
+        throw httpError(409, `Installed skill ${skill.name} already exists`);
+      }
+      badRequest(message);
+    }
+    await synchronizeInstalledSkills(pool, root);
+    const result = await pool.query(
+      `SELECT id, name, description, instructions, files, enabled, platform_managed,
+              default_for_agents, created_at, updated_at
+       FROM skills WHERE name = $1`,
+      [skill.name]
+    );
+    const installed = result.rows[0] ?? notFound("Installed skill");
+    return { skill: { ...installed, key: `SKILL-${skill.name}` } };
   });
 
   app.get("/api/agent-tools/v1/agents", async (request) => {

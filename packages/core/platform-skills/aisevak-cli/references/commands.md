@@ -10,10 +10,12 @@ aisevak capabilities
 aisevak agents list [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak agents show AGENT
 aisevak skills path
+aisevak skills install DIRECTORY
 ```
 
 `capabilities` also lists the skills resolved for the current agent, project, and task.
-`skills path` returns the persistent directory where a reusable skill can be installed for discovery by the Skills tab.
+`skills path` returns the isolated skill view resolved for the current thread. Do not modify that regenerated view.
+`skills install` publishes a separate local skill directory through the authenticated API for discovery by the Skills tab. It requires `skills:write`, which the Orchestrator has by default.
 
 ## Generic resources
 

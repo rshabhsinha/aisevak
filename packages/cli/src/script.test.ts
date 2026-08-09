@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,9 +56,10 @@ describe("embedded aisevak CLI", () => {
     expect(result.stdout).toContain("incidents");
     expect(result.stdout).toContain("schedules");
     expect(result.stdout).toContain("skills path");
+    expect(result.stdout).toContain("skills install");
   });
 
-  it("prints the persistent installed-skills path", async () => {
+  it("prints the isolated skill-view path", async () => {
     const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
     cleanup.push(directory);
     const cliPath = join(directory, "aisevak");
@@ -67,11 +68,59 @@ describe("embedded aisevak CLI", () => {
       env: {
         ...process.env,
         AISEVAK_AGENT_TOKEN: "test-token",
-        AISEVAK_SKILLS_DIR: "/srv/aisevak/skills"
+        AISEVAK_SKILLS_DIR: "/srv/aisevak/codex-homes/thread-1/.agents/skills"
       }
     });
 
-    expect(JSON.parse(result.stdout)).toEqual({ path: "/srv/aisevak/skills" });
+    expect(JSON.parse(result.stdout)).toEqual({
+      path: "/srv/aisevak/codex-homes/thread-1/.agents/skills"
+    });
+  });
+
+  it("publishes a validated skill directory through the authenticated API", async () => {
+    let requestPath = "";
+    let requestBody: Record<string, unknown> = {};
+    const server = createServer((request, response) => {
+      requestPath = request.url ?? "";
+      let body = "";
+      request.on("data", (chunk) => { body += String(chunk); });
+      request.on("end", () => {
+        requestBody = JSON.parse(body) as Record<string, unknown>;
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ skill: { key: "SKILL-background-terminals" } }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    const skillPath = join(directory, "background-terminals");
+    await mkdir(join(skillPath, "references"), { recursive: true });
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    await writeFile(
+      join(skillPath, "SKILL.md"),
+      "---\nname: background-terminals\ndescription: Keep background commands alive safely.\n---\n\n# Background terminals\n"
+    );
+    await writeFile(join(skillPath, "references", "tmux.md"), "Use a detached tmux session.\n");
+
+    const result = await execFileAsync(process.execPath, [cliPath, "skills", "install", skillPath], {
+      env: {
+        ...process.env,
+        AISEVAK_API_URL: `http://127.0.0.1:${address.port}`,
+        AISEVAK_AGENT_TOKEN: "test-token"
+      }
+    });
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    expect(requestPath).toBe("/api/agent-tools/v1/skills");
+    expect(requestBody).toMatchObject({
+      markdown: expect.stringContaining("name: background-terminals"),
+      files: { "references/tmux.md": "Use a detached tmux session.\n" }
+    });
+    expect(JSON.parse(result.stdout)).toMatchObject({ skill: { key: "SKILL-background-terminals" } });
   });
 
   it("reads rotating agent credentials from a token file", async () => {

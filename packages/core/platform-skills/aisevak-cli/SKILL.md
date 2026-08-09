@@ -1,6 +1,6 @@
 ---
 name: aisevak-cli
-description: Use the Aisevak CLI when an isolated agent needs platform context, must coordinate through durable threads, tasks, schedules, reports, or incidents, or needs the persistent location for installing a reusable skill. Apply it to discover available agents and capabilities, inspect paginated resources lazily, delegate or route tracked work, schedule explicit future work, message another agent, and report completion or blockers back to the initiating thread.
+description: Use the Aisevak CLI when an isolated agent needs platform context, must coordinate through durable threads, tasks, schedules, reports, or incidents, or needs to publish a reusable skill. Apply it to discover available agents and capabilities, inspect paginated resources lazily, delegate or route tracked work, schedule explicit future work, message another agent, and report completion or blockers back to the initiating thread.
 ---
 
 # Aisevak CLI
@@ -17,9 +17,10 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 
 ## Install reusable skills
 
-- Run `aisevak skills path` to discover the persistent installed-skill catalog. Aisevak also exposes it as `$AISEVAK_SKILLS_DIR`.
-- Create a reusable skill at `$AISEVAK_SKILLS_DIR/<skill-name>/SKILL.md`; the Skills tab discovers valid skill directories there.
-- Do not install persistent skills under `$CODEX_HOME`. That home and its `.agents/skills` directory are isolated, generated views for the current thread.
+- Run `aisevak skills path` to inspect the skills resolved for this thread. Aisevak also exposes this isolated, regenerated view as `$AISEVAK_SKILLS_DIR`.
+- Do not modify `$AISEVAK_SKILLS_DIR`; changes there are private to the thread and may be replaced before a later turn.
+- To publish a reusable skill, author it in a separate directory under your private `$CODEX_HOME`, then run `aisevak skills install <directory>`. The authenticated API validates and copies it into the installed catalog followed by the Skills tab.
+- Publishing requires `skills:write`, which is available to the Orchestrator by default. If it is unavailable, coordinate with the Orchestrator instead of editing shared storage directly.
 
 ## Choose the coordination primitive
 

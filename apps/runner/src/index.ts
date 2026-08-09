@@ -13,7 +13,6 @@ import {
   githubCloneEnv,
   githubHeaders,
   hashToken,
-  installedSkillsRoot,
   managedCodexHome,
   managedWorktreePath,
   newSessionToken,
@@ -513,7 +512,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
-        AISEVAK_SKILLS_DIR: installedSkillsRoot(env.managedRoot),
+        AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home),
         PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
@@ -684,7 +683,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
-        AISEVAK_SKILLS_DIR: installedSkillsRoot(env.managedRoot),
+        AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home),
         PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
@@ -920,7 +919,7 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
 }
 
 export async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
-  const skillsRoot = join(codexHome, ".agents", "skills");
+  const skillsRoot = materializedSkillsRoot(codexHome);
   await rm(skillsRoot, { recursive: true, force: true });
   await mkdir(skillsRoot, { recursive: true });
   for (const skill of skills ?? []) {
@@ -933,6 +932,10 @@ export async function materializeSkills(codexHome: string, skills: CodexSkillSna
       await writeFile(filePath, content, "utf8");
     }
   }
+}
+
+export function materializedSkillsRoot(codexHome: string): string {
+  return join(codexHome, ".agents", "skills");
 }
 
 function safeSkillDirectoryName(name: string): string {

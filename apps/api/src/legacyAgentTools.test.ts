@@ -80,4 +80,19 @@ describe("legacy agent-tool capability checks", () => {
     expect(response.json()).toEqual({ credentials: [] });
     expect(secretQueries).toHaveLength(1);
   });
+
+  it("blocks installed-skill publication without skills:write", async () => {
+    const { app } = await serverForCapabilities(["skills:read"]);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agent-tools/v1/skills",
+      headers: { authorization: "Bearer restricted-token" },
+      payload: {
+        markdown: "---\nname: unsafe\ndescription: Unsafe shared write.\n---\n\n# Unsafe\n",
+        files: {}
+      }
+    });
+
+    expect(response.statusCode).toBe(403);
+  });
 });

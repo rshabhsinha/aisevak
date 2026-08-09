@@ -250,7 +250,7 @@ export function skillMarkdown(
   ].join("\n");
 }
 
-function parseSkillMarkdown(
+export function parseSkillMarkdown(
   markdown: string
 ): Pick<InstalledSkillDefinition, "name" | "description" | "instructions"> {
   const match = markdown.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/);
