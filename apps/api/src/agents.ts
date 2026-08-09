@@ -6,6 +6,7 @@ export interface AgentDeletionCandidate {
 export interface AgentDeletionUsage {
   taskCount: number;
   threadCount: number;
+  scheduleCount: number;
   otherEnabledDispatcherCount: number;
 }
 
@@ -15,7 +16,10 @@ export function agentDeletionBlockReason(
 ): string | null {
   const references = [
     usage.taskCount > 0 ? `${usage.taskCount} task${usage.taskCount === 1 ? "" : "s"}` : null,
-    usage.threadCount > 0 ? `${usage.threadCount} thread${usage.threadCount === 1 ? "" : "s"}` : null
+    usage.threadCount > 0 ? `${usage.threadCount} thread${usage.threadCount === 1 ? "" : "s"}` : null,
+    usage.scheduleCount > 0
+      ? `${usage.scheduleCount} schedule${usage.scheduleCount === 1 ? "" : "s"}`
+      : null
   ].filter(Boolean);
 
   if (references.length > 0) {

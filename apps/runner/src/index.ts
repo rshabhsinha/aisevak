@@ -1,11 +1,13 @@
 import {
   buildCodexConfigToml,
   buildDispatcherPrompt,
+  buildScheduledAgentPrompt,
   codexChatGptAuthSecrets,
   CODEX_CHATGPT_AUTH_SECRET_NAME,
   createPool,
   decryptSecret,
   encryptSecret,
+  extractPromptSkillNames,
   extractThreadId,
   fetchGithubInstallationToken,
   githubCloneEnv,
@@ -14,6 +16,7 @@ import {
   managedCodexHome,
   managedWorktreePath,
   newSessionToken,
+  nextScheduleRunAt,
   normalizeCodexSkillSnapshots,
   normalizeCodexEvent,
   parseCodexChatGptAuthFile,
@@ -23,12 +26,14 @@ import {
   serializeCodexChatGptAuthFile,
   runMigrations,
   serializeCodexSkillSnapshots,
+  withTransaction,
   type CodexSkillSnapshot,
   type CodexChatGptAuthFile,
   type DbPool
 } from "@aisevak/core";
 import { agentToolScript } from "@aisevak/cli";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -101,6 +106,9 @@ interface DispatcherJob {
   scope: string;
   agent_id: string;
   agent_kind: "worker" | "dispatcher";
+  agent_name: string;
+  agent_description: string;
+  agent_instructions: string;
   coordination_thread_id: string | null;
   message_delivery_id: string | null;
 }
@@ -121,6 +129,7 @@ async function main(): Promise<void> {
   while (!shuttingDown) {
     try {
       await processOneImportJob(pool);
+      await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
       await processOneDispatcherRun(pool);
       await processOneRunJob(pool);
@@ -130,6 +139,112 @@ async function main(): Promise<void> {
     await sleep(env.pollMs);
   }
   await pool.end();
+}
+
+interface DueSchedule {
+  id: string;
+  title: string;
+  prompt: string;
+  agent_id: string;
+  schedule_kind: "once" | "interval";
+  next_run_at: Date;
+  interval_seconds: number | null;
+  model: string;
+  model_options: Array<{ id: string; value: string | number | boolean }>;
+}
+
+async function enqueueDueSchedule(pool: DbPool): Promise<void> {
+  await withTransaction(pool, async (client) => {
+    const dueResult = await client.query<DueSchedule>(
+      `SELECT schedules.id,
+              schedules.title,
+              schedules.prompt,
+              schedules.agent_id,
+              schedules.schedule_kind,
+              schedules.next_run_at,
+              schedules.interval_seconds,
+              agents.model,
+              agents.model_options
+       FROM schedules
+       JOIN agents ON agents.id = schedules.agent_id
+       WHERE schedules.enabled = true
+         AND schedules.next_run_at <= now()
+         AND agents.enabled = true
+       ORDER BY schedules.next_run_at ASC, schedules.created_at ASC
+       LIMIT 1
+       FOR UPDATE OF schedules SKIP LOCKED`
+    );
+    const schedule = dueResult.rows[0];
+    if (!schedule) return;
+
+    const scheduledFor = schedule.next_run_at;
+    const runtimeHome = managedCodexHome(
+      env.managedRoot,
+      `schedule-${schedule.id}-${randomUUID()}`
+    );
+    const skillNames = extractPromptSkillNames(schedule.prompt);
+    const skillsSnapshot = await resolveAgentSkills(client, schedule.agent_id, skillNames);
+    const threadResult = await client.query<{ id: string }>(
+      `INSERT INTO agent_threads
+         (title, agent_id, provider_instance_id, model, model_options, cwd, runtime_home)
+       VALUES ($1, $2, 'codex-local', $3, $4, $5, $6)
+       RETURNING id`,
+      [
+        schedule.title,
+        schedule.agent_id,
+        schedule.model,
+        JSON.stringify(schedule.model_options ?? []),
+        env.managedRoot,
+        runtimeHome
+      ]
+    );
+    const threadId = mustRow(threadResult.rows[0]).id;
+    const runResult = await client.query<{ id: string }>(
+      `INSERT INTO dispatcher_runs
+         (agent_thread_id, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'schedule', 'schedule', 'queued', $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        threadId,
+        env.managedRoot,
+        runtimeHome,
+        schedule.model,
+        JSON.stringify(schedule.model_options ?? []),
+        schedule.prompt,
+        serializeCodexSkillSnapshots(skillsSnapshot)
+      ]
+    );
+    const dispatcherRunId = mustRow(runResult.rows[0]).id;
+    await client.query(
+      `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
+       VALUES ($1, -1, 'thread.message-sent', $2, $3)`,
+      [
+        dispatcherRunId,
+        schedule.prompt,
+        { type: "thread.message-sent", role: "user", text: schedule.prompt, scheduled: true }
+      ]
+    );
+    await client.query(
+      `INSERT INTO schedule_runs (schedule_id, agent_thread_id, dispatcher_run_id, scheduled_for)
+       VALUES ($1, $2, $3, $4)`,
+      [schedule.id, threadId, dispatcherRunId, scheduledFor]
+    );
+
+    const nextRunAt =
+      schedule.schedule_kind === "interval" && schedule.interval_seconds
+        ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
+        : scheduledFor;
+    await client.query(
+      `UPDATE schedules
+       SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END,
+           next_run_at = $2,
+           last_run_at = now(),
+           last_agent_thread_id = $3,
+           updated_at = now()
+       WHERE id = $1`,
+      [schedule.id, nextRunAt, threadId]
+    );
+  });
 }
 
 async function processOneImportJob(pool: DbPool): Promise<void> {
@@ -330,6 +445,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
             dispatcher_runs.skills_snapshot,
             agents.id AS agent_id,
             agents.kind AS agent_kind,
+            agents.name AS agent_name,
+            agents.description AS agent_description,
+            agents.instructions AS agent_instructions,
             agent_threads.coordination_thread_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
@@ -374,7 +492,15 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       codexHome: job.codex_home,
       model: job.model,
       modelOptions: job.model_options,
-      prompt: job.prompt,
+      prompt:
+        job.scope === "schedule"
+          ? buildScheduledAgentPrompt({
+              agentName: job.agent_name,
+              agentDescription: job.agent_description,
+              agentInstructions: job.agent_instructions,
+              prompt: job.prompt
+            })
+          : job.prompt,
       threadId: job.codex_thread_id,
       env: {
         ...codexProcessEnv(),
@@ -939,7 +1065,13 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
   return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
 }
 
-async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
+type Queryable = Pick<DbPool, "query">;
+
+async function resolveAgentSkills(
+  pool: Queryable,
+  agentId: string,
+  promptSkillNames: string[] = []
+): Promise<CodexSkillSnapshot[]> {
   const result = await pool.query<{
     id: string;
     name: string;
@@ -958,10 +1090,11 @@ async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexS
      JOIN (
        SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
        UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+       UNION ALL SELECT id, 'prompt' FROM skills WHERE name = ANY($2::text[])
      ) selected ON selected.skill_id = skills.id
      WHERE skills.enabled = true
      ORDER BY skills.name ASC`
-    , [agentId]
+    , [agentId, promptSkillNames]
   );
   const byId = new Map<string, CodexSkillSnapshot>();
   for (const row of result.rows) {

@@ -534,6 +534,43 @@ CREATE TABLE IF NOT EXISTS incident_updates (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS schedules (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  title text NOT NULL,
+  prompt text NOT NULL,
+  agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  schedule_kind text NOT NULL CHECK (schedule_kind IN ('once', 'interval')),
+  next_run_at timestamptz NOT NULL,
+  interval_seconds integer CHECK (interval_seconds IS NULL OR interval_seconds >= 60),
+  enabled boolean NOT NULL DEFAULT true,
+  last_run_at timestamptz,
+  last_agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  created_by uuid REFERENCES users(id) ON DELETE SET NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CHECK (
+    (schedule_kind = 'once' AND interval_seconds IS NULL)
+    OR (schedule_kind = 'interval' AND interval_seconds IS NOT NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS schedules_due_idx
+ON schedules(enabled, next_run_at) WHERE enabled = true;
+CREATE INDEX IF NOT EXISTS schedules_agent_idx ON schedules(agent_id);
+
+CREATE TABLE IF NOT EXISTS schedule_runs (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  schedule_id uuid NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+  agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  dispatcher_run_id uuid REFERENCES dispatcher_runs(id) ON DELETE SET NULL,
+  scheduled_for timestamptz NOT NULL,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (schedule_id, scheduled_for)
+);
+
+CREATE INDEX IF NOT EXISTS schedule_runs_schedule_idx
+ON schedule_runs(schedule_id, scheduled_for DESC);
+
 DO $$ BEGIN
   ALTER TABLE tasks ADD CONSTRAINT tasks_coordination_thread_id_fkey
     FOREIGN KEY (coordination_thread_id) REFERENCES coordination_threads(id) ON DELETE SET NULL;

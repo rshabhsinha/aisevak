@@ -6,7 +6,7 @@ describe("agentDeletionBlockReason", () => {
     expect(
       agentDeletionBlockReason(
         { kind: "worker", name: "Builder" },
-        { taskCount: 0, threadCount: 0, otherEnabledDispatcherCount: 1 }
+        { taskCount: 0, threadCount: 0, scheduleCount: 0, otherEnabledDispatcherCount: 1 }
       )
     ).toBeNull();
   });
@@ -15,7 +15,7 @@ describe("agentDeletionBlockReason", () => {
     expect(
       agentDeletionBlockReason(
         { kind: "worker", name: "Builder" },
-        { taskCount: 2, threadCount: 1, otherEnabledDispatcherCount: 1 }
+        { taskCount: 2, threadCount: 1, scheduleCount: 0, otherEnabledDispatcherCount: 1 }
       )
     ).toBe("Cannot delete Builder because it is used by 2 tasks and 1 thread. Reassign those first.");
   });
@@ -24,8 +24,17 @@ describe("agentDeletionBlockReason", () => {
     expect(
       agentDeletionBlockReason(
         { kind: "dispatcher", name: "Orchestrator" },
-        { taskCount: 0, threadCount: 0, otherEnabledDispatcherCount: 0 }
+        { taskCount: 0, threadCount: 0, scheduleCount: 0, otherEnabledDispatcherCount: 0 }
       )
     ).toBe("Cannot delete Orchestrator because it is the last enabled Orchestrator.");
+  });
+
+  it("requires schedules to be removed or reassigned", () => {
+    expect(
+      agentDeletionBlockReason(
+        { kind: "worker", name: "Reviewer" },
+        { taskCount: 0, threadCount: 0, scheduleCount: 1, otherEnabledDispatcherCount: 1 }
+      )
+    ).toBe("Cannot delete Reviewer because it is used by 1 schedule. Reassign those first.");
   });
 });

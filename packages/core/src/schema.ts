@@ -341,6 +341,44 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
   updatedAt
 });
 
+export const schedules = pgTable("schedules", {
+  id,
+  title: text("title").notNull(),
+  prompt: text("prompt").notNull(),
+  agentId: uuid("agent_id").notNull().references(() => agents.id, { onDelete: "restrict" }),
+  scheduleKind: text("schedule_kind").notNull(),
+  nextRunAt: timestamp("next_run_at", { withTimezone: true }).notNull(),
+  intervalSeconds: integer("interval_seconds"),
+  enabled: boolean("enabled").notNull().default(true),
+  lastRunAt: timestamp("last_run_at", { withTimezone: true }),
+  lastAgentThreadId: uuid("last_agent_thread_id").references(() => agentThreads.id, {
+    onDelete: "set null"
+  }),
+  createdBy: uuid("created_by").references(() => users.id, { onDelete: "set null" }),
+  createdAt,
+  updatedAt
+});
+
+export const scheduleRuns = pgTable(
+  "schedule_runs",
+  {
+    id,
+    scheduleId: uuid("schedule_id").notNull().references(() => schedules.id, { onDelete: "cascade" }),
+    agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
+    dispatcherRunId: uuid("dispatcher_run_id").references(() => dispatcherRuns.id, {
+      onDelete: "set null"
+    }),
+    scheduledFor: timestamp("scheduled_for", { withTimezone: true }).notNull(),
+    createdAt
+  },
+  (table) => ({
+    scheduledUnique: uniqueIndex("schedule_runs_schedule_scheduled_unique").on(
+      table.scheduleId,
+      table.scheduledFor
+    )
+  })
+);
+
 export const dispatcherRunEvents = pgTable("dispatcher_run_events", {
   id,
   dispatcherRunId: uuid("dispatcher_run_id").notNull().references(() => dispatcherRuns.id, {

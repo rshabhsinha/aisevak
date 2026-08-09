@@ -541,11 +541,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       const usageResult = await client.query<{
         task_count: string;
         thread_count: string;
+        schedule_count: string;
         other_enabled_dispatcher_count: string;
       }>(
         `SELECT
            (SELECT count(*) FROM tasks WHERE agent_id = $1) AS task_count,
            (SELECT count(*) FROM agent_threads WHERE agent_id = $1) AS thread_count,
+           (SELECT count(*) FROM schedules WHERE agent_id = $1) AS schedule_count,
            (SELECT count(*) FROM agents WHERE kind = 'dispatcher' AND enabled = true AND id <> $1)
              AS other_enabled_dispatcher_count`,
         [id]
@@ -554,6 +556,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       const blocked = agentDeletionBlockReason(agent, {
         taskCount: Number(usage.task_count),
         threadCount: Number(usage.thread_count),
+        scheduleCount: Number(usage.schedule_count),
         otherEnabledDispatcherCount: Number(usage.other_enabled_dispatcher_count)
       });
       if (blocked) throw app.httpErrors.conflict(blocked);
@@ -561,6 +564,102 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       await client.query("DELETE FROM agents WHERE id = $1", [id]);
       return { deleted: true, agent: { id: agent.id, name: agent.name } };
     });
+  });
+
+  app.get("/api/schedules", async (request) => {
+    requireUser(request);
+    return { schedules: await listSchedules(pool) };
+  });
+
+  app.post("/api/schedules", async (request) => {
+    const user = requireUser(request);
+    const body = scheduleSchema.parse(request.body);
+    const nextRunAt = new Date(body.nextRunAt);
+    if (nextRunAt.getTime() <= Date.now()) throwBadRequest("First run must be in the future");
+    validateScheduleTiming(body.scheduleKind, body.intervalSeconds ?? null);
+    await requireEnabledAgent(pool, body.agentId);
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO schedules
+         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        body.title,
+        body.prompt,
+        body.agentId,
+        body.scheduleKind,
+        nextRunAt,
+        body.scheduleKind === "interval" ? body.intervalSeconds : null,
+        user.id
+      ]
+    );
+    return { schedule: await getSchedule(pool, mustRow(result.rows[0]).id) };
+  });
+
+  app.patch("/api/schedules/:id", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const body = schedulePatchSchema.parse(request.body);
+    await withTransaction(pool, async (client) => {
+      const currentResult = await client.query<ScheduleTimingRow>(
+        `SELECT id, schedule_kind, next_run_at, interval_seconds, enabled
+         FROM schedules WHERE id = $1 FOR UPDATE`,
+        [id]
+      );
+      const current = currentResult.rows[0];
+      if (!current) throw app.httpErrors.notFound("Schedule not found");
+
+      const scheduleKind = body.scheduleKind ?? current.schedule_kind;
+      const intervalSeconds =
+        scheduleKind === "once"
+          ? null
+          : body.intervalSeconds === null
+            ? null
+            : body.intervalSeconds ?? current.interval_seconds;
+      validateScheduleTiming(scheduleKind, intervalSeconds);
+      if (body.agentId) await requireEnabledAgent(client, body.agentId);
+
+      const enabled = body.enabled ?? current.enabled;
+      let nextRunAt = body.nextRunAt ? new Date(body.nextRunAt) : new Date(current.next_run_at);
+      if (enabled && nextRunAt.getTime() <= Date.now()) {
+        if (scheduleKind === "once") {
+          throwBadRequest("Choose a future time before enabling this one-time schedule");
+        }
+        nextRunAt = new Date(Date.now() + Number(intervalSeconds) * 1000);
+      }
+
+      await client.query(
+        `UPDATE schedules
+         SET title = COALESCE($2, title),
+             prompt = COALESCE($3, prompt),
+             agent_id = COALESCE($4, agent_id),
+             schedule_kind = $5,
+             next_run_at = $6,
+             interval_seconds = $7,
+             enabled = $8,
+             updated_at = now()
+         WHERE id = $1`,
+        [
+          id,
+          body.title ?? null,
+          body.prompt ?? null,
+          body.agentId ?? null,
+          scheduleKind,
+          nextRunAt,
+          intervalSeconds,
+          enabled
+        ]
+      );
+    });
+    return { schedule: await getSchedule(pool, id) };
+  });
+
+  app.delete("/api/schedules/:id", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const result = await pool.query<{ id: string }>("DELETE FROM schedules WHERE id = $1 RETURNING id", [id]);
+    if (!result.rows[0]) throw app.httpErrors.notFound("Schedule not found");
+    return { deleted: true };
   });
 
   app.get("/api/tasks", async (request) => {
@@ -1307,6 +1406,16 @@ const agentSchema = z.object({
   instructions: z.string().min(1)
 });
 const agentPatchSchema = agentSchema.partial().extend({ enabled: z.boolean().optional() });
+const scheduleFieldsSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+  prompt: z.string().trim().min(1).max(50_000),
+  agentId: z.string().uuid(),
+  scheduleKind: z.enum(["once", "interval"]),
+  nextRunAt: z.string().datetime(),
+  intervalSeconds: z.number().int().min(60).max(31_536_000).nullable().optional()
+});
+const scheduleSchema = scheduleFieldsSchema;
+const schedulePatchSchema = scheduleFieldsSchema.partial().extend({ enabled: z.boolean().optional() });
 const taskSchema = z.object({
   title: z.string().min(1),
   description: z.string().min(1).optional(),
@@ -1465,6 +1574,48 @@ interface AgentThreadRow {
   latest_error: string | null;
 }
 
+interface ScheduleTimingRow {
+  id: string;
+  schedule_kind: "once" | "interval";
+  next_run_at: string | Date;
+  interval_seconds: number | null;
+  enabled: boolean;
+}
+
+interface ScheduleRow extends ScheduleTimingRow {
+  title: string;
+  prompt: string;
+  agent_id: string;
+  agent_name: string;
+  agent_kind: "worker" | "dispatcher";
+  last_run_at: string | Date | null;
+  last_agent_thread_id: string | null;
+  last_thread_title: string | null;
+  last_run_status: string | null;
+  run_count: number;
+  created_at: string | Date;
+  updated_at: string | Date;
+}
+
+const scheduleSelectSql = `
+  SELECT schedules.*,
+         agents.name AS agent_name,
+         agents.kind AS agent_kind,
+         agent_threads.title AS last_thread_title,
+         latest.status AS last_run_status,
+         (SELECT count(*)::int FROM schedule_runs WHERE schedule_runs.schedule_id = schedules.id) AS run_count
+  FROM schedules
+  JOIN agents ON agents.id = schedules.agent_id
+  LEFT JOIN agent_threads ON agent_threads.id = schedules.last_agent_thread_id
+  LEFT JOIN LATERAL (
+    SELECT dispatcher_runs.status
+    FROM schedule_runs
+    JOIN dispatcher_runs ON dispatcher_runs.id = schedule_runs.dispatcher_run_id
+    WHERE schedule_runs.schedule_id = schedules.id
+    ORDER BY schedule_runs.scheduled_for DESC
+    LIMIT 1
+  ) latest ON true`;
+
 interface AgentToolContext {
   role: "worker" | "dispatcher";
   taskId: string | null;
@@ -1488,6 +1639,41 @@ function requireAdmin(request: FastifyRequest): AuthUser {
     throw error;
   }
   return user;
+}
+
+type ApiQueryable = Pick<DbPool, "query">;
+
+async function listSchedules(pool: ApiQueryable): Promise<ScheduleRow[]> {
+  const result = await pool.query<ScheduleRow>(
+    `${scheduleSelectSql}
+     ORDER BY schedules.enabled DESC, schedules.next_run_at ASC, schedules.created_at DESC`
+  );
+  return result.rows;
+}
+
+async function getSchedule(pool: ApiQueryable, id: string): Promise<ScheduleRow> {
+  const result = await pool.query<ScheduleRow>(`${scheduleSelectSql} WHERE schedules.id = $1`, [id]);
+  return mustRow(result.rows[0]);
+}
+
+async function requireEnabledAgent(pool: ApiQueryable, id: string): Promise<void> {
+  const result = await pool.query<{ id: string }>(
+    "SELECT id FROM agents WHERE id = $1 AND enabled = true",
+    [id]
+  );
+  if (!result.rows[0]) throwBadRequest("Select an enabled agent");
+}
+
+function validateScheduleTiming(
+  scheduleKind: "once" | "interval",
+  intervalSeconds: number | null
+): void {
+  if (scheduleKind === "once" && intervalSeconds !== null) {
+    throwBadRequest("A one-time schedule cannot have an interval");
+  }
+  if (scheduleKind === "interval" && (!intervalSeconds || intervalSeconds < 60)) {
+    throwBadRequest("A repeating schedule needs an interval of at least one minute");
+  }
 }
 
 async function getUserFromRequest(pool: DbPool, request: FastifyRequest): Promise<AuthUser | undefined> {
