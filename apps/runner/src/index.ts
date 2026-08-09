@@ -1,8 +1,11 @@
 import {
   buildCodexConfigToml,
   buildDispatcherPrompt,
+  codexChatGptAuthSecrets,
+  CODEX_CHATGPT_AUTH_SECRET_NAME,
   createPool,
   decryptSecret,
+  encryptSecret,
   extractThreadId,
   fetchGithubInstallationToken,
   githubCloneEnv,
@@ -13,17 +16,20 @@ import {
   newSessionToken,
   normalizeCodexSkillSnapshots,
   normalizeCodexEvent,
+  parseCodexChatGptAuthFile,
   parseCodexJsonLine,
   redactSecrets,
   resolveCodexBinary,
+  serializeCodexChatGptAuthFile,
   runMigrations,
   serializeCodexSkillSnapshots,
   type CodexSkillSnapshot,
+  type CodexChatGptAuthFile,
   type DbPool
 } from "@aisevak/core";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { chmod, copyFile, mkdir, rm, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -305,9 +311,8 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
-    const apiKey = await readSecret(pool, "openai_api_key");
+    const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
-    await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
       role: "dispatcher",
       dispatcherRunId: job.id,
@@ -323,15 +328,17 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       prompt: job.prompt,
       threadId: job.codex_thread_id,
       env: {
-        ...process.env,
+        ...codexProcessEnv(),
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN: toolToken,
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
-        ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
+        ...(codexAuth.apiKey
+          ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
+          : {})
       },
-      secrets: [apiKey, toolToken, ...credentialSecrets],
+      secrets: [...codexAuth.redactionSecrets, toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         await pool.query(
@@ -357,6 +364,15 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
+    if (codexAuth.chatGptAuth) {
+      try {
+        await persistRefreshedCodexAuth(pool, job.codex_home, codexAuth.chatGptAuth);
+      } catch (error) {
+        stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
+          error instanceof Error ? error.message : error
+        )}`;
+      }
+    }
     exitCode = turn.exitCode;
     finalStatus =
       turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
@@ -454,9 +470,8 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     await mkdir(job.codex_home, { recursive: true });
     await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
-    const apiKey = await readSecret(pool, "openai_api_key");
+    const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
-    await ensureCodexAuth(job.codex_home, apiKey);
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
       taskRunId: job.id,
@@ -472,15 +487,17 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       prompt: job.prompt,
       threadId: job.codex_thread_id,
       env: {
-        ...process.env,
+        ...codexProcessEnv(),
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN: toolToken,
         PATH: `${toolBin}:${process.env.PATH ?? ""}`,
-        ...(apiKey ? { CODEX_API_KEY: apiKey, OPENAI_API_KEY: apiKey } : {})
+        ...(codexAuth.apiKey
+          ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
+          : {})
       },
-      secrets: [apiKey, toolToken, ...credentialSecrets],
+      secrets: [...codexAuth.redactionSecrets, toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         await pool.query(
@@ -507,6 +524,15 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
+    if (codexAuth.chatGptAuth) {
+      try {
+        await persistRefreshedCodexAuth(pool, job.codex_home, codexAuth.chatGptAuth);
+      } catch (error) {
+        stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
+          error instanceof Error ? error.message : error
+        )}`;
+      }
+    }
     exitCode = turn.exitCode;
     finalStatus =
       turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
@@ -545,10 +571,85 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
   }
 }
 
-async function ensureCodexAuth(codexHome: string, apiKey: string | undefined): Promise<void> {
-  if (apiKey) return;
-  if (!existsSync(env.codexHostAuthJson)) return;
-  await copyFile(env.codexHostAuthJson, join(codexHome, "auth.json"));
+interface MaterializedCodexAuth {
+  apiKey?: string;
+  chatGptAuth?: CodexChatGptAuthFile;
+  redactionSecrets: string[];
+}
+
+async function materializeCodexAuth(pool: DbPool, codexHome: string): Promise<MaterializedCodexAuth> {
+  const authPath = join(codexHome, "auth.json");
+  const storedChatGptAuth = await readSecret(pool, CODEX_CHATGPT_AUTH_SECRET_NAME);
+  if (storedChatGptAuth) {
+    const auth = parseCodexChatGptAuthFile(storedChatGptAuth);
+    await writeFile(authPath, serializeCodexChatGptAuthFile(auth), { encoding: "utf8", mode: 0o600 });
+    await chmod(authPath, 0o600);
+    return { chatGptAuth: auth, redactionSecrets: codexChatGptAuthSecrets(auth) };
+  }
+
+  const apiKey = await readSecret(pool, "openai_api_key");
+  if (apiKey) {
+    await rm(authPath, { force: true });
+    return { apiKey, redactionSecrets: [apiKey] };
+  }
+
+  if (existsSync(env.codexHostAuthJson)) {
+    await copyFile(env.codexHostAuthJson, authPath);
+    await chmod(authPath, 0o600);
+    return { redactionSecrets: authFileRedactionSecrets(await readFile(authPath, "utf8")) };
+  }
+
+  throw new Error(
+    "Codex is not authenticated. An admin must connect ChatGPT from Manage > ChatGPT in Aisevak."
+  );
+}
+
+async function persistRefreshedCodexAuth(
+  pool: DbPool,
+  codexHome: string,
+  original: CodexChatGptAuthFile
+): Promise<void> {
+  const refreshed = parseCodexChatGptAuthFile(await readFile(join(codexHome, "auth.json"), "utf8"));
+  if (refreshed.tokens.account_id !== original.tokens.account_id) {
+    throw new Error("Codex changed to a different ChatGPT account during the run");
+  }
+  const encrypted = encryptSecret(serializeCodexChatGptAuthFile(refreshed), env.secretKey);
+  await pool.query(
+    `INSERT INTO secrets (name, description, encrypted_value, agent_accessible)
+     VALUES ($1, $2, $3, false)
+     ON CONFLICT (name) DO UPDATE
+     SET description = excluded.description,
+         encrypted_value = excluded.encrypted_value,
+         agent_accessible = false,
+         updated_at = now()`,
+    [
+      CODEX_CHATGPT_AUTH_SECRET_NAME,
+      "Internal ChatGPT authentication used by the Codex runner",
+      encrypted
+    ]
+  );
+}
+
+function codexProcessEnv(): NodeJS.ProcessEnv {
+  const value = { ...process.env };
+  delete value.CODEX_API_KEY;
+  delete value.OPENAI_API_KEY;
+  return value;
+}
+
+function authFileRedactionSecrets(value: string): string[] {
+  try {
+    return codexChatGptAuthSecrets(parseCodexChatGptAuthFile(value));
+  } catch {
+    try {
+      const parsed = JSON.parse(value) as { OPENAI_API_KEY?: unknown };
+      return typeof parsed.OPENAI_API_KEY === "string" && parsed.OPENAI_API_KEY.length > 0
+        ? [parsed.OPENAI_API_KEY]
+        : [];
+    } catch {
+      return [];
+    }
+  }
 }
 
 async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {

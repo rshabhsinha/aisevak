@@ -42,6 +42,7 @@ import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
+import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 
 interface AuthUser {
   id: string;
@@ -75,6 +76,7 @@ let codexModelCache:
 
 export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
+  const codexAuth = new CodexAuthManager(pool, env.secretKey);
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
   await app.register(cors, {
@@ -205,6 +207,35 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       [id]
     );
     return { credential: result.rows[0] ?? null };
+  });
+
+  app.get("/api/codex-auth", async (request) => {
+    requireAdmin(request);
+    return codexAuth.getStatus();
+  });
+
+  app.post("/api/codex-auth/login", async (request) => {
+    const user = requireAdmin(request);
+    try {
+      return await codexAuth.startDeviceLogin(user.id);
+    } catch (error) {
+      throw app.httpErrors.badGateway(sanitizeCodexAuthError(error));
+    }
+  });
+
+  app.get("/api/codex-auth/login/:id", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    try {
+      return await codexAuth.pollDeviceLogin(id, user.id);
+    } catch (error) {
+      throw app.httpErrors.badRequest(sanitizeCodexAuthError(error));
+    }
+  });
+
+  app.delete("/api/codex-auth", async (request) => {
+    requireAdmin(request);
+    return codexAuth.disconnect();
   });
 
   app.get("/api/codex/models", async (request) => {
@@ -1107,6 +1138,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 }
 
 const idParams = z.object({ id: z.string().uuid() });
+const codexLoginParams = z.object({ id: z.string().uuid() });
 const taskKeyParams = z.object({ key: z.string().min(1) });
 const credentialNameParams = z.object({ name: z.string().min(1) });
 const runEventsParams = z.object({

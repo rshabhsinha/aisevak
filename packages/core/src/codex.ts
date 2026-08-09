@@ -12,6 +12,7 @@ export function buildCodexConfigToml(model?: string | null): string {
   return [
     'approval_policy = "never"',
     'sandbox_mode = "danger-full-access"',
+    'cli_auth_credentials_store = "file"',
     isExplicitModel(model) ? `model = ${JSON.stringify(model)}` : undefined,
     "",
     "[history]",
