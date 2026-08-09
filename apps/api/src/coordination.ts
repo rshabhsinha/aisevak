@@ -717,9 +717,26 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write");
     const id = await resolveResourceId(pool, "incidents", "INC", refParams.parse(request.params).ref); const body = optionalMarkdownSchema.parse(request.body ?? {});
     const incident = await showIncident(pool, id);
-    if (body.markdown) await pool.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
-    await pool.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
-    if (incident.thread_id) await finalizeThread(pool, managedRoot, context, incident.thread_id, "completed", body.markdown || "Incident resolved.");
+    if (incident.thread_id) {
+      await finalizeThread(
+        pool,
+        managedRoot,
+        context,
+        incident.thread_id,
+        "completed",
+        body.markdown || "Incident resolved.",
+        undefined,
+        async (client) => {
+          if (body.markdown) {
+            await client.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
+          }
+          await client.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
+        }
+      );
+    } else {
+      if (body.markdown) await pool.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
+      await pool.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
+    }
     return { incident: await showIncident(pool, id) };
   });
 }
@@ -964,26 +981,39 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
   );
 }
 
-function coordinationPrompt(thread: any, recipient: any, message: any, history: any[]): string {
+export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[]): string {
   const lines = history.map((item) => `- ${item.sender_agent_name ?? "System"} -> ${item.recipient_agent_name ?? "thread"} [${item.message_type}]: ${String(item.body).slice(0, 1200)}`);
-  return [
+  const context = [
     `You are ${recipient.name}: ${recipient.description}`,
     "You have received an Aisevak coordination message. Use the aisevak CLI based on your judgment; inspect resources lazily instead of loading everything.",
     "",
     `Thread: THREAD-${thread.number} — ${thread.title}`,
     `Description: ${thread.description}`,
     `Purpose: ${thread.purpose}`,
-    `Triggered by: ${thread.created_by_agent_name ?? "platform"}`,
+    `Thread started by: ${thread.created_by_agent_name ?? "platform"}`,
+    `Message from: ${message.sender_agent_name ?? "platform"}`,
+    `Message type: ${message.message_type ?? "message"}`,
     `Why you were triggered: ${message.body}`,
     thread.origin_thread_id ? `Origin thread: THREAD-${thread.origin_thread_number ?? thread.origin_thread_id}` : "Origin thread: none",
-    `Assigned agent: ${recipient.name}`,
-    `Callback agent: ${thread.callback_agent_name ?? "none"}`,
-    `Completion instruction: ${thread.completion_instructions}`,
+    `Triggered agent: ${thread.primary_agent_name ?? "none"}`,
+    `Result recipient: ${thread.callback_agent_name ?? "none"}`,
     "",
     "Recent thread history:",
     ...(lines.length ? lines : ["- No earlier messages."]),
-    "",
-    "Complete the requested work. When finished, send the completed work back through the thread using the completion instruction. If blocked, run: aisevak threads block THREAD-" + thread.number + " --reason-stdin"
+    ""
+  ];
+  if (message.message_type === "completion" || message.message_type === "blocked") {
+    return [
+      ...context,
+      `This is a final ${message.message_type} response from the agent you triggered. Treat it as a result notification, not as new work on THREAD-${thread.number}.`,
+      `Do not complete or block THREAD-${thread.number}, and do not send an automatic acknowledgement. Continue the work that caused the handoff using the result above.`,
+      `If the triggered agent needs to do more work, explicitly send a new message on the same thread with: aisevak threads send THREAD-${thread.number} --body-stdin. That reactivates the thread and delivers the follow-up to the triggered agent.`
+    ].join("\n");
+  }
+  return [
+    ...context,
+    `Completion instruction: ${thread.completion_instructions}`,
+    "Complete the requested work. When finished, send the completed work back to the triggering agent through this thread using the completion instruction. If blocked, run: aisevak threads block THREAD-" + thread.number + " --reason-stdin"
   ].join("\n");
 }
 
@@ -1014,24 +1044,45 @@ function normalizeFiles(value: unknown): Record<string, string> {
   return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => typeof entry[1] === "string"));
 }
 
-async function finalizeThread(pool: DbPool, managedRoot: string, context: AgentContext, threadId: string, status: "completed" | "blocked", body: string, idempotencyKey?: string): Promise<string> {
+async function finalizeThread(
+  pool: DbPool,
+  managedRoot: string,
+  context: AgentContext,
+  threadId: string,
+  status: "completed" | "blocked",
+  body: string,
+  idempotencyKey?: string,
+  updateRelatedResource?: (client: PoolClient) => Promise<void>
+): Promise<string> {
   return withTransaction(pool, async (client) => {
     const thread = await lockThread(client, threadId);
     const duplicate = await existingIdempotentMessage(client, context.agentId, idempotencyKey);
     if (duplicate) return duplicate.id;
-    const recipientId =
-      thread.callback_agent_id && thread.callback_agent_id !== context.agentId
-        ? thread.callback_agent_id
-        : thread.primary_agent_id && thread.primary_agent_id !== context.agentId
-          ? thread.primary_agent_id
-          : null;
+    assertThreadCanFinalize(thread, context.agentId);
+    const recipientId = thread.callback_agent_id && thread.callback_agent_id !== context.agentId
+      ? thread.callback_agent_id
+      : null;
     const message = await insertMessage(client, { threadId, senderAgentId: context.agentId, recipientAgentId: recipientId,
       body, type: status === "completed" ? "completion" : "blocked", idempotencyKey });
     await client.query("UPDATE coordination_threads SET status = $2, last_activity_at = now(), updated_at = now() WHERE id = $1", [threadId, status]);
     if (thread.task_id) await client.query("UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1", [thread.task_id, status === "completed" ? "completed" : "blocked"]);
+    if (updateRelatedResource) await updateRelatedResource(client);
     if (recipientId) await queueDelivery(client, managedRoot, threadId, message.id, recipientId);
     return message.id;
   });
+}
+
+export function assertThreadCanFinalize(
+  thread: { number?: number; status: string; primary_agent_id: string | null },
+  agentId: string
+): void {
+  const ref = thread.number ? `THREAD-${thread.number}` : "Thread";
+  if (thread.status !== "active") {
+    throw httpError(409, `${ref} is already ${thread.status}. Send a new message to reactivate it before requesting more work.`);
+  }
+  if (thread.primary_agent_id !== agentId) {
+    throw httpError(403, `Only the agent triggered on ${ref} can complete or block it. Use threads send for follow-up work.`);
+  }
 }
 
 async function showResource(pool: DbPool, context: AgentContext, ref: string): Promise<any> {
