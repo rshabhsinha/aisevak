@@ -2160,7 +2160,7 @@ async function cancelAgentThread(
   return { turn: result.rows[0] ?? null };
 }
 
-async function queueAgentTurnInput(
+export async function queueAgentTurnInput(
   pool: DbPool,
   threadId: string,
   message: string
@@ -2186,11 +2186,18 @@ async function queueAgentTurnInput(
   const result = await pool.query(
     `INSERT INTO agent_turn_inputs
        (agent_thread_id, task_run_id, dispatcher_run_id, message)
-     VALUES ($1, $2, $3, $4)
+     SELECT $1, $2, $3, $4
+     WHERE EXISTS (
+       SELECT 1 FROM task_runs WHERE id = $2 AND status = 'running'
+       UNION ALL
+       SELECT 1 FROM dispatcher_runs WHERE id = $3 AND status = 'running'
+     )
      RETURNING *`,
     [threadId, turn.kind === "worker" ? turn.id : null, turn.kind === "dispatcher" ? turn.id : null, message]
   );
-  return { input: mustRow(result.rows[0]) };
+  const input = result.rows[0];
+  if (!input) throwBadRequest("This thread does not have an active turn to steer");
+  return { input };
 }
 
 async function resolveModelSelection(

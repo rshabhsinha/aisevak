@@ -42,6 +42,8 @@ describe("worker run finalization", () => {
     ]);
     expect(queries[2]?.params).toEqual(["task-id", "completed"]);
     expect(queries[3]?.params).toEqual(["coordination-thread-id", "completed"]);
+    expect(queries[2]?.sql).toContain("status = 'open'");
+    expect(queries[3]?.sql).toContain("status = 'active'");
   });
 
   it.each(["failed", "cancelled"] as const)("blocks the thread when a run is %s", async (finalStatus) => {
@@ -66,5 +68,25 @@ describe("worker run finalization", () => {
       "coordination-thread-id",
       "blocked"
     ]);
+  });
+
+  it("only applies automatic statuses while the task and thread remain unresolved", async () => {
+    const { pool, queries } = recordingPool();
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id",
+      taskId: "task-id",
+      agentThreadId: null,
+      coordinationThreadId: "coordination-thread-id",
+      finalStatus: "succeeded",
+      stdout: "done",
+      stderr: "",
+      exitCode: 0
+    });
+
+    const taskUpdate = queries.find((query) => query.sql.includes("UPDATE tasks"));
+    const threadUpdate = queries.find((query) => query.sql.includes("UPDATE coordination_threads"));
+    expect(taskUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'open'/);
+    expect(threadUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'active'/);
   });
 });

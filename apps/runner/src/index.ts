@@ -125,7 +125,6 @@ async function main(): Promise<void> {
 
   const beginShutdown = () => {
     shuttingDown = true;
-    void closeAllCodexAppServers();
   };
   process.on("SIGINT", beginShutdown);
   process.on("SIGTERM", beginShutdown);
@@ -780,7 +779,11 @@ export async function finalizeWorkerRunState(
       [input.runId, input.finalStatus, input.stdout, input.stderr, input.exitCode]
     );
     await client.query(
-      "UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1",
+      `UPDATE tasks
+       SET status = $2,
+           updated_at = now()
+       WHERE id = $1
+         AND status = 'open'`,
       [input.taskId, taskStatus]
     );
     if (input.coordinationThreadId) {
@@ -789,7 +792,8 @@ export async function finalizeWorkerRunState(
          SET status = $2,
              last_activity_at = now(),
              updated_at = now()
-         WHERE id = $1`,
+         WHERE id = $1
+           AND status = 'active'`,
         [input.coordinationThreadId, threadStatus]
       );
     }
