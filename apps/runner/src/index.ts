@@ -45,6 +45,7 @@ import {
   runCodexAppServerTurn,
   type AppServerTurnInput
 } from "./appServerClient.js";
+import { agentGithubEnvironment, safeChildEnvironment } from "./githubCli.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 
 const env = {
@@ -866,10 +867,10 @@ async function persistRefreshedCodexAuth(
 }
 
 function codexProcessEnv(): NodeJS.ProcessEnv {
-  const value = { ...process.env };
-  delete value.CODEX_API_KEY;
-  delete value.OPENAI_API_KEY;
-  return value;
+  return {
+    ...safeChildEnvironment(),
+    ...agentGithubEnvironment(env.managedRoot)
+  };
 }
 
 function authFileRedactionSecrets(value: string): string[] {
