@@ -19,9 +19,10 @@ import {
   resolveCodexBinary,
   normalizeCodexSkillSnapshots,
   normalizeCodexModel,
+  applyCodexModelDefaults,
   normalizeGithubRepo,
   CODEX_HARNESS_MODELS,
-  DEFAULT_CODEX_MODEL,
+  defaultCodexModelOptions,
   runMigrations,
   serializeCodexSkillSnapshots,
   taskBranchName,
@@ -66,7 +67,6 @@ const env = {
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
-  codexPreferredModel: process.env.CODEX_DEFAULT_MODEL?.trim() || "auto",
   codexDefaultModel: normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL),
   githubApiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com"
 };
@@ -473,6 +473,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/agents", async (request) => {
     const user = requireAdmin(request);
     const body = agentSchema.parse(request.body);
+    const model = body.model ?? env.codexDefaultModel;
     const result = await pool.query(
       `INSERT INTO agents (name, description, model, model_options, capabilities, instructions, enabled)
        VALUES ($1, $2, $3, $4, $5, $6, true)
@@ -480,8 +481,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       [
         body.name,
         body.description ?? "",
-        body.model ?? env.codexDefaultModel,
-        JSON.stringify(body.modelOptions ?? []),
+        model,
+        JSON.stringify(body.modelOptions ?? defaultCodexModelOptions(model)),
         JSON.stringify(body.capabilities ?? []),
         body.instructions
       ]
@@ -1539,10 +1540,17 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
 
   for (const agent of defaults) {
     const result = await pool.query(
-      `INSERT INTO agents (kind, name, description, model, instructions, enabled)
-       VALUES ($1, $2, $3, $4, $5, true)
+      `INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6, true)
        RETURNING *`,
-      [agent.kind, agent.name, agent.description, env.codexDefaultModel, agent.instructions]
+      [
+        agent.kind,
+        agent.name,
+        agent.description,
+        env.codexDefaultModel,
+        JSON.stringify(defaultCodexModelOptions(env.codexDefaultModel)),
+        agent.instructions
+      ]
     );
     await insertAgentVersion(pool, mustRow(result.rows[0]), userId);
   }
@@ -1606,14 +1614,10 @@ async function getCodexModelSnapshot(): Promise<{
   try {
     const liveModels = await discoverCodexModels({ codexBinary: env.codexBinary });
     if (liveModels.length > 0) {
-      const defaultModel =
-        liveModels.find((model) => model.id === env.codexPreferredModel)?.id ??
-        liveModels.find((model) => model.badge === "Default")?.id ??
-        liveModels[0]?.id ??
-        env.codexDefaultModel;
+      const configured = applyCodexModelDefaults(liveModels, env.codexDefaultModel);
       codexModelCache = {
-        defaultModel,
-        models: liveModels,
+        defaultModel: configured.defaultModel,
+        models: configured.models,
         source: "live",
         expiresAt: Date.now() + 5 * 60_000
       };
@@ -1622,13 +1626,10 @@ async function getCodexModelSnapshot(): Promise<{
   } catch (error) {
     console.warn("Codex model discovery failed; using fallback catalog", error);
   }
-  const fallbackDefaultModel =
-    CODEX_HARNESS_MODELS.find((model) => model.id === env.codexPreferredModel)?.id ??
-    CODEX_HARNESS_MODELS.find((model) => model.badge === "Default")?.id ??
-    DEFAULT_CODEX_MODEL;
+  const configured = applyCodexModelDefaults(CODEX_HARNESS_MODELS, env.codexDefaultModel);
   codexModelCache = {
-    defaultModel: fallbackDefaultModel,
-    models: CODEX_HARNESS_MODELS,
+    defaultModel: configured.defaultModel,
+    models: configured.models,
     source: "fallback",
     expiresAt: Date.now() + 30_000
   };

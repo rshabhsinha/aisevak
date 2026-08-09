@@ -1,3 +1,5 @@
+import type { ModelOptionSelection } from "./types.js";
+
 export interface CodexHarnessModel {
   id: string;
   label: string;
@@ -13,7 +15,8 @@ export interface CodexModelOption {
   defaultValue?: string;
 }
 
-export const DEFAULT_CODEX_MODEL = "gpt-5.6-sol";
+export const DEFAULT_CODEX_MODEL = "gpt-5.6-luna";
+export const DEFAULT_CODEX_REASONING_EFFORT = "max";
 
 const EXTENDED_REASONING: CodexModelOption = {
   id: "reasoningEffort",
@@ -45,7 +48,6 @@ export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
     id: "gpt-5.6-sol",
     label: "GPT-5.6-Sol",
     description: "Latest frontier agentic coding model.",
-    badge: "Default",
     options: reasoning("low", "ultra")
   },
   {
@@ -58,7 +60,8 @@ export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
     id: "gpt-5.6-luna",
     label: "GPT-5.6-Luna",
     description: "Fast and affordable agentic coding model.",
-    options: reasoning("medium", "max")
+    badge: "Default",
+    options: reasoning(DEFAULT_CODEX_REASONING_EFFORT, "max")
   },
   {
     id: "gpt-5.5",
@@ -91,4 +94,41 @@ export function normalizeCodexModel(model: string | null | undefined): string {
     return DEFAULT_CODEX_MODEL;
   }
   return model;
+}
+
+export function applyCodexModelDefaults(
+  models: CodexHarnessModel[],
+  preferredModel = DEFAULT_CODEX_MODEL
+): { defaultModel: string; models: CodexHarnessModel[] } {
+  const defaultModel =
+    models.find((model) => model.id === preferredModel)?.id ??
+    models.find((model) => model.badge === "Default")?.id ??
+    models[0]?.id ??
+    preferredModel;
+
+  return {
+    defaultModel,
+    models: models.map((model) => ({
+      ...model,
+      ...(model.id === defaultModel ? { badge: "Default" } : { badge: undefined }),
+      options: model.options?.map((option) => {
+        if (
+          model.id !== DEFAULT_CODEX_MODEL ||
+          option.id !== "reasoningEffort" ||
+          !option.values.some((value) => value.id === DEFAULT_CODEX_REASONING_EFFORT)
+        ) {
+          return option;
+        }
+        return { ...option, defaultValue: DEFAULT_CODEX_REASONING_EFFORT };
+      })
+    }))
+  };
+}
+
+export function defaultCodexModelOptions(modelId = DEFAULT_CODEX_MODEL): ModelOptionSelection[] {
+  const model = CODEX_HARNESS_MODELS.find((entry) => entry.id === modelId);
+  return (model?.options ?? []).flatMap((option): ModelOptionSelection[] => {
+    const value = option.defaultValue ?? option.values[0]?.id;
+    return value ? [{ id: option.id, value }] : [];
+  });
 }

@@ -94,8 +94,8 @@ CREATE TABLE IF NOT EXISTS agents (
   kind text NOT NULL DEFAULT 'worker',
   name text NOT NULL,
   description text NOT NULL DEFAULT '',
-  model text NOT NULL DEFAULT 'gpt-5.6-sol',
-  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  model text NOT NULL DEFAULT 'gpt-5.6-luna',
+  model_options jsonb NOT NULL DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
   instructions text NOT NULL,
   enabled boolean NOT NULL DEFAULT true,
   created_at timestamptz NOT NULL DEFAULT now(),
@@ -384,7 +384,8 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS capabilities jsonb NOT NULL DEFAULT 
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS bundled boolean NOT NULL DEFAULT false;
 ALTER TABLE skills ADD COLUMN IF NOT EXISTS default_for_agents boolean NOT NULL DEFAULT false;
 ALTER TABLE agent_versions ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
-ALTER TABLE agents ALTER COLUMN model SET DEFAULT 'gpt-5.6-sol';
+ALTER TABLE agents ALTER COLUMN model SET DEFAULT 'gpt-5.6-luna';
+ALTER TABLE agents ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
@@ -566,12 +567,17 @@ SET kind = 'dispatcher', updated_at = now()
 WHERE lower(name) IN ('dispatcher', 'orchestrator')
   AND kind <> 'dispatcher';
 
-INSERT INTO agents (kind, name, description, model, instructions, enabled)
+INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
 SELECT
   'dispatcher',
   'Orchestrator',
   'Routes unassigned work and coordinates specialized agents across durable threads.',
-  COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.6-sol'),
+  COALESCE(NULLIF(current_setting('aisevak.default_model', true), ''), 'gpt-5.6-luna'),
+  CASE
+    WHEN current_setting('aisevak.default_model', true) = 'gpt-5.6-luna'
+      THEN '[{"id":"reasoningEffort","value":"max"}]'::jsonb
+    ELSE '[]'::jsonb
+  END,
   'You are the Aisevak Orchestrator. Use the aisevak CLI to inspect work, route tasks, coordinate agents through durable threads, and request precise follow-up when work is ambiguous or blocked.',
   true
 WHERE NOT EXISTS (SELECT 1 FROM agents WHERE kind = 'dispatcher');
@@ -581,6 +587,34 @@ SET name = 'Orchestrator',
     description = 'Routes unassigned work and coordinates specialized agents across durable threads.',
     updated_at = now()
 WHERE kind = 'dispatcher' AND lower(name) = 'dispatcher';
+
+CREATE TABLE IF NOT EXISTS app_migrations (
+  name text PRIMARY KEY,
+  applied_at timestamptz NOT NULL DEFAULT now()
+);
+
+DO $$ BEGIN
+  IF current_setting('aisevak.default_model', true) = 'gpt-5.6-luna'
+     AND NOT EXISTS (
+       SELECT 1 FROM app_migrations WHERE name = '20260809_luna_max_agent_default'
+     ) THEN
+    WITH migrated AS (
+      UPDATE agents
+      SET model = 'gpt-5.6-luna',
+          model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
+          updated_at = now()
+      WHERE model IN ('gpt-5.5', 'gpt-5.6-sol')
+        AND model_options = '[]'::jsonb
+      RETURNING id, name, description, model, model_options, instructions
+    )
+    INSERT INTO agent_versions
+      (agent_id, name, description, model, model_options, instructions, created_by)
+    SELECT id, name, description, model, model_options, instructions, NULL
+    FROM migrated;
+
+    INSERT INTO app_migrations (name) VALUES ('20260809_luna_max_agent_default');
+  END IF;
+END $$;
 
 INSERT INTO coordination_threads
   (title, description, purpose, status, project_id, task_id, primary_agent_id, completion_instructions,
