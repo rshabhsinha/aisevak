@@ -27,7 +27,7 @@ aisevak incidents declare --title "Queue stalled" --description "No deliveries p
   --severity high --markdown-stdin
 ```
 
-Addressed messages create durable per-recipient deliveries. The runner presents them serially for each agent/thread pair, retries transient failures up to three times, and records delivery state. Completing or blocking a thread atomically appends the callback message and wakes the initiating agent. Sending a later message to a completed thread reactivates the thread without reopening a linked completed task.
+Addressed messages create durable per-recipient deliveries. The runner presents them serially for each agent/thread pair, retries transient failures up to three times, and records delivery state. Only the triggered agent can complete or block an active thread; that atomically sends one final result to the triggering agent. The result is a notification and does not produce an automatic reply. If more work is needed, the triggering agent can explicitly send a later message on the same thread, reactivating it without reopening a linked completed task.
 
 Skills and capabilities are separate. The bundled `$aisevak-cli` skill is enabled for every agent by default so each isolated session knows how to inspect context and coordinate with judgment. Additional agent, project, and task skill links remain selective. Backend-enforced capabilities control which CLI mutations that agent may perform.
 

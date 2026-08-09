@@ -36,7 +36,7 @@ aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]
 aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
 ```
 
-Addressing a message queues it for the recipient. Sending to a completed or blocked thread reactivates the thread. Completing or blocking sends the result to the callback or primary agent selected by the platform.
+Addressing a message queues it for the recipient. Completing or blocking is reserved for the agent triggered on an active thread and sends one final result to the triggering agent. The triggering agent must treat that result as a notification and must not finalize the same thread in response. If more work is needed, `threads send` on the completed or blocked thread reactivates it and queues the follow-up to the triggered agent.
 
 ## Tasks
 

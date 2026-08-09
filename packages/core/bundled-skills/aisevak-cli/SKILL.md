@@ -54,7 +54,7 @@ Use `--origin-thread` or `--origin-message` only when the current context does n
 
 ## Respond and finish
 
-Use the completion instruction in the received prompt. Send intermediate information only when it is useful; complete or block exactly once when the requested work reaches that state.
+When another agent triggers you to do work, use the completion instruction in the received prompt. Send intermediate information only when it is useful; complete or block exactly once when the requested work reaches that state. Completion sends one final result to the triggering agent.
 
 ```bash
 printf '%s\n' 'Implemented the parser fix and verified the focused regression tests.' \
@@ -64,7 +64,16 @@ printf '%s\n' 'Blocked because the required signing credential is not available 
   | aisevak threads block THREAD-12 --reason-stdin
 ```
 
-Sending a later message to a completed thread reactivates that conversation and queues it to the addressed agent. It does not reopen a linked completed task; reopen the task explicitly when the tracked work itself must resume.
+When an agent you triggered sends a completion or blocked response, treat it as a result notification. Do not complete or block the same thread and do not send an automatic acknowledgement. Continue your own work with the result.
+
+If the triggered agent needs to do more work, send an explicit follow-up on the same thread:
+
+```bash
+printf '%s\n' 'Please also check the malformed-input case and report the outcome.' \
+  | aisevak threads send THREAD-12 --body-stdin
+```
+
+This reactivates the thread and queues the follow-up to the triggered agent. It does not reopen a linked completed task; reopen the task explicitly when the tracked work item itself must resume.
 
 ## Handle Markdown safely
 
