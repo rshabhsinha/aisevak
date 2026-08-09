@@ -8,9 +8,6 @@ import {
   decryptSecret,
   discoverCodexModels,
   encryptSecret,
-  fetchGithubInstallationToken,
-  githubCloneEnv,
-  githubHeaders,
   hashPassword,
   hashToken,
   installedSkillsRoot,
@@ -22,7 +19,6 @@ import {
   normalizeCodexSkillSnapshots,
   normalizeCodexModel,
   applyCodexModelDefaults,
-  normalizeGithubRepo,
   CODEX_HARNESS_MODELS,
   defaultCodexModelOptions,
   runMigrations,
@@ -73,7 +69,7 @@ const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
   codexDefaultModel: normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL),
-  githubApiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com"
+  githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
 const skillsRoot = installedSkillsRoot(env.managedRoot);
 
@@ -1229,91 +1225,107 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return { taskId: task.id, agent, run };
   });
 
-  app.post("/api/github/app-manifest/start", async (request) => {
+  app.get("/api/github/status", async (request) => {
     requireAdmin(request);
-    const body = githubManifestSchema.parse(request.body ?? {});
-    const manifest = {
-      name: body.name ?? "Aisevak",
-      url: env.appOrigin,
-      redirect_url: `${env.appOrigin}/github/callback`,
-      public: false,
-      default_permissions: {
-        metadata: "read",
-        contents: "write",
-        pull_requests: "write",
-        issues: "write"
-      }
-    };
-    return {
-      manifest,
-      manifestUrl: `https://github.com/settings/apps/new?manifest=${encodeURIComponent(
-        JSON.stringify(manifest)
-      )}`
-    };
+    const result = await pool.query(
+      `SELECT id, name, status, account_login, error, last_synced_at, created_at, updated_at
+       FROM github_connections
+       WHERE auth_mode = 'pat' AND status <> 'replaced'
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    );
+    return { connection: result.rows[0] ?? null, hostname: env.githubHost };
   });
 
-  app.post("/api/github/app-manifest/callback", async (request) => {
+  app.post("/api/github/connect", async (request) => {
     const user = requireAdmin(request);
-    const body = githubCallbackSchema.parse(request.body);
-    const privateKeySecretId = body.privateKey
-      ? await upsertSecret(pool, `github_app_private_key_${body.appId}`, body.privateKey)
-      : null;
-    const webhookSecretId = body.webhookSecret
-      ? await upsertSecret(pool, `github_app_webhook_${body.appId}`, body.webhookSecret)
-      : null;
-    const result = await pool.query(
-      `INSERT INTO github_connections
-       (auth_mode, name, app_id, client_id, private_key_secret_id, webhook_secret_id, created_by)
-       VALUES ('app', $1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [body.name, body.appId, body.clientId ?? null, privateKeySecretId, webhookSecretId, user.id]
+    const body = githubConnectSchema.parse(request.body);
+    const existing = await pool.query<{ id: string; status: string }>(
+      `SELECT id, status FROM github_connections
+       WHERE auth_mode = 'pat' AND status <> 'replaced'
+       ORDER BY updated_at DESC LIMIT 1`
     );
-    const connection = mustRow(result.rows[0]);
-    if (body.installationId && body.accountLogin) {
-      await pool.query(
-        `INSERT INTO github_installations
-         (connection_id, installation_id, account_login, permissions)
-         VALUES ($1, $2, $3, '{}'::jsonb)`,
-        [connection.id, body.installationId, body.accountLogin]
-      );
+    if (
+      existing.rows[0] &&
+      ["pending", "sync_requested", "syncing", "disconnect_requested", "disconnecting"].includes(
+        existing.rows[0].status
+      )
+    ) {
+      throw app.httpErrors.conflict("Wait for the current GitHub operation to finish");
     }
-    return { connection };
+    const secretId = await upsertSecret(pool, "github_cli_auth_token", body.token.trim());
+    const connection = existing.rows[0]
+      ? await pool.query(
+          `UPDATE github_connections
+           SET name = 'GitHub CLI', status = 'pending', account_login = NULL,
+               error = NULL, pat_secret_id = $2, created_by = $3, updated_at = now()
+           WHERE id = $1
+           RETURNING id, name, status, account_login, error, last_synced_at, created_at, updated_at`,
+          [existing.rows[0].id, secretId, user.id]
+        )
+      : await pool.query(
+          `INSERT INTO github_connections (auth_mode, name, status, pat_secret_id, created_by)
+           VALUES ('pat', 'GitHub CLI', 'pending', $1, $2)
+           RETURNING id, name, status, account_login, error, last_synced_at, created_at, updated_at`,
+          [secretId, user.id]
+        );
+    const row = mustRow(connection.rows[0] as Record<string, unknown> | undefined);
+    await pool.query(
+      `UPDATE github_connections SET status = 'replaced', updated_at = now()
+       WHERE auth_mode = 'pat' AND id <> $1 AND status <> 'replaced'`,
+      [row.id]
+    );
+    return { connection: row, hostname: env.githubHost };
   });
 
-  app.post("/api/github/pat", async (request) => {
-    const user = requireAdmin(request);
-    const body = githubPatSchema.parse(request.body);
-    const secretId = await upsertSecret(pool, `github_pat_${Date.now()}`, body.token);
+  app.post("/api/github/sync", async (request) => {
+    requireAdmin(request);
     const result = await pool.query(
-      `INSERT INTO github_connections (auth_mode, name, pat_secret_id, created_by)
-       VALUES ('pat', $1, $2, $3)
-       RETURNING *`,
-      [body.name, secretId, user.id]
+      `UPDATE github_connections
+       SET status = 'sync_requested', error = NULL, updated_at = now()
+       WHERE id = (
+         SELECT id FROM github_connections
+         WHERE auth_mode = 'pat' AND status = 'ready'
+         ORDER BY updated_at DESC LIMIT 1
+       )
+       RETURNING id, name, status, account_login, error, last_synced_at, created_at, updated_at`
     );
+    if (!result.rows[0]) throw app.httpErrors.conflict("Connect GitHub before refreshing repositories");
     return { connection: result.rows[0] };
   });
 
-  app.get("/api/github/installations", async (request) => {
+  app.delete("/api/github/connection", async (request) => {
     requireAdmin(request);
     const result = await pool.query(
-      `SELECT github_installations.*, github_connections.name AS connection_name
-       FROM github_installations
-       JOIN github_connections ON github_connections.id = github_installations.connection_id
-       ORDER BY github_installations.created_at DESC`
+      `UPDATE github_connections
+       SET status = 'disconnect_requested', error = NULL, updated_at = now()
+       WHERE id = (
+         SELECT id FROM github_connections
+         WHERE auth_mode = 'pat' AND status IN ('ready', 'failed', 'disconnected')
+         ORDER BY updated_at DESC LIMIT 1
+       )
+       RETURNING id, name, status, account_login, error, last_synced_at, created_at, updated_at`
     );
-    return { installations: result.rows };
+    return { connection: result.rows[0] ?? null };
   });
 
   app.get("/api/github/repositories", async (request) => {
     requireAdmin(request);
-    const query = repositoriesQuerySchema.parse(request.query);
-    if (query.refresh === "true") {
-      await refreshPatRepositories(pool);
-    }
     const result = await pool.query(
-      `SELECT github_repositories.*, github_connections.name AS connection_name
+      `SELECT github_repositories.*, github_connections.name AS connection_name,
+              latest_import.id AS import_job_id,
+              latest_import.status AS import_status,
+              latest_import.error AS import_error
        FROM github_repositories
        JOIN github_connections ON github_connections.id = github_repositories.connection_id
+       LEFT JOIN LATERAL (
+         SELECT id, status, error
+         FROM repo_import_jobs
+         WHERE repo_import_jobs.github_repository_id = github_repositories.id
+         ORDER BY created_at DESC LIMIT 1
+       ) latest_import ON true
+       WHERE github_connections.auth_mode = 'pat'
+         AND github_connections.status <> 'replaced'
        ORDER BY github_repositories.full_name ASC`
     );
     return { repositories: result.rows };
@@ -1323,10 +1335,20 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireAdmin(request);
     const { id } = idParams.parse(request.params);
     const repo = await pool.query(
-      "SELECT * FROM github_repositories WHERE id = $1",
+      `SELECT github_repositories.*
+       FROM github_repositories
+       JOIN github_connections ON github_connections.id = github_repositories.connection_id
+       WHERE github_repositories.id = $1 AND github_connections.status = 'ready'`,
       [id]
     );
     const repoRow = mustRow(repo.rows[0]);
+    const active = await pool.query(
+      `SELECT * FROM repo_import_jobs
+       WHERE github_repository_id = $1 AND status IN ('queued', 'running')
+       ORDER BY created_at DESC LIMIT 1`,
+      [id]
+    );
+    if (active.rows[0]) return { importJob: active.rows[0] };
     const localPath = managedGithubRepoPath(env.managedRoot, repoRow.owner, repoRow.name);
     const result = await pool.query(
       `INSERT INTO repo_import_jobs (github_repository_id, status, local_path, created_by)
@@ -1352,23 +1374,6 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       [project.github_repository_id, user.id]
     );
     return { importJob: result.rows[0] };
-  });
-
-  app.post("/api/tasks/:id/pr/prepare", async (request) => {
-    requireUser(request);
-    const { id } = idParams.parse(request.params);
-    const context = await getPullRequestContext(pool, id);
-    const diff = await runCommand("git", ["diff", "--stat"], undefined, undefined, context.cwd);
-    const patch = await runCommand("git", ["diff"], undefined, undefined, context.cwd);
-    return { diffStat: diff.stdout, diff: patch.stdout, branch: context.branch };
-  });
-
-  app.post("/api/tasks/:id/pr/create-or-update", async (request) => {
-    requireUser(request);
-    const { id } = idParams.parse(request.params);
-    const body = prSchema.parse(request.body ?? {});
-    const result = await createOrUpdatePr(pool, id, body.title, body.body);
-    return { pullRequest: result };
   });
 
   await registerCoordinationRoutes(app, pool, { managedRoot: env.managedRoot });
@@ -1519,22 +1524,7 @@ const agentToolAssignSchema = z.object({
   projectId: z.string().uuid().nullable().optional(),
   run: z.boolean().optional()
 });
-const githubManifestSchema = z.object({ name: z.string().optional() });
-const githubCallbackSchema = z.object({
-  name: z.string().min(1),
-  appId: z.string().min(1),
-  clientId: z.string().optional(),
-  installationId: z.string().optional(),
-  accountLogin: z.string().optional(),
-  privateKey: z.string().optional(),
-  webhookSecret: z.string().optional()
-});
-const githubPatSchema = z.object({
-  name: z.string().min(1),
-  token: z.string().min(10)
-});
-const repositoriesQuerySchema = z.object({ refresh: z.string().optional() });
-const prSchema = z.object({ title: z.string().optional(), body: z.string().optional() });
+const githubConnectSchema = z.object({ token: z.string().trim().min(10).max(1000) });
 
 interface CommandResult {
   exitCode: number | null;
@@ -3388,244 +3378,6 @@ async function readSecret(pool: DbPool, name: string): Promise<string | undefine
   );
   const row = result.rows[0];
   return row ? decryptSecret(row.encrypted_value, env.secretKey) : undefined;
-}
-
-async function readSecretById(pool: DbPool, id: string): Promise<string> {
-  const result = await pool.query<{ encrypted_value: string }>(
-    "SELECT encrypted_value FROM secrets WHERE id = $1",
-    [id]
-  );
-  return decryptSecret(mustRow(result.rows[0]).encrypted_value, env.secretKey);
-}
-
-async function refreshPatRepositories(pool: DbPool): Promise<void> {
-  const result = await pool.query<{ id: string; pat_secret_id: string | null }>(
-    "SELECT id, pat_secret_id FROM github_connections WHERE auth_mode = 'pat'"
-  );
-  for (const connection of result.rows) {
-    if (!connection.pat_secret_id) continue;
-    const token = await readSecretById(pool, connection.pat_secret_id);
-    const response = await fetch(`${env.githubApiUrl}/user/repos?per_page=100&sort=updated`, {
-      headers: githubHeaders(token)
-    });
-    if (!response.ok) {
-      throw new Error(`GitHub repo refresh failed: ${response.status} ${await response.text()}`);
-    }
-    const repos = (await response.json()) as Array<Record<string, unknown>>;
-    for (const repoPayload of repos) {
-      const repo = normalizeGithubRepo(repoPayload);
-      await pool.query(
-        `INSERT INTO github_repositories
-         (connection_id, owner, name, full_name, clone_url, default_branch)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         ON CONFLICT (connection_id, full_name) DO UPDATE
-           SET clone_url = excluded.clone_url,
-               default_branch = excluded.default_branch,
-               updated_at = now()`,
-        [connection.id, repo.owner, repo.name, repo.fullName, repo.cloneUrl, repo.defaultBranch]
-      );
-    }
-  }
-
-  const appConnections = await pool.query<{
-    connection_id: string;
-    app_id: string;
-    private_key_secret_id: string;
-    installation_pk: string;
-    installation_id: string;
-  }>(
-    `SELECT github_connections.id AS connection_id,
-            github_connections.app_id,
-            github_connections.private_key_secret_id,
-            github_installations.id AS installation_pk,
-            github_installations.installation_id
-     FROM github_connections
-     JOIN github_installations ON github_installations.connection_id = github_connections.id
-     WHERE github_connections.auth_mode = 'app'
-       AND github_connections.app_id IS NOT NULL
-       AND github_connections.private_key_secret_id IS NOT NULL`
-  );
-  for (const connection of appConnections.rows) {
-    const privateKey = await readSecretById(pool, connection.private_key_secret_id);
-    const token = await fetchGithubInstallationToken({
-      apiUrl: env.githubApiUrl,
-      appId: connection.app_id,
-      privateKey,
-      installationId: connection.installation_id
-    });
-    const response = await fetch(`${env.githubApiUrl}/installation/repositories?per_page=100`, {
-      headers: githubHeaders(token)
-    });
-    if (!response.ok) {
-      throw new Error(`GitHub App repo refresh failed: ${response.status} ${await response.text()}`);
-    }
-    const payload = (await response.json()) as { repositories?: Array<Record<string, unknown>> };
-    for (const repoPayload of payload.repositories ?? []) {
-      const repo = normalizeGithubRepo(repoPayload);
-      await pool.query(
-        `INSERT INTO github_repositories
-         (connection_id, installation_id, owner, name, full_name, clone_url, default_branch)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         ON CONFLICT (connection_id, full_name) DO UPDATE
-           SET clone_url = excluded.clone_url,
-               default_branch = excluded.default_branch,
-               updated_at = now()`,
-        [
-          connection.connection_id,
-          connection.installation_pk,
-          repo.owner,
-          repo.name,
-          repo.fullName,
-          repo.cloneUrl,
-          repo.defaultBranch
-        ]
-      );
-    }
-  }
-}
-
-async function getPullRequestContext(pool: DbPool, taskId: string): Promise<{
-  taskId: string;
-  taskNumber: number;
-  taskTitle: string;
-  cwd: string;
-  branch: string;
-  owner: string;
-  repo: string;
-  defaultBranch: string;
-  connectionId: string;
-  authMode: "pat" | "app";
-  patSecretId: string | null;
-  appId: string | null;
-  privateKeySecretId: string | null;
-  installationValue: string | null;
-}> {
-  const result = await pool.query(
-    `SELECT tasks.id AS task_id, tasks.number AS task_number, tasks.title AS task_title,
-            projects.local_path, projects.github_owner, projects.github_repo, projects.default_branch,
-            github_repositories.connection_id, github_connections.auth_mode,
-            github_connections.pat_secret_id, github_connections.app_id, github_connections.private_key_secret_id,
-            github_installations.installation_id AS installation_value,
-            latest.cwd, latest.branch
-     FROM tasks
-     JOIN projects ON projects.id = tasks.project_id
-     JOIN github_repositories ON github_repositories.id = projects.github_repository_id
-     JOIN github_connections ON github_connections.id = github_repositories.connection_id
-     LEFT JOIN github_installations ON github_installations.id = github_repositories.installation_id
-     LEFT JOIN LATERAL (
-       SELECT cwd, branch FROM task_runs WHERE task_runs.task_id = tasks.id ORDER BY created_at DESC LIMIT 1
-     ) latest ON true
-     WHERE tasks.id = $1 AND projects.source = 'github'`,
-    [taskId]
-  );
-  const row = mustRow(result.rows[0] as Record<string, unknown> | undefined);
-  return {
-    taskId: String(row.task_id),
-    taskNumber: Number(row.task_number),
-    taskTitle: String(row.task_title),
-    cwd: String(row.cwd ?? row.local_path),
-    branch: String(row.branch ?? taskBranchName(Number(row.task_number), String(row.task_title))),
-    owner: String(row.github_owner),
-    repo: String(row.github_repo),
-    defaultBranch: String(row.default_branch ?? "main"),
-    connectionId: String(row.connection_id),
-    authMode: row.auth_mode === "app" ? "app" : "pat",
-    patSecretId: row.pat_secret_id ? String(row.pat_secret_id) : null,
-    appId: row.app_id ? String(row.app_id) : null,
-    privateKeySecretId: row.private_key_secret_id ? String(row.private_key_secret_id) : null,
-    installationValue: row.installation_value ? String(row.installation_value) : null
-  };
-}
-
-async function createOrUpdatePr(pool: DbPool, taskId: string, title?: string, body?: string): Promise<unknown> {
-  const context = await getPullRequestContext(pool, taskId);
-  const token = await tokenForPullRequest(pool, context);
-  await runCommand("git", ["checkout", context.branch], undefined, undefined, context.cwd);
-  const status = await runCommand("git", ["status", "--porcelain"], undefined, undefined, context.cwd);
-  if (status.stdout.trim()) {
-    await runCommand("git", ["config", "user.name", "Aisevak"], undefined, undefined, context.cwd);
-    await runCommand("git", ["config", "user.email", "aisevak@localhost"], undefined, undefined, context.cwd);
-    await runCommand("git", ["add", "-A"], undefined, undefined, context.cwd);
-    await runCommand(
-      "git",
-      ["commit", "-m", title ?? context.taskTitle],
-      undefined,
-      undefined,
-      context.cwd
-    );
-  }
-  await runCommand(
-    "git",
-    ["push", "-u", "origin", context.branch],
-    undefined,
-    token,
-    context.cwd,
-    githubCloneEnv(token)
-  );
-
-  const existing = await pool.query("SELECT * FROM pull_requests WHERE task_id = $1 LIMIT 1", [taskId]);
-  if (existing.rows[0]?.url) {
-    return existing.rows[0];
-  }
-
-  const response = await fetch(`${env.githubApiUrl}/repos/${context.owner}/${context.repo}/pulls`, {
-    method: "POST",
-    headers: {
-      ...githubHeaders(token),
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      title: title ?? context.taskTitle,
-      body: body ?? `Created by Aisevak for task #${context.taskNumber}.`,
-      head: context.branch,
-      base: context.defaultBranch
-    })
-  });
-  if (!response.ok) {
-    const error = await response.text();
-    await pool.query(
-      `INSERT INTO pull_requests (task_id, project_id, branch, title, body, state, error)
-       SELECT tasks.id, tasks.project_id, $2, $3, $4, 'failed', $5 FROM tasks WHERE tasks.id = $1`,
-      [taskId, context.branch, title ?? context.taskTitle, body ?? "", error]
-    );
-    throw new Error(`GitHub PR creation failed: ${response.status} ${error}`);
-  }
-  const pr = (await response.json()) as Record<string, unknown>;
-  const stored = await pool.query(
-    `INSERT INTO pull_requests (task_id, project_id, branch, title, body, number, url, state)
-     SELECT tasks.id, tasks.project_id, $2, $3, $4, $5, $6, $7 FROM tasks WHERE tasks.id = $1
-     RETURNING *`,
-    [
-      taskId,
-      context.branch,
-      title ?? context.taskTitle,
-      body ?? "",
-      typeof pr.number === "number" ? pr.number : null,
-      typeof pr.html_url === "string" ? pr.html_url : null,
-      typeof pr.state === "string" ? pr.state : "open"
-    ]
-  );
-  return stored.rows[0];
-}
-
-async function tokenForPullRequest(
-  pool: DbPool,
-  context: Awaited<ReturnType<typeof getPullRequestContext>>
-): Promise<string> {
-  if (context.authMode === "pat") {
-    if (!context.patSecretId) throw new Error("PAT GitHub connection is missing a secret");
-    return readSecretById(pool, context.patSecretId);
-  }
-  if (!context.appId || !context.privateKeySecretId || !context.installationValue) {
-    throw new Error("GitHub App connection is missing app id, private key, or installation id");
-  }
-  const privateKey = await readSecretById(pool, context.privateKeySecretId);
-  return fetchGithubInstallationToken({
-    apiUrl: env.githubApiUrl,
-    appId: context.appId,
-    privateKey,
-    installationId: context.installationValue
-  });
 }
 
 function mustRow<T>(row: T | undefined): T {

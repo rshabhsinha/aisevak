@@ -309,6 +309,10 @@ CREATE TABLE IF NOT EXISTS github_connections (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   auth_mode github_auth_mode NOT NULL,
   name text NOT NULL,
+  status text NOT NULL DEFAULT 'pending',
+  account_login text,
+  error text,
+  last_synced_at timestamptz,
   app_id text,
   client_id text,
   private_key_secret_id uuid REFERENCES secrets(id) ON DELETE SET NULL,
@@ -422,6 +426,152 @@ ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS last_used_at timestamptz;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'pending';
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS account_login text;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS error text;
+ALTER TABLE github_connections ADD COLUMN IF NOT EXISTS last_synced_at timestamptz;
+
+CREATE TEMP TABLE aisevak_github_repository_rehomes ON COMMIT DROP AS
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+), ranked_repositories AS (
+  SELECT repository.id AS source_repository_id,
+         repository.imported_project_id AS source_imported_project_id,
+         repository.updated_at AS source_updated_at,
+         first_value(repository.id) OVER (
+           PARTITION BY repository.full_name
+           ORDER BY (repository.connection_id = canonical_connection.id) DESC,
+                    repository.updated_at DESC,
+                    repository.created_at DESC,
+                    repository.id DESC
+         ) AS target_repository_id,
+         canonical_connection.id AS canonical_connection_id
+  FROM canonical_github_connection canonical_connection
+  JOIN github_connections connection ON connection.auth_mode = 'pat'
+  JOIN github_repositories repository ON repository.connection_id = connection.id
+)
+SELECT source_repository_id,
+       source_imported_project_id,
+       source_updated_at,
+       target_repository_id,
+       canonical_connection_id
+FROM ranked_repositories
+WHERE source_repository_id <> target_repository_id;
+
+WITH legacy_imports AS (
+  SELECT DISTINCT ON (target_repository_id)
+         target_repository_id,
+         source_imported_project_id
+  FROM aisevak_github_repository_rehomes
+  WHERE source_imported_project_id IS NOT NULL
+  ORDER BY target_repository_id, source_updated_at DESC, source_repository_id DESC
+)
+UPDATE github_repositories target_repository
+SET imported_project_id = COALESCE(
+      target_repository.imported_project_id,
+      legacy_imports.source_imported_project_id
+    ),
+    updated_at = now()
+FROM legacy_imports
+WHERE target_repository.id = legacy_imports.target_repository_id;
+
+UPDATE projects
+SET github_repository_id = rehome.target_repository_id,
+    updated_at = now()
+FROM aisevak_github_repository_rehomes rehome
+WHERE projects.github_repository_id = rehome.source_repository_id;
+
+UPDATE repo_import_jobs
+SET github_repository_id = rehome.target_repository_id,
+    updated_at = now()
+FROM aisevak_github_repository_rehomes rehome
+WHERE repo_import_jobs.github_repository_id = rehome.source_repository_id;
+
+DELETE FROM github_repositories source_repository
+USING aisevak_github_repository_rehomes rehome
+WHERE source_repository.id = rehome.source_repository_id;
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_repositories repository
+SET connection_id = canonical_connection.id,
+    updated_at = now()
+FROM canonical_github_connection canonical_connection,
+     github_connections legacy_connection
+WHERE repository.connection_id = legacy_connection.id
+  AND legacy_connection.auth_mode = 'pat'
+  AND legacy_connection.id <> canonical_connection.id;
+
+CREATE TEMP TABLE aisevak_replaced_github_pat_secrets ON COMMIT DROP AS
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+SELECT DISTINCT legacy_connection.pat_secret_id AS secret_id
+FROM canonical_github_connection canonical_connection
+JOIN github_connections legacy_connection
+  ON legacy_connection.auth_mode = 'pat'
+ AND legacy_connection.id <> canonical_connection.id
+WHERE legacy_connection.pat_secret_id IS NOT NULL;
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_connections legacy_connection
+SET pat_secret_id = NULL,
+    updated_at = now()
+FROM canonical_github_connection canonical_connection
+WHERE legacy_connection.auth_mode = 'pat'
+  AND legacy_connection.id <> canonical_connection.id
+  AND legacy_connection.pat_secret_id IS NOT NULL;
+
+DELETE FROM secrets candidate_secret
+USING aisevak_replaced_github_pat_secrets candidate
+WHERE candidate_secret.id = candidate.secret_id
+  AND NOT EXISTS (
+    SELECT 1
+    FROM github_connections github_connection
+    WHERE candidate_secret.id IN (
+      github_connection.pat_secret_id,
+      github_connection.private_key_secret_id,
+      github_connection.webhook_secret_id
+    )
+  );
+
+WITH canonical_github_connection AS (
+  SELECT id
+  FROM github_connections
+  WHERE auth_mode = 'pat' AND status <> 'replaced'
+  ORDER BY updated_at DESC, created_at DESC, id DESC
+  LIMIT 1
+)
+UPDATE github_connections legacy
+SET status = 'replaced', updated_at = now()
+FROM canonical_github_connection canonical
+WHERE legacy.auth_mode = 'pat'
+  AND legacy.status <> 'replaced'
+  AND legacy.id <> canonical.id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS github_connections_single_pat_identity
+ON github_connections ((auth_mode))
+WHERE auth_mode = 'pat' AND status <> 'replaced';
+
 ALTER TABLE tasks ALTER COLUMN project_id DROP NOT NULL;
 ALTER TABLE tasks DROP CONSTRAINT IF EXISTS tasks_project_id_fkey;
 ALTER TABLE tasks ADD CONSTRAINT tasks_project_id_fkey FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE SET NULL;

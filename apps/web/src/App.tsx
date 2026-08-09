@@ -235,6 +235,20 @@ interface GithubRepository {
   default_branch: string;
   imported_project_id?: string | null;
   connection_name: string;
+  import_job_id?: string | null;
+  import_status?: "queued" | "running" | "succeeded" | "failed" | null;
+  import_error?: string | null;
+}
+
+interface GithubConnection {
+  id: string;
+  name: string;
+  status: "pending" | "sync_requested" | "syncing" | "ready" | "failed" | "disconnect_requested" | "disconnecting" | "disconnected";
+  account_login: string | null;
+  error: string | null;
+  last_synced_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 interface RunEvent {
@@ -320,6 +334,8 @@ export function App() {
   const [tasks, setTasks] = useState<Task[]>([]);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
+  const [githubConnection, setGithubConnection] = useState<GithubConnection | null>(null);
+  const [githubHostname, setGithubHostname] = useState("github.com");
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
@@ -406,6 +422,22 @@ export function App() {
   }, [user]);
 
   useEffect(() => {
+    if (!user || user.role === "member") return;
+    const connectionBusy = githubConnection
+      ? ["pending", "sync_requested", "syncing", "disconnect_requested", "disconnecting"].includes(
+          githubConnection.status
+        )
+      : false;
+    const importBusy = repos.some((repo) => repo.import_status === "queued" || repo.import_status === "running");
+    if (!connectionBusy && !importBusy) return;
+    const timer = window.setInterval(() => {
+      void reloadGithub();
+      if (importBusy) void reloadProjects();
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [user?.id, githubConnection?.status, repos.map((repo) => repo.import_status).join(",")]);
+
+  useEffect(() => {
     if (!selectedThreadId) {
       setSelectedThreadRun(null);
       setAgentThreadEvents([]);
@@ -454,7 +486,7 @@ export function App() {
       reloadSchedules(),
       reloadProviderInstances(),
       reloadAgentThreads(),
-      reloadRepos(false)
+      reloadGithub()
     ]);
   }
 
@@ -525,12 +557,19 @@ export function App() {
     return data.threads;
   }
 
-  async function reloadRepos(refresh: boolean) {
-    if (!user || user.role === "member") return;
-    const data = await api<{ repositories: GithubRepository[] }>(
-      `/api/github/repositories${refresh ? "?refresh=true" : ""}`
-    );
-    setRepos(data.repositories);
+  async function reloadGithub() {
+    if (!user || user.role === "member") {
+      setGithubConnection(null);
+      setRepos([]);
+      return;
+    }
+    const [status, repositories] = await Promise.all([
+      api<{ connection: GithubConnection | null; hostname: string }>("/api/github/status"),
+      api<{ repositories: GithubRepository[] }>("/api/github/repositories")
+    ]);
+    setGithubConnection(status.connection);
+    setGithubHostname(status.hostname);
+    setRepos(repositories.repositories);
   }
 
   async function loadAgentThread(threadId: string) {
@@ -838,14 +877,24 @@ export function App() {
           {view === "connectors" ? (
             <ConnectorsView
               repos={repos}
-              onConnect={async (payload) => {
-                await api("/api/github/pat", { method: "POST", body: JSON.stringify(payload) });
-                await reloadRepos(true);
+              connection={githubConnection}
+              hostname={githubHostname}
+              onConnect={async (token) => {
+                await api("/api/github/connect", { method: "POST", body: JSON.stringify({ token }) });
+                await reloadGithub();
               }}
-              onRefresh={() => reloadRepos(true)}
+              onRefresh={async () => {
+                await api("/api/github/sync", { method: "POST" });
+                await reloadGithub();
+              }}
+              onDisconnect={async () => {
+                await api("/api/github/connection", { method: "DELETE" });
+                await reloadGithub();
+              }}
               onImport={async (repoId) => {
                 await api(`/api/github/repositories/${repoId}/import`, { method: "POST" });
                 setMessage("Import queued");
+                await reloadGithub();
               }}
             />
           ) : null}
@@ -2603,12 +2652,34 @@ function ProjectsView({
 
 function ConnectorsView(props: {
   repos: GithubRepository[];
-  onConnect: (payload: { name: string; token: string }) => Promise<void>;
+  connection: GithubConnection | null;
+  hostname: string;
+  onConnect: (token: string) => Promise<void>;
   onRefresh: () => Promise<void>;
+  onDisconnect: () => Promise<void>;
   onImport: (repoId: string) => Promise<void>;
 }) {
-  const [name, setName] = useState("GitHub");
   const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const connectionBusy = props.connection
+    ? ["pending", "sync_requested", "syncing", "disconnect_requested", "disconnecting"].includes(
+        props.connection.status
+      )
+    : false;
+  const connected = props.connection?.status === "ready";
+
+  async function perform(action: () => Promise<void>): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      await action();
+    } catch (actionError) {
+      setError(actionError instanceof Error ? actionError.message : "GitHub operation failed");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <div className="master-detail">
@@ -2621,28 +2692,78 @@ function ConnectorsView(props: {
             <Github size={24} />
             <div>
               <div style={{ fontWeight: 600 }}>GitHub</div>
-              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>Repository import</div>
+              <div style={{ fontSize: 12, color: "var(--text-muted)" }}>CLI authentication and projects</div>
             </div>
           </div>
-          <form
-            className="stack"
-            onSubmit={async (event) => {
-              event.preventDefault();
-              await props.onConnect({ name, token });
-              setToken("");
-            }}
-          >
-            <Input value={name} onChange={(event) => setName(event.target.value)} />
-            <Input value={token} onChange={(event) => setToken(event.target.value)} placeholder="Fine-grained PAT" type="password" />
-            <div style={{ display: "flex", gap: 8 }}>
-              <Button type="submit">
-                <Github size={14} /> Connect
-              </Button>
-              <Button variant="secondary" type="button" onClick={props.onRefresh}>
-                <RefreshCw size={14} /> Refresh
-              </Button>
+          {props.connection && props.connection.status !== "disconnected" ? (
+            <div className="stack">
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+                <div>
+                  <div className="data-title">
+                    {props.connection.account_login ? `@${props.connection.account_login}` : props.hostname}
+                  </div>
+                  <div className="data-subtitle">
+                    {connected ? "gh and git are authenticated" : githubConnectionStatus(props.connection.status)}
+                  </div>
+                </div>
+                <Badge variant={connected ? "success" : props.connection.status === "failed" ? "destructive" : "warning"}>
+                  {githubConnectionStatus(props.connection.status)}
+                </Badge>
+              </div>
+              {props.connection.last_synced_at ? (
+                <div className="data-subtitle">Repositories synced {formatDateTime(props.connection.last_synced_at)}</div>
+              ) : null}
+              {props.connection.error ? <div className="notice error">{props.connection.error}</div> : null}
+              {connected ? (
+                <div style={{ display: "flex", gap: 8 }}>
+                  <Button
+                    variant="secondary"
+                    type="button"
+                    disabled={busy || connectionBusy}
+                    onClick={() => void perform(props.onRefresh)}
+                  >
+                    <RefreshCw size={14} /> Refresh
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    type="button"
+                    disabled={busy || connectionBusy}
+                    onClick={() => void perform(props.onDisconnect)}
+                  >
+                    Disconnect
+                  </Button>
+                </div>
+              ) : null}
             </div>
-          </form>
+          ) : null}
+          {!connected && !connectionBusy ? (
+            <form
+              className="stack"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void perform(async () => {
+                  await props.onConnect(token);
+                  setToken("");
+                });
+              }}
+            >
+              <div className="data-subtitle">
+                Enter a classic token with <code>repo</code>, <code>read:org</code>, and <code>gist</code> scopes.
+                Aisevak uses it once to sign the host runner into <code>gh</code> and configure Git credentials.
+              </div>
+              <Input
+                value={token}
+                onChange={(event) => setToken(event.target.value)}
+                placeholder="GitHub personal access token"
+                type="password"
+                autoComplete="off"
+              />
+              <Button type="submit" disabled={busy || token.trim().length < 10}>
+                {busy ? <Loader2 size={14} className="spin" /> : <Github size={14} />} Connect GitHub
+              </Button>
+            </form>
+          ) : null}
+          {error ? <div className="notice error" style={{ marginTop: 12 }}>{error}</div> : null}
         </div>
       </aside>
       <main className="detail-view">
@@ -2657,11 +2778,26 @@ function ConnectorsView(props: {
                   <div className="data-icon"><Github size={16} /></div>
                   <div>
                     <div className="data-title">{repo.full_name}</div>
-                    <div className="data-subtitle">{repo.connection_name} / {repo.default_branch}</div>
+                    <div className="data-subtitle">
+                      {repo.default_branch}
+                      {repo.import_status === "failed" && repo.import_error ? ` · ${repo.import_error}` : ""}
+                    </div>
                   </div>
                 </div>
-                <Button variant="secondary" onClick={() => props.onImport(repo.id)} disabled={Boolean(repo.imported_project_id)}>
-                  {repo.imported_project_id ? "Imported" : "Import"}
+                <Button
+                  variant="secondary"
+                  onClick={() => void perform(() => props.onImport(repo.id))}
+                  disabled={Boolean(repo.imported_project_id) || repo.import_status === "queued" || repo.import_status === "running"}
+                >
+                  {repo.imported_project_id
+                    ? "Imported"
+                    : repo.import_status === "queued"
+                      ? "Queued"
+                      : repo.import_status === "running"
+                        ? "Importing…"
+                        : repo.import_status === "failed"
+                          ? "Retry"
+                          : "Import"}
                 </Button>
               </div>
             ))}
@@ -2671,6 +2807,26 @@ function ConnectorsView(props: {
       </main>
     </div>
   );
+}
+
+function githubConnectionStatus(status: GithubConnection["status"]): string {
+  switch (status) {
+    case "pending":
+      return "Waiting for runner";
+    case "sync_requested":
+      return "Refresh queued";
+    case "syncing":
+      return "Connecting";
+    case "ready":
+      return "Connected";
+    case "failed":
+      return "Needs attention";
+    case "disconnect_requested":
+    case "disconnecting":
+      return "Disconnecting";
+    case "disconnected":
+      return "Disconnected";
+  }
 }
 
 function CodexSessionTimeline({

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { managedGithubRepoPath, normalizeGithubRepo, sanitizeRemoteUrl, taskBranchName } from "./github.js";
+import { managedGithubRepoPath, normalizeGithubRepo, taskBranchName } from "./github.js";
 
 describe("github helpers", () => {
   it("creates stable branch names", () => {
@@ -20,11 +20,5 @@ describe("github helpers", () => {
         default_branch: "main"
       })
     ).toMatchObject({ owner: "owner", name: "repo" });
-  });
-
-  it("removes credentials from logged remotes", () => {
-    expect(sanitizeRemoteUrl("https://x-access-token:secret@github.com/a/b.git")).toBe(
-      "https://github.com/a/b.git"
-    );
   });
 });
