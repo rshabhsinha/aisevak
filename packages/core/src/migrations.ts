@@ -615,6 +615,41 @@ SET kind = 'dispatcher', updated_at = now()
 WHERE lower(name) IN ('dispatcher', 'orchestrator')
   AND kind <> 'dispatcher';
 
+DELETE FROM agents duplicate
+WHERE duplicate.kind = 'dispatcher'
+  AND lower(duplicate.name) = 'orchestrator'
+  AND duplicate.id <> (
+    SELECT canonical.id
+    FROM agents canonical
+    WHERE canonical.kind = 'dispatcher' AND lower(canonical.name) = 'orchestrator'
+    ORDER BY canonical.created_at ASC, canonical.id ASC
+    LIMIT 1
+  )
+  AND NOT EXISTS (SELECT 1 FROM tasks WHERE tasks.agent_id = duplicate.id)
+  AND NOT EXISTS (SELECT 1 FROM agent_threads WHERE agent_threads.agent_id = duplicate.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM coordination_threads
+    WHERE duplicate.id IN (created_by_agent_id, primary_agent_id, callback_agent_id)
+  )
+  AND NOT EXISTS (SELECT 1 FROM thread_participants WHERE thread_participants.agent_id = duplicate.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM thread_messages
+    WHERE duplicate.id IN (sender_agent_id, recipient_agent_id)
+  )
+  AND NOT EXISTS (SELECT 1 FROM message_deliveries WHERE message_deliveries.recipient_agent_id = duplicate.id)
+  AND NOT EXISTS (SELECT 1 FROM reports WHERE reports.author_agent_id = duplicate.id)
+  AND NOT EXISTS (SELECT 1 FROM report_versions WHERE report_versions.created_by_agent_id = duplicate.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM incidents
+    WHERE duplicate.id IN (commander_agent_id, created_by_agent_id)
+  )
+  AND NOT EXISTS (SELECT 1 FROM incident_updates WHERE incident_updates.author_agent_id = duplicate.id)
+  AND NOT EXISTS (
+    SELECT 1 FROM schedules
+    WHERE duplicate.id IN (agent_id, created_by_agent_id)
+  )
+  AND NOT EXISTS (SELECT 1 FROM agent_tool_tokens WHERE agent_tool_tokens.agent_id = duplicate.id);
+
 INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
 SELECT
   'dispatcher',
