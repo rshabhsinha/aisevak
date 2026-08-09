@@ -2256,7 +2256,7 @@ async function getDispatcherThreadTimeline(pool: DbPool, threadId: string): Prom
   };
 }
 
-async function ensureTaskAgentThread(
+export async function ensureTaskAgentThread(
   pool: DbPool,
   input: {
     task: TaskJoin;
@@ -2267,24 +2267,39 @@ async function ensureTaskAgentThread(
     cwd: string;
     branch: string | null;
   }
-): Promise<{ id: string; model: string; model_options: unknown }> {
+): Promise<{
+  id: string;
+  model: string;
+  model_options: unknown;
+  runtime_home: string;
+  provider_thread_id: string | null;
+}> {
   if (input.task.coordination_thread_id) {
-    const coordinated = await pool.query<{ id: string; model: string; model_options: unknown }>(
+    const coordinated = await pool.query<{
+      id: string;
+      model: string;
+      model_options: unknown;
+      runtime_home: string;
+      provider_thread_id: string | null;
+    }>(
       `INSERT INTO agent_threads
-         (title, agent_id, project_id, provider_instance_id, model, model_options,
+         (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
           cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
-       VALUES ($1, $2, $3, 'codex-local', $4, $5, $6, $7, $8, $9, $10)
+       VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL DO UPDATE
          SET title = EXCLUDED.title,
+             task_id = EXCLUDED.task_id,
              project_id = EXCLUDED.project_id,
              cwd = EXCLUDED.cwd,
              branch = EXCLUDED.branch,
+             provider_thread_id = COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id),
              last_activity_at = now(),
              updated_at = now()
-       RETURNING id, model, model_options`,
+       RETURNING id, model, model_options, runtime_home, provider_thread_id`,
       [
         input.task.title,
         input.task.agent_id,
+        input.task.id,
         input.task.project_id,
         input.model,
         JSON.stringify(input.modelOptions),
@@ -2297,7 +2312,13 @@ async function ensureTaskAgentThread(
     );
     return mustRow(coordinated.rows[0]);
   }
-  const result = await pool.query<{ id: string; model: string; model_options: unknown }>(
+  const result = await pool.query<{
+    id: string;
+    model: string;
+    model_options: unknown;
+    runtime_home: string;
+    provider_thread_id: string | null;
+  }>(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id)
@@ -2322,7 +2343,7 @@ async function ensureTaskAgentThread(
            END,
            last_activity_at = now(),
            updated_at = now()
-     RETURNING id, model, model_options`,
+     RETURNING id, model, model_options, runtime_home, provider_thread_id`,
     [
       input.task.title,
       input.task.agent_id,
@@ -2354,6 +2375,7 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
       `UPDATE agent_threads
        SET title = $2,
            agent_id = $3,
+           task_id = $9,
            project_id = $4,
            model = CASE WHEN agent_id <> $3 THEN $5 ELSE model END,
            model_options = CASE WHEN agent_id <> $3 THEN $6 ELSE model_options END,
@@ -2370,7 +2392,8 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
         task.agent_model,
         JSON.stringify(normalizeModelOptions(task.agent_model_options)),
         task.local_path ?? env.managedRoot,
-        managedCodexHome(env.managedRoot, task.id)
+        managedCodexHome(env.managedRoot, task.id),
+        task.id
       ]
     );
     await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
@@ -2415,10 +2438,10 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
   const latest = latestResult.rows[0];
   const runtimeHome = latest?.runtime_home ?? managedCodexHome(env.managedRoot, task.id);
   const created = await pool.query<{ id: string }>(
-    `INSERT INTO agent_threads
+     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
-     VALUES ($1, $2, CASE WHEN $11::uuid IS NULL THEN $3 ELSE NULL END, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
+     VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (task_id) WHERE task_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [
@@ -2609,6 +2632,12 @@ async function queueWorkerRun(
     cwd: projectPath,
     branch
   });
+  await synchronizeTaskSessionRuntime(
+    pool,
+    session.id,
+    thread.runtime_home,
+    thread.provider_thread_id
+  );
   const model = options.modelSelection?.model ?? thread.model;
   const modelOptions = options.modelSelection?.options ?? normalizeModelOptions(thread.model_options);
   const runResult = await pool.query(
@@ -3041,6 +3070,22 @@ async function upsertTaskSession(
     [taskId, codexHome, agentSnapshot]
   );
   return mustRow(result.rows[0]);
+}
+
+export async function synchronizeTaskSessionRuntime(
+  pool: DbPool,
+  sessionId: string,
+  runtimeHome: string,
+  providerThreadId: string | null
+): Promise<void> {
+  await pool.query(
+    `UPDATE task_sessions
+     SET codex_home = $2,
+         codex_thread_id = COALESCE($3, codex_thread_id),
+         updated_at = now()
+     WHERE id = $1`,
+    [sessionId, runtimeHome, providerThreadId]
+  );
 }
 
 async function resolveTaskSkills(pool: DbPool, task: Pick<TaskJoin, "id" | "project_id" | "agent_id">): Promise<CodexSkillSnapshot[]> {

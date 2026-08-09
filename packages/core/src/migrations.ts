@@ -859,6 +859,22 @@ SET coordination_thread_id = tasks.coordination_thread_id
 FROM tasks
 WHERE agent_threads.task_id = tasks.id
   AND agent_threads.coordination_thread_id IS NULL;
+
+UPDATE agent_threads
+SET task_id = tasks.id,
+    project_id = COALESCE(agent_threads.project_id, tasks.project_id),
+    updated_at = now()
+FROM coordination_threads, tasks
+WHERE agent_threads.coordination_thread_id = coordination_threads.id
+  AND coordination_threads.task_id = tasks.id
+  AND agent_threads.agent_id = tasks.agent_id
+  AND agent_threads.task_id IS NULL
+  AND NOT EXISTS (
+    SELECT 1
+    FROM agent_threads existing_task_thread
+    WHERE existing_task_thread.task_id = tasks.id
+      AND existing_task_thread.id <> agent_threads.id
+  );
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

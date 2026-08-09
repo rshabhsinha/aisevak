@@ -1118,6 +1118,10 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
      RETURNING id`, [messageId, recipientAgentId]);
   const thread = await showThread(client, threadId, true);
   const recipient = await getAgent(client, recipientAgentId);
+  const linkedTask = thread.task_id
+    ? await client.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [thread.task_id])
+    : null;
+  const linkedTaskId = linkedTask?.rows[0]?.agent_id === recipientAgentId ? thread.task_id : null;
   const existing = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
     `SELECT id, runtime_home, provider_thread_id, cwd FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
@@ -1136,10 +1140,10 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     const runtimeHome = managedCodexHome(managedRoot, `thread-${threadId}-${recipientAgentId}`);
     const created = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
       `INSERT INTO agent_threads
-         (title, agent_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
-       VALUES ($1, $2, $3, 'codex-local', $4, $5, $6, $7, $8)
+         (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
+       VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
        RETURNING id, runtime_home, provider_thread_id, cwd`,
-      [thread.title, recipientAgentId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
+      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
     );
     session = created.rows[0]!;
   }
