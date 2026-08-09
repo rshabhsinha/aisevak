@@ -1,6 +1,8 @@
 export { Pulse as Activity } from "@phosphor-icons/react/dist/icons/Pulse";
 export { ArrowUp } from "@phosphor-icons/react/dist/icons/ArrowUp";
+export { ArrowDown } from "@phosphor-icons/react/dist/icons/ArrowDown";
 export { BookOpen } from "@phosphor-icons/react/dist/icons/BookOpen";
+export { CalendarDots as Calendar } from "@phosphor-icons/react/dist/icons/CalendarDots";
 export { Robot as Bot } from "@phosphor-icons/react/dist/icons/Robot";
 export { CheckCircle as CheckCircle2 } from "@phosphor-icons/react/dist/icons/CheckCircle";
 export { Check } from "@phosphor-icons/react/dist/icons/Check";
@@ -23,6 +25,7 @@ export { LockOpen } from "@phosphor-icons/react/dist/icons/LockOpen";
 export { LockKey as LockKeyhole } from "@phosphor-icons/react/dist/icons/LockKey";
 export { SignOut as LogOut } from "@phosphor-icons/react/dist/icons/SignOut";
 export { Play } from "@phosphor-icons/react/dist/icons/Play";
+export { Pause } from "@phosphor-icons/react/dist/icons/Pause";
 export { Plus } from "@phosphor-icons/react/dist/icons/Plus";
 export { ArrowsClockwise as RefreshCw } from "@phosphor-icons/react/dist/icons/ArrowsClockwise";
 export { MagnifyingGlass as Search } from "@phosphor-icons/react/dist/icons/MagnifyingGlass";

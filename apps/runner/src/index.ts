@@ -1,11 +1,13 @@
 import {
   buildCodexConfigToml,
   buildDispatcherPrompt,
+  buildScheduledAgentPrompt,
   codexChatGptAuthSecrets,
   CODEX_CHATGPT_AUTH_SECRET_NAME,
   createPool,
   decryptSecret,
   encryptSecret,
+  extractPromptSkillNames,
   extractThreadId,
   fetchGithubInstallationToken,
   githubCloneEnv,
@@ -14,6 +16,7 @@ import {
   managedCodexHome,
   managedWorktreePath,
   newSessionToken,
+  nextScheduleRunAt,
   normalizeCodexSkillSnapshots,
   normalizeCodexEvent,
   parseCodexChatGptAuthFile,
@@ -23,17 +26,24 @@ import {
   serializeCodexChatGptAuthFile,
   runMigrations,
   serializeCodexSkillSnapshots,
+  withTransaction,
   type CodexSkillSnapshot,
   type CodexChatGptAuthFile,
   type DbPool
 } from "@aisevak/core";
+import { agentToolScript } from "@aisevak/cli";
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { runCodexAppServerTurn } from "./appServerClient.js";
+import {
+  closeAllCodexAppServers,
+  runCodexAppServerTurn,
+  type AppServerTurnInput
+} from "./appServerClient.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 
 const env = {
@@ -82,6 +92,8 @@ interface RunJob {
   workspace_mode: "direct" | "git_worktree";
   project_source: "local_path" | "github";
   skills_snapshot: CodexSkillSnapshot[];
+  agent_id: string;
+  coordination_thread_id: string | null;
 }
 
 interface DispatcherJob {
@@ -95,6 +107,14 @@ interface DispatcherJob {
   codex_home: string;
   codex_thread_id: string | null;
   skills_snapshot: CodexSkillSnapshot[];
+  scope: string;
+  agent_id: string;
+  agent_kind: "worker" | "dispatcher";
+  agent_name: string;
+  agent_description: string;
+  agent_instructions: string;
+  coordination_thread_id: string | null;
+  message_delivery_id: string | null;
 }
 
 async function main(): Promise<void> {
@@ -102,17 +122,17 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
 
-  process.on("SIGINT", () => {
+  const beginShutdown = () => {
     shuttingDown = true;
-  });
-  process.on("SIGTERM", () => {
-    shuttingDown = true;
-  });
+  };
+  process.on("SIGINT", beginShutdown);
+  process.on("SIGTERM", beginShutdown);
 
   console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
     try {
       await processOneImportJob(pool);
+      await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
       await processOneDispatcherRun(pool);
       await processOneRunJob(pool);
@@ -121,7 +141,114 @@ async function main(): Promise<void> {
     }
     await sleep(env.pollMs);
   }
+  await closeAllCodexAppServers();
   await pool.end();
+}
+
+interface DueSchedule {
+  id: string;
+  title: string;
+  prompt: string;
+  agent_id: string;
+  schedule_kind: "once" | "interval";
+  next_run_at: Date;
+  interval_seconds: number | null;
+  model: string;
+  model_options: Array<{ id: string; value: string | number | boolean }>;
+}
+
+async function enqueueDueSchedule(pool: DbPool): Promise<void> {
+  await withTransaction(pool, async (client) => {
+    const dueResult = await client.query<DueSchedule>(
+      `SELECT schedules.id,
+              schedules.title,
+              schedules.prompt,
+              schedules.agent_id,
+              schedules.schedule_kind,
+              schedules.next_run_at,
+              schedules.interval_seconds,
+              agents.model,
+              agents.model_options
+       FROM schedules
+       JOIN agents ON agents.id = schedules.agent_id
+       WHERE schedules.enabled = true
+         AND schedules.next_run_at <= now()
+         AND agents.enabled = true
+       ORDER BY schedules.next_run_at ASC, schedules.created_at ASC
+       LIMIT 1
+       FOR UPDATE OF schedules SKIP LOCKED`
+    );
+    const schedule = dueResult.rows[0];
+    if (!schedule) return;
+
+    const scheduledFor = schedule.next_run_at;
+    const runtimeHome = managedCodexHome(
+      env.managedRoot,
+      `schedule-${schedule.id}-${randomUUID()}`
+    );
+    const skillNames = extractPromptSkillNames(schedule.prompt);
+    const skillsSnapshot = await resolveAgentSkills(client, schedule.agent_id, skillNames);
+    const threadResult = await client.query<{ id: string }>(
+      `INSERT INTO agent_threads
+         (title, agent_id, provider_instance_id, model, model_options, cwd, runtime_home)
+       VALUES ($1, $2, 'codex-local', $3, $4, $5, $6)
+       RETURNING id`,
+      [
+        schedule.title,
+        schedule.agent_id,
+        schedule.model,
+        JSON.stringify(schedule.model_options ?? []),
+        env.managedRoot,
+        runtimeHome
+      ]
+    );
+    const threadId = mustRow(threadResult.rows[0]).id;
+    const runResult = await client.query<{ id: string }>(
+      `INSERT INTO dispatcher_runs
+         (agent_thread_id, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'schedule', 'schedule', 'queued', $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        threadId,
+        env.managedRoot,
+        runtimeHome,
+        schedule.model,
+        JSON.stringify(schedule.model_options ?? []),
+        schedule.prompt,
+        serializeCodexSkillSnapshots(skillsSnapshot)
+      ]
+    );
+    const dispatcherRunId = mustRow(runResult.rows[0]).id;
+    await client.query(
+      `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
+       VALUES ($1, -1, 'thread.message-sent', $2, $3)`,
+      [
+        dispatcherRunId,
+        schedule.prompt,
+        { type: "thread.message-sent", role: "user", text: schedule.prompt, scheduled: true }
+      ]
+    );
+    await client.query(
+      `INSERT INTO schedule_runs (schedule_id, agent_thread_id, dispatcher_run_id, scheduled_for)
+       VALUES ($1, $2, $3, $4)`,
+      [schedule.id, threadId, dispatcherRunId, scheduledFor]
+    );
+
+    const nextRunAt =
+      schedule.schedule_kind === "interval" && schedule.interval_seconds
+        ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
+        : scheduledFor;
+    await client.query(
+      `UPDATE schedules
+       SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END,
+           next_run_at = $2,
+           last_run_at = now(),
+           last_agent_thread_id = $3,
+           updated_at = now()
+       WHERE id = $1`,
+      [schedule.id, nextRunAt, threadId]
+    );
+  });
 }
 
 async function processOneImportJob(pool: DbPool): Promise<void> {
@@ -278,7 +405,30 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     `UPDATE dispatcher_runs
      SET status = 'running', started_at = now(), updated_at = now()
      WHERE id = (
-       SELECT id FROM dispatcher_runs WHERE status = 'queued' ORDER BY queued_at ASC LIMIT 1
+       SELECT candidate.id
+       FROM dispatcher_runs candidate
+       WHERE candidate.status = 'queued'
+         AND (
+           candidate.message_delivery_id IS NULL
+           OR EXISTS (
+             SELECT 1
+             FROM message_deliveries delivery
+             WHERE delivery.id = candidate.message_delivery_id
+               AND delivery.available_at <= now()
+           )
+         )
+         AND (
+           candidate.scope <> 'coordination'
+           OR NOT EXISTS (
+             SELECT 1 FROM dispatcher_runs active
+             WHERE active.agent_thread_id = candidate.agent_thread_id
+               AND active.scope = 'coordination'
+               AND active.status = 'running'
+           )
+         )
+       ORDER BY candidate.queued_at ASC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED
      )
      RETURNING id`
   );
@@ -286,7 +436,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   if (!picked) return;
   const detail = await pool.query<DispatcherJob>(
     `SELECT dispatcher_runs.id,
+            dispatcher_runs.scope,
             dispatcher_runs.agent_thread_id,
+            dispatcher_runs.message_delivery_id,
             dispatcher_runs.task_id,
             dispatcher_runs.prompt,
             dispatcher_runs.model,
@@ -294,13 +446,29 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
             dispatcher_runs.cwd,
             dispatcher_runs.codex_home,
             COALESCE(agent_threads.provider_thread_id, dispatcher_runs.codex_thread_id) AS codex_thread_id,
-            dispatcher_runs.skills_snapshot
+            dispatcher_runs.skills_snapshot,
+            agents.id AS agent_id,
+            agents.kind AS agent_kind,
+            agents.name AS agent_name,
+            agents.description AS agent_description,
+            agents.instructions AS agent_instructions,
+            agent_threads.coordination_thread_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN agents ON agents.id = agent_threads.agent_id
      WHERE dispatcher_runs.id = $1`,
     [picked.id]
   );
   const job = mustRow(detail.rows[0]);
+  if (job.message_delivery_id) {
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'running', attempt_count = attempt_count + 1,
+           presented_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [job.message_delivery_id]
+    );
+  }
 
   let stdout = "";
   let stderr = "";
@@ -314,26 +482,38 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     const toolToken = await createAgentToolToken(pool, {
-      role: "dispatcher",
+      role: job.agent_kind ?? "dispatcher",
       dispatcherRunId: job.id,
-      taskId: job.task_id
+      taskId: job.task_id,
+      agentId: job.agent_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id
     });
-    const toolBin = await writeAgentTool(job.codex_home);
+    const agentTool = await writeAgentTool(job.codex_home, toolToken);
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
       codexHome: job.codex_home,
       model: job.model,
       modelOptions: job.model_options,
-      prompt: job.prompt,
+      prompt:
+        job.scope === "schedule"
+          ? buildScheduledAgentPrompt({
+              agentName: job.agent_name,
+              agentDescription: job.agent_description,
+              agentInstructions: job.agent_instructions,
+              prompt: job.prompt
+            })
+          : job.prompt,
       threadId: job.codex_thread_id,
       env: {
         ...codexProcessEnv(),
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
-        AISEVAK_AGENT_TOKEN: toolToken,
-        PATH: `${toolBin}:${process.env.PATH ?? ""}`,
+        AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home),
+        PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
@@ -360,7 +540,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
           [job.id]
         );
         return current.rows[0]?.status === "cancel_requested";
-      }
+      },
+      nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
+      onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
@@ -398,11 +580,15 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
     if (job.agent_thread_id) {
       await pool.query(
         "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
         [job.agent_thread_id]
       );
+    }
+    if (job.message_delivery_id) {
+      await finishMessageDelivery(pool, job, finalStatus, stderr);
     }
   }
 }
@@ -450,7 +636,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
             COALESCE(agent_threads.provider_thread_id, task_sessions.codex_thread_id) AS codex_thread_id,
             projects.workspace_mode,
             projects.source AS project_source,
-            task_runs.skills_snapshot
+            task_runs.skills_snapshot,
+            tasks.agent_id,
+            agent_threads.coordination_thread_id
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
@@ -480,9 +668,12 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
       taskRunId: job.id,
-      taskId: job.task_id
+      taskId: job.task_id,
+      agentId: job.agent_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id
     });
-    const toolBin = await writeAgentTool(job.codex_home);
+    const agentTool = await writeAgentTool(job.codex_home, toolToken);
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd,
@@ -496,8 +687,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         CODEX_HOME: job.codex_home,
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
-        AISEVAK_AGENT_TOKEN: toolToken,
-        PATH: `${toolBin}:${process.env.PATH ?? ""}`,
+        AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home),
+        PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
@@ -525,7 +717,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
           [job.id]
         );
         return current.rows[0]?.status === "cancel_requested";
-      }
+      },
+      nextInput: () => claimAgentTurnInput(pool, "worker", job.id),
+      onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
@@ -551,7 +745,37 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
-    await pool.query(
+    await finalizeWorkerRunState(pool, {
+      runId: job.id,
+      taskId: job.task_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id,
+      finalStatus,
+      stdout,
+      stderr,
+      exitCode
+    });
+    await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
+  }
+}
+
+export async function finalizeWorkerRunState(
+  pool: DbPool,
+  input: {
+    runId: string;
+    taskId: string;
+    agentThreadId: string | null;
+    coordinationThreadId: string | null;
+    finalStatus: "succeeded" | "failed" | "cancelled";
+    stdout: string;
+    stderr: string;
+    exitCode: number | null;
+  }
+): Promise<void> {
+  const taskStatus = input.finalStatus === "succeeded" ? "completed" : "needs_attention";
+  const threadStatus = input.finalStatus === "succeeded" ? "completed" : "blocked";
+  await withTransaction(pool, async (client) => {
+    await client.query(
       `UPDATE task_runs
        SET status = $2::run_status,
            raw_stdout = $3,
@@ -561,24 +785,34 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
        WHERE id = $1`,
-      [job.id, finalStatus, stdout, stderr, exitCode]
+      [input.runId, input.finalStatus, input.stdout, input.stderr, input.exitCode]
     );
-    if (job.agent_thread_id) {
-      await pool.query(
-        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
-        [job.agent_thread_id]
+    await client.query(
+      `UPDATE tasks
+       SET status = $2,
+           updated_at = now()
+       WHERE id = $1
+         AND status = 'open'`,
+      [input.taskId, taskStatus]
+    );
+    if (input.coordinationThreadId) {
+      await client.query(
+        `UPDATE coordination_threads
+         SET status = $2,
+             last_activity_at = now(),
+             updated_at = now()
+         WHERE id = $1
+           AND status = 'active'`,
+        [input.coordinationThreadId, threadStatus]
       );
     }
-    if (finalStatus === "succeeded") {
-      await pool.query("UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1", [
-        job.task_id
-      ]);
-    } else if (finalStatus === "failed" || finalStatus === "cancelled") {
-      await pool.query("UPDATE tasks SET status = 'needs_attention', updated_at = now() WHERE id = $1", [
-        job.task_id
-      ]);
+    if (input.agentThreadId) {
+      await client.query(
+        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [input.agentThreadId]
+      );
     }
-  }
+  });
 }
 
 interface MaterializedCodexAuth {
@@ -702,8 +936,8 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
   return job.cwd;
 }
 
-async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
-  const skillsRoot = join(codexHome, ".agents", "skills");
+export async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[] | null | undefined): Promise<void> {
+  const skillsRoot = materializedSkillsRoot(codexHome);
   await rm(skillsRoot, { recursive: true, force: true });
   await mkdir(skillsRoot, { recursive: true });
   for (const skill of skills ?? []) {
@@ -716,6 +950,10 @@ async function materializeSkills(codexHome: string, skills: CodexSkillSnapshot[]
       await writeFile(filePath, content, "utf8");
     }
   }
+}
+
+export function materializedSkillsRoot(codexHome: string): string {
+  return join(codexHome, ".agents", "skills");
 }
 
 function safeSkillDirectoryName(name: string): string {
@@ -783,6 +1021,71 @@ async function persistDispatcherCodexLine(
   );
 }
 
+export async function finishMessageDelivery(
+  pool: DbPool,
+  job: Pick<DispatcherJob, "id" | "message_delivery_id">,
+  status: "succeeded" | "failed" | "cancelled",
+  error: string
+): Promise<void> {
+  if (!job.message_delivery_id) return;
+  if (status === "succeeded") {
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
+       WHERE id = $1`,
+      [job.message_delivery_id]
+    );
+    return;
+  }
+
+  const delivery = await pool.query<{ attempt_count: number }>(
+    "SELECT attempt_count FROM message_deliveries WHERE id = $1",
+    [job.message_delivery_id]
+  );
+  const attempts = delivery.rows[0]?.attempt_count ?? 3;
+  if (status === "failed" && attempts < 3) {
+    try {
+      await withTransaction(pool, async (client) => {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
+               error = NULLIF($3, ''), updated_at = now()
+           WHERE id = $1`,
+          [job.message_delivery_id, attempts, error]
+        );
+        await client.query(
+          `INSERT INTO dispatcher_runs
+             (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+              codex_thread_id, model, model_options, prompt, skills_snapshot)
+           SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
+                  codex_thread_id, model, model_options, prompt, skills_snapshot
+           FROM dispatcher_runs WHERE id = $1`,
+          [job.id]
+        );
+      });
+    } catch (retryError) {
+      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+      await pool.query(
+        `UPDATE message_deliveries
+         SET status = 'failed', completed_at = now(),
+             error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [
+          job.message_delivery_id,
+          `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`
+        ]
+      );
+    }
+    return;
+  }
+  await pool.query(
+    `UPDATE message_deliveries
+     SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
+     WHERE id = $1`,
+    [job.message_delivery_id, error]
+  );
+}
+
 async function createAgentToolToken(
   pool: DbPool,
   options: {
@@ -790,205 +1093,105 @@ async function createAgentToolToken(
     taskRunId?: string;
     dispatcherRunId?: string;
     taskId?: string | null;
+    agentId?: string | null;
+    agentThreadId?: string | null;
+    coordinationThreadId?: string | null;
   }
 ): Promise<string> {
   const token = newSessionToken();
   await pool.query(
     `INSERT INTO agent_tool_tokens
-     (token_hash, task_run_id, dispatcher_run_id, task_id, role, expires_at)
-     VALUES ($1, $2, $3, $4, $5, now() + interval '24 hours')`,
+     (token_hash, task_run_id, dispatcher_run_id, task_id, agent_id, agent_thread_id,
+      coordination_thread_id, role, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '24 hours')`,
     [
       hashToken(token),
       options.taskRunId ?? null,
       options.dispatcherRunId ?? null,
       options.taskId ?? null,
+      options.agentId ?? null,
+      options.agentThreadId ?? null,
+      options.coordinationThreadId ?? null,
       options.role
     ]
   );
   return token;
 }
 
-async function writeAgentTool(codexHome: string): Promise<string> {
+async function writeAgentTool(
+  codexHome: string,
+  token: string
+): Promise<{ binDir: string; tokenFile: string }> {
   const binDir = join(codexHome, "bin");
   await mkdir(binDir, { recursive: true });
   const toolPath = join(binDir, "aisevak");
+  const tokenFile = join(codexHome, "agent-tool-token");
   await writeFile(toolPath, agentToolScript(), "utf8");
   await chmod(toolPath, 0o700);
-  return binDir;
+  await writeFile(tokenFile, `${token}\n`, { encoding: "utf8", mode: 0o600 });
+  await chmod(tokenFile, 0o600);
+  return { binDir, tokenFile };
 }
 
-function agentToolScript(): string {
-  return `#!/usr/bin/env node
-const apiUrl = process.env.AISEVAK_API_URL || "http://localhost:8787";
-const token = process.env.AISEVAK_AGENT_TOKEN;
-if (!token) fail("AISEVAK_AGENT_TOKEN is missing");
-
-const args = process.argv.slice(2);
-main().catch((error) => fail(error && error.message ? error.message : String(error)));
-
-async function main() {
-  if (args.length === 0 || args[0] === "help" || args[0] === "--help") return help();
-  if (args[0] === "context") return print(await request("/api/agent-tools/context"));
-  if (args[0] === "credential" || args[0] === "credentials") {
-    const credentialCommand = args[1] || "list";
-    if (credentialCommand === "list") {
-      return print(await request("/api/agent-tools/credentials"));
-    }
-    if (credentialCommand === "get") {
-      const name = args[2];
-      if (!name) return fail("Credential name is required");
-      return print(await request("/api/agent-tools/credentials/" + encodeURIComponent(name)));
-    }
-    if (credentialCommand === "add") {
-      const name = option("--name") || args[2];
-      if (!name || name.startsWith("--")) return fail("Credential name is required");
-      const value = args.includes("--value-stdin") ? await readStdin() : option("--value", true);
-      return print(await request("/api/agent-tools/credentials", {
-        method: "POST",
-        body: {
-          name,
-          description: option("--description"),
-          value
-        }
-      }));
-    }
-    return fail("Unknown credential command. Run: aisevak help");
-  }
-  if (args[0] !== "task") return fail("Unknown command. Run: aisevak help");
-  const command = args[1];
-  if (command === "create") {
-    return print(await request("/api/agent-tools/tasks", {
-      method: "POST",
-      body: {
-        title: option("--title", true),
-        body: option("--body"),
-        status: option("--status"),
-        projectId: option("--project-id"),
-        agentId: option("--agent-id")
-      }
-    }));
-  }
-  const key = args[2];
-  if (!key) return fail("Task key is required, for example TASK-12");
-  if (command === "comment") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-      method: "POST",
-      body: { body: restAfter(3) }
-    }));
-  }
-  if (command === "attention") {
-    const reason = restAfter(3);
-    await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: { status: "needs_attention" }
-    });
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-      method: "POST",
-      body: { body: reason }
-    }));
-  }
-  if (command === "complete") {
-    const summary = option("--summary") || restAfter(3);
-    await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: { status: "completed" }
-    });
-    if (summary) {
-      await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-        method: "POST",
-        body: { body: summary }
-      });
-    }
-    return print({ ok: true });
-  }
-  if (command === "update") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: {
-          title: option("--title"),
-          body: option("--body"),
-          status: option("--status"),
-          projectId: option("--project-id"),
-          agentId: option("--agent-id")
-      }
-    }));
-  }
-  if (command === "assign") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/assign-run", {
-      method: "POST",
-      body: {
-        agent: option("--agent", true),
-        projectId: option("--project-id"),
-        run: args.includes("--run")
-      }
-    }));
-  }
-  return fail("Unknown task command. Run: aisevak help");
+async function claimAgentTurnInput(
+  pool: DbPool,
+  kind: "worker" | "dispatcher",
+  runId: string
+): Promise<AppServerTurnInput | null> {
+  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  const result = await pool.query<AppServerTurnInput>(
+    `UPDATE agent_turn_inputs
+     SET status = 'delivering', updated_at = now()
+     WHERE id = (
+       SELECT id
+       FROM agent_turn_inputs
+       WHERE ${runColumn} = $1 AND status = 'queued'
+       ORDER BY created_at ASC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, message`,
+    [runId]
+  );
+  return result.rows[0] ?? null;
 }
 
-async function request(path, options = {}) {
-  const response = await fetch(apiUrl + path, {
-    method: options.method || "GET",
-    headers: {
-      Authorization: "Bearer " + token,
-      "Content-Type": "application/json"
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-  const text = await response.text();
-  let payload;
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = text;
-  }
-  if (!response.ok) throw new Error(typeof payload === "string" ? payload : JSON.stringify(payload));
-  return payload;
+async function finishAgentTurnInput(
+  pool: DbPool,
+  input: AppServerTurnInput,
+  error?: string
+): Promise<void> {
+  await pool.query(
+    `UPDATE agent_turn_inputs
+     SET status = $2,
+         error = $3,
+         delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END,
+         updated_at = now()
+     WHERE id = $1`,
+    [input.id, error ? "failed" : "delivered", error ?? null]
+  );
 }
 
-function option(name, required = false) {
-  const index = args.indexOf(name);
-  const value = index >= 0 ? args[index + 1] : undefined;
-  if (required && !value) fail(name + " is required");
-  return value;
-}
-
-function restAfter(index) {
-  return args.slice(index).join(" ").trim();
-}
-
-async function readStdin() {
-  let text = "";
-  for await (const chunk of process.stdin) {
-    text += String(chunk);
-  }
-  return text.replace(/\\r?\\n$/, "");
-}
-
-function print(value) {
-  console.log(JSON.stringify(value, null, 2));
-}
-
-function help() {
-  console.log([
-    "aisevak context",
-    "aisevak credential list",
-    "aisevak credential get <name>",
-    "aisevak credential add <name> --value-stdin [--description <description>]",
-    "aisevak task create --title <title> [--body <body>] [--status needs_attention] [--project-id <project-id>]",
-    "aisevak task assign TASK-1 --agent <agent-name> [--project-id <project-id>] --run",
-    "aisevak task attention TASK-1 <reason>",
-    "aisevak task comment TASK-1 <note>",
-    "aisevak task complete TASK-1 --summary <summary>",
-    "aisevak task update TASK-1 [--status open|needs_attention|completed] [--project-id <project-id>]"
-  ].join("\\n"));
-}
-
-function fail(message) {
-  console.error(message);
-  process.exit(1);
-}
-`;
+async function failPendingAgentTurnInputs(
+  pool: DbPool,
+  kind: "worker" | "dispatcher",
+  runId: string,
+  finalStatus: "succeeded" | "failed" | "cancelled"
+): Promise<void> {
+  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  await pool.query(
+    `UPDATE agent_turn_inputs
+     SET status = 'failed',
+         error = $2,
+         updated_at = now()
+     WHERE ${runColumn} = $1 AND status IN ('queued', 'delivering')`,
+    [
+      runId,
+      finalStatus === "cancelled"
+        ? "The turn was stopped before this message could be delivered"
+        : "The turn finished before this message could be delivered"
+    ]
+  );
 }
 
 async function getDispatcherAgent(pool: DbPool): Promise<{
@@ -1018,31 +1221,59 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
   return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
 }
 
-async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<CodexSkillSnapshot[]> {
+type Queryable = Pick<DbPool, "query">;
+
+async function resolveAgentSkills(
+  pool: Queryable,
+  agentId: string,
+  promptSkillNames: string[] = []
+): Promise<CodexSkillSnapshot[]> {
   const result = await pool.query<{
     id: string;
     name: string;
     description: string;
     instructions: string;
     files: unknown;
+    source: string;
   }>(
     `SELECT skills.id,
             skills.name,
             skills.description,
             skills.instructions,
-            skills.files
+            skills.files,
+            selected.source
      FROM skills
+     JOIN (
+       SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
+       UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+       UNION ALL
+         SELECT skills.id, 'instruction'
+         FROM skills
+         JOIN agents ON agents.id = $1
+         WHERE position('@skill(' || skills.name || ')' in agents.instructions) > 0
+       UNION ALL SELECT id, 'prompt' FROM skills WHERE name = ANY($2::text[])
+     ) selected ON selected.skill_id = skills.id
      WHERE skills.enabled = true
      ORDER BY skills.name ASC`
+    , [agentId, promptSkillNames]
   );
-  return result.rows.map((row) => ({
-    id: row.id,
-    name: row.name,
-    description: row.description,
-    instructions: row.instructions,
-    files: normalizeSkillFiles(row.files),
-    sources: ["global"]
-  }));
+  const byId = new Map<string, CodexSkillSnapshot>();
+  for (const row of result.rows) {
+    const existing = byId.get(row.id);
+    if (existing) {
+      if (!existing.sources.includes(row.source)) existing.sources.push(row.source);
+      continue;
+    }
+    byId.set(row.id, {
+      id: row.id,
+      name: row.name,
+      description: row.description,
+      instructions: row.instructions,
+      files: normalizeSkillFiles(row.files),
+      sources: [row.source]
+    });
+  }
+  return [...byId.values()];
 }
 
 function normalizeSkillFiles(value: unknown): Record<string, string> {

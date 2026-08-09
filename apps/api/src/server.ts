@@ -13,19 +13,24 @@ import {
   githubHeaders,
   hashPassword,
   hashToken,
+  installedSkillsRoot,
   managedCodexHome,
   managedGithubRepoPath,
   newSessionToken,
   resolveCodexBinary,
+  removeInstalledSkill,
   normalizeCodexSkillSnapshots,
   normalizeCodexModel,
+  applyCodexModelDefaults,
   normalizeGithubRepo,
   CODEX_HARNESS_MODELS,
-  DEFAULT_CODEX_MODEL,
+  defaultCodexModelOptions,
   runMigrations,
   serializeCodexSkillSnapshots,
+  synchronizeInstalledSkills,
   taskBranchName,
   verifyPassword,
+  writeInstalledSkill,
   withTransaction,
   type CodexSkillSnapshot,
   type DbPool,
@@ -43,6 +48,8 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
+import { registerCoordinationRoutes, requireAgent, requireCapability, type AgentContext } from "./coordination.js";
+import { agentDeletionBlockReason } from "./agents.js";
 
 interface AuthUser {
   id: string;
@@ -65,10 +72,10 @@ const env = {
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
-  codexPreferredModel: process.env.CODEX_DEFAULT_MODEL?.trim() || "auto",
   codexDefaultModel: normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL),
   githubApiUrl: process.env.GITHUB_API_URL ?? "https://api.github.com"
 };
+const skillsRoot = installedSkillsRoot(env.managedRoot);
 
 let codexModelCache:
   | { expiresAt: number; models: typeof CODEX_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
@@ -404,35 +411,72 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/skills", async (request) => {
     requireUser(request);
-    const result = await pool.query("SELECT * FROM skills ORDER BY enabled DESC, name ASC");
-    return { skills: result.rows };
+    const scan = await synchronizeInstalledSkills(pool, skillsRoot);
+    const result = await pool.query(
+      `SELECT id, name, description, instructions, files, enabled, platform_managed,
+              default_for_agents, created_by, created_at, updated_at
+       FROM skills
+       ORDER BY enabled DESC, name ASC`
+    );
+    return { skills: result.rows, root: skillsRoot, errors: scan.errors };
   });
 
   app.post("/api/skills", async (request) => {
     const user = requireAdmin(request);
     const body = skillSchema.parse(request.body);
     validateSkillFiles(body.files ?? {});
+    await writeInstalledSkill(skillsRoot, {
+      name: body.name,
+      description: body.description,
+      instructions: body.instructions,
+      files: body.files ?? {}
+    });
+    await synchronizeInstalledSkills(pool, skillsRoot);
     const result = await pool.query(
-      `INSERT INTO skills (name, description, instructions, files, enabled, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [
-        body.name,
-        body.description,
-        body.instructions,
-        body.files ?? {},
-        body.enabled ?? true,
-        user.id
-      ]
+      `UPDATE skills
+       SET enabled = $2, created_by = COALESCE(created_by, $3), updated_at = now()
+       WHERE name = $1
+       RETURNING id, name, description, instructions, files, enabled, platform_managed,
+                 default_for_agents, created_by, created_at, updated_at`,
+      [body.name, body.enabled ?? true, user.id]
     );
-    return { skill: result.rows[0] };
+    return { skill: mustRow(result.rows[0]) };
   });
 
   app.patch("/api/skills/:id", async (request) => {
     requireAdmin(request);
     const { id } = idParams.parse(request.params);
     const body = skillPatchSchema.parse(request.body);
+    const currentResult = await pool.query<{
+      name: string;
+      description: string;
+      instructions: string;
+      files: Record<string, string>;
+      platform_managed: boolean;
+    }>(
+      `SELECT name, description, instructions, files, platform_managed
+       FROM skills WHERE id = $1`,
+      [id]
+    );
+    const current = mustRow(currentResult.rows[0]);
+    if (current.platform_managed && Object.keys(body).some((key) => key !== "enabled")) {
+      throwBadRequest("This skill is maintained by Aisevak releases; only availability can be changed");
+    }
     if (body.files) validateSkillFiles(body.files);
+    const nextName = body.name ?? current.name;
+    const contentChanged = ["name", "description", "instructions", "files"].some((key) => key in body);
+    if (contentChanged) {
+      await writeInstalledSkill(
+        skillsRoot,
+        {
+          name: nextName,
+          description: body.description ?? current.description,
+          instructions: body.instructions ?? current.instructions,
+          files: body.files ?? normalizeSkillFiles(current.files)
+        },
+        { overwrite: nextName === current.name }
+      );
+    }
     const result = await pool.query(
       `UPDATE skills
        SET name = COALESCE($2, name),
@@ -452,6 +496,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.enabled ?? null
       ]
     );
+    if (contentChanged && nextName !== current.name) {
+      await removeInstalledSkill(skillsRoot, current.name);
+    }
     return { skill: mustRow(result.rows[0]) };
   });
 
@@ -468,19 +515,22 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/agents", async (request) => {
     const user = requireAdmin(request);
     const body = agentSchema.parse(request.body);
+    const model = body.model ?? env.codexDefaultModel;
     const result = await pool.query(
-      `INSERT INTO agents (name, description, model, model_options, instructions, enabled)
-       VALUES ($1, $2, $3, $4, $5, true)
+      `INSERT INTO agents (name, description, model, model_options, capabilities, instructions, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6, true)
        RETURNING *`,
       [
         body.name,
         body.description ?? "",
-        body.model ?? env.codexDefaultModel,
-        JSON.stringify(body.modelOptions ?? []),
+        model,
+        JSON.stringify(body.modelOptions ?? defaultCodexModelOptions(model)),
+        JSON.stringify(body.capabilities ?? []),
         body.instructions
       ]
     );
     const agent = mustRow(result.rows[0]);
+    await replaceAgentSkills(pool, agent.id, body.skillIds ?? []);
     await insertAgentVersion(pool, agent, user.id);
     return { agent };
   });
@@ -495,8 +545,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
            description = COALESCE($3, description),
            model = COALESCE($4, model),
            model_options = COALESCE($5, model_options),
-           instructions = COALESCE($6, instructions),
-           enabled = COALESCE($7, enabled),
+           capabilities = COALESCE($6, capabilities),
+           instructions = COALESCE($7, instructions),
+           enabled = COALESCE($8, enabled),
            updated_at = now()
        WHERE id = $1
        RETURNING *`,
@@ -506,13 +557,150 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.description ?? null,
         body.model ?? null,
         body.modelOptions ? JSON.stringify(body.modelOptions) : null,
+        body.capabilities ? JSON.stringify(body.capabilities) : null,
         body.instructions ?? null,
         body.enabled ?? null
       ]
     );
     const agent = mustRow(result.rows[0]);
+    if (body.skillIds) await replaceAgentSkills(pool, agent.id, body.skillIds);
     await insertAgentVersion(pool, agent, user.id);
     return { agent };
+  });
+
+  app.delete("/api/agents/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    return withTransaction(pool, async (client) => {
+      const agentResult = await client.query<{ id: string; kind: string; name: string }>(
+        "SELECT id, kind, name FROM agents WHERE id = $1 FOR UPDATE",
+        [id]
+      );
+      const agent = agentResult.rows[0];
+      if (!agent) throw app.httpErrors.notFound("Agent not found");
+
+      const usageResult = await client.query<{
+        task_count: string;
+        thread_count: string;
+        schedule_count: string;
+        other_enabled_dispatcher_count: string;
+      }>(
+        `SELECT
+           (SELECT count(*) FROM tasks WHERE agent_id = $1) AS task_count,
+           (SELECT count(*) FROM agent_threads WHERE agent_id = $1) AS thread_count,
+           (SELECT count(*) FROM schedules WHERE agent_id = $1) AS schedule_count,
+           (SELECT count(*) FROM agents WHERE kind = 'dispatcher' AND enabled = true AND id <> $1)
+             AS other_enabled_dispatcher_count`,
+        [id]
+      );
+      const usage = mustRow(usageResult.rows[0]);
+      const blocked = agentDeletionBlockReason(agent, {
+        taskCount: Number(usage.task_count),
+        threadCount: Number(usage.thread_count),
+        scheduleCount: Number(usage.schedule_count),
+        otherEnabledDispatcherCount: Number(usage.other_enabled_dispatcher_count)
+      });
+      if (blocked) throw app.httpErrors.conflict(blocked);
+
+      await client.query("DELETE FROM agents WHERE id = $1", [id]);
+      return { deleted: true, agent: { id: agent.id, name: agent.name } };
+    });
+  });
+
+  app.get("/api/schedules", async (request) => {
+    requireUser(request);
+    return { schedules: await listSchedules(pool) };
+  });
+
+  app.post("/api/schedules", async (request) => {
+    const user = requireUser(request);
+    const body = scheduleSchema.parse(request.body);
+    const nextRunAt = new Date(body.nextRunAt);
+    if (nextRunAt.getTime() <= Date.now()) throwBadRequest("First run must be in the future");
+    validateScheduleTiming(body.scheduleKind, body.intervalSeconds ?? null);
+    await requireEnabledAgent(pool, body.agentId);
+    const result = await pool.query<{ id: string }>(
+      `INSERT INTO schedules
+         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       RETURNING id`,
+      [
+        body.title,
+        body.prompt,
+        body.agentId,
+        body.scheduleKind,
+        nextRunAt,
+        body.scheduleKind === "interval" ? body.intervalSeconds : null,
+        user.id
+      ]
+    );
+    return { schedule: await getSchedule(pool, mustRow(result.rows[0]).id) };
+  });
+
+  app.patch("/api/schedules/:id", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const body = schedulePatchSchema.parse(request.body);
+    await withTransaction(pool, async (client) => {
+      const currentResult = await client.query<ScheduleTimingRow>(
+        `SELECT id, schedule_kind, next_run_at, interval_seconds, enabled
+         FROM schedules WHERE id = $1 FOR UPDATE`,
+        [id]
+      );
+      const current = currentResult.rows[0];
+      if (!current) throw app.httpErrors.notFound("Schedule not found");
+
+      const scheduleKind = body.scheduleKind ?? current.schedule_kind;
+      const intervalSeconds =
+        scheduleKind === "once"
+          ? null
+          : body.intervalSeconds === null
+            ? null
+            : body.intervalSeconds ?? current.interval_seconds;
+      validateScheduleTiming(scheduleKind, intervalSeconds);
+      if (body.agentId) await requireEnabledAgent(client, body.agentId);
+
+      const enabled = body.enabled ?? current.enabled;
+      let nextRunAt = body.nextRunAt ? new Date(body.nextRunAt) : new Date(current.next_run_at);
+      if (enabled && nextRunAt.getTime() <= Date.now()) {
+        if (scheduleKind === "once") {
+          throwBadRequest("Choose a future time before enabling this one-time schedule");
+        }
+        nextRunAt = new Date(Date.now() + Number(intervalSeconds) * 1000);
+      }
+
+      await client.query(
+        `UPDATE schedules
+         SET title = COALESCE($2, title),
+             prompt = COALESCE($3, prompt),
+             agent_id = COALESCE($4, agent_id),
+             schedule_kind = $5,
+             next_run_at = $6,
+             interval_seconds = $7,
+             enabled = $8,
+             updated_at = now()
+         WHERE id = $1`,
+        [
+          id,
+          body.title ?? null,
+          body.prompt ?? null,
+          body.agentId ?? null,
+          scheduleKind,
+          nextRunAt,
+          intervalSeconds,
+          enabled
+        ]
+      );
+    });
+    return { schedule: await getSchedule(pool, id) };
+  });
+
+  app.delete("/api/schedules/:id", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const result = await pool.query<{ id: string }>("DELETE FROM schedules WHERE id = $1 RETURNING id", [id]);
+    if (!result.rows[0]) throw app.httpErrors.notFound("Schedule not found");
+    return { deleted: true };
   });
 
   app.get("/api/tasks", async (request) => {
@@ -548,13 +736,25 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireUser(request);
     const body = taskSchema.parse(request.body);
     const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
-    const result = await pool.query(
-      `INSERT INTO tasks (title, body, project_id, agent_id, created_by, open_pr_on_success)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
-      [body.title, body.body ?? "", body.projectId ?? null, agentId, user.id, body.openPrOnSuccess ?? false]
-    );
-    const task = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    const task = await withTransaction(pool, async (client) => {
+      const description = body.description ?? summarizeTaskDescription(body.title, body.body);
+      const result = await client.query(
+        `INSERT INTO tasks (title, description, body, project_id, agent_id, created_by, open_pr_on_success)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING *`,
+        [body.title, description, body.body ?? "", body.projectId ?? null, agentId, user.id, body.openPrOnSuccess ?? false]
+      );
+      const created = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+      const thread = await client.query<{ id: string }>(
+        `INSERT INTO coordination_threads
+           (title, description, purpose, project_id, task_id, created_by_user_id, primary_agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+        [body.title, description, body.body ?? "", body.projectId ?? null, created.id, user.id, agentId]
+      );
+      await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [created.id, thread.rows[0]!.id]);
+      await client.query("INSERT INTO thread_participants (thread_id, agent_id, role) VALUES ($1, $2, 'assignee') ON CONFLICT DO NOTHING", [thread.rows[0]!.id, agentId]);
+      return { ...created, coordination_thread_id: thread.rows[0]!.id };
+    });
     return { task };
   });
 
@@ -571,6 +771,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
            project_id = CASE WHEN $8::boolean THEN $5 ELSE project_id END,
            agent_id = COALESCE($6, agent_id),
            open_pr_on_success = COALESCE($7, open_pr_on_success),
+           description = COALESCE($9, description),
            updated_at = now()
        WHERE id = $1
        RETURNING *`,
@@ -582,10 +783,29 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         hasProjectId ? body.projectId ?? null : null,
         body.agentId ?? null,
         body.openPrOnSuccess ?? null,
-        hasProjectId
+        hasProjectId,
+        body.description ?? null
       ]
     );
     const task = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+    if (task.coordination_thread_id) {
+      await pool.query(
+        `UPDATE coordination_threads
+         SET title = $2, description = $3, purpose = $4, project_id = $5, primary_agent_id = $6,
+             status = CASE WHEN $7 = 'completed' THEN 'completed' WHEN $7 = 'blocked' THEN 'blocked' ELSE 'active' END,
+             updated_at = now()
+         WHERE id = $1`,
+        [
+          task.coordination_thread_id,
+          task.title,
+          task.description,
+          task.body,
+          task.project_id,
+          task.agent_id,
+          task.status
+        ]
+      );
+    }
     return { task };
   });
 
@@ -635,7 +855,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const { id } = idParams.parse(request.params);
     const result = await pool.query(
       `UPDATE task_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = $1 AND status IN ('queued', 'running')
        RETURNING *`,
@@ -719,6 +942,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return queueAgentThreadMessage(pool, id, body);
   });
 
+  app.post("/api/agent-threads/:id/steer", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const body = threadMessageSchema.parse(request.body);
+    return queueAgentTurnInput(pool, id, body.message);
+  });
+
   app.post("/api/agent-threads/:id/cancel", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
@@ -735,7 +965,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         task_number: null,
         task_title: null,
         project_name: null,
-        agent_name: "Dispatcher"
+        agent_name: "Orchestrator"
       }
     };
   });
@@ -778,7 +1008,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
                 tasks.number AS task_number,
                 tasks.title AS task_title,
                 projects.name AS project_name,
-                'Dispatcher' AS agent_name,
+                'Orchestrator' AS agent_name,
                 dispatcher_runs.prompt,
                 dispatcher_runs.queued_at,
                 dispatcher_runs.started_at,
@@ -809,7 +1039,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
                   tasks.number AS task_number,
                   tasks.title AS task_title,
                   projects.name AS project_name,
-                  'Dispatcher' AS agent_name,
+                  'Orchestrator' AS agent_name,
                   dispatcher_runs.prompt,
                   dispatcher_runs.queued_at,
                   dispatcher_runs.started_at,
@@ -856,12 +1086,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/agent-tools/context", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "agents:read", "projects:read", "tasks:read");
     return getDispatcherContext(pool);
   });
 
   app.get("/api/agent-tools/credentials", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:read");
     const result = await pool.query(
       `SELECT name, description, last_used_at
        FROM secrets
@@ -872,7 +1102,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/agent-tools/credentials/:name", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:read");
     const params = credentialNameParams.parse(request.params);
     const name = credentialNameSchema.parse(params.name);
     const result = await pool.query<{ id: string; name: string; description: string; encrypted_value: string }>(
@@ -894,7 +1124,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/credentials", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "credentials:write");
     const body = credentialSchema.parse(request.body);
     const existing = await pool.query<{ id: string }>("SELECT id FROM secrets WHERE name = $1 LIMIT 1", [
       body.name
@@ -913,21 +1143,31 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks", async (request) => {
-    const context = await requireAgentTool(pool, request);
+    const context = await requireLegacyAgentCapabilities(pool, request, "tasks:create");
     const body = agentToolCreateTaskSchema.parse(request.body);
     const projectId = body.projectId ?? context.taskProjectId ?? null;
     const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
-    const result = await pool.query(
-      `INSERT INTO tasks (title, body, status, project_id, agent_id)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING *`,
-      [body.title, body.body ?? "", body.status ?? "open", projectId, agentId]
-    );
-    return { task: result.rows[0] };
+    const task = await withTransaction(pool, async (client) => {
+      const description = summarizeTaskDescription(body.title, body.body);
+      const result = await client.query(
+        `INSERT INTO tasks (title, description, body, status, project_id, agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+        [body.title, description, body.body ?? "", body.status ?? "open", projectId, agentId]
+      );
+      const created = mustRow(result.rows[0] as Record<string, unknown> | undefined);
+      const thread = await client.query<{ id: string }>(
+        `INSERT INTO coordination_threads (title, description, purpose, project_id, task_id, primary_agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
+        [body.title, description, body.body ?? "", projectId, created.id, agentId]
+      );
+      await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [created.id, thread.rows[0]!.id]);
+      return { ...created, coordination_thread_id: thread.rows[0]!.id };
+    });
+    return { task };
   });
 
   app.patch("/api/agent-tools/tasks/:key", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "tasks:update");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolPatchTaskSchema.parse(request.body);
@@ -956,7 +1196,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks/:key/comment", async (request) => {
-    await requireAgentTool(pool, request);
+    await requireLegacyAgentCapabilities(pool, request, "tasks:update");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolCommentSchema.parse(request.body);
@@ -970,10 +1210,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks/:key/assign-run", async (request) => {
-    const context = await requireAgentTool(pool, request);
-    if (context.role !== "dispatcher") {
-      throw app.httpErrors.forbidden("Only Dispatcher can start worker runs");
-    }
+    await requireLegacyAgentCapabilities(pool, request, "tasks:assign");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolAssignSchema.parse(request.body);
@@ -1134,6 +1371,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return { pullRequest: result };
   });
 
+  await registerCoordinationRoutes(app, pool, { managedRoot: env.managedRoot });
   return app;
 }
 
@@ -1208,14 +1446,27 @@ const modelOptionSelectionSchema = z.object({
 });
 const agentSchema = z.object({
   name: z.string().min(1),
-  description: z.string().optional(),
+  description: z.string().min(1),
   model: z.string().optional(),
   modelOptions: z.array(modelOptionSelectionSchema).max(20).optional(),
+  capabilities: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
+  skillIds: z.array(z.string().uuid()).max(100).optional(),
   instructions: z.string().min(1)
 });
 const agentPatchSchema = agentSchema.partial().extend({ enabled: z.boolean().optional() });
+const scheduleFieldsSchema = z.object({
+  title: z.string().trim().min(1).max(120),
+  prompt: z.string().trim().min(1).max(50_000),
+  agentId: z.string().uuid(),
+  scheduleKind: z.enum(["once", "interval"]),
+  nextRunAt: z.string().datetime(),
+  intervalSeconds: z.number().int().min(60).max(31_536_000).nullable().optional()
+});
+const scheduleSchema = scheduleFieldsSchema;
+const schedulePatchSchema = scheduleFieldsSchema.partial().extend({ enabled: z.boolean().optional() });
 const taskSchema = z.object({
   title: z.string().min(1),
+  description: z.string().min(1).optional(),
   body: z.string().optional(),
   projectId: z.string().uuid().nullable().optional(),
   agentId: z.string().uuid().optional(),
@@ -1296,6 +1547,7 @@ interface TaskJoin {
   number: number;
   title: string;
   body: string;
+  coordination_thread_id: string | null;
   project_id: string | null;
   agent_id: string;
   agent_kind: "worker" | "dispatcher";
@@ -1370,11 +1622,47 @@ interface AgentThreadRow {
   latest_error: string | null;
 }
 
-interface AgentToolContext {
-  role: "worker" | "dispatcher";
-  taskId: string | null;
-  taskProjectId: string | null;
+interface ScheduleTimingRow {
+  id: string;
+  schedule_kind: "once" | "interval";
+  next_run_at: string | Date;
+  interval_seconds: number | null;
+  enabled: boolean;
 }
+
+interface ScheduleRow extends ScheduleTimingRow {
+  title: string;
+  prompt: string;
+  agent_id: string;
+  agent_name: string;
+  agent_kind: "worker" | "dispatcher";
+  last_run_at: string | Date | null;
+  last_agent_thread_id: string | null;
+  last_thread_title: string | null;
+  last_run_status: string | null;
+  run_count: number;
+  created_at: string | Date;
+  updated_at: string | Date;
+}
+
+const scheduleSelectSql = `
+  SELECT schedules.*,
+         agents.name AS agent_name,
+         agents.kind AS agent_kind,
+         agent_threads.title AS last_thread_title,
+         latest.status AS last_run_status,
+         (SELECT count(*)::int FROM schedule_runs WHERE schedule_runs.schedule_id = schedules.id) AS run_count
+  FROM schedules
+  JOIN agents ON agents.id = schedules.agent_id
+  LEFT JOIN agent_threads ON agent_threads.id = schedules.last_agent_thread_id
+  LEFT JOIN LATERAL (
+    SELECT dispatcher_runs.status
+    FROM schedule_runs
+    JOIN dispatcher_runs ON dispatcher_runs.id = schedule_runs.dispatcher_run_id
+    WHERE schedule_runs.schedule_id = schedules.id
+    ORDER BY schedule_runs.scheduled_for DESC
+    LIMIT 1
+  ) latest ON true`;
 
 function requireUser(request: FastifyRequest): AuthUser {
   if (!request.user) {
@@ -1393,6 +1681,41 @@ function requireAdmin(request: FastifyRequest): AuthUser {
     throw error;
   }
   return user;
+}
+
+type ApiQueryable = Pick<DbPool, "query">;
+
+async function listSchedules(pool: ApiQueryable): Promise<ScheduleRow[]> {
+  const result = await pool.query<ScheduleRow>(
+    `${scheduleSelectSql}
+     ORDER BY schedules.enabled DESC, schedules.next_run_at ASC, schedules.created_at DESC`
+  );
+  return result.rows;
+}
+
+async function getSchedule(pool: ApiQueryable, id: string): Promise<ScheduleRow> {
+  const result = await pool.query<ScheduleRow>(`${scheduleSelectSql} WHERE schedules.id = $1`, [id]);
+  return mustRow(result.rows[0]);
+}
+
+async function requireEnabledAgent(pool: ApiQueryable, id: string): Promise<void> {
+  const result = await pool.query<{ id: string }>(
+    "SELECT id FROM agents WHERE id = $1 AND enabled = true",
+    [id]
+  );
+  if (!result.rows[0]) throwBadRequest("Select an enabled agent");
+}
+
+function validateScheduleTiming(
+  scheduleKind: "once" | "interval",
+  intervalSeconds: number | null
+): void {
+  if (scheduleKind === "once" && intervalSeconds !== null) {
+    throwBadRequest("A one-time schedule cannot have an interval");
+  }
+  if (scheduleKind === "interval" && (!intervalSeconds || intervalSeconds < 60)) {
+    throwBadRequest("A repeating schedule needs an interval of at least one minute");
+  }
 }
 
 async function getUserFromRequest(pool: DbPool, request: FastifyRequest): Promise<AuthUser | undefined> {
@@ -1459,10 +1782,10 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
   const defaults = [
     {
       kind: "dispatcher",
-      name: "Dispatcher",
-      description: "Routes Todo and Needs attention tasks to the right worker agent.",
+      name: "Orchestrator",
+      description: "Routes unassigned work and coordinates specialized agents across durable threads.",
       instructions:
-        "You are the Aisevak Dispatcher. Review the task board, assign work to enabled worker agents, start worker runs with the aisevak CLI, and move ambiguous or blocked work to Needs attention with a precise comment."
+        "You are the Aisevak Orchestrator. Use the aisevak CLI to inspect work, route tasks, coordinate agents through durable threads, and request precise follow-up when work is ambiguous or blocked."
     },
     {
       kind: "worker",
@@ -1481,11 +1804,34 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
   ];
 
   for (const agent of defaults) {
+    const existingResult = await pool.query<Record<string, unknown>>(
+      `SELECT * FROM agents
+       WHERE kind = $1 AND lower(name) = lower($2)
+       ORDER BY created_at ASC
+       LIMIT 1`,
+      [agent.kind, agent.name]
+    );
+    const existing = existingResult.rows[0];
+    if (existing) {
+      const version = await pool.query<{ exists: boolean }>(
+        "SELECT EXISTS (SELECT 1 FROM agent_versions WHERE agent_id = $1) AS exists",
+        [existing.id]
+      );
+      if (!version.rows[0]?.exists) await insertAgentVersion(pool, existing, userId);
+      continue;
+    }
     const result = await pool.query(
-      `INSERT INTO agents (kind, name, description, model, instructions, enabled)
-       VALUES ($1, $2, $3, $4, $5, true)
+      `INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6, true)
        RETURNING *`,
-      [agent.kind, agent.name, agent.description, env.codexDefaultModel, agent.instructions]
+      [
+        agent.kind,
+        agent.name,
+        agent.description,
+        env.codexDefaultModel,
+        JSON.stringify(defaultCodexModelOptions(env.codexDefaultModel)),
+        agent.instructions
+      ]
     );
     await insertAgentVersion(pool, mustRow(result.rows[0]), userId);
   }
@@ -1505,6 +1851,23 @@ async function insertAgentVersion(pool: DbPool, agent: Record<string, unknown>, 
       userId
     ]
   );
+}
+
+async function replaceAgentSkills(pool: DbPool, agentId: string, skillIds: string[]): Promise<void> {
+  await withTransaction(pool, async (client) => {
+    await client.query("DELETE FROM agent_skills WHERE agent_id = $1", [agentId]);
+    for (const skillId of skillIds) {
+      await client.query(
+        "INSERT INTO agent_skills (agent_id, skill_id) VALUES ($1, $2)",
+        [agentId, skillId]
+      );
+    }
+  });
+}
+
+function summarizeTaskDescription(title: string, body: string | undefined): string {
+  const firstParagraph = body?.trim().split(/\n\s*\n/, 1)[0]?.replace(/\s+/g, " ").trim();
+  return (firstParagraph || title).slice(0, 280);
 }
 
 async function getTaskJoin(pool: DbPool, taskId: string): Promise<TaskJoin> {
@@ -1532,14 +1895,10 @@ async function getCodexModelSnapshot(): Promise<{
   try {
     const liveModels = await discoverCodexModels({ codexBinary: env.codexBinary });
     if (liveModels.length > 0) {
-      const defaultModel =
-        liveModels.find((model) => model.id === env.codexPreferredModel)?.id ??
-        liveModels.find((model) => model.badge === "Default")?.id ??
-        liveModels[0]?.id ??
-        env.codexDefaultModel;
+      const configured = applyCodexModelDefaults(liveModels, env.codexDefaultModel);
       codexModelCache = {
-        defaultModel,
-        models: liveModels,
+        defaultModel: configured.defaultModel,
+        models: configured.models,
         source: "live",
         expiresAt: Date.now() + 5 * 60_000
       };
@@ -1548,13 +1907,10 @@ async function getCodexModelSnapshot(): Promise<{
   } catch (error) {
     console.warn("Codex model discovery failed; using fallback catalog", error);
   }
-  const fallbackDefaultModel =
-    CODEX_HARNESS_MODELS.find((model) => model.id === env.codexPreferredModel)?.id ??
-    CODEX_HARNESS_MODELS.find((model) => model.badge === "Default")?.id ??
-    DEFAULT_CODEX_MODEL;
+  const configured = applyCodexModelDefaults(CODEX_HARNESS_MODELS, env.codexDefaultModel);
   codexModelCache = {
-    defaultModel: fallbackDefaultModel,
-    models: CODEX_HARNESS_MODELS,
+    defaultModel: configured.defaultModel,
+    models: configured.models,
     source: "fallback",
     expiresAt: Date.now() + 30_000
   };
@@ -1779,13 +2135,19 @@ async function cancelAgentThread(
        LIMIT 1
      ), updated_worker AS (
        UPDATE task_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = (SELECT id FROM latest WHERE kind = 'worker')
        RETURNING id, 'worker'::text AS kind, status::text
      ), updated_dispatcher AS (
        UPDATE dispatcher_runs
-       SET status = CASE WHEN status = 'queued' THEN 'cancelled' ELSE 'cancel_requested' END,
+       SET status = CASE
+             WHEN status = 'queued' THEN 'cancelled'::run_status
+             ELSE 'cancel_requested'::run_status
+           END,
            updated_at = now()
        WHERE id = (SELECT id FROM latest WHERE kind = 'dispatcher')
        RETURNING id, 'dispatcher'::text AS kind, status::text
@@ -1796,6 +2158,46 @@ async function cancelAgentThread(
     [id]
   );
   return { turn: result.rows[0] ?? null };
+}
+
+export async function queueAgentTurnInput(
+  pool: DbPool,
+  threadId: string,
+  message: string
+): Promise<{ input: Record<string, unknown> }> {
+  await getAgentThread(pool, threadId);
+  const active = await pool.query<{ id: string; kind: "worker" | "dispatcher" }>(
+    `SELECT id, kind
+     FROM (
+       SELECT id, 'worker'::text AS kind, started_at
+       FROM task_runs
+       WHERE agent_thread_id = $1 AND status = 'running'
+       UNION ALL
+       SELECT id, 'dispatcher'::text AS kind, started_at
+       FROM dispatcher_runs
+       WHERE agent_thread_id = $1 AND status = 'running'
+     ) active_turns
+     ORDER BY started_at DESC NULLS LAST
+     LIMIT 1`,
+    [threadId]
+  );
+  const turn = active.rows[0];
+  if (!turn) throwBadRequest("This thread does not have an active turn to steer");
+  const result = await pool.query(
+    `INSERT INTO agent_turn_inputs
+       (agent_thread_id, task_run_id, dispatcher_run_id, message)
+     SELECT $1, $2, $3, $4
+     WHERE EXISTS (
+       SELECT 1 FROM task_runs WHERE id = $2 AND status = 'running'
+       UNION ALL
+       SELECT 1 FROM dispatcher_runs WHERE id = $3 AND status = 'running'
+     )
+     RETURNING *`,
+    [threadId, turn.kind === "worker" ? turn.id : null, turn.kind === "dispatcher" ? turn.id : null, message]
+  );
+  const input = result.rows[0];
+  if (!input) throwBadRequest("This thread does not have an active turn to steer");
+  return { input };
 }
 
 async function resolveModelSelection(
@@ -1850,11 +2252,42 @@ async function getDispatcherThreadTimeline(pool: DbPool, threadId: string): Prom
       [threadId]
     ),
     pool.query<TimelineEventRow>(
-      `SELECT dispatcher_run_events.*
-       FROM dispatcher_run_events
-       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-       WHERE dispatcher_runs.agent_thread_id = $1
-       ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.created_at ASC, dispatcher_run_events.seq ASC`,
+      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
+       FROM (
+         SELECT dispatcher_run_events.id,
+                NULL::uuid AS run_id,
+                dispatcher_run_events.dispatcher_run_id,
+                dispatcher_run_events.seq,
+                dispatcher_run_events.event_type,
+                dispatcher_run_events.text,
+                dispatcher_run_events.payload,
+                dispatcher_run_events.created_at,
+                dispatcher_runs.queued_at
+         FROM dispatcher_run_events
+         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+         WHERE dispatcher_runs.agent_thread_id = $1
+         UNION ALL
+         SELECT agent_turn_inputs.id,
+                NULL::uuid AS run_id,
+                agent_turn_inputs.dispatcher_run_id,
+                0 AS seq,
+                'thread.message-sent' AS event_type,
+                agent_turn_inputs.message AS text,
+                jsonb_build_object(
+                  'type', 'thread.message-sent',
+                  'role', 'user',
+                  'text', agent_turn_inputs.message,
+                  'steer', true,
+                  'deliveryStatus', agent_turn_inputs.status,
+                  'error', agent_turn_inputs.error
+                ) AS payload,
+                agent_turn_inputs.created_at,
+                dispatcher_runs.queued_at
+         FROM agent_turn_inputs
+         JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+         WHERE agent_turn_inputs.agent_thread_id = $1
+       ) thread_events
+       ORDER BY queued_at ASC, created_at ASC, seq ASC`,
       [threadId]
     )
   ]);
@@ -1871,7 +2304,7 @@ async function getDispatcherThreadTimeline(pool: DbPool, threadId: string): Prom
   };
 }
 
-async function ensureTaskAgentThread(
+export async function ensureTaskAgentThread(
   pool: DbPool,
   input: {
     task: TaskJoin;
@@ -1882,8 +2315,58 @@ async function ensureTaskAgentThread(
     cwd: string;
     branch: string | null;
   }
-): Promise<{ id: string; model: string; model_options: unknown }> {
-  const result = await pool.query<{ id: string; model: string; model_options: unknown }>(
+): Promise<{
+  id: string;
+  model: string;
+  model_options: unknown;
+  runtime_home: string;
+  provider_thread_id: string | null;
+}> {
+  if (input.task.coordination_thread_id) {
+    const coordinated = await pool.query<{
+      id: string;
+      model: string;
+      model_options: unknown;
+      runtime_home: string;
+      provider_thread_id: string | null;
+    }>(
+      `INSERT INTO agent_threads
+         (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
+          cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
+       VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
+       ON CONFLICT (coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL DO UPDATE
+         SET title = EXCLUDED.title,
+             task_id = EXCLUDED.task_id,
+             project_id = EXCLUDED.project_id,
+             cwd = EXCLUDED.cwd,
+             branch = EXCLUDED.branch,
+             provider_thread_id = COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id),
+             last_activity_at = now(),
+             updated_at = now()
+       RETURNING id, model, model_options, runtime_home, provider_thread_id`,
+      [
+        input.task.title,
+        input.task.agent_id,
+        input.task.id,
+        input.task.project_id,
+        input.model,
+        JSON.stringify(input.modelOptions),
+        input.cwd,
+        input.branch,
+        input.runtimeHome,
+        input.providerThreadId,
+        input.task.coordination_thread_id
+      ]
+    );
+    return mustRow(coordinated.rows[0]);
+  }
+  const result = await pool.query<{
+    id: string;
+    model: string;
+    model_options: unknown;
+    runtime_home: string;
+    provider_thread_id: string | null;
+  }>(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id)
@@ -1908,7 +2391,7 @@ async function ensureTaskAgentThread(
            END,
            last_activity_at = now(),
            updated_at = now()
-     RETURNING id, model, model_options`,
+     RETURNING id, model, model_options, runtime_home, provider_thread_id`,
     [
       input.task.title,
       input.task.agent_id,
@@ -1928,14 +2411,19 @@ async function ensureTaskAgentThread(
 async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise<AgentThreadRow> {
   const task = await getTaskJoin(pool, taskId);
   const existing = await pool.query<{ id: string }>(
-    "SELECT id FROM agent_threads WHERE task_id = $1 LIMIT 1",
-    [taskId]
+    `SELECT id FROM agent_threads
+     WHERE task_id = $1
+        OR (coordination_thread_id = $2 AND agent_id = $3)
+     ORDER BY (coordination_thread_id = $2 AND agent_id = $3) DESC
+     LIMIT 1`,
+    [taskId, task.coordination_thread_id, task.agent_id]
   );
   if (existing.rows[0]) {
     await pool.query(
       `UPDATE agent_threads
        SET title = $2,
            agent_id = $3,
+           task_id = $9,
            project_id = $4,
            model = CASE WHEN agent_id <> $3 THEN $5 ELSE model END,
            model_options = CASE WHEN agent_id <> $3 THEN $6 ELSE model_options END,
@@ -1952,7 +2440,8 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
         task.agent_model,
         JSON.stringify(normalizeModelOptions(task.agent_model_options)),
         task.local_path ?? env.managedRoot,
-        managedCodexHome(env.managedRoot, task.id)
+        managedCodexHome(env.managedRoot, task.id),
+        task.id
       ]
     );
     await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
@@ -1997,10 +2486,10 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
   const latest = latestResult.rows[0];
   const runtimeHome = latest?.runtime_home ?? managedCodexHome(env.managedRoot, task.id);
   const created = await pool.query<{ id: string }>(
-    `INSERT INTO agent_threads
+     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
-        cwd, branch, runtime_home, provider_thread_id)
-     VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10)
+        cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
+     VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (task_id) WHERE task_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [
@@ -2013,11 +2502,15 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
       latest?.cwd ?? task.local_path ?? env.managedRoot,
       latest?.branch ?? null,
       runtimeHome,
-      latest?.provider_thread_id ?? null
+      latest?.provider_thread_id ?? null,
+      task.coordination_thread_id
     ]
   );
   const threadId = created.rows[0]?.id ?? (
-    await pool.query<{ id: string }>("SELECT id FROM agent_threads WHERE task_id = $1 LIMIT 1", [taskId])
+    await pool.query<{ id: string }>(
+      "SELECT id FROM agent_threads WHERE task_id = $1 OR (coordination_thread_id = $2 AND agent_id = $3) LIMIT 1",
+      [taskId, task.coordination_thread_id, task.agent_id]
+    )
   ).rows[0]?.id;
   if (!threadId) throw new Error("Failed to create the task's agent thread");
   await linkTaskRunsToThread(pool, taskId, threadId);
@@ -2187,6 +2680,12 @@ async function queueWorkerRun(
     cwd: projectPath,
     branch
   });
+  await synchronizeTaskSessionRuntime(
+    pool,
+    session.id,
+    thread.runtime_home,
+    thread.provider_thread_id
+  );
   const model = options.modelSelection?.model ?? thread.model;
   const modelOptions = options.modelSelection?.options ?? normalizeModelOptions(thread.model_options);
   const runResult = await pool.query(
@@ -2448,7 +2947,7 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
                 tasks.number AS task_number,
                 tasks.title AS task_title,
                 projects.name AS project_name,
-                'Dispatcher'::text AS agent_name,
+                'Orchestrator'::text AS agent_name,
                 dispatcher_runs.prompt,
                 dispatcher_runs.queued_at,
                 dispatcher_runs.started_at,
@@ -2491,6 +2990,27 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          FROM dispatcher_run_events
          JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
          WHERE dispatcher_runs.task_id = $1
+         UNION ALL
+         SELECT agent_turn_inputs.id,
+                agent_turn_inputs.task_run_id AS run_id,
+                agent_turn_inputs.dispatcher_run_id,
+                0 AS seq,
+                'thread.message-sent' AS event_type,
+                agent_turn_inputs.message AS text,
+                jsonb_build_object(
+                  'type', 'thread.message-sent',
+                  'role', 'user',
+                  'text', agent_turn_inputs.message,
+                  'steer', true,
+                  'deliveryStatus', agent_turn_inputs.status,
+                  'error', agent_turn_inputs.error
+                ) AS payload,
+                agent_turn_inputs.created_at,
+                COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
+         FROM agent_turn_inputs
+         LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
+         LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+         WHERE task_runs.task_id = $1 OR dispatcher_runs.task_id = $1
        ) task_events
        ORDER BY queued_at ASC, created_at ASC, seq ASC`,
       [taskId]
@@ -2600,15 +3120,36 @@ async function upsertTaskSession(
   return mustRow(result.rows[0]);
 }
 
-async function resolveTaskSkills(pool: DbPool, _task: Pick<TaskJoin, "id" | "project_id" | "agent_id">): Promise<CodexSkillSnapshot[]> {
-  return resolveEnabledSkills(pool);
+export async function synchronizeTaskSessionRuntime(
+  pool: DbPool,
+  sessionId: string,
+  runtimeHome: string,
+  providerThreadId: string | null
+): Promise<void> {
+  await pool.query(
+    `UPDATE task_sessions
+     SET codex_home = $2,
+         codex_thread_id = COALESCE($3, codex_thread_id),
+         updated_at = now()
+     WHERE id = $1`,
+    [sessionId, runtimeHome, providerThreadId]
+  );
 }
 
-async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<CodexSkillSnapshot[]> {
-  return resolveEnabledSkills(pool);
+async function resolveTaskSkills(pool: DbPool, task: Pick<TaskJoin, "id" | "project_id" | "agent_id">): Promise<CodexSkillSnapshot[]> {
+  return resolveSelectedSkills(pool, task.agent_id, task.project_id, task.id);
 }
 
-async function resolveEnabledSkills(pool: DbPool): Promise<CodexSkillSnapshot[]> {
+async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
+  return resolveSelectedSkills(pool, agentId, null, null);
+}
+
+async function resolveSelectedSkills(
+  pool: DbPool,
+  agentId: string,
+  projectId: string | null,
+  taskId: string | null
+): Promise<CodexSkillSnapshot[]> {
   const result = await pool.query<{
     id: string;
     name: string;
@@ -2622,10 +3163,22 @@ async function resolveEnabledSkills(pool: DbPool): Promise<CodexSkillSnapshot[]>
             skills.description,
             skills.instructions,
             skills.files,
-            'global' AS source
+            selected.source
      FROM skills
+     JOIN (
+       SELECT id AS skill_id, 'default'::text AS source FROM skills WHERE default_for_agents = true
+       UNION ALL SELECT skill_id, 'agent' FROM agent_skills WHERE agent_id = $1
+       UNION ALL
+         SELECT skills.id, 'instruction'
+         FROM skills
+         JOIN agents ON agents.id = $1
+         WHERE position('@skill(' || skills.name || ')' in agents.instructions) > 0
+       UNION ALL SELECT skill_id, 'project' FROM project_skills WHERE project_id = $2
+       UNION ALL SELECT skill_id, 'task' FROM task_skills WHERE task_id = $3
+     ) selected ON selected.skill_id = skills.id
      WHERE skills.enabled = true
      ORDER BY skills.name ASC`
+    , [agentId, projectId, taskId]
   );
   return mergeSkillRows(result.rows);
 }
@@ -2794,36 +3347,14 @@ async function getDispatcherContext(pool: DbPool): Promise<{
   return { tasks: tasks.rows, agents: agents.rows, projects: projects.rows };
 }
 
-async function requireAgentTool(pool: DbPool, request: FastifyRequest): Promise<AgentToolContext> {
-  const authorization = request.headers.authorization;
-  const token = authorization?.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : undefined;
-  if (!token) {
-    const error = new Error("Agent tool token required") as Error & { statusCode: number };
-    error.statusCode = 401;
-    throw error;
-  }
-  const result = await pool.query<{
-    role: "worker" | "dispatcher";
-    task_id: string | null;
-    task_project_id: string | null;
-  }>(
-    `SELECT agent_tool_tokens.role,
-            agent_tool_tokens.task_id,
-            tasks.project_id AS task_project_id
-     FROM agent_tool_tokens
-     LEFT JOIN tasks ON tasks.id = agent_tool_tokens.task_id
-     WHERE agent_tool_tokens.token_hash = $1
-       AND agent_tool_tokens.expires_at > now()
-     LIMIT 1`,
-    [hashToken(token)]
-  );
-  const row = result.rows[0];
-  if (!row) {
-    const error = new Error("Invalid agent tool token") as Error & { statusCode: number };
-    error.statusCode = 401;
-    throw error;
-  }
-  return { role: row.role, taskId: row.task_id, taskProjectId: row.task_project_id };
+async function requireLegacyAgentCapabilities(
+  pool: DbPool,
+  request: FastifyRequest,
+  ...capabilities: string[]
+): Promise<AgentContext> {
+  const context = await requireAgent(pool, request);
+  for (const capability of capabilities) requireCapability(context, capability);
+  return context;
 }
 
 async function getTaskByKey(pool: DbPool, key: string): Promise<{ id: string; number: number }> {

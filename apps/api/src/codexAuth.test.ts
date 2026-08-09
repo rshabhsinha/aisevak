@@ -75,6 +75,31 @@ describe("CodexAuthManager", () => {
       account_id: "account-123456"
     });
   });
+
+  it("aborts a stalled outbound OAuth request after the configured deadline", async () => {
+    const observed: { signal: AbortSignal | null } = { signal: null };
+    const fetchImpl = (_input: string | URL | Request, init?: RequestInit) => {
+      observed.signal = init?.signal ?? null;
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init?.signal;
+        if (!signal) return;
+        const rejectAbort = () => reject(signal.reason);
+        if (signal.aborted) rejectAbort();
+        else signal.addEventListener("abort", rejectAbort, { once: true });
+      });
+    };
+    const manager = new CodexAuthManager({} as DbPool, secretKey, {
+      authBaseUrl: "https://auth.example.test",
+      fetchImpl: fetchImpl as typeof fetch,
+      requestTimeoutMs: 10
+    });
+
+    await expect(manager.startDeviceLogin("user-id")).rejects.toMatchObject({
+      name: "TimeoutError",
+      message: "ChatGPT authentication request timed out after 10ms"
+    });
+    expect(observed.signal?.aborted).toBe(true);
+  });
 });
 
 function jwt(payload: Record<string, unknown>): string {

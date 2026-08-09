@@ -5,6 +5,7 @@ APP_NAME="aisevak"
 APP_DIR="${AISEVAK_APP_DIR:-/opt/${APP_NAME}}"
 WORKSPACE_DIR="${AISEVAK_WORKSPACE_DIR:-/srv/${APP_NAME}}"
 RUNNER_USER="aisevak"
+RUNNER_SHELL="/bin/bash"
 CURRENT_DIR="${APP_DIR}/current"
 ENV_FILE="${APP_DIR}/.env"
 RELEASES_DIR="${APP_DIR}/releases"
@@ -48,7 +49,11 @@ require_command() {
 
 if ! id "${RUNNER_USER}" >/dev/null 2>&1; then
   log "Creating ${RUNNER_USER} service user"
-  useradd --system --create-home --shell /usr/sbin/nologin "${RUNNER_USER}"
+  useradd --system --create-home --shell "${RUNNER_SHELL}" "${RUNNER_USER}"
+else
+  # Codex PTY-backed and background terminal commands need a real shell. The
+  # system account remains password-locked and is not granted SSH access.
+  usermod --shell "${RUNNER_SHELL}" "${RUNNER_USER}"
 fi
 
 log "Creating directories"
@@ -58,10 +63,13 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/workspaces" \
   "${WORKSPACE_DIR}/workspaces/github" \
   "${WORKSPACE_DIR}/codex-homes" \
+  "${WORKSPACE_DIR}/skills" \
   "${WORKSPACE_DIR}/worktrees"
 # Older API releases created Codex homes as root from inside the container.
 # The host-native runner is the only process that writes their runtime files.
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/codex-homes"
+# The API and host runner both maintain the shared installed-skill catalog.
+chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/skills"
 
 require_command docker "Docker is not installed. Install Docker Engine first: https://docs.docker.com/engine/install/ubuntu/"
 require_command rsync "rsync is required to stage releases."

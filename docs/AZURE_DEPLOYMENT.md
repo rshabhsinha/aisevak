@@ -85,6 +85,8 @@ rsync -az --delete \
   --exclude='.env.local' \
   --exclude='.aisevak-dev/' \
   --exclude='.aisevak-managed/' \
+  --exclude='data/' \
+  --exclude='tmp/' \
   --exclude='node_modules/' \
   --exclude='dist/' \
   --exclude='coverage/' \
