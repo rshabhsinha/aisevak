@@ -27,6 +27,7 @@ import {
   type CodexChatGptAuthFile,
   type DbPool
 } from "@aisevak/core";
+import { agentToolScript } from "@aisevak/cli";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -82,6 +83,8 @@ interface RunJob {
   workspace_mode: "direct" | "git_worktree";
   project_source: "local_path" | "github";
   skills_snapshot: CodexSkillSnapshot[];
+  agent_id: string;
+  coordination_thread_id: string | null;
 }
 
 interface DispatcherJob {
@@ -95,6 +98,11 @@ interface DispatcherJob {
   codex_home: string;
   codex_thread_id: string | null;
   skills_snapshot: CodexSkillSnapshot[];
+  scope: string;
+  agent_id: string;
+  agent_kind: "worker" | "dispatcher";
+  coordination_thread_id: string | null;
+  message_delivery_id: string | null;
 }
 
 async function main(): Promise<void> {
@@ -278,7 +286,23 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     `UPDATE dispatcher_runs
      SET status = 'running', started_at = now(), updated_at = now()
      WHERE id = (
-       SELECT id FROM dispatcher_runs WHERE status = 'queued' ORDER BY queued_at ASC LIMIT 1
+       SELECT candidate.id
+       FROM dispatcher_runs candidate
+       LEFT JOIN message_deliveries ON message_deliveries.id = candidate.message_delivery_id
+       WHERE candidate.status = 'queued'
+         AND (candidate.message_delivery_id IS NULL OR message_deliveries.available_at <= now())
+         AND (
+           candidate.scope <> 'coordination'
+           OR NOT EXISTS (
+             SELECT 1 FROM dispatcher_runs active
+             WHERE active.agent_thread_id = candidate.agent_thread_id
+               AND active.scope = 'coordination'
+               AND active.status = 'running'
+           )
+         )
+       ORDER BY candidate.queued_at ASC
+       LIMIT 1
+       FOR UPDATE SKIP LOCKED
      )
      RETURNING id`
   );
@@ -286,7 +310,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   if (!picked) return;
   const detail = await pool.query<DispatcherJob>(
     `SELECT dispatcher_runs.id,
+            dispatcher_runs.scope,
             dispatcher_runs.agent_thread_id,
+            dispatcher_runs.message_delivery_id,
             dispatcher_runs.task_id,
             dispatcher_runs.prompt,
             dispatcher_runs.model,
@@ -294,13 +320,26 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
             dispatcher_runs.cwd,
             dispatcher_runs.codex_home,
             COALESCE(agent_threads.provider_thread_id, dispatcher_runs.codex_thread_id) AS codex_thread_id,
-            dispatcher_runs.skills_snapshot
+            dispatcher_runs.skills_snapshot,
+            agents.id AS agent_id,
+            agents.kind AS agent_kind,
+            agent_threads.coordination_thread_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN agents ON agents.id = agent_threads.agent_id
      WHERE dispatcher_runs.id = $1`,
     [picked.id]
   );
   const job = mustRow(detail.rows[0]);
+  if (job.message_delivery_id) {
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'running', attempt_count = attempt_count + 1,
+           presented_at = now(), updated_at = now()
+       WHERE id = $1`,
+      [job.message_delivery_id]
+    );
+  }
 
   let stdout = "";
   let stderr = "";
@@ -314,9 +353,12 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     const toolToken = await createAgentToolToken(pool, {
-      role: "dispatcher",
+      role: job.agent_kind ?? "dispatcher",
       dispatcherRunId: job.id,
-      taskId: job.task_id
+      taskId: job.task_id,
+      agentId: job.agent_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id
     });
     const toolBin = await writeAgentTool(job.codex_home);
     const turn = await runCodexAppServerTurn({
@@ -399,6 +441,9 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         [job.agent_thread_id]
       );
     }
+    if (job.message_delivery_id) {
+      await finishMessageDelivery(pool, job, finalStatus, stderr);
+    }
   }
 }
 
@@ -445,7 +490,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
             COALESCE(agent_threads.provider_thread_id, task_sessions.codex_thread_id) AS codex_thread_id,
             projects.workspace_mode,
             projects.source AS project_source,
-            task_runs.skills_snapshot
+            task_runs.skills_snapshot,
+            tasks.agent_id,
+            agent_threads.coordination_thread_id
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
@@ -475,7 +522,10 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
       taskRunId: job.id,
-      taskId: job.task_id
+      taskId: job.task_id,
+      agentId: job.agent_id,
+      agentThreadId: job.agent_thread_id,
+      coordinationThreadId: job.coordination_thread_id
     });
     const toolBin = await writeAgentTool(job.codex_home);
     const turn = await runCodexAppServerTurn({
@@ -765,6 +815,55 @@ async function persistDispatcherCodexLine(
   );
 }
 
+async function finishMessageDelivery(
+  pool: DbPool,
+  job: DispatcherJob,
+  status: "succeeded" | "failed" | "cancelled",
+  error: string
+): Promise<void> {
+  if (!job.message_delivery_id) return;
+  if (status === "succeeded") {
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
+       WHERE id = $1`,
+      [job.message_delivery_id]
+    );
+    return;
+  }
+
+  const delivery = await pool.query<{ attempt_count: number }>(
+    "SELECT attempt_count FROM message_deliveries WHERE id = $1",
+    [job.message_delivery_id]
+  );
+  const attempts = delivery.rows[0]?.attempt_count ?? 3;
+  if (status === "failed" && attempts < 3) {
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
+           error = NULLIF($3, ''), updated_at = now()
+       WHERE id = $1`,
+      [job.message_delivery_id, attempts, error]
+    );
+    await pool.query(
+      `INSERT INTO dispatcher_runs
+         (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+          codex_thread_id, model, model_options, prompt, skills_snapshot)
+       SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
+              codex_thread_id, model, model_options, prompt, skills_snapshot
+       FROM dispatcher_runs WHERE id = $1`,
+      [job.id]
+    );
+    return;
+  }
+  await pool.query(
+    `UPDATE message_deliveries
+     SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
+     WHERE id = $1`,
+    [job.message_delivery_id, error]
+  );
+}
+
 async function createAgentToolToken(
   pool: DbPool,
   options: {
@@ -772,18 +871,25 @@ async function createAgentToolToken(
     taskRunId?: string;
     dispatcherRunId?: string;
     taskId?: string | null;
+    agentId?: string | null;
+    agentThreadId?: string | null;
+    coordinationThreadId?: string | null;
   }
 ): Promise<string> {
   const token = newSessionToken();
   await pool.query(
     `INSERT INTO agent_tool_tokens
-     (token_hash, task_run_id, dispatcher_run_id, task_id, role, expires_at)
-     VALUES ($1, $2, $3, $4, $5, now() + interval '24 hours')`,
+     (token_hash, task_run_id, dispatcher_run_id, task_id, agent_id, agent_thread_id,
+      coordination_thread_id, role, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '24 hours')`,
     [
       hashToken(token),
       options.taskRunId ?? null,
       options.dispatcherRunId ?? null,
       options.taskId ?? null,
+      options.agentId ?? null,
+      options.agentThreadId ?? null,
+      options.coordinationThreadId ?? null,
       options.role
     ]
   );
@@ -797,180 +903,6 @@ async function writeAgentTool(codexHome: string): Promise<string> {
   await writeFile(toolPath, agentToolScript(), "utf8");
   await chmod(toolPath, 0o700);
   return binDir;
-}
-
-function agentToolScript(): string {
-  return `#!/usr/bin/env node
-const apiUrl = process.env.AISEVAK_API_URL || "http://localhost:8787";
-const token = process.env.AISEVAK_AGENT_TOKEN;
-if (!token) fail("AISEVAK_AGENT_TOKEN is missing");
-
-const args = process.argv.slice(2);
-main().catch((error) => fail(error && error.message ? error.message : String(error)));
-
-async function main() {
-  if (args.length === 0 || args[0] === "help" || args[0] === "--help") return help();
-  if (args[0] === "context") return print(await request("/api/agent-tools/context"));
-  if (args[0] === "credential" || args[0] === "credentials") {
-    const credentialCommand = args[1] || "list";
-    if (credentialCommand === "list") {
-      return print(await request("/api/agent-tools/credentials"));
-    }
-    if (credentialCommand === "get") {
-      const name = args[2];
-      if (!name) return fail("Credential name is required");
-      return print(await request("/api/agent-tools/credentials/" + encodeURIComponent(name)));
-    }
-    if (credentialCommand === "add") {
-      const name = option("--name") || args[2];
-      if (!name || name.startsWith("--")) return fail("Credential name is required");
-      const value = args.includes("--value-stdin") ? await readStdin() : option("--value", true);
-      return print(await request("/api/agent-tools/credentials", {
-        method: "POST",
-        body: {
-          name,
-          description: option("--description"),
-          value
-        }
-      }));
-    }
-    return fail("Unknown credential command. Run: aisevak help");
-  }
-  if (args[0] !== "task") return fail("Unknown command. Run: aisevak help");
-  const command = args[1];
-  if (command === "create") {
-    return print(await request("/api/agent-tools/tasks", {
-      method: "POST",
-      body: {
-        title: option("--title", true),
-        body: option("--body"),
-        status: option("--status"),
-        projectId: option("--project-id"),
-        agentId: option("--agent-id")
-      }
-    }));
-  }
-  const key = args[2];
-  if (!key) return fail("Task key is required, for example TASK-12");
-  if (command === "comment") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-      method: "POST",
-      body: { body: restAfter(3) }
-    }));
-  }
-  if (command === "attention") {
-    const reason = restAfter(3);
-    await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: { status: "needs_attention" }
-    });
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-      method: "POST",
-      body: { body: reason }
-    }));
-  }
-  if (command === "complete") {
-    const summary = option("--summary") || restAfter(3);
-    await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: { status: "completed" }
-    });
-    if (summary) {
-      await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/comment", {
-        method: "POST",
-        body: { body: summary }
-      });
-    }
-    return print({ ok: true });
-  }
-  if (command === "update") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key), {
-      method: "PATCH",
-      body: {
-          title: option("--title"),
-          body: option("--body"),
-          status: option("--status"),
-          projectId: option("--project-id"),
-          agentId: option("--agent-id")
-      }
-    }));
-  }
-  if (command === "assign") {
-    return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(key) + "/assign-run", {
-      method: "POST",
-      body: {
-        agent: option("--agent", true),
-        projectId: option("--project-id"),
-        run: args.includes("--run")
-      }
-    }));
-  }
-  return fail("Unknown task command. Run: aisevak help");
-}
-
-async function request(path, options = {}) {
-  const response = await fetch(apiUrl + path, {
-    method: options.method || "GET",
-    headers: {
-      Authorization: "Bearer " + token,
-      "Content-Type": "application/json"
-    },
-    body: options.body ? JSON.stringify(options.body) : undefined
-  });
-  const text = await response.text();
-  let payload;
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = text;
-  }
-  if (!response.ok) throw new Error(typeof payload === "string" ? payload : JSON.stringify(payload));
-  return payload;
-}
-
-function option(name, required = false) {
-  const index = args.indexOf(name);
-  const value = index >= 0 ? args[index + 1] : undefined;
-  if (required && !value) fail(name + " is required");
-  return value;
-}
-
-function restAfter(index) {
-  return args.slice(index).join(" ").trim();
-}
-
-async function readStdin() {
-  let text = "";
-  for await (const chunk of process.stdin) {
-    text += String(chunk);
-  }
-  return text.replace(/\\r?\\n$/, "");
-}
-
-function print(value) {
-  console.log(JSON.stringify(value, null, 2));
-}
-
-function help() {
-  console.log([
-    "aisevak context",
-    "aisevak credential list",
-    "aisevak credential get <name>",
-    "aisevak credential add <name> --value-stdin [--description <description>]",
-    "aisevak task create --title <title> [--body <body>] [--status needs_attention] [--project-id <project-id>]",
-    "aisevak task assign TASK-1 --agent <agent-name> [--project-id <project-id>] --run",
-    "aisevak task attention TASK-1 <reason>",
-    "aisevak task comment TASK-1 <note>",
-    "aisevak task complete TASK-1 --summary <summary>",
-    "aisevak task update TASK-1 [--status open|needs_attention|completed] [--project-id <project-id>]"
-  ].join("\\n"));
-}
-
-function fail(message) {
-  console.error(message);
-  process.exit(1);
-}
-`;
 }
 
 async function getDispatcherAgent(pool: DbPool): Promise<{
@@ -1000,7 +932,7 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
   return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
 }
 
-async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<CodexSkillSnapshot[]> {
+async function resolveAgentSkills(pool: DbPool, agentId: string): Promise<CodexSkillSnapshot[]> {
   const result = await pool.query<{
     id: string;
     name: string;
@@ -1014,8 +946,10 @@ async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<Codex
             skills.instructions,
             skills.files
      FROM skills
-     WHERE skills.enabled = true
+     JOIN agent_skills ON agent_skills.skill_id = skills.id
+     WHERE skills.enabled = true AND agent_skills.agent_id = $1
      ORDER BY skills.name ASC`
+    , [agentId]
   );
   return result.rows.map((row) => ({
     id: row.id,
@@ -1023,7 +957,7 @@ async function resolveAgentSkills(pool: DbPool, _agentId: string): Promise<Codex
     description: row.description,
     instructions: row.instructions,
     files: normalizeSkillFiles(row.files),
-    sources: ["global"]
+    sources: ["agent"]
   }));
 }
 

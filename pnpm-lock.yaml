@@ -51,6 +51,9 @@ importers:
 
   apps/runner:
     dependencies:
+      '@aisevak/cli':
+        specifier: workspace:*
+        version: link:../../packages/cli
       '@aisevak/core':
         specifier: workspace:*
         version: link:../../packages/core
@@ -116,6 +119,8 @@ importers:
       '@types/react-dom':
         specifier: ^19.0.2
         version: 19.2.3(@types/react@19.2.14)
+
+  packages/cli: {}
 
   packages/core:
     dependencies:

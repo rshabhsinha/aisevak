@@ -4,12 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "pnpm --filter @aisevak/core build && tsc -p tsconfig.json",
+    "build": "pnpm --filter @aisevak/core build && pnpm --filter @aisevak/cli build && tsc -p tsconfig.json",
     "dev": "cd ../.. && NODE_OPTIONS='--conditions=development' tsx watch --env-file=.env apps/runner/src/index.ts",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@aisevak/cli": "workspace:*",
     "@aisevak/core": "workspace:*",
     "pg": "^8.13.1"
   },
