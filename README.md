@@ -29,7 +29,7 @@ aisevak incidents declare --title "Queue stalled" --description "No deliveries p
 
 Addressed messages create durable per-recipient deliveries. The runner presents them serially for each agent/thread pair, retries transient failures up to three times, and records delivery state. Only the triggered agent can complete or block an active thread; that atomically sends one final result to the triggering agent. The result is a notification and does not produce an automatic reply. If more work is needed, the triggering agent can explicitly send a later message on the same thread, reactivating it without reopening a linked completed task.
 
-Skills and capabilities are separate. The bundled `$aisevak-cli` skill is enabled for every agent by default so each isolated session knows how to inspect context and coordinate with judgment. Additional agent, project, and task skill links remain selective. Backend-enforced capabilities control which CLI mutations that agent may perform.
+Skills and capabilities are separate. Installed skills live in the persistent `${MANAGED_ROOT}/skills` catalog (exposed to agents as `$AISEVAK_SKILLS_DIR`), and the Skills tab follows that directory. The `$aisevak-cli` skill is installed for every agent by default so each isolated session knows how to inspect context and coordinate with judgment. Additional agent, project, and task skill links remain selective. Backend-enforced capabilities control which CLI mutations that agent may perform. Selected skills are copied into each thread's isolated `$CODEX_HOME/.agents/skills` view when it runs.
 
 ## Local development
 

@@ -55,6 +55,23 @@ describe("embedded aisevak CLI", () => {
     expect(result.stdout).toContain("reports");
     expect(result.stdout).toContain("incidents");
     expect(result.stdout).toContain("schedules");
+    expect(result.stdout).toContain("skills path");
+  });
+
+  it("prints the persistent installed-skills path", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const result = await execFileAsync(process.execPath, [cliPath, "skills", "path"], {
+      env: {
+        ...process.env,
+        AISEVAK_AGENT_TOKEN: "test-token",
+        AISEVAK_SKILLS_DIR: "/srv/aisevak/skills"
+      }
+    });
+
+    expect(JSON.parse(result.stdout)).toEqual({ path: "/srv/aisevak/skills" });
   });
 
   it("reads rotating agent credentials from a token file", async () => {

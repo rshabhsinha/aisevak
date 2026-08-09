@@ -21,6 +21,7 @@ async function main() {
     return print(await request("/api/agent-tools/v1/resources/" + encodeURIComponent(ref) + "/content" + query({ cursor: option("--cursor"), limit: option("--limit") })));
   }
   if (["agent", "agents"].includes(root)) return agents();
+  if (["skill", "skills"].includes(root)) return skills();
   if (["thread", "threads"].includes(root)) return threads();
   if (["task", "tasks"].includes(root)) return tasks();
   if (["schedule", "schedules"].includes(root)) return schedules();
@@ -28,6 +29,16 @@ async function main() {
   if (["incident", "incidents"].includes(root)) return incidents();
   if (["credential", "credentials"].includes(root)) return credentials();
   fail("Unknown command. Run: aisevak help", "USAGE");
+}
+
+async function skills() {
+  const command = args[1] || "path";
+  if (command === "path") {
+    const path = process.env.AISEVAK_SKILLS_DIR;
+    if (!path) fail("AISEVAK_SKILLS_DIR is missing", "CONFIG_MISSING");
+    return print({ path });
+  }
+  fail("Usage: aisevak skills path", "USAGE");
 }
 
 async function agents() {
@@ -175,6 +186,7 @@ function fail(message, code = "CLI_ERROR") { console.error(JSON.stringify({ erro
 function help() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT",
+  "aisevak skills path",
   "aisevak threads list | show | messages | create | send | complete | block",
   "aisevak tasks list | show | create | update | assign | complete | reopen",
   "aisevak schedules list | show | create | pause | resume | delete",

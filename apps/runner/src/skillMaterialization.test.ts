@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { loadBundledSkills } from "@aisevak/core";
+import { loadPlatformSkills } from "@aisevak/core";
 import { materializeSkills } from "./index.js";
 
 const cleanup: string[] = [];
@@ -12,14 +12,14 @@ afterEach(async () => {
 });
 
 describe("skill materialization", () => {
-  it("installs the bundled Aisevak CLI skill into an isolated Codex home", async () => {
+  it("materializes an installed Aisevak CLI skill into an isolated Codex home", async () => {
     const codexHome = await mkdtemp(join(tmpdir(), "aisevak-skill-home-"));
     cleanup.push(codexHome);
-    const [skill] = await loadBundledSkills();
-    if (!skill) throw new Error("Expected bundled Aisevak CLI skill");
+    const [skill] = await loadPlatformSkills();
+    if (!skill) throw new Error("Expected installed Aisevak CLI skill");
 
     await materializeSkills(codexHome, [{
-      id: "bundled-aisevak-cli",
+      id: "installed-aisevak-cli",
       name: skill.name,
       description: skill.description,
       instructions: skill.instructions,

@@ -13,6 +13,7 @@ import {
   githubCloneEnv,
   githubHeaders,
   hashToken,
+  installedSkillsRoot,
   managedCodexHome,
   managedWorktreePath,
   newSessionToken,
@@ -513,6 +514,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        AISEVAK_SKILLS_DIR: installedSkillsRoot(env.managedRoot),
         PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
@@ -683,6 +685,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
         HOME: job.codex_home,
         AISEVAK_API_URL: env.apiUrl,
         AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+        AISEVAK_SKILLS_DIR: installedSkillsRoot(env.managedRoot),
         PATH: `${agentTool.binDir}:${process.env.PATH ?? ""}`,
         ...(codexAuth.apiKey
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
