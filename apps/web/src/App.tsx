@@ -34,6 +34,7 @@ import {
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
+import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
@@ -2622,7 +2623,7 @@ function TaskCommentTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { k
     <div className="task-comment-row">
       <div className="task-comment-bubble">
         <div className="task-comment-label">Task comment</div>
-        <BasicMarkdown text={row.text} plain />
+        <MarkdownContent text={row.text} plain />
         <TimelineMeta createdAt={row.createdAt} />
       </div>
     </div>
@@ -2644,7 +2645,7 @@ function AssistantTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kin
   return (
     <div className="timeline-assistant-row">
       <div className="assistant-message group-assistant">
-        <BasicMarkdown text={row.message.text || (row.message.streaming ? "" : "(empty response)")} />
+        <MarkdownContent text={row.message.text || (row.message.streaming ? "" : "(empty response)")} />
         <div className="assistant-meta-row">
           <TimelineMeta
             createdAt={row.message.createdAt}
@@ -2753,28 +2754,13 @@ function CollapsibleText({ text }: { text: string }) {
   return (
     <div>
       <div className={`collapsible-message ${collapsed ? "collapsed" : ""}`}>
-        <BasicMarkdown text={text} plain />
+        <MarkdownContent text={text} plain />
       </div>
       {shouldCollapse ? (
         <button className="text-button" type="button" onClick={() => setExpanded((value) => !value)}>
           {expanded ? "Show less" : "Show full message"}
         </button>
       ) : null}
-    </div>
-  );
-}
-
-function BasicMarkdown({ text, plain = false }: { text: string; plain?: boolean }) {
-  const blocks = useMemo(() => parseMarkdownBlocks(text), [text]);
-  return (
-    <div className={`basic-markdown ${plain ? "plain" : ""}`}>
-      {blocks.map((block, index) =>
-        block.type === "code" ? (
-          <CodeBlock code={block.content} language={block.language} key={`${block.type}-${index}`} />
-        ) : (
-          <p key={`${block.type}-${index}`}>{block.content}</p>
-        )
-      )}
     </div>
   );
 }
@@ -2860,37 +2846,6 @@ function workEntryPreview(workEntry: AgentRunWorkLogEntry): string | null {
   const normalizedHeading = normalizeCompactToolLabel(toolWorkEntryHeading(workEntry)).toLowerCase();
   if (normalizedPreview === normalizedHeading) return null;
   return preview.replace(/\s+/g, " ").trim();
-}
-
-function parseMarkdownBlocks(text: string): Array<{ type: "text" | "code"; content: string; language?: string }> {
-  const blocks: Array<{ type: "text" | "code"; content: string; language?: string }> = [];
-  const fence = /```([^\n`]*)\n?([\s\S]*?)```/g;
-  let cursor = 0;
-  let match: RegExpExecArray | null;
-  while ((match = fence.exec(text))) {
-    if (match.index > cursor) {
-      pushTextBlocks(blocks, text.slice(cursor, match.index));
-    }
-    blocks.push({ type: "code", language: match[1]?.trim() || undefined, content: match[2] ?? "" });
-    cursor = match.index + match[0].length;
-  }
-  if (cursor < text.length) {
-    pushTextBlocks(blocks, text.slice(cursor));
-  }
-  return blocks.length > 0 ? blocks : [{ type: "text", content: "" }];
-}
-
-function pushTextBlocks(
-  blocks: Array<{ type: "text" | "code"; content: string; language?: string }>,
-  text: string
-): void {
-  const chunks = text
-    .split(/\n{2,}/)
-    .map((chunk) => chunk.trim())
-    .filter(Boolean);
-  for (const chunk of chunks) {
-    blocks.push({ type: "text", content: chunk });
-  }
 }
 
 function TaskStatus({ status }: { status?: string | null }) {
