@@ -1,5 +1,6 @@
 export { Pulse as Activity } from "@phosphor-icons/react/dist/icons/Pulse";
 export { ArrowUp } from "@phosphor-icons/react/dist/icons/ArrowUp";
+export { ArrowDown } from "@phosphor-icons/react/dist/icons/ArrowDown";
 export { BookOpen } from "@phosphor-icons/react/dist/icons/BookOpen";
 export { CalendarDots as Calendar } from "@phosphor-icons/react/dist/icons/CalendarDots";
 export { Robot as Bot } from "@phosphor-icons/react/dist/icons/Robot";

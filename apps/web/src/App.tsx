@@ -1,5 +1,6 @@
 import {
   Activity,
+  ArrowDown,
   ArrowUp,
   BookOpen,
   Bot,
@@ -31,7 +32,7 @@ import {
   Trash2,
   Wrench
 } from "./components/icons";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
 import { MarkdownContent } from "./components/markdown";
@@ -67,6 +68,7 @@ import {
 } from "./agentRunTimeline";
 import { mergeRefreshedAgentThreads } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
+import { isThreadScrollNearBottom } from "./threadScroll";
 
 type View =
   | "tasks"
@@ -1318,11 +1320,39 @@ function AgentChatsView(props: {
   onSendMessage: (message: string, selection: ModelSelection) => Promise<void>;
   onCancel: () => Promise<void>;
 }) {
+  const timelineRef = useRef<HTMLDivElement>(null);
+  const pinnedToBottomRef = useRef(true);
+  const previousThreadRef = useRef<string | null>(null);
+  const [showScrollDown, setShowScrollDown] = useState(false);
   const active = isActiveRun(props.thread?.latest_status);
   const title = props.draft ? "New thread" : (props.thread?.title ?? "Agent thread");
   const agentName = props.thread?.agent_name ?? "Orchestrator";
   const projectName = props.thread?.project_name ?? "Aisevak workspace";
   const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
+  const threadKey = props.thread?.id ?? (props.draft ? "draft" : "loading");
+
+  useLayoutEffect(() => {
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    if (previousThreadRef.current !== threadKey) {
+      previousThreadRef.current = threadKey;
+      pinnedToBottomRef.current = true;
+    }
+    if (pinnedToBottomRef.current) {
+      timeline.scrollTop = timeline.scrollHeight;
+      setShowScrollDown(false);
+      return;
+    }
+    setShowScrollDown(!isThreadScrollNearBottom(timeline));
+  }, [threadKey, props.run, props.events, props.pendingMessages, latestError]);
+
+  function scrollToLatest() {
+    const timeline = timelineRef.current;
+    if (!timeline) return;
+    pinnedToBottomRef.current = true;
+    setShowScrollDown(false);
+    timeline.scrollTo({ top: timeline.scrollHeight, behavior: "smooth" });
+  }
 
   return (
     <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
@@ -1353,7 +1383,19 @@ function AgentChatsView(props: {
             <p>Start a durable thread. You can switch models before sending or between turns.</p>
           </div>
         ) : (
-          <div className="agent-chat-timeline-wrap">
+          <div
+            className="agent-chat-timeline-wrap"
+            ref={timelineRef}
+            role="log"
+            aria-label="Thread messages"
+            aria-live="polite"
+            tabIndex={0}
+            onScroll={(event) => {
+              const nearBottom = isThreadScrollNearBottom(event.currentTarget);
+              pinnedToBottomRef.current = nearBottom;
+              setShowScrollDown(!nearBottom);
+            }}
+          >
             <CodexSessionTimeline
               run={props.run}
               events={props.events}
@@ -1370,6 +1412,18 @@ function AgentChatsView(props: {
             ) : null}
           </div>
         )}
+
+        {showScrollDown ? (
+          <button
+            className="agent-chat-scroll-down"
+            type="button"
+            onClick={scrollToLatest}
+            aria-label="Scroll to latest message"
+            title="Scroll to latest message"
+          >
+            <ArrowDown size={16} weight="bold" />
+          </button>
+        ) : null}
 
         <div className="agent-chat-composer-wrap">
           <AgentChatComposer

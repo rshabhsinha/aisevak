@@ -1349,6 +1349,14 @@ select:disabled {
   scroll-behavior: smooth;
 }
 
+.agent-chat-timeline-wrap:focus {
+  outline: none;
+}
+
+.agent-chat-timeline-wrap:focus-visible {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 40%, transparent);
+}
+
 .agent-chat-timeline-wrap .chat-timeline {
   min-height: 0;
   margin: 0;
@@ -1365,6 +1373,35 @@ select:disabled {
   max-width: 760px;
   border-color: color-mix(in srgb, var(--border) 78%, transparent);
   background: color-mix(in srgb, var(--card) 58%, transparent);
+}
+
+.agent-chat-scroll-down {
+  position: absolute;
+  right: max(24px, calc((100% - 820px) / 2));
+  bottom: 112px;
+  width: 34px;
+  height: 34px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--card) 96%, transparent);
+  color: var(--foreground);
+  box-shadow: var(--shadow-md);
+  cursor: pointer;
+  z-index: 9;
+}
+
+.agent-chat-scroll-down:hover {
+  border-color: color-mix(in srgb, var(--primary) 45%, var(--border));
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
+.agent-chat-scroll-down:focus-visible {
+  outline: 0;
+  box-shadow: 0 0 0 3px var(--ring), var(--shadow-md);
 }
 
 .agent-run-failure {
@@ -3581,6 +3618,10 @@ label {
   .agent-chat-timeline-wrap {
     padding-inline: 24px;
   }
+
+  .agent-chat-scroll-down {
+    right: 24px;
+  }
 }
 
 @media (max-width: 700px) {
@@ -3640,6 +3681,11 @@ label {
   .main-content {
     width: 100%;
     min-height: calc(100svh - 58px);
+  }
+
+  .agent-chat-scroll-down {
+    right: 14px;
+    bottom: 110px;
   }
 
   .top-header {
