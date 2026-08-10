@@ -70,6 +70,7 @@ import { mergeRefreshedAgentThreads } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
 import { createTaskAndQueueRun } from "./taskCreation";
+import { createThreadLoadGuard } from "./threadLoadGuard";
 
 type View =
   | "tasks"
@@ -349,6 +350,7 @@ export function App() {
   const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const threadLoadGuardRef = useRef(createThreadLoadGuard());
 
   const filteredTasks = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -574,20 +576,33 @@ export function App() {
   }
 
   async function loadAgentThread(threadId: string) {
+    const isCurrentRequest = threadLoadGuardRef.current.begin(threadId);
     const data = await api<{
       thread: AgentThread;
       run?: AgentRunTimelineRun | null;
       events: RunEvent[];
     }>(`/api/agent-threads/${threadId}`);
-    setAgentThreads((current) =>
-      current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
-    );
+    if (!isCurrentRequest()) return;
+    setAgentThreads((current) => [
+      data.thread,
+      ...current.filter((thread) => thread.id !== data.thread.id)
+    ]);
     setSelectedThreadRun(data.run ?? null);
     setAgentThreadEvents(data.events);
   }
 
+  function selectAgentThread(threadId: string) {
+    threadLoadGuardRef.current.select(threadId);
+    setSelectedThreadId(threadId);
+    setDraftThread(false);
+    setSelectedThreadRun(null);
+    setAgentThreadEvents([]);
+    setPendingThreadMessages([]);
+  }
+
   function createAgentThread() {
     const provider = providerInstances[0];
+    threadLoadGuardRef.current.select(null);
     setSelectedThreadId(null);
     setDraftThread(true);
     setSelectedThreadRun(null);
@@ -614,9 +629,7 @@ export function App() {
         method: "POST"
       })).thread;
       setAgentThreads((current) => [thread, ...current.filter((entry) => entry.id !== thread.id)]);
-      setDraftThread(false);
-      setSelectedThreadId(thread.id);
-      setPendingThreadMessages([]);
+      selectAgentThread(thread.id);
       setQuery("");
       setView("runs");
       setMessage(null);
@@ -637,8 +650,7 @@ export function App() {
           body: payload
         });
         setAgentThreads((current) => [data.thread, ...current.filter((thread) => thread.id !== data.thread.id)]);
-        setSelectedThreadId(data.thread.id);
-        setDraftThread(false);
+        selectAgentThread(data.thread.id);
         setMessage(null);
         writeStickyModelSelection(selection);
         await loadAgentThread(data.thread.id);
@@ -757,8 +769,7 @@ export function App() {
           onNewThread={createAgentThread}
           onLoadMore={() => void loadOlderAgentThreads()}
           onSelectThread={(threadId) => {
-            setDraftThread(false);
-            setSelectedThreadId(threadId);
+            selectAgentThread(threadId);
           }}
         />
       ) : null}
@@ -837,20 +848,10 @@ export function App() {
               tasks={tasks}
               onSaved={reloadSchedules}
               onOpenThread={async (threadId) => {
-                const data = await api<{ thread: AgentThread; run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
-                  `/api/agent-threads/${threadId}`
-                );
-                setAgentThreads((current) => [
-                  data.thread,
-                  ...current.filter((thread) => thread.id !== data.thread.id)
-                ]);
-                setSelectedThreadId(data.thread.id);
-                setSelectedThreadRun(data.run ?? null);
-                setAgentThreadEvents(data.events);
-                setPendingThreadMessages([]);
-                setDraftThread(false);
+                selectAgentThread(threadId);
                 setQuery("");
                 setView("runs");
+                await loadAgentThread(threadId);
               }}
             />
           ) : null}
