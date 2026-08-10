@@ -69,6 +69,7 @@ import {
 import { mergeRefreshedAgentThreads } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
+import { createTaskAndQueueRun } from "./taskCreation";
 
 type View =
   | "tasks"
@@ -787,11 +788,8 @@ export function App() {
               agents={agents}
               projects={projects}
               onCreate={async (payload) => {
-                await api<{ task: Task }>("/api/tasks", {
-                  method: "POST",
-                  body: JSON.stringify(payload)
-                });
-                await reloadTasks();
+                await createTaskAndQueueRun<Task>(api, payload);
+                await Promise.all([reloadTasks(), reloadAgentThreads()]);
               }}
               onSelect={(task) => void openTaskThread(task)}
             />
