@@ -1,8 +1,46 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
+import { transferTaskAgentThread } from "./coordination.js";
 import { ensureTaskAgentThread, synchronizeTaskSessionRuntime } from "./server.js";
 
 describe("coordinated task agent threads", () => {
+  it("transfers the task navigation thread to a newly assigned agent", async () => {
+    const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    const pool = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        return {
+          rows: [{
+            id: "thread-id",
+            runtime_home: "/runtime/task",
+            provider_thread_id: null,
+            cwd: "/workspace"
+          }]
+        };
+      }
+    } as unknown as DbPool;
+
+    const thread = await transferTaskAgentThread(pool, {
+      threadId: "coordination-thread-id",
+      taskId: "task-id",
+      recipientAgentId: "builder-id",
+      model: "gpt-test",
+      modelOptions: [{ id: "reasoningEffort", value: "high" }]
+    });
+
+    expect(queries[0]?.sql).toContain("agent_id = $3");
+    expect(queries[0]?.sql).toContain("provider_thread_id = CASE WHEN agent_id = $3");
+    expect(queries[0]?.sql).toContain("WHERE task_id = $2");
+    expect(queries[0]?.params).toEqual([
+      "coordination-thread-id",
+      "task-id",
+      "builder-id",
+      "gpt-test",
+      JSON.stringify([{ id: "reasoningEffort", value: "high" }])
+    ]);
+    expect(thread).toMatchObject({ id: "thread-id", provider_thread_id: null });
+  });
+
   it("keeps the task link and returns the existing coordinated runtime", async () => {
     const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
     const pool = {
