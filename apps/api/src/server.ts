@@ -1956,7 +1956,7 @@ async function getAgentThreadTimeline(pool: DbPool, id: string): Promise<{
 }> {
   const thread = await getAgentThread(pool, id);
   if (thread.task_id) {
-    const timeline = await getTaskSessionTimeline(pool, thread.task_id, id);
+    const timeline = await getTaskSessionTimeline(pool, thread.task_id, id, false);
     return { thread, ...timeline };
   }
   const timeline = await getDispatcherThreadTimeline(pool, id);
@@ -2912,7 +2912,12 @@ async function queueDispatcherRun(
   return run;
 }
 
-export async function getTaskSessionTimeline(pool: DbPool, taskId: string, agentThreadId?: string): Promise<{
+export async function getTaskSessionTimeline(
+  pool: DbPool,
+  taskId: string,
+  agentThreadId?: string,
+  includeTaskComments = true
+): Promise<{
   run: TimelineRunRow | null;
   events: TimelineEventRow[];
 }> {
@@ -3044,8 +3049,9 @@ export async function getTaskSessionTimeline(pool: DbPool, taskId: string, agent
               task_comments.created_at
        FROM task_comments
        WHERE task_comments.task_id = $1
+         AND $2::boolean
        ORDER BY task_comments.created_at ASC`,
-      [taskId]
+      [taskId, includeTaskComments]
     )
   ]);
   const runs = runsResult.rows;

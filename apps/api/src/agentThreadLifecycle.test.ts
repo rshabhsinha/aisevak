@@ -163,7 +163,8 @@ describe("coordinated task agent threads", () => {
     const timeline = await getTaskSessionTimeline(
       pool,
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      false
     );
 
     expect(queries).toHaveLength(3);
@@ -173,6 +174,11 @@ describe("coordinated task agent threads", () => {
     expect(queries[0]?.params).toEqual([
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    ]);
+    expect(queries[2]?.sql).toContain("AND $2::boolean");
+    expect(queries[2]?.params).toEqual([
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      false
     ]);
     expect(timeline).toEqual({ run: null, events: [] });
   });
