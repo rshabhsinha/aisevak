@@ -1956,7 +1956,7 @@ async function getAgentThreadTimeline(pool: DbPool, id: string): Promise<{
 }> {
   const thread = await getAgentThread(pool, id);
   if (thread.task_id) {
-    const timeline = await getTaskSessionTimeline(pool, thread.task_id);
+    const timeline = await getTaskSessionTimeline(pool, thread.task_id, id);
     return { thread, ...timeline };
   }
   const timeline = await getDispatcherThreadTimeline(pool, id);
@@ -2330,7 +2330,13 @@ export async function ensureTaskAgentThread(
              project_id = EXCLUDED.project_id,
              cwd = EXCLUDED.cwd,
              branch = EXCLUDED.branch,
-             provider_thread_id = COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id),
+             runtime_home = EXCLUDED.runtime_home,
+             provider_thread_id = CASE
+               WHEN agent_threads.task_id = EXCLUDED.task_id
+                 AND agent_threads.runtime_home = EXCLUDED.runtime_home
+                 THEN COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id)
+               ELSE EXCLUDED.provider_thread_id
+             END,
              last_activity_at = now(),
              updated_at = now()
        RETURNING id, model, model_options, runtime_home, provider_thread_id`,
@@ -2376,8 +2382,10 @@ export async function ensureTaskAgentThread(
            branch = EXCLUDED.branch,
            runtime_home = EXCLUDED.runtime_home,
            provider_thread_id = CASE
-             WHEN agent_threads.agent_id <> EXCLUDED.agent_id THEN EXCLUDED.provider_thread_id
-             ELSE COALESCE(EXCLUDED.provider_thread_id, agent_threads.provider_thread_id)
+             WHEN agent_threads.agent_id = EXCLUDED.agent_id
+               AND agent_threads.runtime_home = EXCLUDED.runtime_home
+               THEN COALESCE(EXCLUDED.provider_thread_id, agent_threads.provider_thread_id)
+             ELSE EXCLUDED.provider_thread_id
            END,
            last_activity_at = now(),
            updated_at = now()
@@ -2400,11 +2408,17 @@ export async function ensureTaskAgentThread(
 
 async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise<AgentThreadRow> {
   const task = await getTaskJoin(pool, taskId);
+  const runtimeHome = managedCodexHome(env.managedRoot, task.id);
+  await isolateTaskNavigationThread(pool, {
+    taskId,
+    coordinationThreadId: task.coordination_thread_id,
+    agentId: task.agent_id
+  });
   const existing = await pool.query<{ id: string }>(
     `SELECT id FROM agent_threads
      WHERE task_id = $1
         OR (coordination_thread_id = $2 AND agent_id = $3)
-     ORDER BY (coordination_thread_id = $2 AND agent_id = $3) DESC
+     ORDER BY (task_id = $1) DESC
      LIMIT 1`,
     [taskId, task.coordination_thread_id, task.agent_id]
   );
@@ -2417,9 +2431,13 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
            project_id = $4,
            model = CASE WHEN agent_id <> $3 THEN $5 ELSE model END,
            model_options = CASE WHEN agent_id <> $3 THEN $6 ELSE model_options END,
-           cwd = CASE WHEN agent_id <> $3 THEN $7 ELSE cwd END,
-           runtime_home = CASE WHEN agent_id <> $3 THEN $8 ELSE runtime_home END,
-           provider_thread_id = CASE WHEN agent_id <> $3 THEN NULL ELSE provider_thread_id END,
+           cwd = $7,
+           runtime_home = $8,
+           provider_thread_id = CASE
+             WHEN agent_id <> $3 OR runtime_home <> $8 THEN NULL
+             ELSE provider_thread_id
+           END,
+           coordination_thread_id = $10,
            updated_at = now()
        WHERE id = $1`,
       [
@@ -2430,51 +2448,15 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
         task.agent_model,
         JSON.stringify(normalizeModelOptions(task.agent_model_options)),
         task.local_path ?? env.managedRoot,
-        managedCodexHome(env.managedRoot, task.id),
-        task.id
+        runtimeHome,
+        task.id,
+        task.coordination_thread_id
       ]
     );
     await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
     return getAgentThread(pool, existing.rows[0].id);
   }
 
-  const latestResult = await pool.query<{
-    model: string;
-    model_options: unknown;
-    cwd: string;
-    branch: string | null;
-    runtime_home: string;
-    provider_thread_id: string | null;
-  }>(
-    `SELECT model, model_options, cwd, branch, runtime_home, provider_thread_id
-     FROM (
-       SELECT task_runs.model,
-              task_runs.model_options,
-              task_runs.cwd,
-              task_runs.branch,
-              task_sessions.codex_home AS runtime_home,
-              COALESCE(task_runs.codex_thread_id, task_sessions.codex_thread_id) AS provider_thread_id,
-              task_runs.queued_at
-       FROM task_runs
-       JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
-       WHERE task_runs.task_id = $1
-       UNION ALL
-       SELECT dispatcher_runs.model,
-              dispatcher_runs.model_options,
-              dispatcher_runs.cwd,
-              NULL::text AS branch,
-              dispatcher_runs.codex_home AS runtime_home,
-              dispatcher_runs.codex_thread_id AS provider_thread_id,
-              dispatcher_runs.queued_at
-       FROM dispatcher_runs
-       WHERE dispatcher_runs.task_id = $1
-     ) task_history
-     ORDER BY queued_at DESC
-     LIMIT 1`,
-    [taskId]
-  );
-  const latest = latestResult.rows[0];
-  const runtimeHome = latest?.runtime_home ?? managedCodexHome(env.managedRoot, task.id);
   const created = await pool.query<{ id: string }>(
      `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
@@ -2487,18 +2469,21 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
       task.agent_id,
       task.id,
       task.project_id,
-      latest?.model ?? task.agent_model,
-      JSON.stringify(normalizeModelOptions(latest?.model_options ?? task.agent_model_options)),
-      latest?.cwd ?? task.local_path ?? env.managedRoot,
-      latest?.branch ?? null,
+      task.agent_model,
+      JSON.stringify(normalizeModelOptions(task.agent_model_options)),
+      task.local_path ?? env.managedRoot,
+      null,
       runtimeHome,
-      latest?.provider_thread_id ?? null,
+      null,
       task.coordination_thread_id
     ]
   );
   const threadId = created.rows[0]?.id ?? (
     await pool.query<{ id: string }>(
-      "SELECT id FROM agent_threads WHERE task_id = $1 OR (coordination_thread_id = $2 AND agent_id = $3) LIMIT 1",
+      `SELECT id FROM agent_threads
+       WHERE task_id = $1 OR (coordination_thread_id = $2 AND agent_id = $3)
+       ORDER BY (task_id = $1) DESC
+       LIMIT 1`,
       [taskId, task.coordination_thread_id, task.agent_id]
     )
   ).rows[0]?.id;
@@ -2507,14 +2492,45 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
   return getAgentThread(pool, threadId);
 }
 
+export async function isolateTaskNavigationThread(
+  pool: DbPool,
+  input: { taskId: string; coordinationThreadId: string | null; agentId: string }
+): Promise<void> {
+  await pool.query(
+    `UPDATE agent_threads
+     SET task_id = NULL,
+         coordination_thread_id = NULL,
+         updated_at = now()
+     WHERE (task_id = $1 OR (coordination_thread_id = $2 AND agent_id = $3))
+       AND (
+         EXISTS (
+           SELECT 1
+           FROM dispatcher_runs
+           WHERE dispatcher_runs.agent_thread_id = agent_threads.id
+             AND (
+               dispatcher_runs.task_id IS DISTINCT FROM $1
+               OR dispatcher_runs.scope IN ('thread', 'heartbeat')
+             )
+         )
+         OR EXISTS (
+           SELECT 1
+           FROM task_runs
+           WHERE task_runs.agent_thread_id = agent_threads.id
+             AND task_runs.task_id <> $1
+         )
+       )`,
+    [input.taskId, input.coordinationThreadId, input.agentId]
+  );
+}
+
 async function linkTaskRunsToThread(pool: DbPool, taskId: string, threadId: string): Promise<void> {
   await Promise.all([
     pool.query(
-      "UPDATE task_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
+      "UPDATE task_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS DISTINCT FROM $2",
       [taskId, threadId]
     ),
     pool.query(
-      "UPDATE dispatcher_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
+      "UPDATE dispatcher_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS DISTINCT FROM $2",
       [taskId, threadId]
     )
   ]);
@@ -2896,7 +2912,7 @@ async function queueDispatcherRun(
   return run;
 }
 
-async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
+export async function getTaskSessionTimeline(pool: DbPool, taskId: string, agentThreadId?: string): Promise<{
   run: TimelineRunRow | null;
   events: TimelineEventRow[];
 }> {
@@ -2926,7 +2942,9 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          LEFT JOIN projects ON projects.id = tasks.project_id
          JOIN agents ON agents.id = tasks.agent_id
          JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
-         WHERE task_runs.task_id = $1 AND task_runs.run_kind = 'worker'
+         WHERE task_runs.task_id = $1
+           AND task_runs.run_kind = 'worker'
+           AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
          UNION ALL
          SELECT dispatcher_runs.id,
                 'dispatcher'::text AS kind,
@@ -2948,9 +2966,10 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          JOIN tasks ON tasks.id = dispatcher_runs.task_id
          LEFT JOIN projects ON projects.id = tasks.project_id
          WHERE dispatcher_runs.task_id = $1
+           AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
        ) task_runs_and_dispatches
        ORDER BY queued_at ASC, created_at ASC`,
-      [taskId]
+      [taskId, agentThreadId ?? null]
     ),
     pool.query<TimelineEventRow>(
       `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
@@ -2966,7 +2985,9 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
                 task_runs.queued_at
          FROM run_events
          JOIN task_runs ON task_runs.id = run_events.run_id
-         WHERE task_runs.task_id = $1 AND task_runs.run_kind = 'worker'
+         WHERE task_runs.task_id = $1
+           AND task_runs.run_kind = 'worker'
+           AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
          UNION ALL
          SELECT dispatcher_run_events.id,
                 NULL::uuid AS run_id,
@@ -2980,6 +3001,7 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          FROM dispatcher_run_events
          JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
          WHERE dispatcher_runs.task_id = $1
+           AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
          UNION ALL
          SELECT agent_turn_inputs.id,
                 agent_turn_inputs.task_run_id AS run_id,
@@ -3000,10 +3022,16 @@ async function getTaskSessionTimeline(pool: DbPool, taskId: string): Promise<{
          FROM agent_turn_inputs
          LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
          LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-         WHERE task_runs.task_id = $1 OR dispatcher_runs.task_id = $1
+         WHERE (
+             task_runs.task_id = $1
+             AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
+           ) OR (
+             dispatcher_runs.task_id = $1
+             AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
+           )
        ) task_events
        ORDER BY queued_at ASC, created_at ASC, seq ASC`,
-      [taskId]
+      [taskId, agentThreadId ?? null]
     ),
     pool.query<TimelineEventRow>(
       `SELECT task_comments.id,
@@ -3103,7 +3131,13 @@ async function upsertTaskSession(
     `INSERT INTO task_sessions (task_id, codex_home, agent_snapshot)
      VALUES ($1, $2, $3)
      ON CONFLICT (task_id) DO UPDATE
-       SET updated_at = now()
+       SET codex_thread_id = CASE
+             WHEN task_sessions.codex_home = EXCLUDED.codex_home THEN task_sessions.codex_thread_id
+             ELSE NULL
+           END,
+           codex_home = EXCLUDED.codex_home,
+           agent_snapshot = EXCLUDED.agent_snapshot,
+           updated_at = now()
      RETURNING id, codex_thread_id`,
     [taskId, codexHome, agentSnapshot]
   );
@@ -3119,7 +3153,7 @@ export async function synchronizeTaskSessionRuntime(
   await pool.query(
     `UPDATE task_sessions
      SET codex_home = $2,
-         codex_thread_id = COALESCE($3, codex_thread_id),
+         codex_thread_id = $3,
          updated_at = now()
      WHERE id = $1`,
     [sessionId, runtimeHome, providerThreadId]

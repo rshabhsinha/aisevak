@@ -1190,10 +1190,19 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
       [linkedTaskId, session.id]
     );
-    await client.query(
-      "UPDATE agent_threads SET task_id = $2, project_id = $3, updated_at = now() WHERE id = $1",
-      [session.id, linkedTaskId, thread.project_id]
+    const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
+    const updated = await client.query<AgentThreadSession>(
+      `UPDATE agent_threads
+       SET task_id = $2,
+           project_id = $3,
+           runtime_home = $4,
+           provider_thread_id = CASE WHEN runtime_home = $4 THEN provider_thread_id ELSE NULL END,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, runtime_home, provider_thread_id, cwd`,
+      [session.id, linkedTaskId, thread.project_id, runtimeHome]
     );
+    session = updated.rows[0];
   }
   if (!session && linkedTaskId) {
     session = await transferTaskAgentThread(client, {
@@ -1201,14 +1210,18 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       taskId: linkedTaskId,
       recipientAgentId,
       model: recipient.model,
-      modelOptions: recipient.model_options ?? []
+      modelOptions: recipient.model_options ?? [],
+      runtimeHome: managedCodexHome(managedRoot, linkedTaskId)
     });
   }
   if (!session) {
     const project = thread.project_id
       ? await client.query<{ local_path: string }>("SELECT local_path FROM projects WHERE id = $1", [thread.project_id])
       : null;
-    const runtimeHome = managedCodexHome(managedRoot, `thread-${threadId}-${recipientAgentId}`);
+    const runtimeHome = managedCodexHome(
+      managedRoot,
+      linkedTaskId ?? `thread-${threadId}-${recipientAgentId}`
+    );
     const created = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
@@ -1245,6 +1258,7 @@ export async function transferTaskAgentThread(
     recipientAgentId: string;
     model: string;
     modelOptions: unknown;
+    runtimeHome: string;
   }
 ): Promise<AgentThreadSession | undefined> {
   const result = await queryable.query<AgentThreadSession>(
@@ -1253,7 +1267,11 @@ export async function transferTaskAgentThread(
          agent_id = $3,
          model = $4,
          model_options = $5,
-         provider_thread_id = CASE WHEN agent_id = $3 THEN provider_thread_id ELSE NULL END,
+         runtime_home = $6,
+         provider_thread_id = CASE
+           WHEN agent_id = $3 AND runtime_home = $6 THEN provider_thread_id
+           ELSE NULL
+         END,
          last_activity_at = now(),
          updated_at = now()
      WHERE task_id = $2
@@ -1263,7 +1281,8 @@ export async function transferTaskAgentThread(
       input.taskId,
       input.recipientAgentId,
       input.model,
-      JSON.stringify(input.modelOptions)
+      JSON.stringify(input.modelOptions),
+      input.runtimeHome
     ]
   );
   return result.rows[0];
