@@ -92,6 +92,22 @@ describe("persistent Codex app-server", () => {
     expect(second.status).toBe("completed");
     expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
   });
+
+  it("starts a replacement thread when the saved rollout is missing", async () => {
+    const fixture = await fakeAppServerFixture();
+    const seenThreadIds: string[] = [];
+    const options = turnOptions(fixture, "recover-missing-rollout", "missing-thread");
+    options.onThreadId = async (threadId) => {
+      seenThreadIds.push(threadId);
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("completed");
+    expect(result.threadId).toBe("thread-1");
+    expect(seenThreadIds.length).toBeGreaterThan(0);
+    expect(new Set(seenThreadIds)).toEqual(new Set(["thread-1"]));
+  });
 });
 
 interface FakeFixture {
@@ -117,6 +133,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialized") return;
   if (message.method === "initialize") return send({ id: message.id, result: {} });
+  if (message.method === "thread/resume" && message.params.threadId === "missing-thread") {
+    return send({ id: message.id, error: { code: -32602, message: "no rollout found for thread id missing-thread" } });
+  }
   if (message.method === "thread/start" || message.method === "thread/resume") {
     return send({ id: message.id, result: { thread: { id: message.params.threadId || "thread-1" } } });
   }

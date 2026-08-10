@@ -531,9 +531,9 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   );
   if (Number(actionable.rows[0]?.count ?? 0) === 0) return;
 
-  const dispatcher = await getDispatcherAgent(pool);
-  const context = await getDispatcherContext(pool);
   const codexHome = managedCodexHome(env.managedRoot, "dispatcher-heartbeat");
+  const dispatcher = await getDispatcherAgent(pool, codexHome);
+  const context = await getDispatcherContext(pool);
   await mkdir(codexHome, { recursive: true });
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
@@ -1352,7 +1352,7 @@ async function failPendingAgentTurnInputs(
   );
 }
 
-async function getDispatcherAgent(pool: DbPool): Promise<{
+export async function getDispatcherAgent(pool: DbPool, codexHome: string): Promise<{
   id: string;
   model: string;
   instructions: string;
@@ -1367,13 +1367,17 @@ async function getDispatcherAgent(pool: DbPool): Promise<{
      LEFT JOIN LATERAL (
        SELECT codex_thread_id
        FROM dispatcher_runs
-       WHERE codex_thread_id IS NOT NULL
+       WHERE scope = 'heartbeat'
+         AND status = 'succeeded'
+         AND codex_home = $1
+         AND codex_thread_id IS NOT NULL
        ORDER BY created_at DESC
        LIMIT 1
      ) latest ON true
      WHERE agents.kind = 'dispatcher' AND agents.enabled = true
      ORDER BY agents.created_at ASC
-     LIMIT 1`
+     LIMIT 1`,
+    [codexHome]
   );
   const row = mustRow(result.rows[0]);
   return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
