@@ -35,6 +35,7 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
+import { AgentAvatar } from "./components/agent-avatar";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
@@ -69,6 +70,8 @@ import {
 import { mergeRefreshedAgentThreads } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
+import { createTaskAndQueueRun } from "./taskCreation";
+import { createThreadLoadGuard } from "./threadLoadGuard";
 
 type View =
   | "tasks"
@@ -171,6 +174,7 @@ interface AgentThread {
   agent_id: string;
   agent_name: string;
   agent_kind: "worker" | "dispatcher";
+  display_agent_identity: boolean;
   task_id: string | null;
   task_number: number | null;
   project_id: string | null;
@@ -348,6 +352,7 @@ export function App() {
   const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const threadLoadGuardRef = useRef(createThreadLoadGuard());
 
   const filteredTasks = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -573,20 +578,33 @@ export function App() {
   }
 
   async function loadAgentThread(threadId: string) {
+    const isCurrentRequest = threadLoadGuardRef.current.begin(threadId);
     const data = await api<{
       thread: AgentThread;
       run?: AgentRunTimelineRun | null;
       events: RunEvent[];
     }>(`/api/agent-threads/${threadId}`);
-    setAgentThreads((current) =>
-      current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
-    );
+    if (!isCurrentRequest()) return;
+    setAgentThreads((current) => [
+      data.thread,
+      ...current.filter((thread) => thread.id !== data.thread.id)
+    ]);
     setSelectedThreadRun(data.run ?? null);
     setAgentThreadEvents(data.events);
   }
 
+  function selectAgentThread(threadId: string) {
+    threadLoadGuardRef.current.select(threadId);
+    setSelectedThreadId(threadId);
+    setDraftThread(false);
+    setSelectedThreadRun(null);
+    setAgentThreadEvents([]);
+    setPendingThreadMessages([]);
+  }
+
   function createAgentThread() {
     const provider = providerInstances[0];
+    threadLoadGuardRef.current.select(null);
     setSelectedThreadId(null);
     setDraftThread(true);
     setSelectedThreadRun(null);
@@ -613,9 +631,7 @@ export function App() {
         method: "POST"
       })).thread;
       setAgentThreads((current) => [thread, ...current.filter((entry) => entry.id !== thread.id)]);
-      setDraftThread(false);
-      setSelectedThreadId(thread.id);
-      setPendingThreadMessages([]);
+      selectAgentThread(thread.id);
       setQuery("");
       setView("runs");
       setMessage(null);
@@ -636,8 +652,7 @@ export function App() {
           body: payload
         });
         setAgentThreads((current) => [data.thread, ...current.filter((thread) => thread.id !== data.thread.id)]);
-        setSelectedThreadId(data.thread.id);
-        setDraftThread(false);
+        selectAgentThread(data.thread.id);
         setMessage(null);
         writeStickyModelSelection(selection);
         await loadAgentThread(data.thread.id);
@@ -756,8 +771,7 @@ export function App() {
           onNewThread={createAgentThread}
           onLoadMore={() => void loadOlderAgentThreads()}
           onSelectThread={(threadId) => {
-            setDraftThread(false);
-            setSelectedThreadId(threadId);
+            selectAgentThread(threadId);
           }}
         />
       ) : null}
@@ -787,11 +801,13 @@ export function App() {
               agents={agents}
               projects={projects}
               onCreate={async (payload) => {
-                await api<{ task: Task }>("/api/tasks", {
-                  method: "POST",
-                  body: JSON.stringify(payload)
-                });
-                await reloadTasks();
+                const result = await createTaskAndQueueRun<Task>(api, payload);
+                await Promise.all([reloadTasks(), reloadAgentThreads()]);
+                if (result.enqueueError) {
+                  setMessage(`Task created, but it could not be started: ${friendlyError(result.enqueueError.message)}`);
+                } else {
+                  setMessage(null);
+                }
               }}
               onSelect={(task) => void openTaskThread(task)}
             />
@@ -839,20 +855,10 @@ export function App() {
               tasks={tasks}
               onSaved={reloadSchedules}
               onOpenThread={async (threadId) => {
-                const data = await api<{ thread: AgentThread; run?: AgentRunTimelineRun | null; events: RunEvent[] }>(
-                  `/api/agent-threads/${threadId}`
-                );
-                setAgentThreads((current) => [
-                  data.thread,
-                  ...current.filter((thread) => thread.id !== data.thread.id)
-                ]);
-                setSelectedThreadId(data.thread.id);
-                setSelectedThreadRun(data.run ?? null);
-                setAgentThreadEvents(data.events);
-                setPendingThreadMessages([]);
-                setDraftThread(false);
+                selectAgentThread(threadId);
                 setQuery("");
                 setView("runs");
+                await loadAgentThread(threadId);
               }}
             />
           ) : null}
@@ -1180,7 +1186,11 @@ function SchedulesView(props: {
             return (
               <article className="schedule-card" key={schedule.id}>
                 <div className="schedule-card-top">
-                  <span className="schedule-agent-avatar">{schedule.agent_name.slice(0, 1).toUpperCase()}</span>
+                  <AgentAvatar
+                    agentId={schedule.agent_id}
+                    agentName={schedule.agent_name}
+                    className="schedule-agent-avatar"
+                  />
                   <div className="schedule-card-title">
                     <strong>{schedule.title}</strong>
                     <span>{schedule.agent_name} · {formatScheduleCadence(schedule)}</span>
@@ -1319,13 +1329,23 @@ function AgentThreadSidebar(props: {
               key={thread.id}
               onClick={() => props.onSelectThread(thread.id)}
             >
-              <span className={`thread-item-icon status-${runBucket(thread.latest_status ?? "succeeded")}`}>
-                <OpenAILogo size={13} />
-              </span>
+              {thread.display_agent_identity ? (
+                <AgentAvatar
+                  agentId={thread.agent_id}
+                  agentName={thread.agent_name}
+                  className={`thread-agent-avatar status-${runBucket(thread.latest_status ?? "succeeded")}`}
+                />
+              ) : (
+                <span className={`thread-item-icon status-${runBucket(thread.latest_status ?? "succeeded")}`}>
+                  <OpenAILogo size={13} />
+                </span>
+              )}
               <span className="sidebar-run-copy">
                 <span className="sidebar-run-title">{thread.title}</span>
                 <span className="sidebar-run-meta">
-                  {formatSidebarRunTime(thread.last_activity_at)} · {thread.model}
+                  {thread.display_agent_identity
+                    ? `${thread.agent_name} · ${formatSidebarRunTime(thread.last_activity_at)}`
+                    : `${formatSidebarRunTime(thread.last_activity_at)} · ${thread.model}`}
                 </span>
               </span>
               {isActiveRun(thread.latest_status) ? <Loader2 className="spin thread-running" size={12} /> : null}
@@ -1411,7 +1431,15 @@ function AgentChatsView(props: {
     <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
       <header className="agent-chat-header">
         <div className="agent-chat-heading">
-          <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
+          {props.thread?.display_agent_identity ? (
+            <AgentAvatar
+              agentId={props.thread.agent_id}
+              agentName={props.thread.agent_name}
+              className="agent-chat-avatar"
+            />
+          ) : (
+            <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
+          )}
           <div className="agent-chat-title-group">
             <div className="agent-chat-breadcrumb">{projectName} <span>/</span> {agentName}</div>
             <h1>{title}</h1>
@@ -1711,9 +1739,11 @@ function AgentsView(props: {
               key={agent.id}
               onClick={() => setEditing(agent)}
             >
-              <div className="list-item-icon">
-                <Bot size={15} />
-              </div>
+              <AgentAvatar
+                agentId={agent.id}
+                agentName={agent.name}
+                className="list-item-icon agent-list-avatar"
+              />
               <div className="list-item-main">
                 <span className="list-item-title">{agent.name}</span>
                 <span className="list-item-desc">{agentSummary(agent, props.models)}</span>
@@ -1797,6 +1827,17 @@ function AgentEditor(props: {
         }
       }}
     >
+      <div className="agent-editor-identity">
+        <AgentAvatar
+          agentId={draft.id}
+          agentName={draft.name}
+          className="agent-editor-avatar"
+        />
+        <div>
+          <h2>{draft.name || "New Agent"}</h2>
+          <p>This unique profile picture follows the agent across automatic threads and schedules.</p>
+        </div>
+      </div>
       <div className="agent-settings-grid">
         <label>
           Name

@@ -1,0 +1,33 @@
+import { describeAgentAvatar } from "../agentAvatar";
+import { cn } from "../lib/utils";
+
+export function AgentAvatar(props: {
+  agentId: string;
+  agentName: string;
+  className?: string;
+}) {
+  const avatar = describeAgentAvatar(props.agentId);
+
+  return (
+    <svg
+      aria-label={`${props.agentName} profile picture`}
+      className={cn("agent-avatar", props.className)}
+      data-agent-avatar={props.agentId}
+      role="img"
+      shapeRendering="crispEdges"
+      viewBox={`0 0 ${avatar.size} ${avatar.size}`}
+    >
+      <rect width={avatar.size} height={avatar.size} fill={avatar.background} />
+      {avatar.cells.map((cell) => (
+        <rect
+          fill={avatar.color}
+          height="1"
+          key={`${cell.x}-${cell.y}`}
+          width="1"
+          x={cell.x}
+          y={cell.y}
+        />
+      ))}
+    </svg>
+  );
+}

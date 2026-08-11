@@ -188,14 +188,20 @@ class PersistentAppServer {
       };
       if (state.threadId) {
         if (!this.loadedThreads.has(state.threadId)) {
-          const response = await this.request("thread/resume", {
-            ...threadParams,
-            threadId: state.threadId,
-            excludeTurns: true
-          });
-          state.threadId = extractThreadId({ result: response }) ?? state.threadId;
+          try {
+            const response = await this.request("thread/resume", {
+              ...threadParams,
+              threadId: state.threadId,
+              excludeTurns: true
+            });
+            state.threadId = extractThreadId({ result: response }) ?? state.threadId;
+          } catch (error) {
+            if (!isMissingRolloutError(error)) throw error;
+            state.threadId = null;
+          }
         }
-      } else {
+      }
+      if (!state.threadId) {
         const response = await this.request("thread/start", {
           ...threadParams,
           experimentalRawEvents: false
@@ -542,6 +548,11 @@ function explicitModel(model: string | null | undefined): string | null {
   return model && !["default", "auto", "codex-default"].includes(model.trim().toLowerCase())
     ? model
     : null;
+}
+
+function isMissingRolloutError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /no rollout found for thread id/i.test(message);
 }
 
 function stringModelOption(

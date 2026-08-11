@@ -1069,6 +1069,35 @@ select:disabled {
   box-shadow: 0 0 0 3px var(--ring);
 }
 
+.agent-avatar {
+  display: block;
+  flex: 0 0 auto;
+  overflow: hidden;
+}
+
+.thread-agent-avatar {
+  width: 27px;
+  height: 27px;
+  border: 2px solid var(--border);
+  border-radius: 8px;
+}
+
+.thread-agent-avatar.status-running,
+.thread-agent-avatar.status-queued,
+.thread-agent-avatar.status-claimed {
+  border-color: color-mix(in srgb, var(--warning) 68%, var(--border));
+}
+
+.thread-agent-avatar.status-succeeded,
+.thread-agent-avatar.status-completed {
+  border-color: color-mix(in srgb, var(--success) 58%, var(--border));
+}
+
+.thread-agent-avatar.status-failed,
+.thread-agent-avatar.status-canceled {
+  border-color: color-mix(in srgb, var(--destructive) 64%, var(--border));
+}
+
 .thread-item-icon {
   width: 27px;
   height: 27px;
@@ -1294,6 +1323,12 @@ select:disabled {
   width: 32px;
   height: 32px;
   border-radius: 9px;
+}
+
+.agent-chat-avatar.agent-avatar {
+  background: none;
+  color: inherit;
+  overflow: hidden;
 }
 
 .agent-chat-title-group {
@@ -2290,6 +2325,18 @@ select:disabled {
   background: var(--accent);
 }
 
+.list-item-icon.agent-list-avatar {
+  border: 1px solid var(--border);
+  background: none;
+  color: inherit;
+  overflow: hidden;
+}
+
+.list-item.selected .agent-list-avatar {
+  background: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 18%, transparent);
+}
+
 .list-item-main {
   min-width: 0;
   display: grid;
@@ -2552,6 +2599,40 @@ select:disabled {
   display: grid;
   grid-template-columns: minmax(180px, 1.15fr) minmax(180px, 1fr) minmax(140px, 0.72fr);
   gap: 14px;
+}
+
+.agent-editor-identity {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 58px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 14px;
+}
+
+.agent-editor-avatar {
+  width: 44px;
+  height: 44px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow-xs);
+}
+
+.agent-editor-identity h2,
+.agent-editor-identity p {
+  margin: 0;
+}
+
+.agent-editor-identity h2 {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+}
+
+.agent-editor-identity p {
+  margin-top: 3px;
+  color: var(--muted-foreground);
+  font-size: 9px;
 }
 
 .agent-setting-select {
@@ -2877,6 +2958,12 @@ label {
   color: var(--accent-foreground);
   font-size: 10px;
   font-weight: 700;
+  overflow: hidden;
+}
+
+.schedule-agent-avatar.agent-avatar {
+  background: none;
+  color: inherit;
 }
 
 .schedule-card-title {

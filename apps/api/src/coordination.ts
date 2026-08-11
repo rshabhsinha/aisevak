@@ -59,6 +59,13 @@ export interface AgentContext {
 
 type Queryable = DbPool | PoolClient;
 
+interface AgentThreadSession {
+  id: string;
+  runtime_home: string;
+  provider_thread_id: string | null;
+  cwd: string;
+}
+
 const pageSchema = z.object({
   cursor: z.string().optional(),
   limit: z.coerce.number().optional(),
@@ -1174,22 +1181,47 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     ? await client.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [thread.task_id])
     : null;
   const linkedTaskId = linkedTask?.rows[0]?.agent_id === recipientAgentId ? thread.task_id : null;
-  const existing = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
+  const existing = await client.query<AgentThreadSession>(
     `SELECT id, runtime_home, provider_thread_id, cwd FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
-  if (!session && thread.task_id) {
-    const taskSession = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
-      `UPDATE agent_threads SET coordination_thread_id = $1, updated_at = now()
-       WHERE task_id = $2 AND agent_id = $3 AND coordination_thread_id IS NULL
-       RETURNING id, runtime_home, provider_thread_id, cwd`, [threadId, thread.task_id, recipientAgentId]);
-    session = taskSession.rows[0];
+  if (session && linkedTaskId) {
+    await client.query(
+      "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
+      [linkedTaskId, session.id]
+    );
+    const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
+    const updated = await client.query<AgentThreadSession>(
+      `UPDATE agent_threads
+       SET task_id = $2,
+           project_id = $3,
+           runtime_home = $4,
+           provider_thread_id = CASE WHEN runtime_home = $4 THEN provider_thread_id ELSE NULL END,
+           updated_at = now()
+       WHERE id = $1
+       RETURNING id, runtime_home, provider_thread_id, cwd`,
+      [session.id, linkedTaskId, thread.project_id, runtimeHome]
+    );
+    session = updated.rows[0];
+  }
+  if (!session && linkedTaskId) {
+    session = await transferTaskAgentThread(client, {
+      threadId,
+      taskId: linkedTaskId,
+      recipientAgentId,
+      model: recipient.model,
+      modelOptions: recipient.model_options ?? [],
+      runtimeHome: managedCodexHome(managedRoot, linkedTaskId)
+    });
   }
   if (!session) {
     const project = thread.project_id
       ? await client.query<{ local_path: string }>("SELECT local_path FROM projects WHERE id = $1", [thread.project_id])
       : null;
-    const runtimeHome = managedCodexHome(managedRoot, `thread-${threadId}-${recipientAgentId}`);
+    const runtimeHome = managedCodexHome(
+      managedRoot,
+      linkedTaskId ?? `thread-${threadId}-${recipientAgentId}`
+    );
     const created = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
@@ -1216,6 +1248,44 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     [thread.task_id, session!.id, delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
   );
+}
+
+export async function transferTaskAgentThread(
+  queryable: Queryable,
+  input: {
+    threadId: string;
+    taskId: string;
+    recipientAgentId: string;
+    model: string;
+    modelOptions: unknown;
+    runtimeHome: string;
+  }
+): Promise<AgentThreadSession | undefined> {
+  const result = await queryable.query<AgentThreadSession>(
+    `UPDATE agent_threads
+     SET coordination_thread_id = $1,
+         agent_id = $3,
+         model = $4,
+         model_options = $5,
+         runtime_home = $6,
+         provider_thread_id = CASE
+           WHEN agent_id = $3 AND runtime_home = $6 THEN provider_thread_id
+           ELSE NULL
+         END,
+         last_activity_at = now(),
+         updated_at = now()
+     WHERE task_id = $2
+     RETURNING id, runtime_home, provider_thread_id, cwd`,
+    [
+      input.threadId,
+      input.taskId,
+      input.recipientAgentId,
+      input.model,
+      JSON.stringify(input.modelOptions),
+      input.runtimeHome
+    ]
+  );
+  return result.rows[0];
 }
 
 export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[]): string {
