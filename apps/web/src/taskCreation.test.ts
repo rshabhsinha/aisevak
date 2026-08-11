@@ -8,9 +8,12 @@ describe("task creation", () => {
       return { run: { id: "run-id" } };
     }) as unknown as TaskApiRequest;
 
-    const task = await createTaskAndQueueRun(request, { title: "Route me" });
+    const result = await createTaskAndQueueRun(request, { title: "Route me" });
 
-    expect(task).toEqual({ id: "task-id", title: "Route me" });
+    expect(result).toEqual({
+      task: { id: "task-id", title: "Route me" },
+      enqueueError: null
+    });
     expect(request).toHaveBeenNthCalledWith(1, "/api/tasks", {
       method: "POST",
       body: JSON.stringify({ title: "Route me" })
@@ -25,5 +28,18 @@ describe("task creation", () => {
 
     await expect(createTaskAndQueueRun(request, { title: "Route me" })).rejects.toThrow("create failed");
     expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns the committed task when run enqueueing fails", async () => {
+    const request = vi.fn(async (path: string) => {
+      if (path === "/api/tasks") return { task: { id: "task-id", title: "Keep me" } };
+      throw new Error("A project is required to start this task");
+    }) as unknown as TaskApiRequest;
+
+    const result = await createTaskAndQueueRun(request, { title: "Keep me" });
+
+    expect(result.task).toEqual({ id: "task-id", title: "Keep me" });
+    expect(result.enqueueError).toEqual(new Error("A project is required to start this task"));
+    expect(request).toHaveBeenCalledTimes(2);
   });
 });

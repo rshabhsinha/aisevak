@@ -801,8 +801,13 @@ export function App() {
               agents={agents}
               projects={projects}
               onCreate={async (payload) => {
-                await createTaskAndQueueRun<Task>(api, payload);
+                const result = await createTaskAndQueueRun<Task>(api, payload);
                 await Promise.all([reloadTasks(), reloadAgentThreads()]);
+                if (result.enqueueError) {
+                  setMessage(`Task created, but it could not be started: ${friendlyError(result.enqueueError.message)}`);
+                } else {
+                  setMessage(null);
+                }
               }}
               onSelect={(task) => void openTaskThread(task)}
             />
