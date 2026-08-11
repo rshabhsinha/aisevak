@@ -699,6 +699,76 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return { deleted: true };
   });
 
+  app.get("/api/reports", async (request) => {
+    requireUser(request);
+    const result = await pool.query(
+      `SELECT reports.id, reports.number, reports.title, reports.description, reports.status,
+              reports.project_id, projects.name AS project_name,
+              reports.thread_id, coordination_threads.number AS thread_number,
+              author_thread.id AS agent_thread_id,
+              reports.author_agent_id, agents.name AS author_agent_name,
+              reports.current_revision, report_versions.markdown,
+              reports.created_at, reports.updated_at
+       FROM reports
+       JOIN report_versions
+         ON report_versions.report_id = reports.id
+        AND report_versions.revision = reports.current_revision
+       LEFT JOIN agents ON agents.id = reports.author_agent_id
+       LEFT JOIN projects ON projects.id = reports.project_id
+       LEFT JOIN coordination_threads ON coordination_threads.id = reports.thread_id
+       LEFT JOIN LATERAL (
+         SELECT agent_threads.id
+         FROM agent_threads
+         WHERE agent_threads.coordination_thread_id = reports.thread_id
+           AND agent_threads.agent_id = reports.author_agent_id
+         ORDER BY agent_threads.last_activity_at DESC, agent_threads.id DESC
+         LIMIT 1
+       ) author_thread ON true
+       ORDER BY reports.updated_at DESC, reports.id DESC
+       LIMIT 200`
+    );
+    return { reports: result.rows };
+  });
+
+  app.get("/api/incidents", async (request) => {
+    requireUser(request);
+    const result = await pool.query(
+      `SELECT incidents.id, incidents.number, incidents.title, incidents.description,
+              incidents.status, incidents.severity,
+              incidents.project_id, projects.name AS project_name,
+              incidents.thread_id, coordination_threads.number AS thread_number,
+              reporter_thread.id AS agent_thread_id,
+              incidents.commander_agent_id, commander.name AS commander_agent_name,
+              incidents.created_by_agent_id, creator.name AS created_by_agent_name,
+              latest.markdown, latest.created_at AS latest_update_at,
+              incidents.resolved_at, incidents.created_at, incidents.updated_at
+       FROM incidents
+       LEFT JOIN agents commander ON commander.id = incidents.commander_agent_id
+       LEFT JOIN agents creator ON creator.id = incidents.created_by_agent_id
+       LEFT JOIN projects ON projects.id = incidents.project_id
+       LEFT JOIN coordination_threads ON coordination_threads.id = incidents.thread_id
+       LEFT JOIN LATERAL (
+         SELECT agent_threads.id
+         FROM agent_threads
+         WHERE agent_threads.coordination_thread_id = incidents.thread_id
+           AND agent_threads.agent_id IN (incidents.created_by_agent_id, incidents.commander_agent_id)
+         ORDER BY (agent_threads.agent_id = incidents.created_by_agent_id) DESC,
+                  agent_threads.last_activity_at DESC, agent_threads.id DESC
+         LIMIT 1
+       ) reporter_thread ON true
+       LEFT JOIN LATERAL (
+         SELECT incident_updates.markdown, incident_updates.created_at
+         FROM incident_updates
+         WHERE incident_updates.incident_id = incidents.id
+         ORDER BY incident_updates.created_at DESC, incident_updates.id DESC
+         LIMIT 1
+       ) latest ON true
+       ORDER BY incidents.updated_at DESC, incidents.id DESC
+       LIMIT 200`
+    );
+    return { incidents: result.rows };
+  });
+
   app.get("/api/tasks", async (request) => {
     requireUser(request);
     const result = await pool.query(

@@ -67,23 +67,12 @@ import {
   type AgentRunTimelineRow,
   type AgentRunWorkLogEntry
 } from "./agentRunTimeline";
-import { mergeRefreshedAgentThreads } from "./agentThreads";
+import { mergeRefreshedAgentThreads, updateAgentThreadInPlace } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
+import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
 import { createTaskAndQueueRun } from "./taskCreation";
 import { createThreadLoadGuard } from "./threadLoadGuard";
-
-type View =
-  | "tasks"
-  | "agents"
-  | "projects"
-  | "connectors"
-  | "runs"
-  | "skills"
-  | "schedules"
-  | "api"
-  | "credentials"
-  | "codex";
 
 interface User {
   id: string;
@@ -213,6 +202,48 @@ interface Task {
   created_at?: string;
 }
 
+interface ActivityReport {
+  id: string;
+  number: number;
+  title: string;
+  description: string;
+  status: string;
+  project_id: string | null;
+  project_name: string | null;
+  thread_id: string | null;
+  thread_number: number | null;
+  agent_thread_id: string | null;
+  author_agent_id: string | null;
+  author_agent_name: string | null;
+  current_revision: number;
+  markdown: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Incident {
+  id: string;
+  number: number;
+  title: string;
+  description: string;
+  status: string;
+  severity: "low" | "medium" | "high" | "critical";
+  project_id: string | null;
+  project_name: string | null;
+  thread_id: string | null;
+  thread_number: number | null;
+  agent_thread_id: string | null;
+  commander_agent_id: string | null;
+  commander_agent_name: string | null;
+  created_by_agent_id: string | null;
+  created_by_agent_name: string | null;
+  markdown: string | null;
+  latest_update_at: string | null;
+  resolved_at: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 interface Schedule {
   id: string;
   title: string;
@@ -322,9 +353,10 @@ const BOARD_COLUMNS = [
 ] as const;
 
 export function App() {
+  const initialRoute = useMemo(() => parseAppRoute(window.location.pathname), []);
   const [user, setUser] = useState<User | null>(null);
   const [hasAdmin, setHasAdmin] = useState<boolean | null>(null);
-  const [view, setView] = useState<View>("runs");
+  const [view, setView] = useState<View>(initialRoute.view);
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [skills, setSkills] = useState<Skill[]>([]);
@@ -336,14 +368,16 @@ export function App() {
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
+  const [activityReports, setActivityReports] = useState<ActivityReport[]>([]);
+  const [incidents, setIncidents] = useState<Incident[]>([]);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [githubConnection, setGithubConnection] = useState<GithubConnection | null>(null);
   const [githubHostname, setGithubHostname] = useState("github.com");
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
-  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(null);
-  const [draftThread, setDraftThread] = useState(true);
+  const [selectedThreadId, setSelectedThreadId] = useState<string | null>(initialRoute.threadId);
+  const [draftThread, setDraftThread] = useState(!initialRoute.threadId);
   const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
   const [agentThreadEvents, setAgentThreadEvents] = useState<RunEvent[]>([]);
   const [composerSelection, setComposerSelection] = useState<ModelSelection | null>(null);
@@ -407,9 +441,62 @@ export function App() {
     );
   }, [query, schedules]);
 
+  const filteredActivityReports = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return activityReports;
+    return activityReports.filter((report) =>
+      [
+        report.title,
+        report.description,
+        report.markdown,
+        report.author_agent_name ?? "",
+        report.project_name ?? "",
+        `REPORT-${report.number}`
+      ].join(" ").toLowerCase().includes(needle)
+    );
+  }, [activityReports, query]);
+
+  const filteredIncidents = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return incidents;
+    return incidents.filter((incident) =>
+      [
+        incident.title,
+        incident.description,
+        incident.markdown ?? "",
+        incident.created_by_agent_name ?? "",
+        incident.commander_agent_name ?? "",
+        incident.project_name ?? "",
+        incident.severity,
+        `INC-${incident.number}`
+      ].join(" ").toLowerCase().includes(needle)
+    );
+  }, [incidents, query]);
+
   useEffect(() => {
     void boot();
   }, []);
+
+  useEffect(() => {
+    if (window.location.pathname !== initialRoute.path) {
+      window.history.replaceState(null, "", initialRoute.path);
+    }
+    const handlePopState = () => {
+      const route = parseAppRoute(window.location.pathname);
+      setView(route.view);
+      setQuery("");
+      setMessage(null);
+      if (route.view !== "runs") return;
+      threadLoadGuardRef.current.select(route.threadId);
+      setSelectedThreadId(route.threadId);
+      setDraftThread(!route.threadId);
+      setSelectedThreadRun(null);
+      setAgentThreadEvents([]);
+      setPendingThreadMessages([]);
+    };
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [initialRoute.path]);
 
   useEffect(() => {
     const handleSearchShortcut = (event: KeyboardEvent) => {
@@ -443,6 +530,7 @@ export function App() {
   }, [user?.id, githubConnection?.status, repos.map((repo) => repo.import_status).join(",")]);
 
   useEffect(() => {
+    if (!user) return;
     if (!selectedThreadId) {
       setSelectedThreadRun(null);
       setAgentThreadEvents([]);
@@ -455,7 +543,7 @@ export function App() {
       void reloadAgentThreads();
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [selectedThreadId, selectedThread?.latest_status]);
+  }, [user?.id, selectedThreadId, selectedThread?.latest_status]);
 
   useEffect(() => {
     if (selectedThread) {
@@ -488,6 +576,8 @@ export function App() {
       reloadApiKeys(),
       reloadCredentials(),
       reloadTasks(),
+      reloadActivityReports(),
+      reloadIncidents(),
       reloadSchedules(),
       reloadProviderInstances(),
       reloadAgentThreads(),
@@ -541,6 +631,16 @@ export function App() {
     setTasks(data.tasks);
   }
 
+  async function reloadActivityReports() {
+    const data = await api<{ reports: ActivityReport[] }>("/api/reports");
+    setActivityReports(data.reports);
+  }
+
+  async function reloadIncidents() {
+    const data = await api<{ incidents: Incident[] }>("/api/incidents");
+    setIncidents(data.incidents);
+  }
+
   async function reloadSchedules() {
     const data = await api<{ schedules: Schedule[] }>("/api/schedules");
     setSchedules(data.schedules);
@@ -585,10 +685,7 @@ export function App() {
       events: RunEvent[];
     }>(`/api/agent-threads/${threadId}`);
     if (!isCurrentRequest()) return;
-    setAgentThreads((current) => [
-      data.thread,
-      ...current.filter((thread) => thread.id !== data.thread.id)
-    ]);
+    setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
     setSelectedThreadRun(data.run ?? null);
     setAgentThreadEvents(data.events);
   }
@@ -600,6 +697,14 @@ export function App() {
     setSelectedThreadRun(null);
     setAgentThreadEvents([]);
     setPendingThreadMessages([]);
+    navigateToView("runs", threadId);
+  }
+
+  function navigateToView(nextView: View, threadId: string | null = null) {
+    const path = appPath(nextView, nextView === "runs" ? threadId : null);
+    if (window.location.pathname !== path) window.history.pushState(null, "", path);
+    setView(nextView);
+    setQuery("");
   }
 
   function createAgentThread() {
@@ -611,7 +716,7 @@ export function App() {
     setAgentThreadEvents([]);
     setPendingThreadMessages([]);
     setComposerSelection(provider ? readStickyModelSelection(provider) : null);
-    setView("runs");
+    navigateToView("runs");
     setMessage(null);
   }
 
@@ -632,8 +737,6 @@ export function App() {
       })).thread;
       setAgentThreads((current) => [thread, ...current.filter((entry) => entry.id !== thread.id)]);
       selectAgentThread(thread.id);
-      setQuery("");
-      setView("runs");
       setMessage(null);
       await loadAgentThread(thread.id);
     } catch (error) {
@@ -718,22 +821,24 @@ export function App() {
 
         <nav className="sidebar-nav">
           <span className="nav-label">Workspace</span>
-          <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => setView("tasks")} />
-          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => setView("agents")} />
-          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => setView("skills")} />
-          <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => setView("schedules")} />
+          <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => navigateToView("tasks")} />
+          <NavButton icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => navigateToView("activity")} />
+          <NavButton icon={<CircleAlert />} label="Incidents" active={view === "incidents"} onClick={() => navigateToView("incidents")} />
+          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => navigateToView("agents")} />
+          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => navigateToView("skills")} />
+          <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
           <span className="nav-label nav-label-spaced">Manage</span>
           {user.role !== "member" ? (
-            <NavButton icon={<OpenAILogo />} label="ChatGPT" active={view === "codex"} onClick={() => setView("codex")} />
+            <NavButton icon={<OpenAILogo />} label="ChatGPT" active={view === "codex"} onClick={() => navigateToView("codex")} />
           ) : null}
-          <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => setView("api")} />
+          <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => navigateToView("api")} />
           {user.role !== "member" ? (
-            <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => setView("credentials")} />
+            <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => navigateToView("credentials")} />
           ) : null}
-          <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => setView("projects")} />
-          <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => setView("connectors")} />
+          <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => navigateToView("projects")} />
+          <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => navigateToView("connectors")} />
           <span className="nav-label nav-label-spaced">Agents</span>
-          <NavButton icon={<Activity />} label="Threads" active={view === "runs"} onClick={() => setView("runs")} />
+          <NavButton icon={<Terminal />} label="Threads" active={view === "runs"} onClick={() => navigateToView("runs", draftThread ? null : selectedThreadId)} />
         </nav>
 
         <div className="sidebar-footer">
@@ -813,6 +918,20 @@ export function App() {
             />
           ) : null}
 
+          {view === "activity" ? (
+            <ActivityView
+              reports={filteredActivityReports}
+              onOpenThread={selectAgentThread}
+            />
+          ) : null}
+
+          {view === "incidents" ? (
+            <IncidentsView
+              incidents={filteredIncidents}
+              onOpenThread={selectAgentThread}
+            />
+          ) : null}
+
           {view === "runs" ? (
             <AgentChatsView
               thread={selectedThread}
@@ -856,8 +975,6 @@ export function App() {
               onSaved={reloadSchedules}
               onOpenThread={async (threadId) => {
                 selectAgentThread(threadId);
-                setQuery("");
-                setView("runs");
                 await loadAgentThread(threadId);
               }}
             />
@@ -909,6 +1026,136 @@ export function App() {
     </div>
     </TooltipProvider>
   );
+}
+
+function ActivityView(props: { reports: ActivityReport[]; onOpenThread: (threadId: string) => void }) {
+  return (
+    <div className="resource-feed-view">
+      <div className="resource-feed-intro">
+        <div>
+          <span className="eyebrow">CLI reports</span>
+          <h2>Agent activity</h2>
+          <p>Durable Markdown reports created by agents, newest first.</p>
+        </div>
+        <Badge variant="secondary">{props.reports.length}</Badge>
+      </div>
+
+      <div className="resource-card-list">
+        {props.reports.map((report) => (
+          <article className="resource-card" key={report.id}>
+            <div className="resource-card-header">
+              <div className="resource-card-heading">
+                <div className="resource-card-badges">
+                  <Badge variant="outline">REPORT-{report.number}</Badge>
+                  <TaskStatus status={report.status} />
+                </div>
+                <h3>{report.title}</h3>
+                {report.description ? <p>{report.description}</p> : null}
+              </div>
+              <span className="resource-card-time">{formatDateTime(report.updated_at)}</span>
+            </div>
+
+            <div className="resource-card-meta">
+              <span>{report.author_agent_name ? `By ${report.author_agent_name}` : "Agent unavailable"}</span>
+              {report.project_name ? <span>{report.project_name}</span> : null}
+              <span>Revision {report.current_revision}</span>
+              <ResourceThreadLink
+                agentThreadId={report.agent_thread_id}
+                threadNumber={report.thread_number}
+                onOpenThread={props.onOpenThread}
+              />
+            </div>
+
+            <div className="resource-card-markdown">
+              <CollapsibleText text={report.markdown} />
+            </div>
+          </article>
+        ))}
+        {props.reports.length === 0 ? (
+          <div className="resource-feed-empty">No activity reports match this view.</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: string) => void }) {
+  return (
+    <div className="resource-feed-view">
+      <div className="resource-feed-intro">
+        <div>
+          <span className="eyebrow">CLI incidents</span>
+          <h2>Incidents</h2>
+          <p>Operational issues declared by agents with their latest Markdown update.</p>
+        </div>
+        <Badge variant="secondary">{props.incidents.length}</Badge>
+      </div>
+
+      <div className="resource-card-list">
+        {props.incidents.map((incident) => (
+          <article className={`resource-card incident severity-${incident.severity}`} key={incident.id}>
+            <div className="resource-card-header">
+              <div className="resource-card-heading">
+                <div className="resource-card-badges">
+                  <Badge variant="outline">INC-{incident.number}</Badge>
+                  <Badge variant={incidentSeverityVariant(incident.severity)}>{incident.severity}</Badge>
+                  <TaskStatus status={incident.status} />
+                </div>
+                <h3>{incident.title}</h3>
+                {incident.description ? <p>{incident.description}</p> : null}
+              </div>
+              <span className="resource-card-time">{formatDateTime(incident.updated_at)}</span>
+            </div>
+
+            <div className="resource-card-meta">
+              <span>{incident.created_by_agent_name ? `Reported by ${incident.created_by_agent_name}` : "Reporter unavailable"}</span>
+              {incident.commander_agent_name ? <span>Owner {incident.commander_agent_name}</span> : null}
+              {incident.project_name ? <span>{incident.project_name}</span> : null}
+              <ResourceThreadLink
+                agentThreadId={incident.agent_thread_id}
+                threadNumber={incident.thread_number}
+                onOpenThread={props.onOpenThread}
+              />
+            </div>
+
+            {incident.markdown ? (
+              <div className="resource-card-markdown">
+                <CollapsibleText text={incident.markdown} />
+              </div>
+            ) : null}
+          </article>
+        ))}
+        {props.incidents.length === 0 ? (
+          <div className="resource-feed-empty">No incidents match this view.</div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function ResourceThreadLink(props: {
+  agentThreadId: string | null;
+  threadNumber: number | null;
+  onOpenThread: (threadId: string) => void;
+}) {
+  const label = props.threadNumber ? `THREAD-${props.threadNumber}` : "Thread";
+  if (!props.agentThreadId) return props.threadNumber ? <span>{label}</span> : null;
+  return (
+    <button
+      type="button"
+      className="resource-thread-link"
+      onClick={() => props.onOpenThread(props.agentThreadId!)}
+    >
+      {label}
+      <ChevronRight size={11} />
+    </button>
+  );
+}
+
+function incidentSeverityVariant(severity: Incident["severity"]): "secondary" | "warning" | "destructive" {
+  if (severity === "critical" || severity === "high") return "destructive";
+  if (severity === "medium") return "warning";
+  return "secondary";
 }
 
 function TasksView(props: {
@@ -3285,7 +3532,7 @@ function taskBucket(task: Task): (typeof BOARD_COLUMNS)[number]["id"] {
 
 function runBucket(status?: string | null): (typeof BOARD_COLUMNS)[number]["id"] {
   if (["queued", "running", "cancel_requested"].includes(status ?? "")) return "running";
-  if (["succeeded", "done", "completed", "active", "enabled"].includes(status ?? "")) return "completed";
+  if (["succeeded", "done", "completed", "active", "enabled", "published", "resolved"].includes(status ?? "")) return "completed";
   if (["failed", "cancelled", "canceled", "needs_attention", "blocked", "expired", "revoked", "disabled"].includes(status ?? "")) return "failed";
   return "open";
 }
@@ -3361,6 +3608,8 @@ function viewTitle(view: View): string {
   return {
     tasks: "Tasks",
     runs: "Threads",
+    activity: "Activity",
+    incidents: "Incidents",
     agents: "Agents",
     skills: "Skills",
     schedules: "Schedule",
