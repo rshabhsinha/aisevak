@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { assertThreadCanFinalize, coordinationPrompt } from "./coordination.js";
+import { assertThreadCanFinalize, coordinationIncrementalPrompt, coordinationPrompt } from "./coordination.js";
 
 const thread = {
   number: 12,
@@ -42,6 +42,12 @@ describe("coordination delivery prompts", () => {
     expect(prompt).toContain("Do not complete or block THREAD-12");
     expect(prompt).toContain("aisevak threads send THREAD-12 --body-stdin");
     expect(prompt).not.toContain("Completion instruction:");
+  });
+
+  it("uses only the new message body after a provider session is established", () => {
+    expect(coordinationIncrementalPrompt({ body: "Follow up with the requested checks." })).toBe(
+      "Follow up with the requested checks."
+    );
   });
 });
 

@@ -933,6 +933,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
         body.markdown || "Incident resolved.",
         undefined,
         async (client) => {
+          await client.query("SELECT id FROM incidents WHERE id = $1 FOR UPDATE", [id]);
           if (body.markdown) {
             await client.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
           }
@@ -940,8 +941,13 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
         }
       );
     } else {
-      if (body.markdown) await pool.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
-      await pool.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
+      await withTransaction(pool, async (client) => {
+        await client.query("SELECT id FROM incidents WHERE id = $1 FOR UPDATE", [id]);
+        if (body.markdown) {
+          await client.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
+        }
+        await client.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
+      });
     }
     return { incident: await showIncident(pool, id) };
   });
@@ -1171,10 +1177,12 @@ async function addParticipants(client: PoolClient, threadId: string, participant
 }
 
 async function queueDelivery(client: PoolClient, managedRoot: string, threadId: string, messageId: string, recipientAgentId: string): Promise<void> {
-  const delivery = await client.query<{ id: string }>(
+  const delivery = await client.query<{ id: string; status: string }>(
     `INSERT INTO message_deliveries (message_id, recipient_agent_id) VALUES ($1, $2)
      ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET updated_at = now()
-     RETURNING id`, [messageId, recipientAgentId]);
+     RETURNING id, status`, [messageId, recipientAgentId]);
+  const deliveryRow = delivery.rows[0];
+  if (!deliveryRow || deliveryRow.status === "completed" || deliveryRow.status === "failed") return;
   const thread = await showThread(client, threadId, true);
   const recipient = await getAgent(client, recipientAgentId);
   const linkedTask = thread.task_id
@@ -1231,15 +1239,22 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     );
     session = created.rows[0]!;
   }
+
+  const message = await showMessage(client, messageId, true);
+  if (await queueIncrementalCoordinationInput(client, session.id, delivery.rows[0]!.id, message.body)) {
+    return;
+  }
+
   const history = await client.query(
     `SELECT thread_messages.message_type, thread_messages.body, thread_messages.created_at,
             sender.name AS sender_agent_name, recipient.name AS recipient_agent_name
      FROM thread_messages LEFT JOIN agents sender ON sender.id = thread_messages.sender_agent_id
      LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
      WHERE thread_messages.thread_id = $1 ORDER BY thread_messages.created_at DESC, thread_messages.id DESC LIMIT 12`, [threadId]);
-  const message = await showMessage(client, messageId, true);
   const skills = await resolveAgentSkills(client, recipientAgentId, thread.project_id, thread.task_id);
-  const prompt = coordinationPrompt(thread, recipient, message, history.rows.reverse());
+  const prompt = session.provider_thread_id
+    ? coordinationIncrementalPrompt(message)
+    : coordinationPrompt(thread, recipient, message, history.rows.reverse());
   await client.query(
     `INSERT INTO dispatcher_runs
        (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
@@ -1248,6 +1263,87 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     [thread.task_id, session!.id, delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
   );
+}
+
+async function queueIncrementalCoordinationInput(
+  client: PoolClient,
+  agentThreadId: string,
+  messageDeliveryId: string,
+  message: string
+): Promise<boolean> {
+  await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [agentThreadId]);
+  const active = await client.query<{
+    id: string;
+    status: "queued" | "running";
+    message_delivery_id: string | null;
+  }>(
+    `SELECT id, status::text, message_delivery_id
+     FROM dispatcher_runs
+     WHERE agent_thread_id = $1
+       AND scope = 'coordination'
+       AND status IN ('queued', 'running')
+     ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+              CASE WHEN status = 'running' THEN started_at ELSE queued_at END ASC NULLS LAST,
+              id ASC
+     LIMIT 1`,
+    [agentThreadId]
+  );
+  const run = active.rows[0];
+  if (!run) return false;
+
+  const queued = await client.query<{
+    id: string;
+    message_delivery_id: string | null;
+  }>(
+    `SELECT id, message_delivery_id
+     FROM dispatcher_runs
+     WHERE agent_thread_id = $1
+       AND scope = 'coordination'
+       AND status = 'queued'
+       AND id <> $2
+     ORDER BY queued_at ASC, id ASC`,
+    [agentThreadId, run.id]
+  );
+  for (const stale of queued.rows) {
+    if (stale.message_delivery_id) {
+      const source = await client.query<{ body: string }>(
+        `SELECT thread_messages.body
+         FROM message_deliveries
+         JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+         WHERE message_deliveries.id = $1`,
+        [stale.message_delivery_id]
+      );
+      const staleMessage = source.rows[0]?.body;
+      if (staleMessage?.trim()) {
+        await client.query(
+          `INSERT INTO agent_turn_inputs
+             (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
+          [agentThreadId, run.id, stale.message_delivery_id, staleMessage]
+        );
+      }
+    }
+    await client.query(
+      `UPDATE dispatcher_runs
+       SET message_delivery_id = NULL,
+           status = 'cancelled',
+           finished_at = now(),
+           error = 'Superseded by an incremental coordination turn',
+           updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [stale.id]
+    );
+  }
+
+  await client.query(
+    `INSERT INTO agent_turn_inputs
+       (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
+     VALUES ($1, $2, $3, $4)
+     ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
+    [agentThreadId, run.id, messageDeliveryId, message]
+  );
+  return true;
 }
 
 export async function transferTaskAgentThread(
@@ -1322,6 +1418,10 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
     `Completion instruction: ${thread.completion_instructions}`,
     "Complete the requested work. When finished, send the completed work back to the triggering agent through this thread using the completion instruction. If blocked, run: aisevak threads block THREAD-" + thread.number + " --reason-stdin"
   ].join("\n");
+}
+
+export function coordinationIncrementalPrompt(message: { body: string }): string {
+  return message.body;
 }
 
 async function resolveAgentSkills(queryable: Queryable, agentId: string, projectId: string | null, taskId: string | null): Promise<CodexSkillSnapshot[]> {

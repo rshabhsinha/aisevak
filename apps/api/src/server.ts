@@ -42,6 +42,7 @@ import { randomUUID } from "node:crypto";
 import { mkdir } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import type { PoolClient } from "pg";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 import { registerCoordinationRoutes, requireAgent, requireCapability, type AgentContext } from "./coordination.js";
@@ -1637,6 +1638,7 @@ interface TimelineRunRow {
   queued_at?: string | Date | null;
   started_at?: string | Date | null;
   finished_at?: string | Date | null;
+  created_at?: string | Date | null;
   error?: string | null;
 }
 
@@ -2026,11 +2028,7 @@ async function getAgentThreadTimeline(pool: DbPool, id: string): Promise<{
   events: TimelineEventRow[];
 }> {
   const thread = await getAgentThread(pool, id);
-  if (thread.task_id) {
-    const timeline = await getTaskSessionTimeline(pool, thread.task_id, id, false);
-    return { thread, ...timeline };
-  }
-  const timeline = await getDispatcherThreadTimeline(pool, id);
+  const timeline = await getTaskSessionTimeline(pool, thread.task_id, id, false);
   return { thread, ...timeline };
 }
 
@@ -2125,6 +2123,12 @@ async function queueAgentThreadMessage(
           agentThreadId: threadId
         });
   } else {
+    const incremental = await queueIncrementalAgentTurnInput(pool, threadId, input.message, {
+      scope: "thread"
+    });
+    if (incremental) {
+      return { thread: await getAgentThread(pool, threadId), turn: incremental.run };
+    }
     const skillsSnapshot = await resolveAgentSkills(pool, thread.agent_id);
     const result = await pool.query(
       `INSERT INTO dispatcher_runs
@@ -2261,6 +2265,192 @@ export async function queueAgentTurnInput(
   return { input };
 }
 
+type AgentTurnKind = "worker" | "dispatcher";
+
+interface ThreadTurnCandidate {
+  id: string;
+  kind: AgentTurnKind;
+  status: "queued" | "running";
+  prompt: string;
+  message_delivery_id: string | null;
+  scope: string | null;
+}
+
+interface IncrementalTurnOptions {
+  kind?: AgentTurnKind;
+  scope?: string;
+  messageDeliveryId?: string;
+}
+
+async function queueIncrementalAgentTurnInput(
+  pool: DbPool,
+  threadId: string,
+  message: string,
+  options: IncrementalTurnOptions = {}
+): Promise<{ input: Record<string, unknown>; run: Record<string, unknown> } | null> {
+  return withTransaction(pool, async (client) => {
+    await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
+    return appendIncrementalAgentTurnInput(client, threadId, message, options);
+  });
+}
+
+async function appendIncrementalAgentTurnInput(
+  client: PoolClient,
+  threadId: string,
+  message: string,
+  options: IncrementalTurnOptions = {}
+): Promise<{ input: Record<string, unknown>; run: Record<string, unknown> } | null> {
+  const turn = await selectThreadTurn(client, threadId, options);
+  if (!turn) return null;
+
+  const queued = await client.query<ThreadTurnCandidate>(
+    `SELECT id, kind, status, prompt, message_delivery_id, scope
+     FROM (
+       SELECT task_runs.id,
+              'worker'::text AS kind,
+              task_runs.status::text AS status,
+              task_runs.prompt,
+              NULL::uuid AS message_delivery_id,
+              NULL::text AS scope,
+              task_runs.queued_at
+       FROM task_runs
+       WHERE task_runs.agent_thread_id = $1 AND task_runs.status = 'queued'
+       UNION ALL
+       SELECT dispatcher_runs.id,
+              'dispatcher'::text AS kind,
+              dispatcher_runs.status::text AS status,
+              dispatcher_runs.prompt,
+              dispatcher_runs.message_delivery_id,
+              dispatcher_runs.scope,
+              dispatcher_runs.queued_at
+       FROM dispatcher_runs
+       WHERE dispatcher_runs.agent_thread_id = $1 AND dispatcher_runs.status = 'queued'
+     ) turns
+     WHERE id <> $2
+       AND ($3::text IS NULL OR kind = $3)
+       AND ($4::text IS NULL OR scope = $4)
+     ORDER BY queued_at ASC, id ASC`,
+    [threadId, turn.id, options.kind ?? null, options.scope ?? null]
+  );
+
+  for (const stale of queued.rows) {
+    let inputMessage = stale.prompt;
+    if (stale.message_delivery_id) {
+      const sourceMessage = await client.query<{ body: string }>(
+        `SELECT thread_messages.body
+         FROM message_deliveries
+         JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+         WHERE message_deliveries.id = $1`,
+        [stale.message_delivery_id]
+      );
+      inputMessage = sourceMessage.rows[0]?.body ?? inputMessage;
+    }
+    if (inputMessage.trim()) {
+      await client.query(
+        `INSERT INTO agent_turn_inputs
+           (agent_thread_id, task_run_id, dispatcher_run_id, message_delivery_id, message)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
+        [
+          threadId,
+          stale.kind === "worker" ? stale.id : null,
+          stale.kind === "dispatcher" ? stale.id : null,
+          stale.message_delivery_id,
+          inputMessage
+        ]
+      );
+    }
+    if (stale.kind === "dispatcher" && stale.message_delivery_id) {
+      await client.query(
+        `UPDATE dispatcher_runs
+         SET message_delivery_id = NULL,
+             status = 'cancelled',
+             finished_at = now(),
+             error = 'Superseded by an incremental coordination turn',
+             updated_at = now()
+         WHERE id = $1 AND status = 'queued'`,
+        [stale.id]
+      );
+    } else {
+      await client.query(
+        `UPDATE ${stale.kind === "worker" ? "task_runs" : "dispatcher_runs"}
+         SET status = 'cancelled',
+             finished_at = now(),
+             error = 'Superseded by an incremental turn',
+             updated_at = now()
+         WHERE id = $1 AND status = 'queued'`,
+        [stale.id]
+      );
+    }
+  }
+
+  const input = await client.query<Record<string, unknown>>(
+    `INSERT INTO agent_turn_inputs
+       (agent_thread_id, task_run_id, dispatcher_run_id, message_delivery_id, message)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING
+     RETURNING *`,
+    [
+      threadId,
+      turn.kind === "worker" ? turn.id : null,
+      turn.kind === "dispatcher" ? turn.id : null,
+      options.messageDeliveryId ?? null,
+      message
+    ]
+  );
+  const run = await client.query<Record<string, unknown>>(
+    `SELECT * FROM ${turn.kind === "worker" ? "task_runs" : "dispatcher_runs"} WHERE id = $1`,
+    [turn.id]
+  );
+  return {
+    input: input.rows[0] ?? { message, status: "queued", id: `input:${turn.id}:${Date.now()}` },
+    run: mustRow(run.rows[0])
+  };
+}
+
+async function selectThreadTurn(
+  queryable: Pick<DbPool, "query">,
+  threadId: string,
+  options: IncrementalTurnOptions
+): Promise<ThreadTurnCandidate | null> {
+  const result = await queryable.query<ThreadTurnCandidate>(
+    `SELECT id, kind, status, prompt, message_delivery_id, scope
+     FROM (
+       SELECT task_runs.id,
+              'worker'::text AS kind,
+              task_runs.status::text AS status,
+              task_runs.prompt,
+              NULL::uuid AS message_delivery_id,
+              NULL::text AS scope,
+              task_runs.queued_at,
+              task_runs.started_at
+       FROM task_runs
+       WHERE task_runs.agent_thread_id = $1
+         AND task_runs.status IN ('queued', 'running')
+       UNION ALL
+       SELECT dispatcher_runs.id,
+              'dispatcher'::text AS kind,
+              dispatcher_runs.status::text AS status,
+              dispatcher_runs.prompt,
+              dispatcher_runs.message_delivery_id,
+              dispatcher_runs.scope,
+              dispatcher_runs.queued_at,
+              dispatcher_runs.started_at
+       FROM dispatcher_runs
+       WHERE dispatcher_runs.agent_thread_id = $1
+         AND dispatcher_runs.status IN ('queued', 'running')
+     ) turns
+     WHERE ($2::text IS NULL OR kind = $2)
+       AND ($3::text IS NULL OR scope = $3)
+     ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+              CASE WHEN status = 'running' THEN started_at ELSE queued_at END ASC NULLS LAST,
+              id ASC
+     LIMIT 1`,
+    [threadId, options.kind ?? null, options.scope ?? null]
+  );
+  return result.rows[0] ?? null;
+}
+
 async function resolveModelSelection(
   pool: DbPool,
   input: ModelSelectionInput | undefined,
@@ -2279,89 +2469,6 @@ async function resolveModelSelection(
     providerInstanceId,
     model: input?.model ?? fallbackModel,
     options: input?.options ?? normalizeModelOptions(thread?.model_options)
-  };
-}
-
-async function getDispatcherThreadTimeline(pool: DbPool, threadId: string): Promise<{
-  run: TimelineRunRow | null;
-  events: TimelineEventRow[];
-}> {
-  const [runsResult, eventsResult] = await Promise.all([
-    pool.query<TimelineRunRow>(
-      `SELECT dispatcher_runs.id,
-              'dispatcher' AS kind,
-              dispatcher_runs.trigger,
-              dispatcher_runs.status::text,
-              dispatcher_runs.model,
-              dispatcher_runs.task_id,
-              tasks.number AS task_number,
-              tasks.title AS task_title,
-              projects.name AS project_name,
-              agents.name AS agent_name,
-              dispatcher_runs.prompt,
-              dispatcher_runs.queued_at,
-              dispatcher_runs.started_at,
-              dispatcher_runs.finished_at,
-              dispatcher_runs.error
-       FROM dispatcher_runs
-       JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
-       JOIN agents ON agents.id = agent_threads.agent_id
-       LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
-       LEFT JOIN projects ON projects.id = tasks.project_id
-       WHERE dispatcher_runs.agent_thread_id = $1
-       ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.created_at ASC`,
-      [threadId]
-    ),
-    pool.query<TimelineEventRow>(
-      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
-       FROM (
-         SELECT dispatcher_run_events.id,
-                NULL::uuid AS run_id,
-                dispatcher_run_events.dispatcher_run_id,
-                dispatcher_run_events.seq,
-                dispatcher_run_events.event_type,
-                dispatcher_run_events.text,
-                dispatcher_run_events.payload,
-                dispatcher_run_events.created_at,
-                dispatcher_runs.queued_at
-         FROM dispatcher_run_events
-         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-         WHERE dispatcher_runs.agent_thread_id = $1
-         UNION ALL
-         SELECT agent_turn_inputs.id,
-                NULL::uuid AS run_id,
-                agent_turn_inputs.dispatcher_run_id,
-                0 AS seq,
-                'thread.message-sent' AS event_type,
-                agent_turn_inputs.message AS text,
-                jsonb_build_object(
-                  'type', 'thread.message-sent',
-                  'role', 'user',
-                  'text', agent_turn_inputs.message,
-                  'steer', true,
-                  'deliveryStatus', agent_turn_inputs.status,
-                  'error', agent_turn_inputs.error
-                ) AS payload,
-                agent_turn_inputs.created_at,
-                dispatcher_runs.queued_at
-         FROM agent_turn_inputs
-         JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-         WHERE agent_turn_inputs.agent_thread_id = $1
-       ) thread_events
-       ORDER BY queued_at ASC, created_at ASC, seq ASC`,
-      [threadId]
-    )
-  ]);
-  const runs = runsResult.rows;
-  const latest = runs.at(-1) ?? null;
-  const aggregateStatus =
-    runs.find((run) => run.status === "running" || run.status === "cancel_requested")?.status ??
-    runs.find((run) => run.status === "queued")?.status ??
-    latest?.status ??
-    "succeeded";
-  return {
-    run: latest ? { ...latest, status: aggregateStatus, prompt: null } : null,
-    events: withSyntheticUserMessages(runs, eventsResult.rows)
   };
 }
 
@@ -2597,11 +2704,11 @@ export async function isolateTaskNavigationThread(
 async function linkTaskRunsToThread(pool: DbPool, taskId: string, threadId: string): Promise<void> {
   await Promise.all([
     pool.query(
-      "UPDATE task_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS DISTINCT FROM $2",
+      "UPDATE task_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
       [taskId, threadId]
     ),
     pool.query(
-      "UPDATE dispatcher_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS DISTINCT FROM $2",
+      "UPDATE dispatcher_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
       [taskId, threadId]
     )
   ]);
@@ -2683,13 +2790,17 @@ const agentThreadSelectSql = `
   LEFT JOIN tasks ON tasks.id = agent_threads.task_id
   LEFT JOIN projects ON projects.id = agent_threads.project_id
   LEFT JOIN LATERAL (
-    SELECT turns.id, turns.kind, turns.status, turns.error
+    SELECT turns.id, turns.kind, turns.status, turns.error,
+           turns.started_at, turns.finished_at, turns.created_at
     FROM (
       SELECT task_runs.id,
              'worker'::text AS kind,
              task_runs.status::text AS status,
              task_runs.error,
-             task_runs.queued_at
+             task_runs.queued_at,
+             task_runs.started_at,
+             task_runs.finished_at,
+             task_runs.created_at
       FROM task_runs
       WHERE task_runs.agent_thread_id = agent_threads.id
       UNION ALL
@@ -2697,11 +2808,24 @@ const agentThreadSelectSql = `
              'dispatcher'::text AS kind,
              dispatcher_runs.status::text AS status,
              dispatcher_runs.error,
-             dispatcher_runs.queued_at
+             dispatcher_runs.queued_at,
+             dispatcher_runs.started_at,
+             dispatcher_runs.finished_at,
+             dispatcher_runs.created_at
       FROM dispatcher_runs
       WHERE dispatcher_runs.agent_thread_id = agent_threads.id
     ) turns
-    ORDER BY turns.queued_at DESC
+    ORDER BY CASE
+               WHEN turns.status IN ('running', 'cancel_requested') THEN 0
+               WHEN turns.status = 'queued' THEN 1
+               ELSE 2
+             END,
+             CASE
+               WHEN turns.status IN ('running', 'cancel_requested') THEN turns.started_at
+               ELSE turns.queued_at
+             END DESC NULLS LAST,
+             turns.created_at DESC,
+             turns.id DESC
     LIMIT 1
   ) latest ON true`;
 
@@ -2774,6 +2898,12 @@ async function queueWorkerRun(
   );
   const model = options.modelSelection?.model ?? thread.model;
   const modelOptions = options.modelSelection?.options ?? normalizeModelOptions(thread.model_options);
+  if (options.promptOverride && options.allowQueuedFollowUp) {
+    const incremental = await queueIncrementalAgentTurnInput(pool, thread.id, options.promptOverride, {
+      kind: "worker"
+    });
+    if (incremental) return incremental.run;
+  }
   const runResult = await pool.query(
     `INSERT INTO task_runs
        (task_id, task_session_id, agent_thread_id, run_kind, trigger, status, cwd, branch,
@@ -2837,6 +2967,7 @@ async function queueDispatcherMessage(
   const existing = options.sourceRunId
     ? await pool.query<{
         id: string;
+        agent_thread_id: string | null;
         task_id: string | null;
         scope: string;
         cwd: string;
@@ -2848,7 +2979,7 @@ async function queueDispatcherMessage(
         status: string;
         skills_snapshot: CodexSkillSnapshot[];
       }>(
-        `SELECT id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
+        `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
          FROM dispatcher_runs
          WHERE id = $1`,
         [options.sourceRunId]
@@ -2856,6 +2987,7 @@ async function queueDispatcherMessage(
     : options.taskId
       ? await pool.query<{
           id: string;
+          agent_thread_id: string | null;
           task_id: string | null;
           scope: string;
           cwd: string;
@@ -2867,7 +2999,7 @@ async function queueDispatcherMessage(
           status: string;
           skills_snapshot: CodexSkillSnapshot[];
         }>(
-          `SELECT id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
+          `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
            FROM dispatcher_runs
            WHERE task_id = $1
            ORDER BY created_at DESC
@@ -2908,7 +3040,15 @@ async function queueDispatcherMessage(
     return run;
   }
   const dispatcher = previous ? null : await getDispatcherAgent(pool);
-  const thread = options.agentThreadId ? await getAgentThread(pool, options.agentThreadId) : null;
+  const threadId = options.agentThreadId ?? previous?.agent_thread_id ?? null;
+  const thread = threadId ? await getAgentThread(pool, threadId) : null;
+  if (thread) {
+    const incremental = await queueIncrementalAgentTurnInput(pool, thread.id, options.prompt, {
+      kind: "dispatcher",
+      scope: previous?.scope
+    });
+    if (incremental) return incremental.run;
+  }
   const codexHome =
     normalizeRunPath(previous?.codex_home) ??
     normalizeRunPath(thread?.runtime_home) ??
@@ -2926,7 +3066,7 @@ async function queueDispatcherMessage(
      RETURNING *`,
     [
       previous?.task_id ?? options.taskId ?? null,
-      options.agentThreadId ?? null,
+      threadId,
       previous?.scope ?? (options.taskId ? "task" : "heartbeat"),
       normalizeRunPath(previous?.cwd) ?? normalizeRunPath(thread?.cwd) ?? env.managedRoot,
       codexHome,
@@ -2994,7 +3134,7 @@ async function queueDispatcherRun(
 
 export async function getTaskSessionTimeline(
   pool: DbPool,
-  taskId: string,
+  taskId: string | null,
   agentThreadId?: string,
   includeTaskComments = true
 ): Promise<{
@@ -3004,7 +3144,7 @@ export async function getTaskSessionTimeline(
   const [runsResult, eventsResult, commentsResult] = await Promise.all([
     pool.query<TimelineRunRow>(
       `SELECT id, kind, trigger, status, model, task_id, task_number, task_title,
-              project_name, agent_name, prompt, queued_at, started_at, finished_at, error
+              project_name, agent_name, prompt, queued_at, started_at, finished_at, created_at, error
        FROM (
          SELECT task_runs.id,
                 'worker'::text AS kind,
@@ -3027,9 +3167,11 @@ export async function getTaskSessionTimeline(
          LEFT JOIN projects ON projects.id = tasks.project_id
          JOIN agents ON agents.id = tasks.agent_id
          JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
-         WHERE task_runs.task_id = $1
-           AND task_runs.run_kind = 'worker'
-           AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
+         WHERE task_runs.run_kind = 'worker'
+           AND (
+             ($2::uuid IS NOT NULL AND task_runs.agent_thread_id = $2)
+             OR ($2::uuid IS NULL AND task_runs.task_id = $1)
+           )
          UNION ALL
          SELECT dispatcher_runs.id,
                 'dispatcher'::text AS kind,
@@ -3048,10 +3190,12 @@ export async function getTaskSessionTimeline(
                 dispatcher_runs.error,
                 dispatcher_runs.created_at
          FROM dispatcher_runs
-         JOIN tasks ON tasks.id = dispatcher_runs.task_id
+         LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
          LEFT JOIN projects ON projects.id = tasks.project_id
-         WHERE dispatcher_runs.task_id = $1
-           AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
+         WHERE (
+             ($2::uuid IS NOT NULL AND dispatcher_runs.agent_thread_id = $2)
+             OR ($2::uuid IS NULL AND dispatcher_runs.task_id = $1)
+           )
        ) task_runs_and_dispatches
        ORDER BY queued_at ASC, created_at ASC`,
       [taskId, agentThreadId ?? null]
@@ -3070,9 +3214,11 @@ export async function getTaskSessionTimeline(
                 task_runs.queued_at
          FROM run_events
          JOIN task_runs ON task_runs.id = run_events.run_id
-         WHERE task_runs.task_id = $1
-           AND task_runs.run_kind = 'worker'
-           AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
+         WHERE task_runs.run_kind = 'worker'
+           AND (
+             ($2::uuid IS NOT NULL AND task_runs.agent_thread_id = $2)
+             OR ($2::uuid IS NULL AND task_runs.task_id = $1)
+           )
          UNION ALL
          SELECT dispatcher_run_events.id,
                 NULL::uuid AS run_id,
@@ -3085,8 +3231,10 @@ export async function getTaskSessionTimeline(
                 dispatcher_runs.queued_at
          FROM dispatcher_run_events
          JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-         WHERE dispatcher_runs.task_id = $1
-           AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
+         WHERE (
+             ($2::uuid IS NOT NULL AND dispatcher_runs.agent_thread_id = $2)
+             OR ($2::uuid IS NULL AND dispatcher_runs.task_id = $1)
+           )
          UNION ALL
          SELECT agent_turn_inputs.id,
                 agent_turn_inputs.task_run_id AS run_id,
@@ -3108,11 +3256,11 @@ export async function getTaskSessionTimeline(
          LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
          LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
          WHERE (
-             task_runs.task_id = $1
-             AND ($2::uuid IS NULL OR task_runs.agent_thread_id = $2)
-           ) OR (
-             dispatcher_runs.task_id = $1
-             AND ($2::uuid IS NULL OR dispatcher_runs.agent_thread_id = $2)
+             ($2::uuid IS NOT NULL AND agent_turn_inputs.agent_thread_id = $2)
+             OR (
+               $2::uuid IS NULL
+               AND (task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)
+             )
            )
        ) task_events
        ORDER BY queued_at ASC, created_at ASC, seq ASC`,
@@ -3135,16 +3283,53 @@ export async function getTaskSessionTimeline(
     )
   ]);
   const runs = runsResult.rows;
-  const latest = runs.at(-1) ?? null;
-  const aggregateStatus =
-    runs.find((run) => run.status === "running" || run.status === "cancel_requested")?.status ??
-    runs.find((run) => run.status === "queued")?.status ??
-    latest?.status ??
-    "open";
+  const latest = selectPreferredTimelineRun(runs);
   return {
-    run: latest ? { ...latest, status: aggregateStatus, prompt: null } : null,
+    run: latest ? { ...latest, prompt: null } : null,
     events: withSyntheticUserMessages(runs, [...eventsResult.rows, ...commentsResult.rows])
   };
+}
+
+type TimelineRunCandidate = Pick<
+  TimelineRunRow,
+  "id" | "status" | "queued_at" | "started_at" | "finished_at" | "created_at"
+>;
+
+/** Select the run whose status should be displayed, keeping status and metadata from one row. */
+export function selectPreferredTimelineRun<T extends TimelineRunCandidate>(
+  runs: readonly T[]
+): T | null {
+  let preferred: T | null = null;
+  for (const run of runs) {
+    if (!preferred) {
+      preferred = run;
+      continue;
+    }
+    const rank = timelineRunStatusRank(run.status);
+    const preferredRank = timelineRunStatusRank(preferred.status);
+    if (
+      rank < preferredRank ||
+      (rank === preferredRank && compareTimelineRunOrder(run, preferred) > 0)
+    ) {
+      preferred = run;
+    }
+  }
+  return preferred;
+}
+
+function timelineRunStatusRank(status: string): number {
+  if (status === "running" || status === "cancel_requested") return 0;
+  if (status === "queued") return 1;
+  return 2;
+}
+
+function compareTimelineRunOrder(left: TimelineRunCandidate, right: TimelineRunCandidate): number {
+  return (
+    dateString(left.started_at ?? left.queued_at ?? left.finished_at ?? left.created_at)
+      .localeCompare(dateString(right.started_at ?? right.queued_at ?? right.finished_at ?? right.created_at)) ||
+    dateString(left.created_at).localeCompare(dateString(right.created_at)) ||
+    left.id.localeCompare(right.id)
+  );
 }
 
 async function insertRunUserMessage(pool: DbPool, runId: string, prompt: string): Promise<void> {
