@@ -3325,10 +3325,17 @@ function timelineRunStatusRank(status: string): number {
 
 function compareTimelineRunOrder(left: TimelineRunCandidate, right: TimelineRunCandidate): number {
   return (
-    dateString(left.started_at ?? left.queued_at ?? left.finished_at ?? left.created_at)
-      .localeCompare(dateString(right.started_at ?? right.queued_at ?? right.finished_at ?? right.created_at)) ||
+    timelineRunSortValue(left).localeCompare(timelineRunSortValue(right)) ||
     dateString(left.created_at).localeCompare(dateString(right.created_at)) ||
     left.id.localeCompare(right.id)
+  );
+}
+
+function timelineRunSortValue(run: TimelineRunCandidate): string {
+  return dateString(
+    run.status === "running" || run.status === "cancel_requested"
+      ? run.started_at ?? run.queued_at
+      : run.queued_at ?? run.started_at ?? run.finished_at ?? run.created_at
   );
 }
 
