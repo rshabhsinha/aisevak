@@ -252,6 +252,10 @@ class PersistentAppServer {
           approvalPolicy: "never",
           sandboxPolicy: { type: "dangerFullAccess" }
         });
+        // Closing a quarantined session rejects pending requests synchronously.
+        // Attach a handler before releasing the fence so that rejection cannot
+        // escape while the original promise is drained below.
+        void turnRequest.catch(() => undefined);
         state.promptMayHaveBeenPresented = true;
         try {
           await releaseTurnStartFence?.();
