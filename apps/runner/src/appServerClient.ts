@@ -517,7 +517,13 @@ class PersistentAppServer {
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, timeout });
     });
-    this.send({ id, method, params });
+    try {
+      this.send({ id, method, params });
+    } catch (error) {
+      clearTimeout(timeout);
+      this.pending.delete(id);
+      throw error;
+    }
     return promise;
   }
 

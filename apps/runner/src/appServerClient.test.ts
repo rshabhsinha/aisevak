@@ -204,6 +204,21 @@ describe("persistent Codex app-server", () => {
     expect(second.status).toBe("completed");
     expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
   });
+
+  it("does not abandon a pending request when turn/start cannot be written", async () => {
+    const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "send-after-close");
+    options.env.FAKE_EXIT_AFTER_THREAD_START = "1";
+    options.onThreadId = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("failed");
+    expect(result.promptMayHaveBeenPresented).toBe(false);
+    expect(result.error).toMatch(/stdin is closed|app-server exited/);
+  });
 });
 
 interface FakeFixture {
@@ -236,7 +251,11 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     return send({ id: message.id, error: { code: -32603, message: "thread setup failed" } });
   }
   if (message.method === "thread/start" || message.method === "thread/resume") {
-    return send({ id: message.id, result: { thread: { id: message.params.threadId || "thread-1" } } });
+    send({ id: message.id, result: { thread: { id: message.params.threadId || "thread-1" } } });
+    if (message.method === "thread/start" && process.env.FAKE_EXIT_AFTER_THREAD_START === "1") {
+      setTimeout(() => process.exit(0), 10);
+    }
+    return;
   }
   if (message.method === "turn/start") {
     const turnId = "turn-" + (++turn);
