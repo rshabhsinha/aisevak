@@ -153,6 +153,29 @@ const skillInstallSchema = z.object({
   }
 });
 
+export async function reopenTask(
+  pool: DbPool,
+  input: { taskId: string; senderAgentId: string; body?: string; managedRoot: string }
+): Promise<void> {
+  await withTransaction(pool, async (client) => {
+    await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
+    const task = await showTask(client, input.taskId);
+    await client.query("UPDATE tasks SET status = 'open', updated_at = now() WHERE id = $1", [input.taskId]);
+    if (!task.coordination_thread_id) return;
+    await client.query("UPDATE coordination_threads SET status = 'active', updated_at = now(), last_activity_at = now() WHERE id = $1", [task.coordination_thread_id]);
+    const message = await insertMessage(client, {
+      threadId: task.coordination_thread_id,
+      senderAgentId: input.senderAgentId,
+      recipientAgentId: task.agent_id,
+      body: input.body || `TASK-${task.number} was reopened.`,
+      type: "task.reopened"
+    });
+    if (task.agent_id !== input.senderAgentId) {
+      await queueDelivery(client, input.managedRoot, task.coordination_thread_id, message.id, task.agent_id);
+    }
+  });
+}
+
 export async function registerCoordinationRoutes(
   app: FastifyInstance,
   pool: DbPool,
@@ -621,21 +644,12 @@ export async function registerCoordinationRoutes(
     requireCapability(context, "tasks:update");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = optionalBodySchema.parse(request.body ?? {});
-    const task = await showTask(pool, id);
-    await pool.query("UPDATE tasks SET status = 'open', updated_at = now() WHERE id = $1", [id]);
-    if (task.coordination_thread_id) {
-      await withTransaction(pool, async (client) => {
-        await client.query("UPDATE coordination_threads SET status = 'active', updated_at = now(), last_activity_at = now() WHERE id = $1", [task.coordination_thread_id]);
-        const message = await insertMessage(client, {
-          threadId: task.coordination_thread_id,
-          senderAgentId: context.agentId,
-          recipientAgentId: task.agent_id,
-          body: body.body || `TASK-${task.number} was reopened.`,
-          type: "task.reopened"
-        });
-        if (task.agent_id !== context.agentId) await queueDelivery(client, options.managedRoot, task.coordination_thread_id, message.id, task.agent_id);
-      });
-    }
+    await reopenTask(pool, {
+      taskId: id,
+      senderAgentId: context.agentId,
+      body: body.body,
+      managedRoot: options.managedRoot
+    });
     return { task: await showTask(pool, id) };
   });
 
