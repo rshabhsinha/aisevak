@@ -2966,6 +2966,7 @@ async function queueWorkerRun(
       skills: skillRefs
     });
   const agentSnapshot = {
+    agentId: task.agent_id,
     name: task.agent_name,
     description: task.agent_description,
     model: task.agent_model,
@@ -3509,7 +3510,9 @@ async function upsertTaskSession(
      VALUES ($1, $2, $3)
      ON CONFLICT (task_id) DO UPDATE
        SET codex_thread_id = CASE
-             WHEN task_sessions.codex_home = EXCLUDED.codex_home THEN task_sessions.codex_thread_id
+             WHEN task_sessions.codex_home = EXCLUDED.codex_home
+               AND task_sessions.agent_snapshot->>'agentId' = EXCLUDED.agent_snapshot->>'agentId'
+               THEN task_sessions.codex_thread_id
              ELSE NULL
            END,
            codex_home = EXCLUDED.codex_home,
