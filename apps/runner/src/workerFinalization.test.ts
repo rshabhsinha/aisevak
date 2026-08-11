@@ -34,16 +34,17 @@ describe("worker run finalization", () => {
 
     expect(queries.map((query) => query.sql.trim())).toEqual([
       "BEGIN",
+      expect.stringContaining("SELECT id FROM tasks WHERE id = $1 FOR UPDATE"),
       expect.stringContaining("UPDATE task_runs"),
       expect.stringContaining("UPDATE tasks"),
       expect.stringContaining("UPDATE coordination_threads"),
       expect.stringContaining("UPDATE agent_threads"),
       "COMMIT"
     ]);
-    expect(queries[2]?.params).toEqual(["task-id", "completed"]);
-    expect(queries[3]?.params).toEqual(["coordination-thread-id", "completed"]);
-    expect(queries[2]?.sql).toContain("status = 'open'");
-    expect(queries[3]?.sql).toContain("status = 'active'");
+    expect(queries[3]?.params).toEqual(["task-id", "completed"]);
+    expect(queries[4]?.params).toEqual(["coordination-thread-id", "completed"]);
+    expect(queries[3]?.sql).toContain("status = 'open'");
+    expect(queries[4]?.sql).toContain("status = 'active'");
   });
 
   it.each(["failed", "cancelled"] as const)("blocks the thread when a run is %s", async (finalStatus) => {
@@ -118,5 +119,35 @@ describe("worker run finalization", () => {
     expect(queries.some((query) => query.sql.includes("UPDATE tasks"))).toBe(false);
     expect(queries.some((query) => query.sql.includes("UPDATE coordination_threads"))).toBe(false);
     expect(queries.some((query) => query.sql.includes("UPDATE agent_threads"))).toBe(false);
+  });
+
+  it("locks the task before checking the worker thread ownership", async () => {
+    const queries: string[] = [];
+    const client = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql.includes("SELECT ownership_generation")) return { rows: [{ ownership_generation: 4 }] };
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id",
+      taskId: "task-id",
+      agentThreadId: "agent-thread-id",
+      agentThreadGeneration: 4,
+      coordinationThreadId: null,
+      finalStatus: "succeeded",
+      stdout: "done",
+      stderr: "",
+      exitCode: 0
+    });
+
+    const taskLock = queries.findIndex((query) => query.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE"));
+    const threadLock = queries.findIndex((query) => query.includes("SELECT ownership_generation"));
+    expect(taskLock).toBeGreaterThan(-1);
+    expect(threadLock).toBeGreaterThan(taskLock);
   });
 });
