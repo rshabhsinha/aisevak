@@ -51,6 +51,26 @@ describe("dispatcher message delivery", () => {
     ).toHaveLength(1);
     expect(deliveryStatus()).toBe("retrying");
   });
+
+  it("does not pick a queued run after its delivery has failed", async () => {
+    let picked = false;
+    const pool = {
+      async query(sql: string) {
+        if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id")) {
+          expect(sql).toContain("delivery.status IN ('queued', 'retrying')");
+          return { rows: [] };
+        }
+        picked = true;
+        return { rows: [] };
+      }
+    } as unknown as DbPool;
+
+    await processOneDispatcherRun(pool, async () => {
+      throw new Error("a failed delivery run must not be picked");
+    });
+
+    expect(picked).toBe(false);
+  });
 });
 
 function dispatcherPool(codexHome: string): {

@@ -575,6 +575,7 @@ export async function processOneDispatcherRun(
              SELECT 1
              FROM message_deliveries delivery
              WHERE delivery.id = candidate.message_delivery_id
+               AND delivery.status IN ('queued', 'retrying')
                AND delivery.available_at <= now()
            )
          )
