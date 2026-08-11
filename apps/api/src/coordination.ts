@@ -160,6 +160,9 @@ export async function reopenTask(
   await withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
     const task = await showTask(client, input.taskId);
+    if (task.agent_id !== input.senderAgentId) {
+      forbidden(`Task ${task.key ?? input.taskId} is assigned to another agent`);
+    }
     await client.query("UPDATE tasks SET status = 'open', updated_at = now() WHERE id = $1", [input.taskId]);
     if (!task.coordination_thread_id) return;
     await client.query("UPDATE coordination_threads SET status = 'active', updated_at = now(), last_activity_at = now() WHERE id = $1", [task.coordination_thread_id]);

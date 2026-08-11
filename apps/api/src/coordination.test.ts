@@ -115,4 +115,32 @@ describe("task reopening ownership", () => {
       null
     ]);
   });
+
+  it("rejects an old provider token after the task has been transferred", async () => {
+    const task = {
+      id: "task-id",
+      number: 42,
+      title: "Transferred task",
+      agent_id: "new-agent",
+      coordination_thread_id: "thread-id",
+      body: "",
+      content_preview: "",
+      content_total_bytes: 0
+    };
+    const query = async (sql: string) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
+      if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      throw new Error(`Unexpected query: ${sql}`);
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await expect(reopenTask(pool, {
+      taskId: "task-id",
+      senderAgentId: "old-agent",
+      body: "stale reopen",
+      managedRoot: "/managed"
+    })).rejects.toMatchObject({ statusCode: 403 });
+  });
 });
