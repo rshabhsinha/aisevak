@@ -139,6 +139,7 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
   await recoverInterruptedGithubJobs(pool);
+  await recoverAmbiguousWorkspaceRuns(pool);
   await recoverInterruptedCoordinationRuns(pool);
   await recoverStaleAgentThreadRuns(pool);
 
@@ -221,6 +222,50 @@ async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
      SET status = 'queued', started_at = NULL, updated_at = now()
      WHERE status = 'running'`
   );
+}
+
+export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void> {
+  const error = "The queued turn was cancelled because its immutable workspace snapshot is unavailable";
+  await withTransaction(pool, async (client) => {
+    const workers = await client.query<{ id: string }>(
+      `UPDATE task_runs
+       SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
+       WHERE status = 'queued'
+         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+       RETURNING id`,
+      [error]
+    );
+    for (const run of workers.rows) {
+      await failPendingAgentTurnInputsInTransaction(client, "worker", run.id, "cancelled");
+    }
+
+    const dispatchers = await client.query<{ id: string; message_delivery_id: string | null }>(
+      `UPDATE dispatcher_runs
+       SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
+       WHERE status = 'queued'
+         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+         AND task_id IS NOT NULL
+         AND EXISTS (
+           SELECT 1 FROM tasks
+           WHERE tasks.id = dispatcher_runs.task_id
+             AND tasks.project_id IS NOT NULL
+         )
+       RETURNING id, message_delivery_id`,
+      [error]
+    );
+    for (const run of dispatchers.rows) {
+      if (run.message_delivery_id) {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [run.message_delivery_id, error]
+        );
+        await cancelQueuedDeliveryRuns(client, run.message_delivery_id, error);
+      }
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, "cancelled");
+    }
+  });
 }
 
 export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<void> {

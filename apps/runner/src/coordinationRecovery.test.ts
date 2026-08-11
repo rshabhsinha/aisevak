@@ -1,8 +1,43 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { recoverInterruptedCoordinationRuns, recoverStaleAgentThreadRuns } from "./index.js";
+import {
+  recoverAmbiguousWorkspaceRuns,
+  recoverInterruptedCoordinationRuns,
+  recoverStaleAgentThreadRuns
+} from "./index.js";
 
 describe("coordination startup recovery", () => {
+  it("cancels queued project-bound runs whose workspace snapshot is ambiguous", async () => {
+    const queries: string[] = [];
+    const query = async (sql: string) => {
+      queries.push(sql);
+      const normalized = sql.trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(normalized)) return { rows: [] };
+      if (normalized.includes("UPDATE task_runs") && normalized.includes("RETURNING id")) {
+        return { rows: [{ id: "ambiguous-worker" }] };
+      }
+      if (
+        normalized.includes("UPDATE dispatcher_runs") &&
+        normalized.includes("task_id IS NOT NULL") &&
+        normalized.includes("RETURNING id")
+      ) {
+        return { rows: [{ id: "ambiguous-dispatcher", message_delivery_id: "delivery-id" }] };
+      }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await recoverAmbiguousWorkspaceRuns(pool);
+
+    expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain("status = 'cancelled'");
+    expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs") && sql.includes("task_id IS NOT NULL"))).toContain(
+      "workspace_source = 'unknown'"
+    );
+    expect(queries.some((sql) => sql.includes("UPDATE message_deliveries") && sql.includes("status = 'failed'"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("status = 'queued' OR status = 'cancel_requested'"))).toBe(true);
+  });
+
   it("fails closed for ambiguous runs and terminalizes queued and delivering inputs", async () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     const inputUpdates: unknown[][] = [];

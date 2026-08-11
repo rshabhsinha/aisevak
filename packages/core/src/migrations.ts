@@ -437,71 +437,69 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation int
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
+WITH task_workspace_projects AS (
+  SELECT task_runs.id,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.id::text) END AS workspace_key,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.workspace_mode::text) END AS workspace_mode,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.source::text) END AS workspace_source
+  FROM task_runs
+  LEFT JOIN projects
+    ON projects.id::text = NULLIF(task_runs.workspace_key, '')
+    OR projects.local_path = task_runs.cwd
+  GROUP BY task_runs.id
+)
 UPDATE task_runs
 SET workspace_key = CASE
-      WHEN task_runs.workspace_key = '' THEN tasks.project_id::text
+      WHEN task_runs.workspace_key = '' THEN COALESCE(task_workspace_projects.workspace_key, '')
       ELSE task_runs.workspace_key
     END,
     workspace_mode = CASE
-      WHEN task_runs.workspace_mode = 'unknown' THEN projects.workspace_mode
+      WHEN task_runs.workspace_mode = 'unknown' THEN COALESCE(task_workspace_projects.workspace_mode, 'unknown')
       ELSE task_runs.workspace_mode
     END,
     workspace_source = CASE
-      WHEN task_runs.workspace_source = 'unknown' THEN projects.source
+      WHEN task_runs.workspace_source = 'unknown' THEN COALESCE(task_workspace_projects.workspace_source, 'unknown')
       ELSE task_runs.workspace_source
     END
-FROM tasks
-JOIN projects ON projects.id = tasks.project_id
-WHERE task_runs.task_id = tasks.id
+FROM task_workspace_projects
+WHERE task_runs.id = task_workspace_projects.id
+  AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = task_runs.task_id)
   AND (
     task_runs.workspace_key = ''
     OR task_runs.workspace_mode = 'unknown'
     OR task_runs.workspace_source = 'unknown'
   );
+WITH dispatcher_workspace_projects AS (
+  SELECT dispatcher_runs.id,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.id::text) END AS workspace_key,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.workspace_mode::text) END AS workspace_mode,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.source::text) END AS workspace_source
+  FROM dispatcher_runs
+  LEFT JOIN projects
+    ON projects.id::text = NULLIF(dispatcher_runs.workspace_key, '')
+    OR projects.local_path = dispatcher_runs.cwd
+  GROUP BY dispatcher_runs.id
+)
 UPDATE dispatcher_runs
 SET workspace_key = CASE
-      WHEN dispatcher_runs.workspace_key = '' THEN COALESCE(
-        (SELECT agent_threads.project_id::text
-         FROM agent_threads
-         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
-        (SELECT tasks.project_id::text
-         FROM tasks
-         WHERE tasks.id = dispatcher_runs.task_id),
-        ''
-      )
+      WHEN dispatcher_runs.workspace_key = '' THEN COALESCE(dispatcher_workspace_projects.workspace_key, '')
       ELSE dispatcher_runs.workspace_key
     END,
     workspace_mode = CASE
-      WHEN dispatcher_runs.workspace_mode = 'unknown' THEN COALESCE(
-        (SELECT projects.workspace_mode
-         FROM agent_threads
-         JOIN projects ON projects.id = agent_threads.project_id
-         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
-        (SELECT projects.workspace_mode
-         FROM tasks
-         JOIN projects ON projects.id = tasks.project_id
-         WHERE tasks.id = dispatcher_runs.task_id),
-        'unknown'
-      )
+      WHEN dispatcher_runs.workspace_mode = 'unknown' THEN COALESCE(dispatcher_workspace_projects.workspace_mode, 'unknown')
       ELSE dispatcher_runs.workspace_mode
     END,
     workspace_source = CASE
-      WHEN dispatcher_runs.workspace_source = 'unknown' THEN COALESCE(
-        (SELECT projects.source
-         FROM agent_threads
-         JOIN projects ON projects.id = agent_threads.project_id
-         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
-        (SELECT projects.source
-         FROM tasks
-         JOIN projects ON projects.id = tasks.project_id
-         WHERE tasks.id = dispatcher_runs.task_id),
-        'unknown'
-      )
+      WHEN dispatcher_runs.workspace_source = 'unknown' THEN COALESCE(dispatcher_workspace_projects.workspace_source, 'unknown')
       ELSE dispatcher_runs.workspace_source
     END
-WHERE dispatcher_runs.workspace_key = ''
-   OR dispatcher_runs.workspace_mode = 'unknown'
-   OR dispatcher_runs.workspace_source = 'unknown';
+FROM dispatcher_workspace_projects
+WHERE dispatcher_runs.id = dispatcher_workspace_projects.id
+  AND (
+    dispatcher_runs.workspace_key = ''
+    OR dispatcher_runs.workspace_mode = 'unknown'
+    OR dispatcher_runs.workspace_source = 'unknown'
+  );
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx

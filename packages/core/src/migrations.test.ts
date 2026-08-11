@@ -3,23 +3,27 @@ import { additiveSql } from "./migrations.js";
 
 describe("run snapshot migration", () => {
   it("correlates task snapshots to their own task and project", () => {
-    const start = additiveSql.indexOf("UPDATE task_runs");
-    const end = additiveSql.indexOf("UPDATE dispatcher_runs", start);
+    const start = additiveSql.indexOf("WITH task_workspace_projects");
+    const end = additiveSql.indexOf("WITH dispatcher_workspace_projects", start);
     const sql = additiveSql.slice(start, end);
 
-    expect(sql).toContain("FROM tasks\nJOIN projects ON projects.id = tasks.project_id");
-    expect(sql).toContain("task_runs.task_id = tasks.id");
+    expect(sql).toContain("FROM task_runs\n  LEFT JOIN projects");
+    expect(sql).toContain("tasks.id = task_runs.task_id");
+    expect(sql).toContain("projects.local_path = task_runs.cwd");
     expect(sql).toContain("workspace_source = CASE");
-    expect(sql).not.toContain("FROM tasks\nJOIN projects ON projects.id = tasks.project_id\nWHERE task_runs.workspace_key = ''");
+    expect(sql).toContain("count(DISTINCT projects.id) = 1");
+    expect(sql).not.toContain("tasks.project_id");
   });
 
   it("backfills linked, task-scoped, and projectless dispatcher snapshots", () => {
-    const start = additiveSql.indexOf("UPDATE dispatcher_runs");
+    const start = additiveSql.indexOf("WITH dispatcher_workspace_projects");
     const end = additiveSql.indexOf("CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx", start);
     const sql = additiveSql.slice(start, end);
 
-    expect(sql).toContain("agent_threads.id = dispatcher_runs.agent_thread_id");
-    expect(sql).toContain("tasks.id = dispatcher_runs.task_id");
+    expect(sql).toContain("FROM dispatcher_runs\n  LEFT JOIN projects");
+    expect(sql).toContain("projects.local_path = dispatcher_runs.cwd");
+    expect(sql).not.toContain("agent_threads.project_id");
+    expect(sql).not.toContain("tasks.project_id");
     expect(sql).toContain("COALESCE(");
     expect(sql).toContain("'unknown'");
     expect(sql).toContain("''");
