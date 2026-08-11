@@ -108,6 +108,51 @@ describe("persistent Codex app-server", () => {
     expect(seenThreadIds.length).toBeGreaterThan(0);
     expect(new Set(seenThreadIds)).toEqual(new Set(["thread-1"]));
   });
+
+  it("does not cross the presentation boundary when thread setup fails", async () => {
+    const fixture = await fakeAppServerFixture();
+    let turnAccepted = false;
+    const options = turnOptions(fixture, "setup-failure", "broken-thread");
+    options.onTurnAccepted = async () => {
+      turnAccepted = true;
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("failed");
+    expect(result.turnStartRequested).toBe(false);
+    expect(turnAccepted).toBe(false);
+  });
+
+  it("reports an ambiguous presentation when app-server exits after turn/start is sent", async () => {
+    const fixture = await fakeAppServerFixture();
+    let turnAccepted = false;
+    const options = turnOptions(fixture, "exit-on-turn-start");
+    options.onTurnAccepted = async () => {
+      turnAccepted = true;
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("failed");
+    expect(result.turnStartRequested).toBe(true);
+    expect(turnAccepted).toBe(false);
+  });
+
+  it("notifies the runner after turn/start is accepted", async () => {
+    const fixture = await fakeAppServerFixture();
+    let acceptedCount = 0;
+    const options = turnOptions(fixture, "accepted-turn");
+    options.onTurnAccepted = async () => {
+      acceptedCount += 1;
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("completed");
+    expect(result.turnStartRequested).toBe(true);
+    expect(acceptedCount).toBe(1);
+  });
 });
 
 interface FakeFixture {
@@ -136,12 +181,16 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "thread/resume" && message.params.threadId === "missing-thread") {
     return send({ id: message.id, error: { code: -32602, message: "no rollout found for thread id missing-thread" } });
   }
+  if (message.method === "thread/resume" && message.params.threadId === "broken-thread") {
+    return send({ id: message.id, error: { code: -32603, message: "thread setup failed" } });
+  }
   if (message.method === "thread/start" || message.method === "thread/resume") {
     return send({ id: message.id, result: { thread: { id: message.params.threadId || "thread-1" } } });
   }
   if (message.method === "turn/start") {
     const turnId = "turn-" + (++turn);
     const prompt = message.params.input[0].text;
+    if (prompt === "exit-on-turn-start") return process.exit(0);
     send({ id: message.id, result: { turn: { id: turnId } } });
     send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id: turnId } } });
     if (prompt === "emit-old-secret") {

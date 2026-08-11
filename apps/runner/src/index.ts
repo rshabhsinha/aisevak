@@ -558,7 +558,10 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   );
 }
 
-async function processOneDispatcherRun(pool: DbPool): Promise<void> {
+export async function processOneDispatcherRun(
+  pool: DbPool,
+  runTurn: typeof runCodexAppServerTurn = runCodexAppServerTurn
+): Promise<void> {
   const result = await pool.query<{ id: string }>(
     `UPDATE dispatcher_runs
      SET status = 'running', started_at = now(), updated_at = now()
@@ -622,7 +625,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     await pool.query(
       `UPDATE message_deliveries
        SET status = 'running', attempt_count = attempt_count + 1,
-           presented_at = now(), updated_at = now()
+           updated_at = now()
        WHERE id = $1`,
       [job.message_delivery_id]
     );
@@ -632,6 +635,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  let turnStartRequested = false;
 
   try {
     await mkdir(job.codex_home, { recursive: true });
@@ -648,7 +652,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
-    const turn = await runCodexAppServerTurn({
+    const turn = await runTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
       codexHome: job.codex_home,
@@ -692,6 +696,15 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
           );
         }
       },
+      onTurnAccepted: async () => {
+        if (!job.message_delivery_id) return;
+        await pool.query(
+          `UPDATE message_deliveries
+           SET presented_at = COALESCE(presented_at, now()), updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [job.message_delivery_id]
+        );
+      },
       shouldCancel: async () => {
         const current = await pool.query<{ status: string }>(
           "SELECT status FROM dispatcher_runs WHERE id = $1",
@@ -702,6 +715,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
+    turnStartRequested = turn.turnStartRequested;
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
     if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
@@ -746,7 +760,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       );
     }
     if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr);
+      await finishMessageDelivery(pool, job, finalStatus, stderr, turnStartRequested);
     }
   }
 }
@@ -1183,7 +1197,8 @@ export async function finishMessageDelivery(
   pool: DbPool,
   job: Pick<DispatcherJob, "id" | "message_delivery_id">,
   status: "succeeded" | "failed" | "cancelled",
-  error: string
+  error: string,
+  turnStartRequested = false
 ): Promise<void> {
   if (!job.message_delivery_id) return;
   if (status === "succeeded") {
@@ -1229,14 +1244,17 @@ export async function finishMessageDelivery(
         return;
       }
 
-      if (delivery.presented_at && delivery.provider_thread_id) {
+      if ((delivery.presented_at || turnStartRequested) && delivery.provider_thread_id) {
+        const suppressionReason = delivery.presented_at
+          ? "the coordination message was already presented to an established provider thread"
+          : "turn/start was sent to an established provider thread and may have presented the coordination message";
         await client.query(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
           [
             job.message_delivery_id,
-            `Automatic delivery retry suppressed: the coordination message was already presented to an established provider thread.${error ? ` Original error: ${error}` : ""}`
+            `Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`
           ]
         );
         return;

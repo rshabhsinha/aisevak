@@ -115,6 +115,27 @@ describe("message delivery retry", () => {
     expect(queries.some((query) => query.sql.includes("SET status = 'retrying'"))).toBe(true);
   });
 
+  it("fails closed when turn/start was sent but its acceptance is unknown", async () => {
+    const { pool, queries } = retryPool({
+      presentedAt: null,
+      providerThreadId: "provider-thread"
+    });
+
+    await finishMessageDelivery(
+      pool,
+      { id: "dispatcher-run", message_delivery_id: "delivery" },
+      "failed",
+      "app-server exited before replying to turn/start",
+      true
+    );
+
+    expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+    expect(queries.find((query) => query.sql.includes("SET status = 'failed'"))?.params).toEqual([
+      "delivery",
+      "Automatic delivery retry suppressed: turn/start was sent to an established provider thread and may have presented the coordination message. Original error: app-server exited before replying to turn/start"
+    ]);
+  });
+
   it("does not enqueue a second retry when finalization is repeated", async () => {
     const { pool, queries } = retryPool();
     const job = { id: "dispatcher-run", message_delivery_id: "delivery" };

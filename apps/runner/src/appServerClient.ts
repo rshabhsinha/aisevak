@@ -34,6 +34,7 @@ export interface AppServerTurnOptions {
   secrets: Array<string | null | undefined>;
   onLine: (line: string, seq: number) => Promise<void>;
   onThreadId: (threadId: string) => Promise<void>;
+  onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
   nextInput?: () => Promise<AppServerTurnInput | null>;
   onInputHandled?: (input: AppServerTurnInput, error?: string) => Promise<void>;
@@ -47,6 +48,7 @@ export interface AppServerTurnResult {
   rawStderr: string;
   exitCode: number | null;
   error: string | null;
+  turnStartRequested: boolean;
 }
 
 interface TurnState {
@@ -56,6 +58,7 @@ interface TurnState {
   seq: number;
   rawStdout: string;
   stderrStart: number;
+  turnStartRequested: boolean;
   completed: boolean;
   finalStatus: AppServerTurnResult["status"] | null;
   finalError: string | null;
@@ -165,6 +168,7 @@ class PersistentAppServer {
       seq: 0,
       rawStdout: "",
       stderrStart: 0,
+      turnStartRequested: false,
       completed: false,
       finalStatus: null,
       finalError: null,
@@ -212,7 +216,7 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
-      const turnResponse = await this.request("turn/start", {
+      const turnRequest = this.request("turn/start", {
         threadId: state.threadId,
         input: [{ type: "text", text: options.prompt, text_elements: [] }],
         cwd: options.cwd,
@@ -223,6 +227,9 @@ class PersistentAppServer {
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" }
       });
+      state.turnStartRequested = true;
+      const turnResponse = await turnRequest;
+      await options.onTurnAccepted?.();
       this.bindTurnId(state, extractTurnId({ result: turnResponse }));
       if (!state.turnId) throw new Error("app-server did not return a turn id");
 
@@ -256,7 +263,8 @@ class PersistentAppServer {
         rawStdout: state.rawStdout,
         rawStderr: this.rawStderr.slice(state.stderrStart),
         exitCode: 0,
-        error: state.finalError
+        error: state.finalError,
+        turnStartRequested: state.turnStartRequested
       };
     } catch (error) {
       await state.eventChain.catch(() => undefined);
@@ -267,7 +275,8 @@ class PersistentAppServer {
         rawStdout: state.rawStdout,
         rawStderr: this.rawStderr.slice(state.stderrStart),
         exitCode: null,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        turnStartRequested: state.turnStartRequested
       };
     } finally {
       if (monitor) clearInterval(monitor);
