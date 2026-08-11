@@ -226,12 +226,19 @@ async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
 
 export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void> {
   const error = "The queued turn was cancelled because its immutable workspace snapshot is unavailable";
+  const ambiguousWorkspacePredicate = `
+         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+         AND NOT (
+           workspace_key = ''
+           AND workspace_mode = 'projectless'
+           AND workspace_source = 'projectless'
+         )`;
   await withTransaction(pool, async (client) => {
     const workers = await client.query<{ id: string }>(
       `UPDATE task_runs
        SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
        WHERE status = 'queued'
-         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+         ${ambiguousWorkspacePredicate}
        RETURNING id`,
       [error]
     );
@@ -243,7 +250,7 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
       `UPDATE dispatcher_runs
        SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
        WHERE status = 'queued'
-         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+         ${ambiguousWorkspacePredicate}
          AND (
            task_id IS NOT NULL
            OR agent_thread_id IS NOT NULL
@@ -1523,6 +1530,7 @@ export async function finalizeWorkerRunState(
   const taskStatus = input.finalStatus === "succeeded" ? "completed" : "needs_attention";
   const threadStatus = input.finalStatus === "succeeded" ? "completed" : "blocked";
   await withTransaction(pool, async (client) => {
+    await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
     let ownsCurrentThread = true;
     if (input.agentThreadId && input.agentThreadGeneration !== null && input.agentThreadGeneration !== undefined) {
       const ownership = await client.query<{ ownership_generation: number }>(

@@ -31,6 +31,12 @@ describe("coordination startup recovery", () => {
     await recoverAmbiguousWorkspaceRuns(pool);
 
     expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain("status = 'cancelled'");
+    expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain(
+      "workspace_mode = 'projectless'"
+    );
+    expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain(
+      "workspace_source = 'projectless'"
+    );
     expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs") && sql.includes("task_id IS NOT NULL"))).toContain(
       "workspace_source = 'unknown'"
     );
