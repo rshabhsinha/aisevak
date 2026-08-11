@@ -584,7 +584,7 @@ export async function registerCoordinationRoutes(
         model: recipient.model,
         modelOptions: recipient.model_options ?? [],
         runtimeHome: managedCodexHome(options.managedRoot, id),
-        preserveCoordination: true
+        preserveCoordination: recipient.id !== context.agentId
       });
       await addParticipants(client, row.coordination_thread_id, [[recipient.id, "assignee"]]);
       const message = await insertMessage(client, {
