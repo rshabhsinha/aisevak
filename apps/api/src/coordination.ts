@@ -1182,11 +1182,12 @@ async function addParticipants(client: PoolClient, threadId: string, participant
 export async function cancelStaleQueuedAgentThreadRuns(
   queryable: Queryable,
   agentThreadId: string,
-  ownershipGeneration: number
+  ownershipGeneration: number,
+  preserveCoordination = false
 ): Promise<void> {
   if (isDbPool(queryable)) {
     await withTransaction(queryable, async (client) => {
-      await cancelStaleQueuedAgentThreadRuns(client, agentThreadId, ownershipGeneration);
+      await cancelStaleQueuedAgentThreadRuns(client, agentThreadId, ownershipGeneration, preserveCoordination);
     });
     return;
   }
@@ -1209,12 +1210,12 @@ export async function cancelStaleQueuedAgentThreadRuns(
          error = $3,
          finished_at = now(),
          updated_at = now()
-     WHERE agent_thread_id = $1
-       AND status = 'queued'
-       AND scope <> 'coordination'
-       AND agent_thread_generation <> $2
-     RETURNING id, message_delivery_id`,
-    [agentThreadId, ownershipGeneration, error]
+       WHERE agent_thread_id = $1
+         AND status = 'queued'
+         AND ($4::boolean = false OR scope <> 'coordination')
+         AND agent_thread_generation <> $2
+         RETURNING id, message_delivery_id`,
+    [agentThreadId, ownershipGeneration, error, preserveCoordination]
   );
 
   for (const run of workerRuns.rows) {
@@ -1291,18 +1292,23 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
   let ownershipTransferUnsafe = false;
-  if (session && linkedTaskId) {
-    const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
-    const cwd = project?.rows[0]?.local_path ?? managedRoot;
+  const desiredRuntimeHome = linkedTaskId
+    ? managedCodexHome(managedRoot, linkedTaskId)
+    : managedCodexHome(managedRoot, `thread-${threadId}-${recipientAgentId}`);
+  const desiredCwd = project?.rows[0]?.local_path ?? managedRoot;
+  if (session) {
+    const desiredTaskId = linkedTaskId;
     ownershipTransferUnsafe =
-      session.task_id !== linkedTaskId ||
+      session.task_id !== desiredTaskId ||
       session.project_id !== thread.project_id ||
-      session.cwd !== cwd ||
-      session.runtime_home !== runtimeHome;
-    await client.query(
-      "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
-      [linkedTaskId, session.id]
-    );
+      session.cwd !== desiredCwd ||
+      session.runtime_home !== desiredRuntimeHome;
+    if (linkedTaskId) {
+      await client.query(
+        "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
+        [linkedTaskId, session.id]
+      );
+    }
     const updated = await client.query<AgentThreadSession>(
       `UPDATE agent_threads
        SET task_id = $2,
@@ -1310,27 +1316,29 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
            runtime_home = $4,
            cwd = $5,
            provider_thread_id = CASE
-             WHEN runtime_home = $4
+             WHEN task_id IS NOT DISTINCT FROM $2
+               AND runtime_home = $4
                AND project_id IS NOT DISTINCT FROM $3
                AND cwd IS NOT DISTINCT FROM $5
                THEN provider_thread_id
              ELSE NULL
            END,
            ownership_generation = ownership_generation + CASE
-             WHEN runtime_home IS DISTINCT FROM $4
+             WHEN task_id IS DISTINCT FROM $2
+               OR runtime_home IS DISTINCT FROM $4
                OR project_id IS DISTINCT FROM $3
                OR cwd IS DISTINCT FROM $5
                THEN 1
-             ELSE $6
-           END,
+             ELSE 0
+            END,
            updated_at = now()
        WHERE id = $1
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [session.id, linkedTaskId, thread.project_id, runtimeHome, cwd, ownershipTransferUnsafe ? 1 : 0]
+      [session.id, desiredTaskId, thread.project_id, desiredRuntimeHome, desiredCwd]
     );
     session = updated.rows[0];
     if (session) {
-      await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation);
+      await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation, true);
     }
   }
   if (!session && linkedTaskId) {
@@ -1341,20 +1349,49 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       recipientAgentId,
       model: recipient.model,
       modelOptions: recipient.model_options ?? [],
-      runtimeHome: managedCodexHome(managedRoot, linkedTaskId)
+      runtimeHome: managedCodexHome(managedRoot, linkedTaskId),
+      preserveCoordination: true
     });
+    if (session) {
+      const updated = await client.query<AgentThreadSession>(
+        `UPDATE agent_threads
+         SET task_id = $2,
+             project_id = $3,
+             cwd = $4,
+             runtime_home = $5,
+             provider_thread_id = CASE
+               WHEN task_id IS NOT DISTINCT FROM $2
+                 AND project_id IS NOT DISTINCT FROM $3
+                 AND cwd IS NOT DISTINCT FROM $4
+                 AND runtime_home = $5
+                 THEN provider_thread_id
+               ELSE NULL
+             END,
+             ownership_generation = ownership_generation + CASE
+               WHEN task_id IS DISTINCT FROM $2
+                 OR project_id IS DISTINCT FROM $3
+                 OR cwd IS DISTINCT FROM $4
+                 OR runtime_home IS DISTINCT FROM $5
+                 THEN 1
+               ELSE 0
+             END,
+             updated_at = now()
+         WHERE id = $1
+         RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+        [session.id, linkedTaskId, thread.project_id, desiredCwd, desiredRuntimeHome]
+      );
+      session = updated.rows[0];
+      if (session) await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation, true);
+    }
   }
   if (!session) {
-    const runtimeHome = managedCodexHome(
-      managedRoot,
-      linkedTaskId ?? `thread-${threadId}-${recipientAgentId}`
-    );
+    const runtimeHome = desiredRuntimeHome;
     const created = await client.query<AgentThreadSession>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
+      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), desiredCwd, runtimeHome, threadId]
     );
     session = created.rows[0]!;
   }
@@ -1479,7 +1516,6 @@ async function queueIncrementalCoordinationInput(
      JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
      WHERE dispatcher_runs.agent_thread_id = $1
        AND dispatcher_runs.scope = 'coordination'
-       AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
        AND dispatcher_runs.status = 'queued'
        AND dispatcher_runs.id <> $2
      ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.id ASC`,
@@ -1539,6 +1575,7 @@ export async function transferTaskAgentThread(
     model: string;
     modelOptions: unknown;
     runtimeHome: string;
+    preserveCoordination?: boolean;
   }
 ): Promise<AgentThreadSession | undefined> {
   if (isDbPool(queryable)) {
@@ -1573,7 +1610,12 @@ export async function transferTaskAgentThread(
     ]
   );
   if (result.rows[0]) {
-    await cancelStaleQueuedAgentThreadRuns(queryable, result.rows[0].id, result.rows[0].ownership_generation);
+    await cancelStaleQueuedAgentThreadRuns(
+      queryable,
+      result.rows[0].id,
+      result.rows[0].ownership_generation,
+      input.preserveCoordination ?? false
+    );
   }
   return result.rows[0];
 }

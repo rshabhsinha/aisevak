@@ -54,8 +54,28 @@ describe("coordinated task agent threads", () => {
 
   it("keeps the task link and returns the existing coordinated runtime", async () => {
     const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    const task = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      number: 1,
+      title: "Coordinated task",
+      body: "",
+      coordination_thread_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      agent_kind: "worker" as const,
+      source: "local_path" as const,
+      local_path: "/workspace",
+      workspace_mode: "direct" as const,
+      default_branch: null,
+      agent_name: "Builder",
+      agent_description: "Builds",
+      agent_model: "gpt-5.6-luna",
+      agent_model_options: [],
+      agent_instructions: "Build it"
+    };
     const query = async (sql: string, params?: unknown[]) => {
       queries.push({ sql, params });
+      if (sql.includes("FROM tasks")) return { rows: [task] };
       if (sql.includes("INSERT INTO agent_threads")) {
         return {
           rows: [{
@@ -77,25 +97,7 @@ describe("coordinated task agent threads", () => {
     } as unknown as DbPool;
 
     const thread = await ensureTaskAgentThread(pool, {
-      task: {
-        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        number: 1,
-        title: "Coordinated task",
-        body: "",
-        coordination_thread_id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-        project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-        agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        agent_kind: "worker",
-        source: "local_path",
-        local_path: "/workspace",
-        workspace_mode: "direct",
-        default_branch: null,
-        agent_name: "Builder",
-        agent_description: "Builds",
-        agent_model: "gpt-5.6-luna",
-        agent_model_options: [],
-        agent_instructions: "Build it"
-      },
+      task,
       runtimeHome: "/runtime/task-default",
       providerThreadId: null,
       model: "gpt-5.6-luna",
@@ -161,47 +163,67 @@ describe("coordinated task agent threads", () => {
     expect(queries.every((sql) => !sql.includes("SET agent_thread_generation = $2"))).toBe(true);
   });
 
-  it("clears a cached provider thread when a task owner changes", async () => {
+  it("terminalizes stale coordination deliveries during ownership changes", async () => {
     const queries: string[] = [];
-    const query = async (sql: string) => {
+    const pool = {
+      async query(sql: string) {
         queries.push(sql);
-        if (sql.includes("INSERT INTO agent_threads")) {
-          return {
-            rows: [{
-              id: "thread-id",
-              model: "gpt-test",
-              model_options: [],
-              runtime_home: "/runtime/task",
-              provider_thread_id: null,
-              ownership_generation: 3
-            }]
-          };
+        if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id")) {
+          return { rows: [{ id: "stale-coordination", message_delivery_id: "delivery-id" }] };
         }
         return { rows: [] };
-      };
+      }
+    } as unknown as DbPool;
+
+    await cancelStaleQueuedAgentThreadRuns(pool, "thread-id", 8);
+
+    expect(queries.some((sql) => sql.includes("UPDATE message_deliveries") && sql.includes("status = 'failed'"))).toBe(true);
+    expect(queries.some((sql) => sql.includes("status IN ('queued', 'cancel_requested')"))).toBe(true);
+  });
+
+  it("clears a cached provider thread when a task owner changes", async () => {
+    const queries: string[] = [];
+    const task = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      number: 1,
+      title: "Transferred task",
+      body: "",
+      coordination_thread_id: null,
+      project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      agent_kind: "worker" as const,
+      source: "local_path" as const,
+      local_path: "/workspace",
+      workspace_mode: "direct" as const,
+      default_branch: null,
+      agent_name: "Builder",
+      agent_description: "Builds",
+      agent_model: "gpt-test",
+      agent_model_options: [],
+      agent_instructions: "Build it"
+    };
+    const query = async (sql: string) => {
+      queries.push(sql);
+      if (sql.includes("FROM tasks")) return { rows: [task] };
+      if (sql.includes("INSERT INTO agent_threads")) {
+        return {
+          rows: [{
+            id: "thread-id",
+            model: "gpt-test",
+            model_options: [],
+            runtime_home: "/runtime/task",
+            provider_thread_id: null,
+            ownership_generation: 3
+          }]
+        };
+      }
+      return { rows: [] };
+    };
     const client = { query, release() {} };
     const pool = { query, async connect() { return client; } } as unknown as DbPool;
 
     const thread = await ensureTaskAgentThread(pool, {
-      task: {
-        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        number: 1,
-        title: "Transferred task",
-        body: "",
-        coordination_thread_id: null,
-        project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-        agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        agent_kind: "worker",
-        source: "local_path",
-        local_path: "/workspace",
-        workspace_mode: "direct",
-        default_branch: null,
-        agent_name: "Builder",
-        agent_description: "Builds",
-        agent_model: "gpt-test",
-        agent_model_options: [],
-        agent_instructions: "Build it"
-      },
+      task,
       runtimeHome: "/runtime/task",
       providerThreadId: "old-provider-thread",
       model: "gpt-test",
@@ -218,8 +240,28 @@ describe("coordinated task agent threads", () => {
 
   it("rolls back ownership changes when stale-run terminalization fails", async () => {
     const statements: string[] = [];
+    const task = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      number: 1,
+      title: "Transferred task",
+      body: "",
+      coordination_thread_id: null,
+      project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      agent_kind: "worker" as const,
+      source: "local_path" as const,
+      local_path: "/workspace",
+      workspace_mode: "direct" as const,
+      default_branch: null,
+      agent_name: "Builder",
+      agent_description: "Builds",
+      agent_model: "gpt-test",
+      agent_model_options: [],
+      agent_instructions: "Build it"
+    };
     const query = async (sql: string) => {
       statements.push(sql);
+      if (sql.includes("FROM tasks")) return { rows: [task] };
       if (sql.includes("INSERT INTO agent_threads")) {
         return {
           rows: [{
@@ -239,25 +281,7 @@ describe("coordinated task agent threads", () => {
     const pool = { query, async connect() { return client; } } as unknown as DbPool;
 
     await expect(ensureTaskAgentThread(pool, {
-      task: {
-        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        number: 1,
-        title: "Transferred task",
-        body: "",
-        coordination_thread_id: null,
-        project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-        agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        agent_kind: "worker",
-        source: "local_path",
-        local_path: "/workspace",
-        workspace_mode: "direct",
-        default_branch: null,
-        agent_name: "Builder",
-        agent_description: "Builds",
-        agent_model: "gpt-test",
-        agent_model_options: [],
-        agent_instructions: "Build it"
-      },
+      task,
       runtimeHome: "/runtime/task",
       providerThreadId: null,
       model: "gpt-test",
