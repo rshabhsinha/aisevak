@@ -1,4 +1,5 @@
 import type { DbPool } from "@aisevak/core";
+import type { PoolClient } from "pg";
 import { describe, expect, it } from "vitest";
 import { cancelStaleQueuedAgentThreadRuns, transferTaskAgentThread } from "./coordination.js";
 import {
@@ -162,6 +163,24 @@ describe("coordinated task agent threads", () => {
     expect(queries[0]).toContain("agent_thread_generation <> $2");
     expect(queries.find((sql) => sql.includes("scope <> 'coordination'"))).toContain("scope <> 'coordination'");
     expect(queries.every((sql) => !sql.includes("SET agent_thread_generation = $2"))).toBe(true);
+  });
+
+  it("does not reconnect a client that is already inside a transaction", async () => {
+    let connectCalls = 0;
+    const client = {
+      async connect() {
+        connectCalls += 1;
+        throw new Error("connected clients cannot be reused");
+      },
+      async query() {
+        return { rows: [] };
+      },
+      release() {}
+    } as unknown as PoolClient;
+
+    await cancelStaleQueuedAgentThreadRuns(client, "thread-id", 8);
+
+    expect(connectCalls).toBe(0);
   });
 
   it("terminalizes stale coordination deliveries during ownership changes", async () => {

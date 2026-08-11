@@ -15,7 +15,7 @@ import {
   type DbPool
 } from "@aisevak/core";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { PoolClient } from "pg";
+import pg, { type PoolClient } from "pg";
 import { z } from "zod";
 
 const DEFAULT_WORKER_CAPABILITIES = [
@@ -1254,7 +1254,7 @@ export async function cancelStaleQueuedAgentThreadRuns(
 }
 
 function isDbPool(queryable: Queryable): queryable is DbPool {
-  return "connect" in queryable && typeof queryable.connect === "function";
+  return queryable instanceof pg.Pool;
 }
 
 async function failStaleQueuedRunInputs(
