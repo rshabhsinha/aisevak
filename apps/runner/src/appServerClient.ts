@@ -22,6 +22,7 @@ class JsonRpcResponseError extends Error {}
 export interface AppServerTurnInput {
   id: string;
   message: string;
+  messageDeliveryId?: string | null;
 }
 
 export interface AppServerTurnOptions {

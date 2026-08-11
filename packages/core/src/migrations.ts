@@ -420,6 +420,10 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT N
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
+ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
+ON dispatcher_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;

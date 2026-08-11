@@ -185,10 +185,10 @@ describe("message delivery retry", () => {
       "temporary failure"
     );
 
-    expect(queries.at(-2)?.sql).toBe("ROLLBACK");
-    expect(queries.at(-1)?.sql).toContain("SET status = 'failed'");
-    expect(queries.at(-1)?.sql).toContain("status = 'running'");
-    expect(queries.at(-1)?.params).toEqual([
+    expect(queries.some((query) => query.sql === "ROLLBACK")).toBe(true);
+    const finalUpdate = [...queries].reverse().find((query) => query.sql.includes("SET status = 'failed'"));
+    expect(finalUpdate?.sql).toContain("status = 'running'");
+    expect(finalUpdate?.params).toEqual([
       "delivery",
       "Could not enqueue delivery retry: injected insert failure. Original error: temporary failure"
     ]);
