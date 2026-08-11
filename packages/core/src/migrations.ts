@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS agent_threads (
   branch text,
   runtime_home text NOT NULL,
   provider_thread_id text,
+  ownership_generation integer NOT NULL DEFAULT 0,
   last_activity_at timestamptz NOT NULL DEFAULT now(),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -251,6 +252,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   trigger text NOT NULL DEFAULT 'heartbeat',
   scope text NOT NULL DEFAULT 'heartbeat',
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  agent_thread_generation integer NOT NULL DEFAULT 0,
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   codex_home text NOT NULL,
@@ -409,6 +411,7 @@ ALTER TABLE agents ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffo
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS ownership_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
@@ -419,7 +422,7 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERE
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
-ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
@@ -766,6 +769,8 @@ CREATE TABLE IF NOT EXISTS agent_turn_inputs (
   updated_at timestamptz NOT NULL DEFAULT now(),
   CHECK ((task_run_id IS NOT NULL)::integer + (dispatcher_run_id IS NOT NULL)::integer = 1)
 );
+
+ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 
 CREATE INDEX IF NOT EXISTS agent_turn_inputs_task_run_idx
 ON agent_turn_inputs(task_run_id, status, created_at) WHERE task_run_id IS NOT NULL;
