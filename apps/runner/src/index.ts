@@ -148,7 +148,7 @@ async function main(): Promise<void> {
       await processOneImportJob(pool);
       await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
-      startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
+      if (!shuttingDown) startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     } catch (error) {
       console.error("runner loop error", error);
     }
@@ -168,7 +168,7 @@ export function startAvailableRunJobs(
   if (runFunctions.length === 0) return;
   const limit = Math.max(1, Math.floor(maxConcurrency));
   let functionIndex = 0;
-  while (activeJobs.size < limit) {
+  while (!shuttingDown && activeJobs.size < limit) {
     const selectedIndex = functionIndex % runFunctions.length;
     const runFunction = runFunctions[selectedIndex];
     functionIndex += 1;
@@ -252,7 +252,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
         { id: run.id, message_delivery_id: run.message_delivery_id },
         finalStatus,
         error,
-        false
+        true
       );
     }
     await failPendingAgentTurnInputs(pool, "dispatcher", run.id, finalStatus);
@@ -275,77 +275,53 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       { id: delivery.run_id, message_delivery_id: delivery.message_delivery_id },
       "failed",
       "The coordination delivery was interrupted when the runner stopped",
-      false
+      true
     );
   }
 
-  const completedInputs = await pool.query<{
+  const terminalInputs = await pool.query<{
     input_id: string;
     message_delivery_id: string | null;
+    input_status: "queued" | "delivering";
+    run_status: "succeeded" | "failed" | "cancelled";
   }>(
-    `SELECT agent_turn_inputs.id AS input_id, agent_turn_inputs.message_delivery_id
+    `SELECT agent_turn_inputs.id AS input_id,
+            agent_turn_inputs.message_delivery_id,
+            agent_turn_inputs.status::text AS input_status,
+            dispatcher_runs.status::text AS run_status
      FROM agent_turn_inputs
      JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-     WHERE agent_turn_inputs.status = 'delivering'
+     WHERE agent_turn_inputs.status IN ('queued', 'delivering')
        AND dispatcher_runs.scope = 'coordination'
-       AND dispatcher_runs.status = 'succeeded'`
+       AND dispatcher_runs.status IN ('succeeded', 'failed', 'cancelled')`
   );
-  for (const input of completedInputs.rows) {
+  for (const input of terminalInputs.rows) {
+    const delivered = input.input_status === "delivering" && input.run_status === "succeeded";
+    const inputError = delivered
+      ? null
+      : input.run_status === "cancelled"
+        ? "The coordination turn was stopped before this message could be delivered"
+        : "The coordination turn finished before this message could be delivered";
     await withTransaction(pool, async (client) => {
       const updated = await client.query(
         `UPDATE agent_turn_inputs
-         SET status = 'delivered', delivered_at = COALESCE(delivered_at, now()), updated_at = now()
-         WHERE id = $1 AND status = 'delivering'
+         SET status = $2,
+             error = $3,
+             delivered_at = CASE WHEN $2 = 'delivered' THEN COALESCE(delivered_at, now()) ELSE delivered_at END,
+             updated_at = now()
+         WHERE id = $1 AND status IN ('queued', 'delivering')
          RETURNING message_delivery_id`,
-        [input.input_id]
+        [input.input_id, delivered ? "delivered" : "failed", inputError]
       );
       const deliveryId = updated.rows[0]?.message_delivery_id ?? input.message_delivery_id;
       if (!deliveryId) return;
       await client.query(
         `UPDATE message_deliveries
-         SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
-         WHERE id = $1 AND status = 'running'`,
-        [deliveryId]
-      );
-      await cancelQueuedDeliveryRuns(client, deliveryId, "Delivery completed");
-    });
-  }
-
-  const orphanedInputs = await pool.query<{ message_delivery_id: string }>(
-    `SELECT DISTINCT agent_turn_inputs.message_delivery_id
-     FROM agent_turn_inputs
-     JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-     WHERE agent_turn_inputs.status = 'delivering'
-       AND agent_turn_inputs.message_delivery_id IS NOT NULL
-       AND dispatcher_runs.scope = 'coordination'
-       AND dispatcher_runs.status IN ('failed', 'cancelled')`
-  );
-  await pool.query(
-    `UPDATE agent_turn_inputs
-     SET status = 'failed',
-         error = COALESCE(error, 'The coordination input was interrupted when the runner stopped'),
-         updated_at = now()
-     WHERE status = 'delivering'
-       AND dispatcher_run_id IN (
-       SELECT id FROM dispatcher_runs
-       WHERE scope = 'coordination' AND status IN ('failed', 'cancelled')
-       )`
-  );
-  for (const input of orphanedInputs.rows) {
-    await withTransaction(pool, async (client) => {
-      await client.query(
-        `UPDATE message_deliveries
-         SET status = 'failed', completed_at = now(),
-             error = COALESCE(error, 'The coordination input was interrupted when the runner stopped'),
-             updated_at = now()
+         SET status = $2, completed_at = now(), error = $3, updated_at = now()
          WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
-        [input.message_delivery_id]
+        [deliveryId, delivered ? "completed" : "failed", inputError]
       );
-      await cancelQueuedDeliveryRuns(
-        client,
-        input.message_delivery_id,
-        "The coordination input was interrupted when the runner stopped"
-      );
+      await cancelQueuedDeliveryRuns(client, deliveryId, inputError ?? "Delivery completed");
     });
   }
 }
@@ -741,9 +717,17 @@ interface ClaimedRun {
 
 async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
   return withTransaction(pool, async (client) => {
-    const candidateResult = await client.query<{ id: string; agent_thread_id: string | null }>(
-      `SELECT candidate.id, candidate.agent_thread_id
+    const candidateResult = await client.query<{
+      id: string;
+      agent_thread_id: string | null;
+      project_id: string | null;
+      workspace_mode: "direct" | "git_worktree" | null;
+    }>(
+      `SELECT candidate.id, candidate.agent_thread_id,
+              candidate_task.project_id, candidate_project.workspace_mode
        FROM dispatcher_runs candidate
+       LEFT JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
+       LEFT JOIN projects candidate_project ON candidate_project.id = candidate_task.project_id
        WHERE candidate.status = 'queued'
          AND (
            candidate.message_delivery_id IS NULL
@@ -771,12 +755,50 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
                AND active_dispatcher.status IN ('running', 'cancel_requested')
            )
          )
+         AND (
+           candidate_project.workspace_mode IS NULL
+           OR candidate_project.workspace_mode <> 'direct'
+           OR NOT EXISTS (
+             SELECT 1
+             FROM (
+               SELECT active.status, active_task.project_id
+               FROM task_runs active
+               JOIN tasks active_task ON active_task.id = active.task_id
+               UNION ALL
+               SELECT active.status, active_task.project_id
+               FROM dispatcher_runs active
+               JOIN tasks active_task ON active_task.id = active.task_id
+             ) active_project_turns
+             WHERE active_project_turns.project_id = candidate_task.project_id
+               AND active_project_turns.status IN ('running', 'cancel_requested')
+           )
+         )
        ORDER BY candidate.queued_at ASC
        LIMIT 1
        FOR UPDATE OF candidate SKIP LOCKED`
     );
     const candidate = candidateResult.rows[0];
     if (!candidate) return null;
+    if (candidate.workspace_mode === "direct" && candidate.project_id) {
+      await client.query("SELECT id FROM projects WHERE id = $1 FOR UPDATE", [candidate.project_id]);
+      const activeProject = await client.query(
+        `SELECT 1
+         FROM (
+           SELECT active.status, active_task.project_id
+           FROM task_runs active
+           JOIN tasks active_task ON active_task.id = active.task_id
+           UNION ALL
+           SELECT active.status, active_task.project_id
+           FROM dispatcher_runs active
+           JOIN tasks active_task ON active_task.id = active.task_id
+         ) active_project_turns
+         WHERE active_project_turns.project_id = $1
+           AND active_project_turns.status IN ('running', 'cancel_requested')
+         LIMIT 1`,
+        [candidate.project_id]
+      );
+      if (activeProject.rows[0]) return null;
+    }
     if (candidate.agent_thread_id) {
       await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [candidate.agent_thread_id]);
       const active = await client.query(
@@ -820,11 +842,17 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
          AND (
            candidate_project.workspace_mode <> 'direct'
            OR NOT EXISTS (
-             SELECT 1
-             FROM task_runs active
-             JOIN tasks active_task ON active_task.id = active.task_id
-             WHERE active_task.project_id = candidate_task.project_id
-               AND active.status = 'running'
+             SELECT 1 FROM (
+               SELECT active.status, active_task.project_id
+               FROM task_runs active
+               JOIN tasks active_task ON active_task.id = active.task_id
+               UNION ALL
+               SELECT active.status, active_task.project_id
+               FROM dispatcher_runs active
+               JOIN tasks active_task ON active_task.id = active.task_id
+             ) active_project_turns
+             WHERE active_project_turns.project_id = candidate_task.project_id
+               AND active_project_turns.status IN ('running', 'cancel_requested')
            )
          )
          AND (
@@ -853,9 +881,17 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
       await client.query("SELECT id FROM projects WHERE id = $1 FOR UPDATE", [candidate.project_id]);
       const activeProject = await client.query(
         `SELECT 1
-         FROM task_runs active
-         JOIN tasks active_task ON active_task.id = active.task_id
-         WHERE active_task.project_id = $1 AND active.status = 'running'
+         FROM (
+           SELECT active.status, active_task.project_id
+           FROM task_runs active
+           JOIN tasks active_task ON active_task.id = active.task_id
+           UNION ALL
+           SELECT active.status, active_task.project_id
+           FROM dispatcher_runs active
+           JOIN tasks active_task ON active_task.id = active.task_id
+         ) active_project_turns
+         WHERE active_project_turns.project_id = $1
+           AND active_project_turns.status IN ('running', 'cancel_requested')
          LIMIT 1`,
         [candidate.project_id]
       );

@@ -23,4 +23,11 @@ describe("thread load guard", () => {
     expect(applyOlderRequest()).toBe(false);
     expect(applyNewerRequest()).toBe(true);
   });
+
+  it("accepts the first request for an initially selected deep-link thread", () => {
+    const guard = createThreadLoadGuard("thread-from-route");
+    const applyInitialRequest = guard.begin("thread-from-route");
+
+    expect(applyInitialRequest()).toBe(true);
+  });
 });

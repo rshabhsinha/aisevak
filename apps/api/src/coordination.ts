@@ -61,6 +61,7 @@ type Queryable = DbPool | PoolClient;
 
 interface AgentThreadSession {
   id: string;
+  task_id: string | null;
   runtime_home: string;
   provider_thread_id: string | null;
   cwd: string;
@@ -1190,10 +1191,12 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : null;
   const linkedTaskId = linkedTask?.rows[0]?.agent_id === recipientAgentId ? thread.task_id : null;
   const existing = await client.query<AgentThreadSession>(
-    `SELECT id, runtime_home, provider_thread_id, cwd FROM agent_threads
+    `SELECT id, task_id, runtime_home, provider_thread_id, cwd FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
+  let ownershipTransferUnsafe = false;
   if (session && linkedTaskId) {
+    ownershipTransferUnsafe = session.task_id !== linkedTaskId;
     await client.query(
       "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
       [linkedTaskId, session.id]
@@ -1207,12 +1210,13 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
            provider_thread_id = CASE WHEN runtime_home = $4 THEN provider_thread_id ELSE NULL END,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
       [session.id, linkedTaskId, thread.project_id, runtimeHome]
     );
     session = updated.rows[0];
   }
   if (!session && linkedTaskId) {
+    ownershipTransferUnsafe = true;
     session = await transferTaskAgentThread(client, {
       threadId,
       taskId: linkedTaskId,
@@ -1230,18 +1234,18 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       managedRoot,
       linkedTaskId ?? `thread-${threadId}-${recipientAgentId}`
     );
-    const created = await client.query<{ id: string; runtime_home: string; provider_thread_id: string | null; cwd: string }>(
+    const created = await client.query<AgentThreadSession>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
-       RETURNING id, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
       [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
     );
     session = created.rows[0]!;
   }
 
   const message = await showMessage(client, messageId, true);
-  if (await queueIncrementalCoordinationInput(client, session.id, delivery.rows[0]!.id, message.body)) {
+  if (!ownershipTransferUnsafe && await queueIncrementalCoordinationInput(client, session.id, delivery.rows[0]!.id, message.body)) {
     return;
   }
 
@@ -1371,7 +1375,7 @@ export async function transferTaskAgentThread(
          last_activity_at = now(),
          updated_at = now()
      WHERE task_id = $2
-     RETURNING id, runtime_home, provider_thread_id, cwd`,
+     RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
     [
       input.threadId,
       input.taskId,

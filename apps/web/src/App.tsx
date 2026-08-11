@@ -394,7 +394,7 @@ export function App() {
   const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
-  const threadLoadGuardRef = useRef(createThreadLoadGuard());
+  const threadLoadGuardRef = useRef(createThreadLoadGuard(initialRoute.threadId));
 
   const filteredTasks = useMemo(() => {
     const needle = query.trim().toLowerCase();
