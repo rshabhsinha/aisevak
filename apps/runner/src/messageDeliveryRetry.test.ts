@@ -165,6 +165,14 @@ describe("message delivery retry", () => {
       "delivery",
       "Automatic delivery retry suppressed: the source run was unavailable or another run for this coordination message was already queued or active. Original error: temporary failure"
     ]);
+    expect(
+      queries.some(
+        (query) =>
+          query.sql.includes("UPDATE dispatcher_runs") &&
+          query.sql.includes("SET status = 'cancelled'") &&
+          query.sql.includes("status = 'queued'")
+      )
+    ).toBe(true);
   });
 
   it("marks the delivery failed after a replacement enqueue rollback", async () => {

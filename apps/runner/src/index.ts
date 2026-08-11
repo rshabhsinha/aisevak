@@ -1283,14 +1283,19 @@ export async function finishMessageDelivery(
         [job.id, job.message_delivery_id]
       );
       if (!retry.rows[0]) {
+        const suppressionError =
+          `Automatic delivery retry suppressed: the source run was unavailable or another run for this coordination message was already queued or active.${error ? ` Original error: ${error}` : ""}`;
+        await client.query(
+          `UPDATE dispatcher_runs
+           SET status = 'cancelled', finished_at = now(), error = $2, updated_at = now()
+           WHERE message_delivery_id = $1 AND status = 'queued'`,
+          [job.message_delivery_id, suppressionError]
+        );
         await client.query(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
-          [
-            job.message_delivery_id,
-            `Automatic delivery retry suppressed: the source run was unavailable or another run for this coordination message was already queued or active.${error ? ` Original error: ${error}` : ""}`
-          ]
+          [job.message_delivery_id, suppressionError]
         );
         return;
       }
