@@ -1411,13 +1411,22 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
   const prompt = session.provider_thread_id
     ? coordinationIncrementalPrompt(message)
     : coordinationPrompt(thread, recipient, message, history.rows.reverse());
+  const workspaceMode = thread.project_id
+    ? project?.rows[0]?.workspace_mode ?? "unknown"
+    : "projectless";
+  const workspaceSource = thread.project_id
+    ? project?.rows[0]?.source ?? "unknown"
+    : "projectless";
   const createdRun = await client.query<{ id: string }>(
     `INSERT INTO dispatcher_runs
        (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
         codex_thread_id, model, model_options, prompt, skills_snapshot)
      VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13)
      RETURNING id`,
-    [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "", project?.rows[0]?.workspace_mode ?? "unknown", project?.rows[0]?.source ?? "unknown", delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
+    [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "",
+      workspaceMode,
+      workspaceSource,
+      delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
   );
   await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
@@ -1703,6 +1712,13 @@ async function finalizeThread(
   updateRelatedResource?: (client: PoolClient) => Promise<void>
 ): Promise<string> {
   return withTransaction(pool, async (client) => {
+    const taskLink = await client.query<{ task_id: string | null }>(
+      "SELECT task_id FROM coordination_threads WHERE id = $1",
+      [threadId]
+    );
+    if (taskLink.rows[0]?.task_id) {
+      await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [taskLink.rows[0].task_id]);
+    }
     const thread = await lockThread(client, threadId);
     const duplicate = await existingIdempotentMessage(client, context.agentId, idempotencyKey);
     if (duplicate) return duplicate.id;

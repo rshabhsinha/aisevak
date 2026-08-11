@@ -244,11 +244,9 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
        SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
        WHERE status = 'queued'
          AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
-         AND task_id IS NOT NULL
-         AND EXISTS (
-           SELECT 1 FROM tasks
-           WHERE tasks.id = dispatcher_runs.task_id
-             AND tasks.project_id IS NOT NULL
+         AND (
+           task_id IS NOT NULL
+           OR agent_thread_id IS NOT NULL
          )
        RETURNING id, message_delivery_id`,
       [error]

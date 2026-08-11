@@ -7,7 +7,7 @@ import {
 } from "./index.js";
 
 describe("coordination startup recovery", () => {
-  it("cancels queued project-bound runs whose workspace snapshot is ambiguous", async () => {
+  it("cancels detached task and project-thread runs whose workspace snapshot is ambiguous", async () => {
     const queries: string[] = [];
     const query = async (sql: string) => {
       queries.push(sql);
@@ -33,6 +33,9 @@ describe("coordination startup recovery", () => {
     expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain("status = 'cancelled'");
     expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs") && sql.includes("task_id IS NOT NULL"))).toContain(
       "workspace_source = 'unknown'"
+    );
+    expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs") && sql.includes("task_id IS NOT NULL"))).toContain(
+      "OR agent_thread_id IS NOT NULL"
     );
     expect(queries.some((sql) => sql.includes("UPDATE message_deliveries") && sql.includes("status = 'failed'"))).toBe(true);
     expect(queries.some((sql) => sql.includes("status = 'queued' OR status = 'cancel_requested'"))).toBe(true);

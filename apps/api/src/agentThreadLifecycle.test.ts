@@ -6,6 +6,7 @@ import {
   getTaskSessionTimeline,
   isolateTaskNavigationThread,
   cancelAgentThread,
+  linkTaskRunsToThread,
   synchronizeTaskSessionRuntime
 } from "./server.js";
 
@@ -179,6 +180,34 @@ describe("coordinated task agent threads", () => {
 
     expect(queries.some((sql) => sql.includes("UPDATE message_deliveries") && sql.includes("status = 'failed'"))).toBe(true);
     expect(queries.some((sql) => sql.includes("status IN ('queued', 'cancel_requested')"))).toBe(true);
+  });
+
+  it("cancels unlinked queued turns before linking only terminal history", async () => {
+    const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
+    const pool = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        if (sql.includes("UPDATE task_runs") && sql.includes("status = 'cancelled'") && sql.includes("RETURNING id")) {
+          return { rows: [{ id: "unlinked-worker" }] };
+        }
+        if (sql.includes("UPDATE dispatcher_runs") && sql.includes("status = 'cancelled'") && sql.includes("RETURNING id")) {
+          return { rows: [{ id: "unlinked-dispatcher", message_delivery_id: "delivery-id" }] };
+        }
+        if (sql.includes("UPDATE agent_turn_inputs")) {
+          return { rows: [{ message_delivery_id: "delivery-id" }] };
+        }
+        return { rows: [] };
+      }
+    } as unknown as DbPool;
+
+    await linkTaskRunsToThread(pool, "task-id", "thread-id");
+
+    const workerLink = queries.find((query) => query.sql.includes("UPDATE task_runs") && query.sql.includes("agent_thread_id = $2"));
+    const dispatcherLink = queries.find((query) => query.sql.includes("UPDATE dispatcher_runs") && query.sql.includes("agent_thread_id = $2"));
+    expect(workerLink?.sql).toContain("status NOT IN ('queued', 'running', 'cancel_requested')");
+    expect(dispatcherLink?.sql).toContain("status NOT IN ('queued', 'running', 'cancel_requested')");
+    expect(queries.some((query) => query.sql.includes("UPDATE message_deliveries") && query.sql.includes("status = 'failed'"))).toBe(true);
+    expect(queries.some((query) => query.sql.includes("status IN ('queued', 'cancel_requested')"))).toBe(true);
   });
 
   it("clears a cached provider thread when a task owner changes", async () => {
