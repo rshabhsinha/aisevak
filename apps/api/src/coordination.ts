@@ -566,6 +566,7 @@ export async function registerCoordinationRoutes(
     const body = assignSchema.parse(request.body);
     const recipient = await getAgent(pool, body.agent);
     const output = await withTransaction(pool, async (client) => {
+      await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [id]);
       const task = await client.query<{ number: number; title: string; coordination_thread_id: string }>(
         `UPDATE tasks SET agent_id = $2, status = 'open', updated_at = now() WHERE id = $1
          RETURNING number, title, coordination_thread_id`,
@@ -576,6 +577,15 @@ export async function registerCoordinationRoutes(
         `UPDATE coordination_threads SET primary_agent_id = $2, status = 'active', updated_at = now(), last_activity_at = now() WHERE id = $1`,
         [row.coordination_thread_id, recipient.id]
       );
+      await transferTaskAgentThread(client, {
+        threadId: row.coordination_thread_id,
+        taskId: id,
+        recipientAgentId: recipient.id,
+        model: recipient.model,
+        modelOptions: recipient.model_options ?? [],
+        runtimeHome: managedCodexHome(options.managedRoot, id),
+        preserveCoordination: true
+      });
       await addParticipants(client, row.coordination_thread_id, [[recipient.id, "assignee"]]);
       const message = await insertMessage(client, {
         threadId: row.coordination_thread_id,
