@@ -58,6 +58,7 @@ const env = {
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
+  maxConcurrency: positiveNumber(process.env.RUNNER_MAX_CONCURRENCY, 4),
   dispatcherHeartbeatMs: Number(process.env.DISPATCHER_HEARTBEAT_MS ?? "300000"),
   apiUrl: process.env.API_URL ?? "http://localhost:8787",
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -66,6 +67,7 @@ const env = {
 };
 
 let shuttingDown = false;
+const activeRunJobs = new Set<Promise<void>>();
 
 interface ImportJob {
   id: string;
@@ -130,6 +132,7 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
   await recoverInterruptedGithubJobs(pool);
+  await recoverInterruptedCoordinationRuns(pool);
 
   const beginShutdown = () => {
     shuttingDown = true;
@@ -139,20 +142,49 @@ async function main(): Promise<void> {
 
   console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
+    startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     try {
       await processOneGithubConnection(pool);
       await processOneImportJob(pool);
       await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
-      await processOneDispatcherRun(pool);
-      await processOneRunJob(pool);
+      startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     } catch (error) {
       console.error("runner loop error", error);
     }
     await sleep(env.pollMs);
   }
+  await waitForRunJobs(activeRunJobs);
   await closeAllCodexAppServers();
   await pool.end();
+}
+
+export function startAvailableRunJobs(
+  pool: DbPool,
+  activeJobs: Set<Promise<void>>,
+  maxConcurrency: number,
+  runFunctions: Array<(pool: DbPool) => Promise<void>> = [processOneDispatcherRun, processOneRunJob]
+): void {
+  const limit = Math.max(1, Math.floor(maxConcurrency));
+  let functionIndex = 0;
+  while (activeJobs.size < limit) {
+    const runFunction = runFunctions[functionIndex % runFunctions.length];
+    functionIndex += 1;
+    if (!runFunction) return;
+    const job = Promise.resolve()
+      .then(() => runFunction(pool))
+      .catch((error) => {
+        console.error("runner run job error", error);
+      });
+    activeJobs.add(job);
+    void job.finally(() => activeJobs.delete(job));
+  }
+}
+
+export async function waitForRunJobs(activeJobs: Set<Promise<void>>): Promise<void> {
+  while (activeJobs.size > 0) {
+    await Promise.all([...activeJobs]);
+  }
 }
 
 async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
@@ -170,6 +202,62 @@ async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
     `UPDATE repo_import_jobs
      SET status = 'queued', started_at = NULL, updated_at = now()
      WHERE status = 'running'`
+  );
+}
+
+export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<void> {
+  const interrupted = await pool.query<{
+    id: string;
+    status: "running" | "cancel_requested";
+    message_delivery_id: string | null;
+  }>(
+    `SELECT id, status::text, message_delivery_id
+     FROM dispatcher_runs
+     WHERE scope = 'coordination'
+       AND status IN ('running', 'cancel_requested')
+     ORDER BY started_at ASC NULLS FIRST, id ASC`
+  );
+
+  for (const run of interrupted.rows) {
+    const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
+    const error =
+      run.status === "cancel_requested"
+        ? "The coordination turn was cancelled when the runner stopped"
+        : "The coordination turn was interrupted when the runner stopped";
+    const updated = await pool.query(
+      `UPDATE dispatcher_runs
+       SET status = $2::run_status,
+           error = $3,
+           finished_at = now(),
+           updated_at = now()
+       WHERE id = $1 AND status IN ('running', 'cancel_requested')
+       RETURNING id`,
+      [run.id, finalStatus, error]
+    );
+    if (!updated.rows[0]) continue;
+
+    await failPendingAgentTurnInputs(pool, "dispatcher", run.id, finalStatus);
+    if (run.message_delivery_id) {
+      await finishMessageDelivery(
+        pool,
+        { id: run.id, message_delivery_id: run.message_delivery_id },
+        finalStatus,
+        error,
+        false
+      );
+    }
+  }
+
+  await pool.query(
+    `UPDATE agent_turn_inputs
+     SET status = 'failed',
+         error = COALESCE(error, 'The coordination input was interrupted when the runner stopped'),
+         updated_at = now()
+     WHERE status = 'delivering'
+       AND dispatcher_run_id IN (
+         SELECT id FROM dispatcher_runs
+         WHERE scope = 'coordination' AND status IN ('failed', 'cancelled')
+       )`
   );
 }
 
@@ -568,6 +656,8 @@ export async function processOneDispatcherRun(
      WHERE id = (
        SELECT candidate.id
        FROM dispatcher_runs candidate
+       LEFT JOIN agent_threads candidate_thread
+         ON candidate_thread.id = candidate.agent_thread_id
        WHERE candidate.status = 'queued'
          AND (
            candidate.message_delivery_id IS NULL
@@ -580,17 +670,26 @@ export async function processOneDispatcherRun(
            )
          )
          AND (
-           candidate.scope <> 'coordination'
+           candidate.agent_thread_id IS NULL
            OR NOT EXISTS (
-             SELECT 1 FROM dispatcher_runs active
-             WHERE active.agent_thread_id = candidate.agent_thread_id
-               AND active.scope = 'coordination'
-               AND active.status = 'running'
+             SELECT 1
+             FROM task_runs active_worker
+             WHERE active_worker.agent_thread_id = candidate.agent_thread_id
+               AND active_worker.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1
+             FROM dispatcher_runs active_dispatcher
+             WHERE active_dispatcher.agent_thread_id = candidate.agent_thread_id
+               AND active_dispatcher.status IN ('running', 'cancel_requested')
            )
          )
        ORDER BY candidate.queued_at ASC
        LIMIT 1
-       FOR UPDATE SKIP LOCKED
+       FOR UPDATE OF candidate, candidate_thread SKIP LOCKED
      )
      RETURNING id`
   );
@@ -775,6 +874,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
        FROM task_runs candidate
        JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
        JOIN projects candidate_project ON candidate_project.id = candidate_task.project_id
+       LEFT JOIN agent_threads candidate_thread ON candidate_thread.id = candidate.agent_thread_id
        WHERE candidate.status = 'queued'
          AND candidate.run_kind = 'worker'
          AND (
@@ -787,9 +887,27 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
                AND active.status = 'running'
            )
          )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1
+             FROM task_runs active_worker
+             WHERE active_worker.agent_thread_id = candidate.agent_thread_id
+               AND active_worker.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1
+             FROM dispatcher_runs active_dispatcher
+             WHERE active_dispatcher.agent_thread_id = candidate.agent_thread_id
+               AND active_dispatcher.status IN ('running', 'cancel_requested')
+           )
+         )
        ORDER BY candidate.queued_at ASC
        LIMIT 1
-       FOR UPDATE SKIP LOCKED
+       FOR UPDATE OF candidate, candidate_project, candidate_thread SKIP LOCKED
      )
      RETURNING id`
   );
@@ -1629,6 +1747,11 @@ function mustRow<T>(row: T | undefined): T {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function positiveNumber(value: string | undefined, fallback: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

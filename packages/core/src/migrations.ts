@@ -419,6 +419,7 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERE
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
@@ -766,6 +767,15 @@ CREATE INDEX IF NOT EXISTS agent_turn_inputs_task_run_idx
 ON agent_turn_inputs(task_run_id, status, created_at) WHERE task_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS agent_turn_inputs_dispatcher_run_idx
 ON agent_turn_inputs(dispatcher_run_id, status, created_at) WHERE dispatcher_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_turn_inputs_delivery_idx
+ON agent_turn_inputs(message_delivery_id) WHERE message_delivery_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_turn_inputs_delivery_unique
+ON agent_turn_inputs(message_delivery_id) WHERE message_delivery_id IS NOT NULL;
+
+DO $$ BEGIN
+  ALTER TABLE agent_turn_inputs ADD CONSTRAINT agent_turn_inputs_message_delivery_id_fkey
+    FOREIGN KEY (message_delivery_id) REFERENCES message_deliveries(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
   ALTER TABLE tasks ADD CONSTRAINT tasks_coordination_thread_id_fkey

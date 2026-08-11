@@ -413,6 +413,9 @@ export const agentTurnInputs = pgTable("agent_turn_inputs", {
   dispatcherRunId: uuid("dispatcher_run_id").references(() => dispatcherRuns.id, {
     onDelete: "cascade"
   }),
+  messageDeliveryId: uuid("message_delivery_id").references(() => messageDeliveries.id, {
+    onDelete: "cascade"
+  }),
   message: text("message").notNull(),
   status: text("status").notNull().default("queued"),
   error: text("error"),
