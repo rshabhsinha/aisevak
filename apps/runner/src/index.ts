@@ -58,7 +58,7 @@ const env = {
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
-  maxConcurrency: positiveNumber(process.env.RUNNER_MAX_CONCURRENCY, 4),
+  maxConcurrency: positiveNumber(process.env.RUNNER_MAX_CONCURRENCY, 4, 32),
   dispatcherHeartbeatMs: Number(process.env.DISPATCHER_HEARTBEAT_MS ?? "300000"),
   apiUrl: process.env.API_URL ?? "http://localhost:8787",
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -277,6 +277,38 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       "The coordination delivery was interrupted when the runner stopped",
       false
     );
+  }
+
+  const completedInputs = await pool.query<{
+    input_id: string;
+    message_delivery_id: string | null;
+  }>(
+    `SELECT agent_turn_inputs.id AS input_id, agent_turn_inputs.message_delivery_id
+     FROM agent_turn_inputs
+     JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+     WHERE agent_turn_inputs.status = 'delivering'
+       AND dispatcher_runs.scope = 'coordination'
+       AND dispatcher_runs.status = 'succeeded'`
+  );
+  for (const input of completedInputs.rows) {
+    await withTransaction(pool, async (client) => {
+      const updated = await client.query(
+        `UPDATE agent_turn_inputs
+         SET status = 'delivered', delivered_at = COALESCE(delivered_at, now()), updated_at = now()
+         WHERE id = $1 AND status = 'delivering'
+         RETURNING message_delivery_id`,
+        [input.input_id]
+      );
+      const deliveryId = updated.rows[0]?.message_delivery_id ?? input.message_delivery_id;
+      if (!deliveryId) return;
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [deliveryId]
+      );
+      await cancelQueuedDeliveryRuns(client, deliveryId, "Delivery completed");
+    });
   }
 
   const orphanedInputs = await pool.query<{ message_delivery_id: string }>(
@@ -1972,9 +2004,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function positiveNumber(value: string | undefined, fallback: number): number {
+function positiveNumber(value: string | undefined, fallback: number, maximum = Number.MAX_SAFE_INTEGER): number {
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
