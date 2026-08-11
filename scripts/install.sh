@@ -491,7 +491,7 @@ prune_releases() {
 }
 
 log "Staging release ${RELEASE_DIR}"
-mkdir -p "${RELEASE_DIR}"
+install -d -m 0755 "${RELEASE_DIR}"
 rsync -a --delete \
   --exclude node_modules \
   --exclude dist \
@@ -500,6 +500,10 @@ rsync -a --delete \
   --exclude .env.local \
   --exclude .DS_Store \
   "${SOURCE_DIR}/" "${RELEASE_DIR}/"
+# rsync preserves the source directory mode. Deployment staging directories
+# are intentionally private, but the host runner must be able to traverse the
+# activated release as its unprivileged service user.
+chmod 0755 "${RELEASE_DIR}"
 printf "%s\n" "${GIT_SHA}" > "${RELEASE_DIR}/REVISION"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
