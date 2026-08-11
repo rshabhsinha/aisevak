@@ -85,7 +85,24 @@ function dispatcherPool(codexHome: string): {
   const query = async (sql: string, params?: unknown[]) => {
     queries.push({ sql, params });
     if (sql.includes("SELECT candidate.id") && sql.includes("FROM dispatcher_runs candidate")) {
-      return { rows: [{ id: "dispatcher-run", agent_thread_id: "agent-thread" }] };
+      return {
+        rows: [{
+          id: "dispatcher-run",
+          agent_thread_id: "agent-thread",
+          agent_thread_generation: 0,
+          workspace_key: "",
+          workspace_mode: "unknown"
+        }]
+      };
+    }
+    if (sql.includes("SELECT id FROM agent_threads") && sql.includes("FOR UPDATE SKIP LOCKED")) {
+      return { rows: [{ id: "agent-thread" }] };
+    }
+    if (sql.includes("SELECT ownership_generation FROM agent_threads")) {
+      return { rows: [{ ownership_generation: 0 }] };
+    }
+    if (sql.includes("SELECT id") && sql.includes("FROM dispatcher_runs") && sql.includes("FOR UPDATE SKIP LOCKED")) {
+      return { rows: [{ id: "dispatcher-run" }] };
     }
     if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id")) {
       return { rows: [{ id: "dispatcher-run" }] };
@@ -97,6 +114,7 @@ function dispatcherPool(codexHome: string): {
             id: "dispatcher-run",
             scope: "coordination",
             agent_thread_id: "agent-thread",
+            agent_thread_generation: 0,
             message_delivery_id: "delivery",
             task_id: null,
             prompt: "coordination message",
@@ -111,6 +129,7 @@ function dispatcherPool(codexHome: string): {
             agent_name: "Builder",
             agent_description: "Builds",
             agent_instructions: "",
+            ownership_generation: 0,
             coordination_thread_id: "coordination-thread"
           }
         ]

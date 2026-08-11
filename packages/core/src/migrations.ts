@@ -225,6 +225,8 @@ CREATE TABLE IF NOT EXISTS task_runs (
   parent_run_id uuid,
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
   agent_thread_generation integer NOT NULL DEFAULT 0,
+  workspace_key text NOT NULL DEFAULT '',
+  workspace_mode text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
@@ -254,6 +256,8 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   scope text NOT NULL DEFAULT 'heartbeat',
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
   agent_thread_generation integer NOT NULL DEFAULT 0,
+  workspace_key text NOT NULL DEFAULT '',
+  workspace_mode text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   codex_home text NOT NULL,
@@ -418,6 +422,8 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'ma
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
@@ -425,6 +431,23 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT N
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
+UPDATE task_runs
+SET workspace_key = tasks.project_id::text,
+    workspace_mode = projects.workspace_mode
+FROM tasks
+JOIN projects ON projects.id = tasks.project_id
+WHERE task_runs.workspace_key = '';
+UPDATE dispatcher_runs
+SET workspace_key = COALESCE(agent_threads.project_id, tasks.project_id)::text,
+    workspace_mode = COALESCE(thread_projects.workspace_mode, task_projects.workspace_mode, 'unknown')
+FROM agent_threads
+LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+LEFT JOIN projects task_projects ON task_projects.id = tasks.project_id
+LEFT JOIN projects thread_projects ON thread_projects.id = agent_threads.project_id
+WHERE dispatcher_runs.agent_thread_id = agent_threads.id
+  AND dispatcher_runs.workspace_key = '';
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
