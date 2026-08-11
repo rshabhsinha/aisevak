@@ -54,19 +54,26 @@ describe("coordinated task agent threads", () => {
 
   it("keeps the task link and returns the existing coordinated runtime", async () => {
     const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
-    const pool = {
-      async query(sql: string, params?: unknown[]) {
-        queries.push({ sql, params });
+    const query = async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      if (sql.includes("INSERT INTO agent_threads")) {
         return {
           rows: [{
             id: "thread-id",
             model: "gpt-5.6-luna",
             model_options: [],
             runtime_home: "/runtime/coordinated-thread",
-            provider_thread_id: "provider-thread-id"
+            provider_thread_id: "provider-thread-id",
+            ownership_generation: 0
           }]
         };
       }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = {
+      query,
+      async connect() { return client; }
     } as unknown as DbPool;
 
     const thread = await ensureTaskAgentThread(pool, {
@@ -97,10 +104,11 @@ describe("coordinated task agent threads", () => {
       branch: null
     });
 
-    expect(queries[0]?.sql).toContain("title, agent_id, task_id, project_id");
-    expect(queries[0]?.sql).toContain("task_id = EXCLUDED.task_id");
-    expect(queries[0]?.sql).toContain("ELSE NULL");
-    expect(queries[0]?.params?.[2]).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    const upsert = queries.find((query) => query.sql.includes("INSERT INTO agent_threads"));
+    expect(upsert?.sql).toContain("title, agent_id, task_id, project_id");
+    expect(upsert?.sql).toContain("task_id = EXCLUDED.task_id");
+    expect(upsert?.sql).toContain("ELSE NULL");
+    expect(upsert?.params?.[2]).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     expect(thread.runtime_home).toBe("/runtime/coordinated-thread");
     expect(thread.provider_thread_id).toBe("provider-thread-id");
   });
@@ -155,8 +163,7 @@ describe("coordinated task agent threads", () => {
 
   it("clears a cached provider thread when a task owner changes", async () => {
     const queries: string[] = [];
-    const pool = {
-      async query(sql: string) {
+    const query = async (sql: string) => {
         queries.push(sql);
         if (sql.includes("INSERT INTO agent_threads")) {
           return {
@@ -171,8 +178,9 @@ describe("coordinated task agent threads", () => {
           };
         }
         return { rows: [] };
-      }
-    } as unknown as DbPool;
+      };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
 
     const thread = await ensureTaskAgentThread(pool, {
       task: {
@@ -203,8 +211,62 @@ describe("coordinated task agent threads", () => {
     });
 
     expect(thread.provider_thread_id).toBeNull();
-    expect(queries[0]).toContain("agent_threads.agent_id = EXCLUDED.agent_id");
-    expect(queries[0]).toContain("ELSE NULL");
+    const upsert = queries.find((query) => query.includes("INSERT INTO agent_threads"));
+    expect(upsert).toContain("agent_threads.agent_id = EXCLUDED.agent_id");
+    expect(upsert).toContain("ELSE NULL");
+  });
+
+  it("rolls back ownership changes when stale-run terminalization fails", async () => {
+    const statements: string[] = [];
+    const query = async (sql: string) => {
+      statements.push(sql);
+      if (sql.includes("INSERT INTO agent_threads")) {
+        return {
+          rows: [{
+            id: "thread-id",
+            model: "gpt-test",
+            model_options: [],
+            runtime_home: "/runtime/task",
+            provider_thread_id: null,
+            ownership_generation: 4
+          }]
+        };
+      }
+      if (sql.includes("UPDATE task_runs")) throw new Error("injected terminalization failure");
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await expect(ensureTaskAgentThread(pool, {
+      task: {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        number: 1,
+        title: "Transferred task",
+        body: "",
+        coordination_thread_id: null,
+        project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        agent_kind: "worker",
+        source: "local_path",
+        local_path: "/workspace",
+        workspace_mode: "direct",
+        default_branch: null,
+        agent_name: "Builder",
+        agent_description: "Builds",
+        agent_model: "gpt-test",
+        agent_model_options: [],
+        agent_instructions: "Build it"
+      },
+      runtimeHome: "/runtime/task",
+      providerThreadId: null,
+      model: "gpt-test",
+      modelOptions: [],
+      cwd: "/workspace",
+      branch: null
+    })).rejects.toThrow("injected terminalization failure");
+    expect(statements[0]).toBe("BEGIN");
+    expect(statements.at(-1)).toBe("ROLLBACK");
   });
 
   it("detaches a task from a thread that contains unrelated provider runs", async () => {

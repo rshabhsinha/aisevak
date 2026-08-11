@@ -71,12 +71,24 @@ describe("coordination startup recovery", () => {
 
   it("cancels stale queued generations instead of promoting them after restart", async () => {
     const queries: string[] = [];
+    let workerScanned = false;
+    let dispatcherScanned = false;
     const query = async (sql: string) => {
       queries.push(sql);
-      if (sql.includes("UPDATE task_runs") && sql.includes("RETURNING id")) {
+      if (sql.includes("FROM agent_threads") && sql.includes("JOIN task_runs")) {
+        if (workerScanned) return { rows: [] };
+        workerScanned = true;
+        return { rows: [{ id: "thread-id" }] };
+      }
+      if (sql.includes("FROM agent_threads") && sql.includes("JOIN dispatcher_runs")) {
+        if (dispatcherScanned) return { rows: [] };
+        dispatcherScanned = true;
+        return { rows: [{ id: "thread-id" }] };
+      }
+      if (sql.includes("FROM task_runs") && sql.includes("FOR UPDATE")) {
         return { rows: [{ id: "stale-worker" }] };
       }
-      if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id, message_delivery_id")) {
+      if (sql.includes("FROM dispatcher_runs") && sql.includes("FOR UPDATE")) {
         return { rows: [{ id: "stale-dispatcher", message_delivery_id: null }] };
       }
       return { rows: [] };
@@ -86,9 +98,63 @@ describe("coordination startup recovery", () => {
 
     await recoverStaleAgentThreadRuns(pool);
 
-    expect(queries[0]).toContain("status = 'cancelled'");
-    expect(queries[0]).toContain("agent_thread_generation <>");
+    expect(queries.find((sql) => sql.includes("UPDATE task_runs"))).toContain("status = 'cancelled'");
+    expect(queries.find((sql) => sql.includes("agent_thread_generation <>"))).toContain("agent_thread_generation <>");
     expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs"))).toContain("status = 'cancelled'");
     expect(queries.every((sql) => !sql.includes("SET agent_thread_generation ="))).toBe(true);
+  });
+
+  it("completes a successful coordination run's stranded initial delivery", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const query = async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      const normalized = sql.trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(normalized)) return { rows: [] };
+      if (normalized.startsWith("SELECT id, status::text, message_delivery_id")) return { rows: [] };
+      if (normalized.includes("SELECT dispatcher_runs.id AS run_id")) {
+        return {
+          rows: [{
+            run_id: "succeeded-run",
+            message_delivery_id: "initial-delivery",
+            run_status: "succeeded"
+          }]
+        };
+      }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await recoverInterruptedCoordinationRuns(pool);
+
+    const completion = queries.find((entry) => entry.sql.includes("UPDATE message_deliveries"));
+    expect(completion?.params).toEqual(["initial-delivery", "completed", null]);
+    expect(queries.some((entry) => entry.sql.includes("status = 'queued' OR status = 'cancel_requested'"))).toBe(true);
+  });
+
+  it("leaves a stale run recoverable when dependent terminalization fails", async () => {
+    let failTerminalization = true;
+    let cancelled = false;
+    const query = async (sql: string) => {
+      const normalized = sql.trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(normalized)) return { rows: [] };
+      if (normalized.includes("FROM agent_threads") && normalized.includes("JOIN task_runs")) {
+        return cancelled ? { rows: [] } : { rows: [{ id: "thread-id" }] };
+      }
+      if (normalized.includes("FROM task_runs") && normalized.includes("FOR UPDATE")) {
+        return { rows: [{ id: "stale-worker" }] };
+      }
+      if (normalized.includes("UPDATE task_runs")) {
+        if (failTerminalization) throw new Error("injected recovery failure");
+        cancelled = true;
+      }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await expect(recoverStaleAgentThreadRuns(pool)).rejects.toThrow("injected recovery failure");
+    failTerminalization = false;
+    await expect(recoverStaleAgentThreadRuns(pool)).resolves.toBeUndefined();
   });
 });

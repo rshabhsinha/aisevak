@@ -1675,6 +1675,7 @@ interface AgentThreadRow {
   task_number: number | null;
   project_id: string | null;
   project_name: string | null;
+  workspace_mode: "direct" | "git_worktree" | null;
   provider_instance_id: string;
   provider_driver: string;
   provider_name: string;
@@ -2026,7 +2027,7 @@ async function listAgentThreads(
   };
 }
 
-async function getAgentThread(pool: DbPool, id: string): Promise<AgentThreadRow> {
+async function getAgentThread(pool: Pick<DbPool, "query">, id: string): Promise<AgentThreadRow> {
   const result = await pool.query<AgentThreadRow>(`${agentThreadSelectSql} WHERE agent_threads.id = $1`, [id]);
   return mustRow(result.rows[0]);
 }
@@ -2142,16 +2143,18 @@ async function queueAgentThreadMessage(
     const skillsSnapshot = await resolveAgentSkills(pool, thread.agent_id);
     const result = await pool.query(
       `INSERT INTO dispatcher_runs
-         (agent_thread_id, trigger, scope, status, cwd, codex_home, codex_thread_id,
-          agent_thread_generation, model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'manual', 'thread', 'queued', $2, $3, $4, $5, $6, $7, $8, $9)
+         (agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, trigger, scope, status, cwd, codex_home, codex_thread_id,
+          model, model_options, prompt, skills_snapshot)
+       VALUES ($1, $2, $3, $4, 'manual', 'thread', 'queued', $5, $6, $7, $8, $9, $10, $11)
        RETURNING *`,
       [
         threadId,
+        thread.ownership_generation,
+        thread.project_id ?? "",
+        thread.workspace_mode ?? "unknown",
         thread.cwd,
         thread.runtime_home,
         thread.provider_thread_id,
-        thread.ownership_generation,
         selection.model,
         JSON.stringify(selection.options),
         input.message,
@@ -2549,8 +2552,9 @@ export async function ensureTaskAgentThread(
   provider_thread_id: string | null;
   ownership_generation: number;
 }> {
+  return withTransaction(pool, async (client) => {
   if (input.task.coordination_thread_id) {
-    const coordinated = await pool.query<{
+    const coordinated = await client.query<{
       id: string;
       model: string;
       model_options: unknown;
@@ -2599,10 +2603,10 @@ export async function ensureTaskAgentThread(
       ]
     );
     const session = mustRow(coordinated.rows[0]);
-    await cancelStaleQueuedAgentThreadRuns(pool, session.id, session.ownership_generation);
+    await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation);
     return session;
   }
-  const result = await pool.query<{
+  const result = await client.query<{
     id: string;
     model: string;
     model_options: unknown;
@@ -2657,19 +2661,21 @@ export async function ensureTaskAgentThread(
     ]
   );
   const session = mustRow(result.rows[0]);
-  await cancelStaleQueuedAgentThreadRuns(pool, session.id, session.ownership_generation);
+  await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation);
   return session;
+  });
 }
 
 async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise<AgentThreadRow> {
   const task = await getTaskJoin(pool, taskId);
   const runtimeHome = managedCodexHome(env.managedRoot, task.id);
-  await isolateTaskNavigationThread(pool, {
-    taskId,
-    coordinationThreadId: task.coordination_thread_id,
-    agentId: task.agent_id
-  });
-  const existing = await pool.query<{ id: string }>(
+  return withTransaction(pool, async (client) => {
+  await isolateTaskNavigationThread(client, {
+      taskId,
+      coordinationThreadId: task.coordination_thread_id,
+      agentId: task.agent_id
+    });
+  const existing = await client.query<{ id: string }>(
     `SELECT id FROM agent_threads
      WHERE task_id = $1
         OR (coordination_thread_id = $2 AND agent_id = $3)
@@ -2678,7 +2684,7 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
     [taskId, task.coordination_thread_id, task.agent_id]
   );
   if (existing.rows[0]) {
-    await pool.query(
+    await client.query(
       `UPDATE agent_threads
        SET title = $2,
            agent_id = $3,
@@ -2712,13 +2718,13 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
         task.coordination_thread_id
       ]
     );
-    await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
-    const thread = await getAgentThread(pool, existing.rows[0].id);
-    await cancelStaleQueuedAgentThreadRuns(pool, thread.id, thread.ownership_generation);
+    await linkTaskRunsToThread(client, taskId, existing.rows[0].id);
+    const thread = await getAgentThread(client, existing.rows[0].id);
+    await cancelStaleQueuedAgentThreadRuns(client, thread.id, thread.ownership_generation);
     return thread;
   }
 
-  const created = await pool.query<{ id: string }>(
+  const created = await client.query<{ id: string }>(
      `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
@@ -2740,7 +2746,7 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
     ]
   );
   const threadId = created.rows[0]?.id ?? (
-    await pool.query<{ id: string }>(
+    await client.query<{ id: string }>(
       `SELECT id FROM agent_threads
        WHERE task_id = $1 OR (coordination_thread_id = $2 AND agent_id = $3)
        ORDER BY (task_id = $1) DESC
@@ -2749,12 +2755,15 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
     )
   ).rows[0]?.id;
   if (!threadId) throw new Error("Failed to create the task's agent thread");
-  await linkTaskRunsToThread(pool, taskId, threadId);
-  return getAgentThread(pool, threadId);
+  await linkTaskRunsToThread(client, taskId, threadId);
+  const thread = await getAgentThread(client, threadId);
+  await cancelStaleQueuedAgentThreadRuns(client, thread.id, thread.ownership_generation);
+  return thread;
+  });
 }
 
 export async function isolateTaskNavigationThread(
-  pool: DbPool,
+  pool: Pick<DbPool, "query">,
   input: { taskId: string; coordinationThreadId: string | null; agentId: string }
 ): Promise<void> {
   await pool.query(
@@ -2784,25 +2793,23 @@ export async function isolateTaskNavigationThread(
   );
 }
 
-async function linkTaskRunsToThread(pool: DbPool, taskId: string, threadId: string): Promise<void> {
-  await Promise.all([
-    pool.query(
-      `UPDATE task_runs
-       SET agent_thread_id = $2,
-           agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
-           updated_at = now()
-       WHERE task_id = $1 AND agent_thread_id IS NULL`,
-      [taskId, threadId]
-    ),
-    pool.query(
-      `UPDATE dispatcher_runs
-       SET agent_thread_id = $2,
-           agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
-           updated_at = now()
-       WHERE task_id = $1 AND agent_thread_id IS NULL`,
-      [taskId, threadId]
-    )
-  ]);
+async function linkTaskRunsToThread(pool: Pick<DbPool, "query">, taskId: string, threadId: string): Promise<void> {
+  await pool.query(
+    `UPDATE task_runs
+     SET agent_thread_id = $2,
+         agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
+         updated_at = now()
+     WHERE task_id = $1 AND agent_thread_id IS NULL`,
+    [taskId, threadId]
+  );
+  await pool.query(
+    `UPDATE dispatcher_runs
+     SET agent_thread_id = $2,
+         agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
+         updated_at = now()
+     WHERE task_id = $1 AND agent_thread_id IS NULL`,
+    [taskId, threadId]
+  );
 }
 
 function normalizeModelOptions(value: unknown): ModelSelectionInput["options"] {
@@ -2858,6 +2865,7 @@ const agentThreadSelectSql = `
          tasks.number AS task_number,
          agent_threads.project_id,
          projects.name AS project_name,
+         projects.workspace_mode,
          agent_threads.provider_instance_id,
          provider_instances.driver AS provider_driver,
          provider_instances.display_name AS provider_name,
@@ -2999,14 +3007,16 @@ async function queueWorkerRun(
   }
   const runResult = await pool.query(
     `INSERT INTO task_runs
-       (task_id, task_session_id, agent_thread_id, agent_thread_generation, run_kind, trigger, status, cwd, branch,
+       (task_id, task_session_id, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, run_kind, trigger, status, cwd, branch,
         model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, $3, (SELECT ownership_generation FROM agent_threads WHERE id = $3), 'worker', $4, 'queued', $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, (SELECT ownership_generation FROM agent_threads WHERE id = $3), $4, $5, 'worker', $6, 'queued', $7, $8, $9, $10, $11, $12)
      RETURNING *`,
     [
       task.id,
       session.id,
       options.agentThreadId ?? thread.id,
+      projectId,
+      workspaceMode,
       trigger,
       projectPath,
       branch,
@@ -3066,13 +3076,15 @@ async function queueDispatcherMessage(
         cwd: string;
         codex_home: string;
         codex_thread_id: string | null;
+        workspace_key: string;
+        workspace_mode: string;
         model: string;
         model_options: unknown;
         prompt: string;
         status: string;
         skills_snapshot: CodexSkillSnapshot[];
       }>(
-        `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
+        `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, workspace_key, workspace_mode, model, model_options, prompt, status::text, skills_snapshot
          FROM dispatcher_runs
          WHERE id = $1`,
         [options.sourceRunId]
@@ -3086,13 +3098,15 @@ async function queueDispatcherMessage(
           cwd: string;
           codex_home: string;
           codex_thread_id: string | null;
+          workspace_key: string;
+          workspace_mode: string;
           model: string;
           model_options: unknown;
           prompt: string;
           status: string;
           skills_snapshot: CodexSkillSnapshot[];
         }>(
-          `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, model, model_options, prompt, status::text, skills_snapshot
+          `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, workspace_key, workspace_mode, model, model_options, prompt, status::text, skills_snapshot
            FROM dispatcher_runs
            WHERE task_id = $1
            ORDER BY created_at DESC
@@ -3157,14 +3171,16 @@ async function queueDispatcherMessage(
       : [];
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
-       (task_id, agent_thread_id, agent_thread_generation, trigger, scope, status, cwd, codex_home, codex_thread_id,
+       (task_id, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, trigger, scope, status, cwd, codex_home, codex_thread_id,
         model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, $3, 'manual', $4, 'queued', $5, $6, $7, $8, $9, $10, $11)
+     VALUES ($1, $2, $3, $4, $5, 'manual', $6, 'queued', $7, $8, $9, $10, $11, $12, $13)
      RETURNING *`,
     [
       previous?.task_id ?? options.taskId ?? null,
       threadId,
       thread?.ownership_generation ?? 0,
+      thread?.project_id ?? previous?.workspace_key ?? "",
+      thread?.workspace_mode ?? previous?.workspace_mode ?? "unknown",
       previous?.scope ?? (options.taskId ? "task" : "heartbeat"),
       normalizeRunPath(previous?.cwd) ?? normalizeRunPath(thread?.cwd) ?? env.managedRoot,
       codexHome,
@@ -3209,13 +3225,15 @@ async function queueDispatcherRun(
   });
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
-       (task_id, agent_thread_id, agent_thread_generation, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10, $11)
+       (task_id, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13)
      RETURNING *`,
     [
       options.taskId ?? null,
       thread?.id ?? null,
       thread?.ownership_generation ?? 0,
+      targetTask?.project_id ?? "",
+      targetTask?.workspace_mode ?? "unknown",
       options.trigger,
       options.taskId ? "task" : "heartbeat",
       thread?.cwd ?? env.managedRoot,
@@ -3714,6 +3732,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             tasks.status,
             tasks.project_id,
             projects.name AS project_name,
+            projects.workspace_mode,
             CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
             agents.kind AS agent_kind,
             latest.status AS latest_worker_status,
