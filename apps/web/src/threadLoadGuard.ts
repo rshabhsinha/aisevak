@@ -13,6 +13,7 @@ export function createThreadLoadGuard(initialThreadId: string | null = null): Th
       revision += 1;
     },
     begin(threadId) {
+      if (selectedThreadId !== threadId) return () => false;
       const requestRevision = ++revision;
       return () => selectedThreadId === threadId && revision === requestRevision;
     }

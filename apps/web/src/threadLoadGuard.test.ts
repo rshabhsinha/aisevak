@@ -30,4 +30,16 @@ describe("thread load guard", () => {
 
     expect(applyInitialRequest()).toBe(true);
   });
+
+  it("does not let a stale selection begin invalidate the current request", () => {
+    const guard = createThreadLoadGuard("thread-a");
+    const applyCurrentRequest = guard.begin("thread-a");
+    guard.select("thread-b");
+    const applyStaleRequest = guard.begin("thread-a");
+    const applyNewRequest = guard.begin("thread-b");
+
+    expect(applyStaleRequest()).toBe(false);
+    expect(applyCurrentRequest()).toBe(false);
+    expect(applyNewRequest()).toBe(true);
+  });
 });

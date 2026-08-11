@@ -689,6 +689,7 @@ export function App() {
 
   async function loadAgentThread(threadId: string) {
     const isCurrentRequest = threadLoadGuardRef.current.begin(threadId);
+    if (!isCurrentRequest()) return;
     setThreadDetailState(threadDetailLoading());
     let data: {
       thread: AgentThread;
