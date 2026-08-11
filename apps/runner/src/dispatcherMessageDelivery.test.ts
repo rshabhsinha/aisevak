@@ -35,7 +35,7 @@ describe("dispatcher message delivery", () => {
         rawStderr: "",
         exitCode: null,
         error: "thread setup failed",
-        turnStartRequested: false
+        promptMayHaveBeenPresented: false
       };
     };
 

@@ -120,7 +120,7 @@ describe("persistent Codex app-server", () => {
     const result = await runCodexAppServerTurn(options);
 
     expect(result.status).toBe("failed");
-    expect(result.turnStartRequested).toBe(false);
+    expect(result.promptMayHaveBeenPresented).toBe(false);
     expect(turnAccepted).toBe(false);
   });
 
@@ -135,7 +135,23 @@ describe("persistent Codex app-server", () => {
     const result = await runCodexAppServerTurn(options);
 
     expect(result.status).toBe("failed");
-    expect(result.turnStartRequested).toBe(true);
+    expect(result.promptMayHaveBeenPresented).toBe(true);
+    expect(turnAccepted).toBe(false);
+  });
+
+  it("keeps an explicit turn/start rejection before the presentation boundary", async () => {
+    const fixture = await fakeAppServerFixture();
+    let turnAccepted = false;
+    const options = turnOptions(fixture, "reject-turn-start", "thread-1");
+    options.onTurnAccepted = async () => {
+      turnAccepted = true;
+    };
+
+    const result = await runCodexAppServerTurn(options);
+
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("turn rejected");
+    expect(result.promptMayHaveBeenPresented).toBe(false);
     expect(turnAccepted).toBe(false);
   });
 
@@ -150,7 +166,7 @@ describe("persistent Codex app-server", () => {
     const result = await runCodexAppServerTurn(options);
 
     expect(result.status).toBe("completed");
-    expect(result.turnStartRequested).toBe(true);
+    expect(result.promptMayHaveBeenPresented).toBe(true);
     expect(acceptedCount).toBe(1);
   });
 });
@@ -191,6 +207,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     const turnId = "turn-" + (++turn);
     const prompt = message.params.input[0].text;
     if (prompt === "exit-on-turn-start") return process.exit(0);
+    if (prompt === "reject-turn-start") {
+      return send({ id: message.id, error: { code: -32602, message: "turn rejected" } });
+    }
     send({ id: message.id, result: { turn: { id: turnId } } });
     send({ method: "turn/started", params: { threadId: message.params.threadId, turn: { id: turnId } } });
     if (prompt === "emit-old-secret") {

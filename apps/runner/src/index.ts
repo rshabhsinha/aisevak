@@ -635,7 +635,7 @@ export async function processOneDispatcherRun(
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
-  let turnStartRequested = false;
+  let promptMayHaveBeenPresented = false;
 
   try {
     await mkdir(job.codex_home, { recursive: true });
@@ -715,7 +715,7 @@ export async function processOneDispatcherRun(
       nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
-    turnStartRequested = turn.turnStartRequested;
+    promptMayHaveBeenPresented = turn.promptMayHaveBeenPresented;
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
     if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
@@ -760,7 +760,7 @@ export async function processOneDispatcherRun(
       );
     }
     if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr, turnStartRequested);
+      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
     }
   }
 }
@@ -1198,7 +1198,7 @@ export async function finishMessageDelivery(
   job: Pick<DispatcherJob, "id" | "message_delivery_id">,
   status: "succeeded" | "failed" | "cancelled",
   error: string,
-  turnStartRequested = false
+  promptMayHaveBeenPresented = false
 ): Promise<void> {
   if (!job.message_delivery_id) return;
   if (status === "succeeded") {
@@ -1244,7 +1244,7 @@ export async function finishMessageDelivery(
         return;
       }
 
-      if ((delivery.presented_at || turnStartRequested) && delivery.provider_thread_id) {
+      if ((delivery.presented_at || promptMayHaveBeenPresented) && delivery.provider_thread_id) {
         const suppressionReason = delivery.presented_at
           ? "the coordination message was already presented to an established provider thread"
           : "turn/start was sent to an established provider thread and may have presented the coordination message";
