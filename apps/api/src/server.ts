@@ -1590,6 +1590,7 @@ interface AgentThreadRow {
   agent_id: string;
   agent_name: string;
   agent_kind: "worker" | "dispatcher";
+  display_agent_identity: boolean;
   task_id: string | null;
   task_number: number | null;
   project_id: string | null;
@@ -2577,6 +2578,14 @@ const agentThreadSelectSql = `
          agent_threads.agent_id,
          agents.name AS agent_name,
          agents.kind AS agent_kind,
+         (
+           coordination_threads.created_by_agent_id IS NOT NULL
+           OR EXISTS (
+             SELECT 1
+             FROM schedule_runs
+             WHERE schedule_runs.agent_thread_id = agent_threads.id
+           )
+         ) AS display_agent_identity,
          agent_threads.task_id,
          tasks.number AS task_number,
          agent_threads.project_id,
@@ -2600,6 +2609,7 @@ const agentThreadSelectSql = `
   FROM agent_threads
   JOIN agents ON agents.id = agent_threads.agent_id
   JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
+  LEFT JOIN coordination_threads ON coordination_threads.id = agent_threads.coordination_thread_id
   LEFT JOIN tasks ON tasks.id = agent_threads.task_id
   LEFT JOIN projects ON projects.id = agent_threads.project_id
   LEFT JOIN LATERAL (

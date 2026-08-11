@@ -35,6 +35,7 @@ import {
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
+import { AgentAvatar } from "./components/agent-avatar";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
@@ -173,6 +174,7 @@ interface AgentThread {
   agent_id: string;
   agent_name: string;
   agent_kind: "worker" | "dispatcher";
+  display_agent_identity: boolean;
   task_id: string | null;
   task_number: number | null;
   project_id: string | null;
@@ -1179,7 +1181,11 @@ function SchedulesView(props: {
             return (
               <article className="schedule-card" key={schedule.id}>
                 <div className="schedule-card-top">
-                  <span className="schedule-agent-avatar">{schedule.agent_name.slice(0, 1).toUpperCase()}</span>
+                  <AgentAvatar
+                    agentId={schedule.agent_id}
+                    agentName={schedule.agent_name}
+                    className="schedule-agent-avatar"
+                  />
                   <div className="schedule-card-title">
                     <strong>{schedule.title}</strong>
                     <span>{schedule.agent_name} · {formatScheduleCadence(schedule)}</span>
@@ -1318,13 +1324,23 @@ function AgentThreadSidebar(props: {
               key={thread.id}
               onClick={() => props.onSelectThread(thread.id)}
             >
-              <span className={`thread-item-icon status-${runBucket(thread.latest_status ?? "succeeded")}`}>
-                <OpenAILogo size={13} />
-              </span>
+              {thread.display_agent_identity ? (
+                <AgentAvatar
+                  agentId={thread.agent_id}
+                  agentName={thread.agent_name}
+                  className={`thread-agent-avatar status-${runBucket(thread.latest_status ?? "succeeded")}`}
+                />
+              ) : (
+                <span className={`thread-item-icon status-${runBucket(thread.latest_status ?? "succeeded")}`}>
+                  <OpenAILogo size={13} />
+                </span>
+              )}
               <span className="sidebar-run-copy">
                 <span className="sidebar-run-title">{thread.title}</span>
                 <span className="sidebar-run-meta">
-                  {formatSidebarRunTime(thread.last_activity_at)} · {thread.model}
+                  {thread.display_agent_identity
+                    ? `${thread.agent_name} · ${formatSidebarRunTime(thread.last_activity_at)}`
+                    : `${formatSidebarRunTime(thread.last_activity_at)} · ${thread.model}`}
                 </span>
               </span>
               {isActiveRun(thread.latest_status) ? <Loader2 className="spin thread-running" size={12} /> : null}
@@ -1410,7 +1426,15 @@ function AgentChatsView(props: {
     <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
       <header className="agent-chat-header">
         <div className="agent-chat-heading">
-          <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
+          {props.thread?.display_agent_identity ? (
+            <AgentAvatar
+              agentId={props.thread.agent_id}
+              agentName={props.thread.agent_name}
+              className="agent-chat-avatar"
+            />
+          ) : (
+            <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
+          )}
           <div className="agent-chat-title-group">
             <div className="agent-chat-breadcrumb">{projectName} <span>/</span> {agentName}</div>
             <h1>{title}</h1>
@@ -1710,9 +1734,11 @@ function AgentsView(props: {
               key={agent.id}
               onClick={() => setEditing(agent)}
             >
-              <div className="list-item-icon">
-                <Bot size={15} />
-              </div>
+              <AgentAvatar
+                agentId={agent.id}
+                agentName={agent.name}
+                className="list-item-icon agent-list-avatar"
+              />
               <div className="list-item-main">
                 <span className="list-item-title">{agent.name}</span>
                 <span className="list-item-desc">{agentSummary(agent, props.models)}</span>
@@ -1796,6 +1822,17 @@ function AgentEditor(props: {
         }
       }}
     >
+      <div className="agent-editor-identity">
+        <AgentAvatar
+          agentId={draft.id}
+          agentName={draft.name}
+          className="agent-editor-avatar"
+        />
+        <div>
+          <h2>{draft.name || "New Agent"}</h2>
+          <p>This unique profile picture follows the agent across automatic threads and schedules.</p>
+        </div>
+      </div>
       <div className="agent-settings-grid">
         <label>
           Name
