@@ -86,5 +86,12 @@ describe("bounded runner execution", () => {
     expect(workerClaim).toContain("active_dispatcher.agent_thread_id = candidate.agent_thread_id");
     expect(dispatcherClaim).toContain("active_project_turns.status IN ('running', 'cancel_requested')");
     expect(workerClaim).toContain("active_project_turns.status IN ('running', 'cancel_requested')");
+    expect(dispatcherClaim).toContain(
+      "COALESCE(candidate_thread.project_id, candidate_task.project_id) AS project_id"
+    );
+    expect(dispatcherClaim).toContain(
+      "active_project_turns.project_id = COALESCE(candidate_thread.project_id, candidate_task.project_id)"
+    );
+    expect(dispatcherClaim).toContain("candidate.agent_thread_generation = candidate_thread.ownership_generation");
   });
 });

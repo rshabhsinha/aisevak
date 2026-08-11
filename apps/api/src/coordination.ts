@@ -62,6 +62,7 @@ type Queryable = DbPool | PoolClient;
 interface AgentThreadSession {
   id: string;
   task_id: string | null;
+  ownership_generation: number;
   runtime_home: string;
   provider_thread_id: string | null;
   cwd: string;
@@ -1191,27 +1192,28 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : null;
   const linkedTaskId = linkedTask?.rows[0]?.agent_id === recipientAgentId ? thread.task_id : null;
   const existing = await client.query<AgentThreadSession>(
-    `SELECT id, task_id, runtime_home, provider_thread_id, cwd FROM agent_threads
+    `SELECT id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
   let ownershipTransferUnsafe = false;
   if (session && linkedTaskId) {
-    ownershipTransferUnsafe = session.task_id !== linkedTaskId;
+    const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
+    ownershipTransferUnsafe = session.task_id !== linkedTaskId || session.runtime_home !== runtimeHome;
     await client.query(
       "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
       [linkedTaskId, session.id]
     );
-    const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
     const updated = await client.query<AgentThreadSession>(
       `UPDATE agent_threads
        SET task_id = $2,
            project_id = $3,
            runtime_home = $4,
            provider_thread_id = CASE WHEN runtime_home = $4 THEN provider_thread_id ELSE NULL END,
+           ownership_generation = ownership_generation + $5,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
-      [session.id, linkedTaskId, thread.project_id, runtimeHome]
+       RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+      [session.id, linkedTaskId, thread.project_id, runtimeHome, ownershipTransferUnsafe ? 1 : 0]
     );
     session = updated.rows[0];
   }
@@ -1238,7 +1240,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
-       RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
       [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
     );
     session = created.rows[0]!;
@@ -1259,14 +1261,72 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
   const prompt = session.provider_thread_id
     ? coordinationIncrementalPrompt(message)
     : coordinationPrompt(thread, recipient, message, history.rows.reverse());
-  await client.query(
+  const createdRun = await client.query<{ id: string }>(
     `INSERT INTO dispatcher_runs
-       (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+       (task_id, trigger, scope, agent_thread_id, agent_thread_generation, message_delivery_id, status, cwd, codex_home,
         codex_thread_id, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, 'message', 'coordination', $2, $3, 'queued', $4, $5, $6, $7, $8, $9, $10)`,
-    [thread.task_id, session!.id, delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
+     VALUES ($1, 'message', 'coordination', $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10, $11)
+     RETURNING id`,
+    [thread.task_id, session!.id, session!.ownership_generation, delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
   );
+  await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
+}
+
+async function migrateStaleCoordinationRuns(
+  client: PoolClient,
+  agentThreadId: string,
+  ownershipGeneration: number,
+  replacementRunId: string
+): Promise<void> {
+  const staleRuns = await client.query<{
+    id: string;
+    message_delivery_id: string | null;
+    prompt: string;
+  }>(
+    `SELECT id, message_delivery_id, prompt
+     FROM dispatcher_runs
+     WHERE agent_thread_id = $1
+       AND scope = 'coordination'
+       AND status = 'queued'
+       AND agent_thread_generation <> $2
+       AND id <> $3
+     ORDER BY queued_at ASC, id ASC`,
+    [agentThreadId, ownershipGeneration, replacementRunId]
+  );
+  for (const stale of staleRuns.rows) {
+    let message = stale.prompt;
+    if (stale.message_delivery_id) {
+      const source = await client.query<{ body: string }>(
+        `SELECT thread_messages.body
+         FROM message_deliveries
+         JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+         WHERE message_deliveries.id = $1`,
+        [stale.message_delivery_id]
+      );
+      message = source.rows[0]?.body ?? message;
+    }
+    await client.query(
+      `INSERT INTO agent_turn_inputs
+         (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
+         SET agent_thread_id = EXCLUDED.agent_thread_id,
+             dispatcher_run_id = EXCLUDED.dispatcher_run_id
+         WHERE agent_turn_inputs.status = 'queued'`,
+      [agentThreadId, replacementRunId, stale.message_delivery_id, message]
+    );
+    await client.query(
+      `UPDATE dispatcher_runs
+       SET message_delivery_id = NULL,
+           status = 'cancelled',
+           finished_at = now(),
+           error = 'Superseded by an ownership transfer',
+           updated_at = now()
+       WHERE id = $1 AND status = 'queued'`,
+      [stale.id]
+    );
+  }
 }
 
 async function queueIncrementalCoordinationInput(
@@ -1281,14 +1341,16 @@ async function queueIncrementalCoordinationInput(
     status: "queued" | "running";
     message_delivery_id: string | null;
   }>(
-    `SELECT id, status::text, message_delivery_id
+    `SELECT dispatcher_runs.id, dispatcher_runs.status::text, dispatcher_runs.message_delivery_id
      FROM dispatcher_runs
-     WHERE agent_thread_id = $1
-       AND scope = 'coordination'
-       AND status IN ('queued', 'running')
-     ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
-              CASE WHEN status = 'running' THEN started_at ELSE queued_at END ASC NULLS LAST,
-              id ASC
+     JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     WHERE dispatcher_runs.agent_thread_id = $1
+       AND dispatcher_runs.scope = 'coordination'
+       AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+       AND dispatcher_runs.status IN ('queued', 'running')
+     ORDER BY CASE WHEN dispatcher_runs.status = 'running' THEN 0 ELSE 1 END,
+              CASE WHEN dispatcher_runs.status = 'running' THEN dispatcher_runs.started_at ELSE dispatcher_runs.queued_at END ASC NULLS LAST,
+              dispatcher_runs.id ASC
      LIMIT 1`,
     [agentThreadId]
   );
@@ -1299,13 +1361,15 @@ async function queueIncrementalCoordinationInput(
     id: string;
     message_delivery_id: string | null;
   }>(
-    `SELECT id, message_delivery_id
+    `SELECT dispatcher_runs.id, dispatcher_runs.message_delivery_id
      FROM dispatcher_runs
-     WHERE agent_thread_id = $1
-       AND scope = 'coordination'
-       AND status = 'queued'
-       AND id <> $2
-     ORDER BY queued_at ASC, id ASC`,
+     JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     WHERE dispatcher_runs.agent_thread_id = $1
+       AND dispatcher_runs.scope = 'coordination'
+       AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+       AND dispatcher_runs.status = 'queued'
+       AND dispatcher_runs.id <> $2
+     ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.id ASC`,
     [agentThreadId, run.id]
   );
   for (const stale of queued.rows) {
@@ -1323,7 +1387,10 @@ async function queueIncrementalCoordinationInput(
           `INSERT INTO agent_turn_inputs
              (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
            VALUES ($1, $2, $3, $4)
-           ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
+           ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
+             SET agent_thread_id = EXCLUDED.agent_thread_id,
+                 dispatcher_run_id = EXCLUDED.dispatcher_run_id
+             WHERE agent_turn_inputs.status = 'queued'`,
           [agentThreadId, run.id, stale.message_delivery_id, staleMessage]
         );
       }
@@ -1372,10 +1439,14 @@ export async function transferTaskAgentThread(
            WHEN agent_id = $3 AND runtime_home = $6 THEN provider_thread_id
            ELSE NULL
          END,
+         ownership_generation = ownership_generation + CASE
+           WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $6 THEN 1
+           ELSE 0
+         END,
          last_activity_at = now(),
          updated_at = now()
      WHERE task_id = $2
-     RETURNING id, task_id, runtime_home, provider_thread_id, cwd`,
+     RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
     [
       input.threadId,
       input.taskId,

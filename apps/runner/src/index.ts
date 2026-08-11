@@ -109,6 +109,7 @@ interface RunJob {
 interface DispatcherJob {
   id: string;
   agent_thread_id: string | null;
+  agent_thread_generation: number;
   task_id: string | null;
   prompt: string;
   model: string;
@@ -720,15 +721,23 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
     const candidateResult = await client.query<{
       id: string;
       agent_thread_id: string | null;
+      agent_thread_generation: number;
       project_id: string | null;
       workspace_mode: "direct" | "git_worktree" | null;
     }>(
-      `SELECT candidate.id, candidate.agent_thread_id,
-              candidate_task.project_id, candidate_project.workspace_mode
+      `SELECT candidate.id, candidate.agent_thread_id, candidate.agent_thread_generation,
+              COALESCE(candidate_thread.project_id, candidate_task.project_id) AS project_id,
+              candidate_project.workspace_mode
        FROM dispatcher_runs candidate
+       LEFT JOIN agent_threads candidate_thread ON candidate_thread.id = candidate.agent_thread_id
        LEFT JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
-       LEFT JOIN projects candidate_project ON candidate_project.id = candidate_task.project_id
+       LEFT JOIN projects candidate_project
+         ON candidate_project.id = COALESCE(candidate_thread.project_id, candidate_task.project_id)
        WHERE candidate.status = 'queued'
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR candidate.agent_thread_generation = candidate_thread.ownership_generation
+         )
          AND (
            candidate.message_delivery_id IS NULL
            OR EXISTS (
@@ -765,11 +774,13 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
                FROM task_runs active
                JOIN tasks active_task ON active_task.id = active.task_id
                UNION ALL
-               SELECT active.status, active_task.project_id
+               SELECT active.status,
+                      COALESCE(active_thread.project_id, active_task.project_id) AS project_id
                FROM dispatcher_runs active
-               JOIN tasks active_task ON active_task.id = active.task_id
+               LEFT JOIN agent_threads active_thread ON active_thread.id = active.agent_thread_id
+               LEFT JOIN tasks active_task ON active_task.id = active.task_id
              ) active_project_turns
-             WHERE active_project_turns.project_id = candidate_task.project_id
+             WHERE active_project_turns.project_id = COALESCE(candidate_thread.project_id, candidate_task.project_id)
                AND active_project_turns.status IN ('running', 'cancel_requested')
            )
          )
@@ -788,9 +799,11 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
            FROM task_runs active
            JOIN tasks active_task ON active_task.id = active.task_id
            UNION ALL
-           SELECT active.status, active_task.project_id
+           SELECT active.status,
+                  COALESCE(active_thread.project_id, active_task.project_id) AS project_id
            FROM dispatcher_runs active
-           JOIN tasks active_task ON active_task.id = active.task_id
+           LEFT JOIN agent_threads active_thread ON active_thread.id = active.agent_thread_id
+           LEFT JOIN tasks active_task ON active_task.id = active.task_id
          ) active_project_turns
          WHERE active_project_turns.project_id = $1
            AND active_project_turns.status IN ('running', 'cancel_requested')
@@ -801,6 +814,11 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
     }
     if (candidate.agent_thread_id) {
       await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [candidate.agent_thread_id]);
+      const generation = await client.query<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1",
+        [candidate.agent_thread_id]
+      );
+      if (generation.rows[0]?.ownership_generation !== candidate.agent_thread_generation) return null;
       const active = await client.query(
         `SELECT 1 FROM (
            SELECT status FROM task_runs WHERE agent_thread_id = $1
@@ -847,9 +865,11 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
                FROM task_runs active
                JOIN tasks active_task ON active_task.id = active.task_id
                UNION ALL
-               SELECT active.status, active_task.project_id
+               SELECT active.status,
+                      COALESCE(active_thread.project_id, active_task.project_id) AS project_id
                FROM dispatcher_runs active
-               JOIN tasks active_task ON active_task.id = active.task_id
+               LEFT JOIN agent_threads active_thread ON active_thread.id = active.agent_thread_id
+               LEFT JOIN tasks active_task ON active_task.id = active.task_id
              ) active_project_turns
              WHERE active_project_turns.project_id = candidate_task.project_id
                AND active_project_turns.status IN ('running', 'cancel_requested')
@@ -886,9 +906,11 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
            FROM task_runs active
            JOIN tasks active_task ON active_task.id = active.task_id
            UNION ALL
-           SELECT active.status, active_task.project_id
+           SELECT active.status,
+                  COALESCE(active_thread.project_id, active_task.project_id) AS project_id
            FROM dispatcher_runs active
-           JOIN tasks active_task ON active_task.id = active.task_id
+           LEFT JOIN agent_threads active_thread ON active_thread.id = active.agent_thread_id
+           LEFT JOIN tasks active_task ON active_task.id = active.task_id
          ) active_project_turns
          WHERE active_project_turns.project_id = $1
            AND active_project_turns.status IN ('running', 'cancel_requested')
@@ -932,6 +954,7 @@ export async function processOneDispatcherRun(
     `SELECT dispatcher_runs.id,
             dispatcher_runs.scope,
             dispatcher_runs.agent_thread_id,
+            dispatcher_runs.agent_thread_generation,
             dispatcher_runs.message_delivery_id,
             dispatcher_runs.task_id,
             dispatcher_runs.prompt,
@@ -1024,8 +1047,8 @@ export async function processOneDispatcherRun(
           await pool.query(
             `UPDATE agent_threads
              SET provider_thread_id = $2, last_activity_at = now(), updated_at = now()
-             WHERE id = $1`,
-            [job.agent_thread_id, threadId]
+             WHERE id = $1 AND ownership_generation = $3`,
+            [job.agent_thread_id, threadId, job.agent_thread_generation]
           );
         }
       },
@@ -1577,10 +1600,10 @@ export async function finishMessageDelivery(
 
       const retry = await client.query<{ id: string }>(
         `INSERT INTO dispatcher_runs
-           (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+           (task_id, trigger, scope, agent_thread_id, agent_thread_generation, message_delivery_id, status, cwd, codex_home,
             codex_thread_id, model, model_options, prompt, skills_snapshot)
          SELECT source_run.task_id, 'retry', source_run.scope, source_run.agent_thread_id,
-                source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+                source_run.agent_thread_generation, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
                 source_run.codex_thread_id, source_run.model, source_run.model_options,
                 source_run.prompt, source_run.skills_snapshot
          FROM dispatcher_runs source_run

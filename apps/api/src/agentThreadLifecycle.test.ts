@@ -19,6 +19,7 @@ describe("coordinated task agent threads", () => {
             id: "thread-id",
             runtime_home: "/runtime/task",
             provider_thread_id: null,
+            ownership_generation: 4,
             cwd: "/workspace"
           }]
         };
@@ -37,6 +38,7 @@ describe("coordinated task agent threads", () => {
     expect(queries[0]?.sql).toContain("agent_id = $3");
     expect(queries[0]?.sql).toContain("WHEN agent_id = $3 AND runtime_home = $6");
     expect(queries[0]?.sql).toContain("runtime_home = $6");
+    expect(queries[0]?.sql).toContain("ownership_generation = ownership_generation + CASE");
     expect(queries[0]?.sql).toContain("WHERE task_id = $2");
     expect(queries[0]?.params).toEqual([
       "coordination-thread-id",
@@ -46,7 +48,7 @@ describe("coordinated task agent threads", () => {
       JSON.stringify([{ id: "reasoningEffort", value: "high" }]),
       "/runtime/task"
     ]);
-    expect(thread).toMatchObject({ id: "thread-id", provider_thread_id: null });
+    expect(thread).toMatchObject({ id: "thread-id", provider_thread_id: null, ownership_generation: 4 });
   });
 
   it("keeps the task link and returns the existing coordinated runtime", async () => {

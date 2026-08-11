@@ -1676,6 +1676,7 @@ interface AgentThreadRow {
   branch: string | null;
   runtime_home: string;
   provider_thread_id: string | null;
+  ownership_generation: number;
   last_activity_at: string | Date;
   created_at: string | Date;
   updated_at: string | Date;
@@ -2046,11 +2047,11 @@ async function createAgentChatThread(
   const title = input.title ?? threadTitleFromMessage(input.message);
 
   const created = await withTransaction(pool, async (client) => {
-    const threadResult = await client.query<{ id: string }>(
+    const threadResult = await client.query<{ id: string; ownership_generation: number }>(
       `INSERT INTO agent_threads
          (title, agent_id, provider_instance_id, model, model_options, cwd, runtime_home)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING id`,
+       RETURNING id, ownership_generation`,
       [
         title,
         dispatcher.id,
@@ -2061,14 +2062,15 @@ async function createAgentChatThread(
         runtimeHome
       ]
     );
-    const threadId = mustRow(threadResult.rows[0]).id;
+    const thread = mustRow(threadResult.rows[0]);
     const runResult = await client.query(
       `INSERT INTO dispatcher_runs
-         (agent_thread_id, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'manual', 'thread', 'queued', $2, $3, $4, $5, $6, $7)
+         (agent_thread_id, agent_thread_generation, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, $2, 'manual', 'thread', 'queued', $3, $4, $5, $6, $7, $8)
        RETURNING *`,
       [
-        threadId,
+        thread.id,
+        thread.ownership_generation,
         env.managedRoot,
         runtimeHome,
         selection.model,
@@ -2083,7 +2085,7 @@ async function createAgentChatThread(
        VALUES ($1, -1, 'thread.message-sent', $2, $3)`,
       [turn.id, input.message, { type: "thread.message-sent", role: "user", text: input.message }]
     );
-    return { threadId, turn };
+    return { threadId: thread.id, turn };
   });
   return { thread: await getAgentThread(pool, created.threadId), turn: created.turn };
 }
@@ -2133,14 +2135,15 @@ async function queueAgentThreadMessage(
     const result = await pool.query(
       `INSERT INTO dispatcher_runs
          (agent_thread_id, trigger, scope, status, cwd, codex_home, codex_thread_id,
-          model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'manual', 'thread', 'queued', $2, $3, $4, $5, $6, $7, $8)
+          agent_thread_generation, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'manual', 'thread', 'queued', $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING *`,
       [
         threadId,
         thread.cwd,
         thread.runtime_home,
         thread.provider_thread_id,
+        thread.ownership_generation,
         selection.model,
         JSON.stringify(selection.options),
         input.message,
@@ -2350,7 +2353,11 @@ async function appendIncrementalAgentTurnInput(
         `INSERT INTO agent_turn_inputs
            (agent_thread_id, task_run_id, dispatcher_run_id, message_delivery_id, message)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
+         ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
+           SET agent_thread_id = EXCLUDED.agent_thread_id,
+               task_run_id = EXCLUDED.task_run_id,
+               dispatcher_run_id = EXCLUDED.dispatcher_run_id
+           WHERE agent_turn_inputs.status = 'queued'`,
         [
           threadId,
           turn.kind === "worker" ? turn.id : null,
@@ -2387,9 +2394,13 @@ async function appendIncrementalAgentTurnInput(
   const input = await client.query<Record<string, unknown>>(
     `INSERT INTO agent_turn_inputs
        (agent_thread_id, task_run_id, dispatcher_run_id, message_delivery_id, message)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING
-     RETURNING *`,
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
+         SET agent_thread_id = EXCLUDED.agent_thread_id,
+             task_run_id = EXCLUDED.task_run_id,
+             dispatcher_run_id = EXCLUDED.dispatcher_run_id
+         WHERE agent_turn_inputs.status = 'queued'
+       RETURNING *`,
     [
       threadId,
       turn.kind === "worker" ? turn.id : null,
@@ -2515,6 +2526,12 @@ export async function ensureTaskAgentThread(
                  THEN COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id)
                ELSE EXCLUDED.provider_thread_id
              END,
+             ownership_generation = agent_threads.ownership_generation + CASE
+               WHEN agent_threads.task_id IS DISTINCT FROM EXCLUDED.task_id
+                 OR agent_threads.runtime_home IS DISTINCT FROM EXCLUDED.runtime_home
+                 THEN 1
+               ELSE 0
+             END,
              last_activity_at = now(),
              updated_at = now()
        RETURNING id, model, model_options, runtime_home, provider_thread_id`,
@@ -2565,6 +2582,12 @@ export async function ensureTaskAgentThread(
                THEN COALESCE(EXCLUDED.provider_thread_id, agent_threads.provider_thread_id)
              ELSE EXCLUDED.provider_thread_id
            END,
+           ownership_generation = agent_threads.ownership_generation + CASE
+             WHEN agent_threads.agent_id IS DISTINCT FROM EXCLUDED.agent_id
+               OR agent_threads.runtime_home IS DISTINCT FROM EXCLUDED.runtime_home
+               THEN 1
+             ELSE 0
+           END,
            last_activity_at = now(),
            updated_at = now()
      RETURNING id, model, model_options, runtime_home, provider_thread_id`,
@@ -2614,6 +2637,10 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
            provider_thread_id = CASE
              WHEN agent_id <> $3 OR runtime_home <> $8 THEN NULL
              ELSE provider_thread_id
+           END,
+           ownership_generation = ownership_generation + CASE
+             WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $8 THEN 1
+             ELSE 0
            END,
            coordination_thread_id = $10,
            updated_at = now()
@@ -2776,6 +2803,7 @@ const agentThreadSelectSql = `
          agent_threads.branch,
          agent_threads.runtime_home,
          agent_threads.provider_thread_id,
+         agent_threads.ownership_generation,
          agent_threads.last_activity_at,
          agent_threads.created_at,
          agent_threads.updated_at,
@@ -3018,6 +3046,10 @@ async function queueDispatcherMessage(
        SET status = 'queued',
            prompt = $2,
            agent_thread_id = COALESCE($3, agent_thread_id),
+           agent_thread_generation = COALESCE(
+             (SELECT ownership_generation FROM agent_threads WHERE id = COALESCE($3, dispatcher_runs.agent_thread_id)),
+             agent_thread_generation
+           ),
            model = COALESCE($4, model),
            model_options = COALESCE($5, model_options),
            queued_at = now(),
@@ -3060,13 +3092,14 @@ async function queueDispatcherMessage(
       : [];
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
-       (task_id, agent_thread_id, trigger, scope, status, cwd, codex_home, codex_thread_id,
+       (task_id, agent_thread_id, agent_thread_generation, trigger, scope, status, cwd, codex_home, codex_thread_id,
         model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, 'manual', $3, 'queued', $4, $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, 'manual', $4, 'queued', $5, $6, $7, $8, $9, $10, $11)
      RETURNING *`,
     [
       previous?.task_id ?? options.taskId ?? null,
       threadId,
+      thread?.ownership_generation ?? 0,
       previous?.scope ?? (options.taskId ? "task" : "heartbeat"),
       normalizeRunPath(previous?.cwd) ?? normalizeRunPath(thread?.cwd) ?? env.managedRoot,
       codexHome,
@@ -3111,12 +3144,13 @@ async function queueDispatcherRun(
   });
   const result = await pool.query(
     `INSERT INTO dispatcher_runs
-       (task_id, agent_thread_id, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, $3, $4, 'queued', $5, $6, $7, $8, $9, $10)
+       (task_id, agent_thread_id, agent_thread_generation, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+     VALUES ($1, $2, $3, $4, $5, 'queued', $6, $7, $8, $9, $10, $11)
      RETURNING *`,
     [
       options.taskId ?? null,
       thread?.id ?? null,
+      thread?.ownership_generation ?? 0,
       options.trigger,
       options.taskId ? "task" : "heartbeat",
       thread?.cwd ?? env.managedRoot,
