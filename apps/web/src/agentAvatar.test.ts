@@ -19,4 +19,13 @@ describe("describeAgentAvatar", () => {
 
     expect(new Set(pictures).size).toBe(agentIds.length);
   });
+
+  it("does not collide for ids that shared the old lossy hash", () => {
+    const first = describeAgentAvatar("00000000-0000-4000-8000-000000001902");
+    const second = describeAgentAvatar("00000000-0000-4000-8000-000000002356");
+
+    expect(first).not.toEqual(second);
+    expect(first.size).toBe(16);
+    expect(second.size).toBe(16);
+  });
 });

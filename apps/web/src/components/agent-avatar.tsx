@@ -15,9 +15,9 @@ export function AgentAvatar(props: {
       data-agent-avatar={props.agentId}
       role="img"
       shapeRendering="crispEdges"
-      viewBox="0 0 5 5"
+      viewBox={`0 0 ${avatar.size} ${avatar.size}`}
     >
-      <rect width="5" height="5" fill={avatar.background} />
+      <rect width={avatar.size} height={avatar.size} fill={avatar.background} />
       {avatar.cells.map((cell) => (
         <rect
           fill={avatar.color}
