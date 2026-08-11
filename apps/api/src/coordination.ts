@@ -62,6 +62,7 @@ export type Queryable = DbPool | PoolClient;
 interface AgentThreadSession {
   id: string;
   task_id: string | null;
+  project_id: string | null;
   ownership_generation: number;
   runtime_home: string;
   provider_thread_id: string | null;
@@ -1283,16 +1284,21 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : null;
   const linkedTaskId = linkedTask?.rows[0]?.agent_id === recipientAgentId ? thread.task_id : null;
   const project = thread.project_id
-    ? await client.query<{ local_path: string; workspace_mode: string }>("SELECT local_path, workspace_mode FROM projects WHERE id = $1", [thread.project_id])
+    ? await client.query<{ local_path: string; workspace_mode: string; source: string }>("SELECT local_path, workspace_mode, source FROM projects WHERE id = $1", [thread.project_id])
     : null;
   const existing = await client.query<AgentThreadSession>(
-    `SELECT id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd FROM agent_threads
+    `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
   let ownershipTransferUnsafe = false;
   if (session && linkedTaskId) {
     const runtimeHome = managedCodexHome(managedRoot, linkedTaskId);
-    ownershipTransferUnsafe = session.task_id !== linkedTaskId || session.runtime_home !== runtimeHome;
+    const cwd = project?.rows[0]?.local_path ?? managedRoot;
+    ownershipTransferUnsafe =
+      session.task_id !== linkedTaskId ||
+      session.project_id !== thread.project_id ||
+      session.cwd !== cwd ||
+      session.runtime_home !== runtimeHome;
     await client.query(
       "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
       [linkedTaskId, session.id]
@@ -1302,12 +1308,25 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
        SET task_id = $2,
            project_id = $3,
            runtime_home = $4,
-           provider_thread_id = CASE WHEN runtime_home = $4 THEN provider_thread_id ELSE NULL END,
-           ownership_generation = ownership_generation + $5,
+           cwd = $5,
+           provider_thread_id = CASE
+             WHEN runtime_home = $4
+               AND project_id IS NOT DISTINCT FROM $3
+               AND cwd IS NOT DISTINCT FROM $5
+               THEN provider_thread_id
+             ELSE NULL
+           END,
+           ownership_generation = ownership_generation + CASE
+             WHEN runtime_home IS DISTINCT FROM $4
+               OR project_id IS DISTINCT FROM $3
+               OR cwd IS DISTINCT FROM $5
+               THEN 1
+             ELSE $6
+           END,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [session.id, linkedTaskId, thread.project_id, runtimeHome, ownershipTransferUnsafe ? 1 : 0]
+       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+      [session.id, linkedTaskId, thread.project_id, runtimeHome, cwd, ownershipTransferUnsafe ? 1 : 0]
     );
     session = updated.rows[0];
     if (session) {
@@ -1334,7 +1353,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
-       RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
       [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), project?.rows[0]?.local_path ?? managedRoot, runtimeHome, threadId]
     );
     session = created.rows[0]!;
@@ -1357,11 +1376,11 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : coordinationPrompt(thread, recipient, message, history.rows.reverse());
   const createdRun = await client.query<{ id: string }>(
     `INSERT INTO dispatcher_runs
-       (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, message_delivery_id, status, cwd, codex_home,
+       (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
         codex_thread_id, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, 'queued', $7, $8, $9, $10, $11, $12)
+     VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13)
      RETURNING id`,
-    [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "", project?.rows[0]?.workspace_mode ?? "unknown", delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
+    [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "", project?.rows[0]?.workspace_mode ?? "unknown", project?.rows[0]?.source ?? "unknown", delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
   );
   await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
@@ -1543,7 +1562,7 @@ export async function transferTaskAgentThread(
          last_activity_at = now(),
          updated_at = now()
      WHERE task_id = $2
-     RETURNING id, task_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+     RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
     [
       input.threadId,
       input.taskId,

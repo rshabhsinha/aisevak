@@ -103,7 +103,7 @@ interface RunJob {
   codex_thread_id: string | null;
   workspace_mode: "direct" | "git_worktree" | "unknown";
   workspace_key: string;
-  project_source: "local_path" | "github";
+  workspace_source: "local_path" | "github" | "unknown";
   skills_snapshot: CodexSkillSnapshot[];
   agent_id: string;
   coordination_thread_id: string | null;
@@ -496,8 +496,8 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     const threadId = mustRow(threadResult.rows[0]).id;
     const runResult = await client.query<{ id: string }>(
       `INSERT INTO dispatcher_runs
-         (agent_thread_id, trigger, scope, workspace_key, workspace_mode, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'schedule', 'schedule', '', 'unknown', 'queued', $2, $3, $4, $5, $6, $7)
+         (agent_thread_id, trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'schedule', 'schedule', '', 'unknown', 'unknown', 'queued', $2, $3, $4, $5, $6, $7)
        RETURNING id`,
       [
         threadId,
@@ -808,8 +808,8 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   });
   await pool.query(
     `INSERT INTO dispatcher_runs
-       (trigger, scope, workspace_key, workspace_mode, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
-     VALUES ('heartbeat', 'heartbeat', '', 'unknown', 'queued', $1, $2, $3, $4, $5, $6)`,
+       (trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
+     VALUES ('heartbeat', 'heartbeat', '', 'unknown', 'unknown', 'queued', $1, $2, $3, $4, $5, $6)`,
     [
       env.managedRoot,
       codexHome,
@@ -1300,7 +1300,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
               ELSE task_sessions.codex_thread_id
             END AS codex_thread_id,
             task_runs.workspace_mode,
-            projects.source AS project_source,
+            task_runs.workspace_source,
             task_runs.skills_snapshot,
             COALESCE(agent_threads.agent_id, tasks.agent_id) AS agent_id,
             agent_threads.ownership_generation,
@@ -1309,7 +1309,6 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
      JOIN tasks ON tasks.id = task_runs.task_id
-     JOIN projects ON projects.id = tasks.project_id
      WHERE task_runs.id = $1`,
     [picked.id]
   );
@@ -1623,7 +1622,7 @@ function authFileRedactionSecrets(value: string): string[] {
 }
 
 async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
-  if (job.project_source !== "github" || !job.branch) return job.cwd;
+  if (job.workspace_source !== "github" || !job.branch) return job.cwd;
 
   if (job.workspace_mode === "git_worktree") {
     const worktreePath = managedWorktreePath(env.managedRoot, job.task_id, job.branch);
@@ -1854,10 +1853,10 @@ export async function finishMessageDelivery(
 
       const retry = await client.query<{ id: string }>(
         `INSERT INTO dispatcher_runs
-           (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, message_delivery_id, status, cwd, codex_home,
+           (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
             codex_thread_id, model, model_options, prompt, skills_snapshot)
          SELECT source_run.task_id, 'retry', source_run.scope, source_run.agent_thread_id,
-                source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+                source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
                 source_run.codex_thread_id, source_run.model, source_run.model_options,
                 source_run.prompt, source_run.skills_snapshot
          FROM dispatcher_runs source_run
