@@ -558,7 +558,10 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   );
 }
 
-async function processOneDispatcherRun(pool: DbPool): Promise<void> {
+export async function processOneDispatcherRun(
+  pool: DbPool,
+  runTurn: typeof runCodexAppServerTurn = runCodexAppServerTurn
+): Promise<void> {
   const result = await pool.query<{ id: string }>(
     `UPDATE dispatcher_runs
      SET status = 'running', started_at = now(), updated_at = now()
@@ -572,6 +575,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
              SELECT 1
              FROM message_deliveries delivery
              WHERE delivery.id = candidate.message_delivery_id
+               AND delivery.status IN ('queued', 'retrying')
                AND delivery.available_at <= now()
            )
          )
@@ -622,7 +626,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
     await pool.query(
       `UPDATE message_deliveries
        SET status = 'running', attempt_count = attempt_count + 1,
-           presented_at = now(), updated_at = now()
+           updated_at = now()
        WHERE id = $1`,
       [job.message_delivery_id]
     );
@@ -632,6 +636,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  let promptMayHaveBeenPresented = false;
 
   try {
     await mkdir(job.codex_home, { recursive: true });
@@ -648,7 +653,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
-    const turn = await runCodexAppServerTurn({
+    const turn = await runTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
       codexHome: job.codex_home,
@@ -692,6 +697,15 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
           );
         }
       },
+      onTurnAccepted: async () => {
+        if (!job.message_delivery_id) return;
+        await pool.query(
+          `UPDATE message_deliveries
+           SET presented_at = COALESCE(presented_at, now()), updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [job.message_delivery_id]
+        );
+      },
       shouldCancel: async () => {
         const current = await pool.query<{ status: string }>(
           "SELECT status FROM dispatcher_runs WHERE id = $1",
@@ -702,6 +716,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
     });
+    promptMayHaveBeenPresented = turn.promptMayHaveBeenPresented;
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
     if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
@@ -746,7 +761,7 @@ async function processOneDispatcherRun(pool: DbPool): Promise<void> {
       );
     }
     if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr);
+      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
     }
   }
 }
@@ -1183,65 +1198,129 @@ export async function finishMessageDelivery(
   pool: DbPool,
   job: Pick<DispatcherJob, "id" | "message_delivery_id">,
   status: "succeeded" | "failed" | "cancelled",
-  error: string
+  error: string,
+  promptMayHaveBeenPresented = false
 ): Promise<void> {
   if (!job.message_delivery_id) return;
   if (status === "succeeded") {
     await pool.query(
       `UPDATE message_deliveries
        SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
-       WHERE id = $1`,
+       WHERE id = $1 AND status = 'running'`,
       [job.message_delivery_id]
     );
     return;
   }
 
-  const delivery = await pool.query<{ attempt_count: number }>(
-    "SELECT attempt_count FROM message_deliveries WHERE id = $1",
-    [job.message_delivery_id]
-  );
-  const attempts = delivery.rows[0]?.attempt_count ?? 3;
-  if (status === "failed" && attempts < 3) {
-    try {
-      await withTransaction(pool, async (client) => {
+  try {
+    await withTransaction(pool, async (client) => {
+      const result = await client.query<{
+        status: string;
+        attempt_count: number;
+        presented_at: Date | null;
+        provider_thread_id: string | null;
+      }>(
+        `SELECT delivery.status,
+                delivery.attempt_count,
+                delivery.presented_at,
+                COALESCE(agent_threads.provider_thread_id, source_run.codex_thread_id) AS provider_thread_id
+         FROM message_deliveries delivery
+         LEFT JOIN dispatcher_runs source_run
+           ON source_run.id = $2 AND source_run.message_delivery_id = delivery.id
+         LEFT JOIN agent_threads ON agent_threads.id = source_run.agent_thread_id
+         WHERE delivery.id = $1
+         FOR UPDATE OF delivery`,
+        [job.message_delivery_id, job.id]
+      );
+      const delivery = result.rows[0];
+      if (!delivery || delivery.status !== "running") return;
+
+      if (status !== "failed" || delivery.attempt_count >= 3) {
         await client.query(
           `UPDATE message_deliveries
-           SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
-               error = NULLIF($3, ''), updated_at = now()
-           WHERE id = $1`,
-          [job.message_delivery_id, attempts, error]
+           SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [job.message_delivery_id, error]
+        );
+        return;
+      }
+
+      if ((delivery.presented_at || promptMayHaveBeenPresented) && delivery.provider_thread_id) {
+        const suppressionReason = delivery.presented_at
+          ? "the coordination message was already presented to an established provider thread"
+          : "turn/start was sent to an established provider thread and may have presented the coordination message";
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [
+            job.message_delivery_id,
+            `Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`
+          ]
+        );
+        return;
+      }
+
+      const retry = await client.query<{ id: string }>(
+        `INSERT INTO dispatcher_runs
+           (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+            codex_thread_id, model, model_options, prompt, skills_snapshot)
+         SELECT source_run.task_id, 'retry', source_run.scope, source_run.agent_thread_id,
+                source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+                source_run.codex_thread_id, source_run.model, source_run.model_options,
+                source_run.prompt, source_run.skills_snapshot
+         FROM dispatcher_runs source_run
+         WHERE source_run.id = $1
+           AND source_run.message_delivery_id = $2
+           AND NOT EXISTS (
+             SELECT 1
+             FROM dispatcher_runs overlapping_run
+             WHERE overlapping_run.message_delivery_id = $2
+               AND overlapping_run.id <> source_run.id
+               AND overlapping_run.status IN ('queued', 'running', 'cancel_requested')
+           )
+         RETURNING id`,
+        [job.id, job.message_delivery_id]
+      );
+      if (!retry.rows[0]) {
+        const suppressionError =
+          `Automatic delivery retry suppressed: the source run was unavailable or another run for this coordination message was already queued or active.${error ? ` Original error: ${error}` : ""}`;
+        await client.query(
+          `UPDATE dispatcher_runs
+           SET status = 'cancelled', finished_at = now(), error = $2, updated_at = now()
+           WHERE message_delivery_id = $1 AND status = 'queued'`,
+          [job.message_delivery_id, suppressionError]
         );
         await client.query(
-          `INSERT INTO dispatcher_runs
-             (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
-              codex_thread_id, model, model_options, prompt, skills_snapshot)
-           SELECT task_id, 'retry', scope, agent_thread_id, message_delivery_id, 'queued', cwd, codex_home,
-                  codex_thread_id, model, model_options, prompt, skills_snapshot
-           FROM dispatcher_runs WHERE id = $1`,
-          [job.id]
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [job.message_delivery_id, suppressionError]
         );
-      });
-    } catch (retryError) {
-      const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-      await pool.query(
+        return;
+      }
+
+      await client.query(
         `UPDATE message_deliveries
-         SET status = 'failed', completed_at = now(),
-             error = $2, updated_at = now()
+         SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
+             error = NULLIF($3, ''), updated_at = now()
          WHERE id = $1 AND status = 'running'`,
-        [
-          job.message_delivery_id,
-          `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`
-        ]
+        [job.message_delivery_id, delivery.attempt_count, error]
       );
-    }
-    return;
+    });
+  } catch (retryError) {
+    const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
+    await pool.query(
+      `UPDATE message_deliveries
+       SET status = 'failed', completed_at = now(),
+           error = $2, updated_at = now()
+       WHERE id = $1 AND status = 'running'`,
+      [
+        job.message_delivery_id,
+        `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`
+      ]
+    );
   }
-  await pool.query(
-    `UPDATE message_deliveries
-     SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
-     WHERE id = $1`,
-    [job.message_delivery_id, error]
-  );
 }
 
 async function createAgentToolToken(

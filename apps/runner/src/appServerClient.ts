@@ -17,6 +17,8 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
+class JsonRpcResponseError extends Error {}
+
 export interface AppServerTurnInput {
   id: string;
   message: string;
@@ -34,6 +36,7 @@ export interface AppServerTurnOptions {
   secrets: Array<string | null | undefined>;
   onLine: (line: string, seq: number) => Promise<void>;
   onThreadId: (threadId: string) => Promise<void>;
+  onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
   nextInput?: () => Promise<AppServerTurnInput | null>;
   onInputHandled?: (input: AppServerTurnInput, error?: string) => Promise<void>;
@@ -47,6 +50,7 @@ export interface AppServerTurnResult {
   rawStderr: string;
   exitCode: number | null;
   error: string | null;
+  promptMayHaveBeenPresented: boolean;
 }
 
 interface TurnState {
@@ -56,6 +60,7 @@ interface TurnState {
   seq: number;
   rawStdout: string;
   stderrStart: number;
+  promptMayHaveBeenPresented: boolean;
   completed: boolean;
   finalStatus: AppServerTurnResult["status"] | null;
   finalError: string | null;
@@ -165,6 +170,7 @@ class PersistentAppServer {
       seq: 0,
       rawStdout: "",
       stderrStart: 0,
+      promptMayHaveBeenPresented: false,
       completed: false,
       finalStatus: null,
       finalError: null,
@@ -212,7 +218,7 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
-      const turnResponse = await this.request("turn/start", {
+      const turnRequest = this.request("turn/start", {
         threadId: state.threadId,
         input: [{ type: "text", text: options.prompt, text_elements: [] }],
         cwd: options.cwd,
@@ -223,6 +229,15 @@ class PersistentAppServer {
         approvalPolicy: "never",
         sandboxPolicy: { type: "dangerFullAccess" }
       });
+      state.promptMayHaveBeenPresented = true;
+      let turnResponse: Record<string, unknown>;
+      try {
+        turnResponse = await turnRequest;
+      } catch (error) {
+        if (error instanceof JsonRpcResponseError) state.promptMayHaveBeenPresented = false;
+        throw error;
+      }
+      await options.onTurnAccepted?.();
       this.bindTurnId(state, extractTurnId({ result: turnResponse }));
       if (!state.turnId) throw new Error("app-server did not return a turn id");
 
@@ -256,7 +271,8 @@ class PersistentAppServer {
         rawStdout: state.rawStdout,
         rawStderr: this.rawStderr.slice(state.stderrStart),
         exitCode: 0,
-        error: state.finalError
+        error: state.finalError,
+        promptMayHaveBeenPresented: state.promptMayHaveBeenPresented
       };
     } catch (error) {
       await state.eventChain.catch(() => undefined);
@@ -267,7 +283,8 @@ class PersistentAppServer {
         rawStdout: state.rawStdout,
         rawStderr: this.rawStderr.slice(state.stderrStart),
         exitCode: null,
-        error: error instanceof Error ? error.message : String(error)
+        error: error instanceof Error ? error.message : String(error),
+        promptMayHaveBeenPresented: state.promptMayHaveBeenPresented
       };
     } finally {
       if (monitor) clearInterval(monitor);
@@ -367,7 +384,10 @@ class PersistentAppServer {
     if (message.id !== undefined) {
       const id = String(message.id);
       if (message.error) {
-        this.rejectOne(id, new Error(message.error.message ?? `app-server request ${id} failed`));
+        this.rejectOne(
+          id,
+          new JsonRpcResponseError(message.error.message ?? `app-server request ${id} failed`)
+        );
       } else {
         this.resolveOne(id, message.result ?? {});
       }
