@@ -22,6 +22,7 @@ class JsonRpcResponseError extends Error {}
 export interface AppServerTurnInput {
   id: string;
   message: string;
+  messageDeliveryId?: string | null;
 }
 
 export interface AppServerTurnOptions {
@@ -36,6 +37,12 @@ export interface AppServerTurnOptions {
   secrets: Array<string | null | undefined>;
   onLine: (line: string, seq: number) => Promise<void>;
   onThreadId: (threadId: string) => Promise<void>;
+  /**
+   * Acquire a short-lived ownership fence immediately before the provider turn
+   * is sent. The returned release function runs after the request is written.
+   * Returning null keeps a stale ownership generation from presenting its prompt.
+   */
+  onBeforeTurnStart?: () => Promise<(() => Promise<void>) | null>;
   onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
   nextInput?: () => Promise<AppServerTurnInput | null>;
@@ -132,11 +139,22 @@ class PersistentAppServer {
       });
     });
 
+    this.child.stdin.on("error", (error) => {
+      this.quarantine(error);
+    });
+
     this.child.stdout.on("data", (chunk) => {
       this.stdoutBuffer += String(chunk);
       const lines = this.stdoutBuffer.split(/\r?\n/);
       this.stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) this.handleLine(line);
+      for (const line of lines) {
+        try {
+          this.handleLine(line);
+        } catch (error) {
+          this.quarantine(error);
+          break;
+        }
+      }
     });
     this.child.stderr.on("data", (chunk) => {
       this.rawStderr += redactText(String(chunk), [...this.redactionSecrets]);
@@ -218,18 +236,55 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
-      const turnRequest = this.request("turn/start", {
-        threadId: state.threadId,
-        input: [{ type: "text", text: options.prompt, text_elements: [] }],
-        cwd: options.cwd,
-        model: explicitModel(options.model),
-        ...(stringModelOption(options.modelOptions, "reasoningEffort")
-          ? { effort: stringModelOption(options.modelOptions, "reasoningEffort") }
-          : {}),
-        approvalPolicy: "never",
-        sandboxPolicy: { type: "dangerFullAccess" }
-      });
-      state.promptMayHaveBeenPresented = true;
+      const releaseTurnStartFence = await options.onBeforeTurnStart?.();
+      if (options.onBeforeTurnStart && !releaseTurnStartFence) {
+        return {
+          status: "interrupted",
+          threadId: state.threadId,
+          turnId: null,
+          rawStdout: state.rawStdout,
+          rawStderr: this.rawStderr.slice(state.stderrStart),
+          exitCode: null,
+          error: "provider turn cancelled because run ownership changed before launch",
+          promptMayHaveBeenPresented: false
+        };
+      }
+
+      let turnRequest: Promise<Record<string, unknown>>;
+      try {
+        turnRequest = this.request("turn/start", {
+          threadId: state.threadId,
+          input: [{ type: "text", text: options.prompt, text_elements: [] }],
+          cwd: options.cwd,
+          model: explicitModel(options.model),
+          ...(stringModelOption(options.modelOptions, "reasoningEffort")
+            ? { effort: stringModelOption(options.modelOptions, "reasoningEffort") }
+            : {}),
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" }
+        });
+        // Closing a quarantined session rejects pending requests synchronously.
+        // Attach a handler before releasing the fence so that rejection cannot
+        // escape while the original promise is drained below.
+        void turnRequest.catch(() => undefined);
+        state.promptMayHaveBeenPresented = true;
+        try {
+          await releaseTurnStartFence?.();
+        } catch (error) {
+          // turn/start has already crossed the presentation boundary. If the
+          // ownership fence cannot be released cleanly, the database outcome
+          // is ambiguous and this provider process must never be reused for a
+          // replacement turn.
+          await this.close().catch(() => undefined);
+          await turnRequest.catch(() => undefined);
+          throw error;
+        }
+      } catch (error) {
+        // A synchronous request/write failure still needs to release the
+        // ownership locks, but it has not presented a provider turn.
+        if (!state.promptMayHaveBeenPresented) await releaseTurnStartFence?.();
+        throw error;
+      }
       let turnResponse: Record<string, unknown>;
       try {
         turnResponse = await turnRequest;
@@ -473,7 +528,13 @@ class PersistentAppServer {
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
       this.pending.set(id, { resolve, reject, timeout });
     });
-    this.send({ id, method, params });
+    try {
+      this.send({ id, method, params });
+    } catch (error) {
+      clearTimeout(timeout);
+      this.pending.delete(id);
+      throw error;
+    }
     return promise;
   }
 
@@ -495,6 +556,13 @@ class PersistentAppServer {
 
   private rejectPending(error: Error): void {
     for (const id of [...this.pending.keys()]) this.rejectOne(id, error);
+  }
+
+  private quarantine(error: unknown): void {
+    if (this.closed) return;
+    const reason = error instanceof Error ? error : new Error(String(error));
+    this.rejectPending(reason);
+    void this.close().catch(() => undefined);
   }
 
   private addSecrets(secrets: Array<string | null | undefined>): void {

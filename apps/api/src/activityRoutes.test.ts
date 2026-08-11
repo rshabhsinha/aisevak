@@ -70,4 +70,10 @@ describe("web activity routes", () => {
     const response = await app.inject({ method: "GET", url: "/api/reports" });
     expect(response.statusCode).toBe(401);
   });
+
+  it("does not expose incidents without a user session", async () => {
+    const { app } = await activityServer();
+    const response = await app.inject({ method: "GET", url: "/api/incidents" });
+    expect(response.statusCode).toBe(401);
+  });
 });

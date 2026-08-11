@@ -58,6 +58,7 @@ const env = {
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
+  maxConcurrency: positiveNumber(process.env.RUNNER_MAX_CONCURRENCY, 4, 32),
   dispatcherHeartbeatMs: Number(process.env.DISPATCHER_HEARTBEAT_MS ?? "300000"),
   apiUrl: process.env.API_URL ?? "http://localhost:8787",
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -66,6 +67,7 @@ const env = {
 };
 
 let shuttingDown = false;
+const activeRunJobs = new Set<Promise<void>>();
 
 interface ImportJob {
   id: string;
@@ -90,6 +92,8 @@ interface RunJob {
   task_id: string;
   task_session_id: string;
   agent_thread_id: string | null;
+  agent_thread_generation: number;
+  ownership_generation: number | null;
   prompt: string;
   model: string;
   model_options: Array<{ id: string; value: string | number | boolean }>;
@@ -97,8 +101,9 @@ interface RunJob {
   branch: string | null;
   codex_home: string;
   codex_thread_id: string | null;
-  workspace_mode: "direct" | "git_worktree";
-  project_source: "local_path" | "github";
+  workspace_mode: "direct" | "git_worktree" | "unknown";
+  workspace_key: string;
+  workspace_source: "local_path" | "github" | "unknown";
   skills_snapshot: CodexSkillSnapshot[];
   agent_id: string;
   coordination_thread_id: string | null;
@@ -107,6 +112,8 @@ interface RunJob {
 interface DispatcherJob {
   id: string;
   agent_thread_id: string | null;
+  agent_thread_generation: number;
+  ownership_generation: number | null;
   task_id: string | null;
   prompt: string;
   model: string;
@@ -122,6 +129,8 @@ interface DispatcherJob {
   agent_description: string;
   agent_instructions: string;
   coordination_thread_id: string | null;
+  workspace_key: string;
+  workspace_mode: string;
   message_delivery_id: string | null;
 }
 
@@ -130,6 +139,9 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
   await recoverInterruptedGithubJobs(pool);
+  await recoverAmbiguousWorkspaceRuns(pool);
+  await recoverInterruptedCoordinationRuns(pool);
+  await recoverStaleAgentThreadRuns(pool);
 
   const beginShutdown = () => {
     shuttingDown = true;
@@ -139,20 +151,59 @@ async function main(): Promise<void> {
 
   console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
   while (!shuttingDown) {
+    startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     try {
       await processOneGithubConnection(pool);
       await processOneImportJob(pool);
       await enqueueDueSchedule(pool);
       await enqueueDispatcherHeartbeat(pool);
-      await processOneDispatcherRun(pool);
-      await processOneRunJob(pool);
+      if (!shuttingDown) startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     } catch (error) {
       console.error("runner loop error", error);
     }
     await sleep(env.pollMs);
   }
+  await waitForRunJobs(activeRunJobs);
   await closeAllCodexAppServers();
   await pool.end();
+}
+
+export function startAvailableRunJobs(
+  pool: DbPool,
+  activeJobs: Set<Promise<void>>,
+  maxConcurrency: number,
+  runFunctions: Array<(pool: DbPool) => Promise<boolean | void>> = [processOneDispatcherRun, processOneRunJob]
+): void {
+  if (runFunctions.length === 0) return;
+  const limit = Math.max(1, Math.floor(maxConcurrency));
+  let functionIndex = 0;
+  while (!shuttingDown && activeJobs.size < limit) {
+    const selectedIndex = functionIndex % runFunctions.length;
+    const runFunction = runFunctions[selectedIndex];
+    functionIndex += 1;
+    if (!runFunction) return;
+    const job = Promise.resolve()
+      .then(async () => {
+        const claimed = await runFunction(pool);
+        if (claimed !== false || runFunctions.length < 2) return;
+        for (let offset = 1; offset < runFunctions.length; offset += 1) {
+          const fallback = runFunctions[(selectedIndex + offset) % runFunctions.length];
+          if (!fallback) continue;
+          if ((await fallback(pool)) !== false) return;
+        }
+      })
+      .catch((error) => {
+        console.error("runner run job error", error);
+      });
+    activeJobs.add(job);
+    void job.finally(() => activeJobs.delete(job));
+  }
+}
+
+export async function waitForRunJobs(activeJobs: Set<Promise<void>>): Promise<void> {
+  while (activeJobs.size > 0) {
+    await Promise.all([...activeJobs]);
+  }
 }
 
 async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
@@ -171,6 +222,268 @@ async function recoverInterruptedGithubJobs(pool: DbPool): Promise<void> {
      SET status = 'queued', started_at = NULL, updated_at = now()
      WHERE status = 'running'`
   );
+}
+
+export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void> {
+  const error = "The queued turn was cancelled because its immutable workspace snapshot is unavailable";
+  const ambiguousWorkspacePredicate = `
+         AND (workspace_key = '' OR workspace_mode = 'unknown' OR workspace_source = 'unknown')
+         AND NOT (
+           workspace_key = ''
+           AND workspace_mode = 'projectless'
+           AND workspace_source = 'projectless'
+         )`;
+  await withTransaction(pool, async (client) => {
+    const workers = await client.query<{ id: string }>(
+      `UPDATE task_runs
+       SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
+       WHERE status = 'queued'
+         ${ambiguousWorkspacePredicate}
+       RETURNING id`,
+      [error]
+    );
+    for (const run of workers.rows) {
+      await failPendingAgentTurnInputsInTransaction(client, "worker", run.id, "cancelled");
+    }
+
+    const dispatchers = await client.query<{ id: string; message_delivery_id: string | null }>(
+      `UPDATE dispatcher_runs
+       SET status = 'cancelled', error = $1, finished_at = now(), updated_at = now()
+       WHERE status = 'queued'
+         ${ambiguousWorkspacePredicate}
+         AND (
+           task_id IS NOT NULL
+           OR agent_thread_id IS NOT NULL
+         )
+       RETURNING id, message_delivery_id`,
+      [error]
+    );
+    for (const run of dispatchers.rows) {
+      if (run.message_delivery_id) {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [run.message_delivery_id, error]
+        );
+        await cancelQueuedDeliveryRuns(client, run.message_delivery_id, error);
+      }
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, "cancelled");
+    }
+  });
+}
+
+export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<void> {
+  const interrupted = await pool.query<{
+    id: string;
+    status: "running" | "cancel_requested";
+    message_delivery_id: string | null;
+  }>(
+    `SELECT id, status::text, message_delivery_id
+     FROM dispatcher_runs
+     WHERE scope = 'coordination'
+       AND status IN ('running', 'cancel_requested')
+     ORDER BY started_at ASC NULLS FIRST, id ASC`
+  );
+
+  for (const run of interrupted.rows) {
+    const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
+    const error =
+      run.status === "cancel_requested"
+        ? "The coordination turn was cancelled when the runner stopped"
+        : "The coordination turn was interrupted when the runner stopped";
+    await withTransaction(pool, async (client) => {
+      const locked = await client.query<{ message_delivery_id: string | null; status: string }>(
+        `SELECT message_delivery_id, status::text
+         FROM dispatcher_runs
+         WHERE id = $1
+         FOR UPDATE`,
+        [run.id]
+      );
+      const current = locked.rows[0];
+      if (!current || !["running", "cancel_requested"].includes(current.status)) return;
+      await client.query(
+        `UPDATE dispatcher_runs
+         SET status = $2::run_status,
+             error = $3,
+             finished_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [run.id, finalStatus, error]
+      );
+      const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
+      if (deliveryId) {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [deliveryId, error]
+        );
+        await cancelQueuedDeliveryRuns(client, deliveryId, error);
+      }
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, finalStatus);
+    });
+  }
+
+  const interruptedDeliveries = await pool.query<{
+    run_id: string;
+    message_delivery_id: string;
+    run_status: string;
+  }>(
+    `SELECT dispatcher_runs.id AS run_id, dispatcher_runs.message_delivery_id, dispatcher_runs.status::text AS run_status
+     FROM dispatcher_runs
+     JOIN message_deliveries ON message_deliveries.id = dispatcher_runs.message_delivery_id
+     WHERE dispatcher_runs.scope = 'coordination'
+       AND dispatcher_runs.status IN ('succeeded', 'failed', 'cancelled')
+       AND message_deliveries.status = 'running'`
+  );
+  for (const delivery of interruptedDeliveries.rows) {
+    await withTransaction(pool, async (client) => {
+      const status = delivery.run_status === "succeeded" ? "completed" : "failed";
+      const error = delivery.run_status === "succeeded"
+        ? null
+        : "The coordination delivery was interrupted when the runner stopped";
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = $2, completed_at = now(), error = $3, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [delivery.message_delivery_id, status, error]
+      );
+      await cancelQueuedDeliveryRuns(client, delivery.message_delivery_id, error ?? "Delivery completed");
+    });
+  }
+
+  const terminalInputs = await pool.query<{
+    input_id: string;
+    message_delivery_id: string | null;
+    input_status: "queued" | "delivering";
+    run_status: "succeeded" | "failed" | "cancelled";
+  }>(
+    `SELECT agent_turn_inputs.id AS input_id,
+            agent_turn_inputs.message_delivery_id,
+            agent_turn_inputs.status::text AS input_status,
+            dispatcher_runs.status::text AS run_status
+     FROM agent_turn_inputs
+     JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+     WHERE agent_turn_inputs.status IN ('queued', 'delivering')
+       AND dispatcher_runs.scope = 'coordination'
+       AND dispatcher_runs.status IN ('succeeded', 'failed', 'cancelled')`
+  );
+  for (const input of terminalInputs.rows) {
+    const delivered = input.input_status === "delivering" && input.run_status === "succeeded";
+    const inputError = delivered
+      ? null
+      : input.run_status === "cancelled"
+        ? "The coordination turn was stopped before this message could be delivered"
+        : "The coordination turn finished before this message could be delivered";
+    await withTransaction(pool, async (client) => {
+      const updated = await client.query(
+        `UPDATE agent_turn_inputs
+         SET status = $2,
+             error = $3,
+             delivered_at = CASE WHEN $2 = 'delivered' THEN COALESCE(delivered_at, now()) ELSE delivered_at END,
+             updated_at = now()
+         WHERE id = $1 AND status IN ('queued', 'delivering')
+         RETURNING message_delivery_id`,
+        [input.input_id, delivered ? "delivered" : "failed", inputError]
+      );
+      const deliveryId = updated.rows[0]?.message_delivery_id ?? input.message_delivery_id;
+      if (!deliveryId) return;
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = $2, completed_at = now(), error = $3, updated_at = now()
+         WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+        [deliveryId, delivered ? "completed" : "failed", inputError]
+      );
+      await cancelQueuedDeliveryRuns(client, deliveryId, inputError ?? "Delivery completed");
+    });
+  }
+}
+
+export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
+  const error = "The queued turn was cancelled because thread ownership changed before it started";
+  while (true) {
+    const recovered = await withTransaction(pool, async (client) => {
+      const workerThread = await client.query<{ id: string }>(
+        `SELECT agent_threads.id
+         FROM agent_threads
+         JOIN task_runs ON task_runs.agent_thread_id = agent_threads.id
+         WHERE task_runs.status = 'queued'
+           AND task_runs.agent_thread_generation <> agent_threads.ownership_generation
+         ORDER BY task_runs.queued_at ASC, task_runs.id ASC
+         LIMIT 1
+         FOR UPDATE OF agent_threads SKIP LOCKED`
+      );
+      const workerThreadId = workerThread.rows[0]?.id;
+      if (workerThreadId) {
+        const run = await client.query<{ id: string }>(
+          `SELECT id
+           FROM task_runs
+           WHERE agent_thread_id = $1
+             AND status = 'queued'
+             AND agent_thread_generation <> (SELECT ownership_generation FROM agent_threads WHERE id = $1)
+           ORDER BY queued_at ASC, id ASC
+           LIMIT 1
+           FOR UPDATE`,
+          [workerThreadId]
+        );
+        const runId = run.rows[0]?.id;
+        if (!runId) return false;
+        await client.query(
+          `UPDATE task_runs
+           SET status = 'cancelled', error = $2, finished_at = now(), updated_at = now()
+           WHERE id = $1`,
+          [runId, error]
+        );
+        await failPendingAgentTurnInputsInTransaction(client, "worker", runId, "cancelled");
+        return true;
+      }
+
+      const dispatcherThread = await client.query<{ id: string }>(
+        `SELECT agent_threads.id
+         FROM agent_threads
+         JOIN dispatcher_runs ON dispatcher_runs.agent_thread_id = agent_threads.id
+         WHERE dispatcher_runs.status = 'queued'
+           AND dispatcher_runs.agent_thread_generation <> agent_threads.ownership_generation
+         ORDER BY dispatcher_runs.queued_at ASC, dispatcher_runs.id ASC
+         LIMIT 1
+         FOR UPDATE OF agent_threads SKIP LOCKED`
+      );
+      const dispatcherThreadId = dispatcherThread.rows[0]?.id;
+      if (!dispatcherThreadId) return false;
+      const run = await client.query<{ id: string; message_delivery_id: string | null }>(
+        `SELECT id, message_delivery_id
+         FROM dispatcher_runs
+         WHERE agent_thread_id = $1
+           AND status = 'queued'
+           AND agent_thread_generation <> (SELECT ownership_generation FROM agent_threads WHERE id = $1)
+         ORDER BY queued_at ASC, id ASC
+         LIMIT 1
+         FOR UPDATE`,
+        [dispatcherThreadId]
+      );
+      const dispatcher = run.rows[0];
+      if (!dispatcher) return false;
+      await client.query(
+        `UPDATE dispatcher_runs
+         SET status = 'cancelled', error = $2, finished_at = now(), updated_at = now()
+         WHERE id = $1`,
+        [dispatcher.id, error]
+      );
+      if (dispatcher.message_delivery_id) {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [dispatcher.message_delivery_id, error]
+        );
+        await cancelQueuedDeliveryRuns(client, dispatcher.message_delivery_id, error);
+      }
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", dispatcher.id, "cancelled");
+      return true;
+    });
+    if (!recovered) break;
+  }
 }
 
 interface DueSchedule {
@@ -233,8 +546,8 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     const threadId = mustRow(threadResult.rows[0]).id;
     const runResult = await client.query<{ id: string }>(
       `INSERT INTO dispatcher_runs
-         (agent_thread_id, trigger, scope, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'schedule', 'schedule', 'queued', $2, $3, $4, $5, $6, $7)
+         (agent_thread_id, trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'schedule', 'schedule', '', 'unknown', 'unknown', 'queued', $2, $3, $4, $5, $6, $7)
        RETURNING id`,
       [
         threadId,
@@ -545,8 +858,8 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   });
   await pool.query(
     `INSERT INTO dispatcher_runs
-       (trigger, scope, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
-     VALUES ('heartbeat', 'heartbeat', 'queued', $1, $2, $3, $4, $5, $6)`,
+       (trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
+     VALUES ('heartbeat', 'heartbeat', '', 'unknown', 'unknown', 'queued', $1, $2, $3, $4, $5, $6)`,
     [
       env.managedRoot,
       codexHome,
@@ -558,17 +871,29 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   );
 }
 
-export async function processOneDispatcherRun(
-  pool: DbPool,
-  runTurn: typeof runCodexAppServerTurn = runCodexAppServerTurn
-): Promise<void> {
-  const result = await pool.query<{ id: string }>(
-    `UPDATE dispatcher_runs
-     SET status = 'running', started_at = now(), updated_at = now()
-     WHERE id = (
-       SELECT candidate.id
+interface ClaimedRun {
+  id: string;
+}
+
+async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
+  return withTransaction(pool, async (client) => {
+    const candidateResult = await client.query<{
+      id: string;
+      agent_thread_id: string | null;
+      agent_thread_generation: number;
+      workspace_key: string;
+      workspace_mode: "direct" | "git_worktree" | "unknown";
+    }>(
+      `SELECT candidate.id, candidate.agent_thread_id, candidate.agent_thread_generation,
+              candidate.workspace_key, candidate.workspace_mode
        FROM dispatcher_runs candidate
+       LEFT JOIN agent_threads candidate_thread ON candidate_thread.id = candidate.agent_thread_id
+       LEFT JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
        WHERE candidate.status = 'queued'
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR candidate.agent_thread_generation = candidate_thread.ownership_generation
+         )
          AND (
            candidate.message_delivery_id IS NULL
            OR EXISTS (
@@ -580,26 +905,239 @@ export async function processOneDispatcherRun(
            )
          )
          AND (
-           candidate.scope <> 'coordination'
+           candidate.agent_thread_id IS NULL
            OR NOT EXISTS (
-             SELECT 1 FROM dispatcher_runs active
-             WHERE active.agent_thread_id = candidate.agent_thread_id
-               AND active.scope = 'coordination'
-               AND active.status = 'running'
+             SELECT 1 FROM task_runs active_worker
+             WHERE active_worker.agent_thread_id = candidate.agent_thread_id
+               AND active_worker.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1 FROM dispatcher_runs active_dispatcher
+             WHERE active_dispatcher.agent_thread_id = candidate.agent_thread_id
+               AND active_dispatcher.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.workspace_mode <> 'direct'
+           OR candidate.workspace_key = ''
+           OR NOT EXISTS (
+             SELECT 1
+             FROM (
+               SELECT active.status, active.workspace_key, active.workspace_mode
+               FROM task_runs active
+               UNION ALL
+               SELECT active.status, active.workspace_key, active.workspace_mode
+               FROM dispatcher_runs active
+             ) active_project_turns
+             WHERE active_project_turns.workspace_key = candidate.workspace_key
+               AND active_project_turns.workspace_mode = 'direct'
+               AND active_project_turns.status IN ('running', 'cancel_requested')
            )
          )
        ORDER BY candidate.queued_at ASC
-       LIMIT 1
-       FOR UPDATE SKIP LOCKED
-     )
-     RETURNING id`
-  );
-  const picked = result.rows[0];
-  if (!picked) return;
+       LIMIT 1`
+    );
+    const candidate = candidateResult.rows[0];
+    if (!candidate) return null;
+    if (candidate.agent_thread_id) {
+      const lockedThread = await client.query(
+        "SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE SKIP LOCKED",
+        [candidate.agent_thread_id]
+      );
+      if (!lockedThread.rows[0]) return null;
+    }
+    if (candidate.workspace_mode === "direct" && candidate.workspace_key) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [candidate.workspace_key]);
+      const activeProject = await client.query(
+        `SELECT 1
+         FROM (
+           SELECT active.status, active.workspace_key, active.workspace_mode
+           FROM task_runs active
+           UNION ALL
+           SELECT active.status, active.workspace_key, active.workspace_mode
+           FROM dispatcher_runs active
+         ) active_project_turns
+         WHERE active_project_turns.workspace_key = $1
+           AND active_project_turns.workspace_mode = 'direct'
+           AND active_project_turns.status IN ('running', 'cancel_requested')
+         LIMIT 1`,
+        [candidate.workspace_key]
+      );
+      if (activeProject.rows[0]) return null;
+    }
+    if (candidate.agent_thread_id) {
+      const generation = await client.query<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1",
+        [candidate.agent_thread_id]
+      );
+      if (generation.rows[0]?.ownership_generation !== candidate.agent_thread_generation) return null;
+      const active = await client.query(
+        `SELECT 1 FROM (
+           SELECT status FROM task_runs WHERE agent_thread_id = $1
+           UNION ALL
+           SELECT status FROM dispatcher_runs WHERE agent_thread_id = $1
+         ) active_turns
+         WHERE status IN ('running', 'cancel_requested')
+         LIMIT 1`,
+        [candidate.agent_thread_id]
+      );
+      if (active.rows[0]) return null;
+    }
+    const lockedCandidate = await client.query(
+      `SELECT id
+       FROM dispatcher_runs
+       WHERE id = $1 AND status = 'queued'
+       FOR UPDATE SKIP LOCKED`,
+      [candidate.id]
+    );
+    if (!lockedCandidate.rows[0]) return null;
+    const claimed = await client.query<{ id: string }>(
+      `UPDATE dispatcher_runs
+       SET status = 'running', started_at = now(), updated_at = now()
+       WHERE id = $1 AND status = 'queued'
+       RETURNING id`,
+      [candidate.id]
+    );
+    return claimed.rows[0] ?? null;
+  });
+}
+
+async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
+  return withTransaction(pool, async (client) => {
+    const candidateResult = await client.query<{
+      id: string;
+      agent_thread_id: string | null;
+      agent_thread_generation: number;
+      workspace_key: string;
+      workspace_mode: "direct" | "git_worktree" | "unknown";
+    }>(
+      `SELECT candidate.id, candidate.agent_thread_id, candidate.agent_thread_generation,
+              candidate.workspace_key, candidate.workspace_mode
+       FROM task_runs candidate
+       LEFT JOIN agent_threads candidate_thread ON candidate_thread.id = candidate.agent_thread_id
+       JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
+       WHERE candidate.status = 'queued'
+         AND candidate.run_kind = 'worker'
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR candidate.agent_thread_generation = candidate_thread.ownership_generation
+         )
+         AND (
+           candidate.workspace_mode <> 'direct'
+           OR candidate.workspace_key = ''
+           OR NOT EXISTS (
+             SELECT 1 FROM (
+               SELECT active.status, active.workspace_key, active.workspace_mode
+               FROM task_runs active
+               UNION ALL
+               SELECT active.status, active.workspace_key, active.workspace_mode
+               FROM dispatcher_runs active
+             ) active_project_turns
+             WHERE active_project_turns.workspace_key = candidate.workspace_key
+               AND active_project_turns.workspace_mode = 'direct'
+               AND active_project_turns.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1 FROM task_runs active_worker
+             WHERE active_worker.agent_thread_id = candidate.agent_thread_id
+               AND active_worker.status IN ('running', 'cancel_requested')
+           )
+         )
+         AND (
+           candidate.agent_thread_id IS NULL
+           OR NOT EXISTS (
+             SELECT 1 FROM dispatcher_runs active_dispatcher
+             WHERE active_dispatcher.agent_thread_id = candidate.agent_thread_id
+               AND active_dispatcher.status IN ('running', 'cancel_requested')
+           )
+         )
+       ORDER BY candidate.queued_at ASC
+       LIMIT 1`
+    );
+    const candidate = candidateResult.rows[0];
+    if (!candidate) return null;
+    if (candidate.agent_thread_id) {
+      const lockedThread = await client.query(
+        "SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE SKIP LOCKED",
+        [candidate.agent_thread_id]
+      );
+      if (!lockedThread.rows[0]) return null;
+    }
+    if (candidate.workspace_mode === "direct" && candidate.workspace_key) {
+      await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [candidate.workspace_key]);
+      const activeProject = await client.query(
+        `SELECT 1
+         FROM (
+           SELECT active.status, active.workspace_key, active.workspace_mode
+           FROM task_runs active
+           UNION ALL
+           SELECT active.status, active.workspace_key, active.workspace_mode
+           FROM dispatcher_runs active
+         ) active_project_turns
+         WHERE active_project_turns.workspace_key = $1
+           AND active_project_turns.workspace_mode = 'direct'
+           AND active_project_turns.status IN ('running', 'cancel_requested')
+         LIMIT 1`,
+        [candidate.workspace_key]
+      );
+      if (activeProject.rows[0]) return null;
+    }
+    if (candidate.agent_thread_id) {
+      const generation = await client.query<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1",
+        [candidate.agent_thread_id]
+      );
+      if (generation.rows[0]?.ownership_generation !== candidate.agent_thread_generation) return null;
+      const activeThread = await client.query(
+        `SELECT 1 FROM (
+           SELECT status FROM task_runs WHERE agent_thread_id = $1
+           UNION ALL
+           SELECT status FROM dispatcher_runs WHERE agent_thread_id = $1
+         ) active_turns
+         WHERE status IN ('running', 'cancel_requested')
+         LIMIT 1`,
+        [candidate.agent_thread_id]
+      );
+      if (activeThread.rows[0]) return null;
+    }
+    const lockedCandidate = await client.query(
+      `SELECT id
+       FROM task_runs
+       WHERE id = $1 AND status = 'queued'
+       FOR UPDATE SKIP LOCKED`,
+      [candidate.id]
+    );
+    if (!lockedCandidate.rows[0]) return null;
+    const claimed = await client.query<{ id: string }>(
+      `UPDATE task_runs
+       SET status = 'running', started_at = now(), updated_at = now()
+       WHERE id = $1 AND status = 'queued'
+       RETURNING id`,
+      [candidate.id]
+    );
+    return claimed.rows[0] ?? null;
+  });
+}
+
+export async function processOneDispatcherRun(
+  pool: DbPool,
+  runTurn: typeof runCodexAppServerTurn = runCodexAppServerTurn
+): Promise<boolean> {
+  const picked = await claimDispatcherRun(pool);
+  if (!picked) return false;
   const detail = await pool.query<DispatcherJob>(
     `SELECT dispatcher_runs.id,
             dispatcher_runs.scope,
             dispatcher_runs.agent_thread_id,
+            dispatcher_runs.agent_thread_generation,
+            dispatcher_runs.workspace_key,
+            dispatcher_runs.workspace_mode,
             dispatcher_runs.message_delivery_id,
             dispatcher_runs.task_id,
             dispatcher_runs.prompt,
@@ -607,13 +1145,17 @@ export async function processOneDispatcherRun(
             dispatcher_runs.model_options,
             dispatcher_runs.cwd,
             dispatcher_runs.codex_home,
-            COALESCE(agent_threads.provider_thread_id, dispatcher_runs.codex_thread_id) AS codex_thread_id,
+            CASE
+              WHEN dispatcher_runs.agent_thread_id IS NOT NULL THEN agent_threads.provider_thread_id
+              ELSE dispatcher_runs.codex_thread_id
+            END AS codex_thread_id,
             dispatcher_runs.skills_snapshot,
             agents.id AS agent_id,
             agents.kind AS agent_kind,
             agents.name AS agent_name,
             agents.description AS agent_description,
             agents.instructions AS agent_instructions,
+            agent_threads.ownership_generation,
             agent_threads.coordination_thread_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
@@ -622,6 +1164,10 @@ export async function processOneDispatcherRun(
     [picked.id]
   );
   const job = mustRow(detail.rows[0]);
+  if (job.agent_thread_id && job.agent_thread_generation !== job.ownership_generation) {
+    await cancelMismatchedDispatcherRun(pool, job);
+    return true;
+  }
   if (job.message_delivery_id) {
     await pool.query(
       `UPDATE message_deliveries
@@ -637,6 +1183,7 @@ export async function processOneDispatcherRun(
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
   let promptMayHaveBeenPresented = false;
+  let ownershipLost = false;
 
   try {
     await mkdir(job.codex_home, { recursive: true });
@@ -644,6 +1191,12 @@ export async function processOneDispatcherRun(
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
+    if (!(await dispatcherRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const toolToken = await createAgentToolToken(pool, {
       role: job.agent_kind ?? "dispatcher",
       dispatcherRunId: job.id,
@@ -653,6 +1206,12 @@ export async function processOneDispatcherRun(
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
+    if (!(await dispatcherRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const turn = await runTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
@@ -692,10 +1251,22 @@ export async function processOneDispatcherRun(
           await pool.query(
             `UPDATE agent_threads
              SET provider_thread_id = $2, last_activity_at = now(), updated_at = now()
-             WHERE id = $1`,
-            [job.agent_thread_id, threadId]
+             WHERE id = $1 AND ownership_generation = $3`,
+            [job.agent_thread_id, threadId, job.agent_thread_generation]
           );
         }
+      },
+      onBeforeTurnStart: async () => {
+        const fence = await acquireRunLaunchFence(pool, {
+          kind: "dispatcher",
+          runId: job.id,
+          taskId: job.task_id,
+          agentThreadId: job.agent_thread_id,
+          agentThreadGeneration: job.agent_thread_generation,
+          agentId: job.agent_id
+        });
+        if (!fence) ownershipLost = true;
+        return fence;
       },
       onTurnAccepted: async () => {
         if (!job.message_delivery_id) return;
@@ -707,11 +1278,27 @@ export async function processOneDispatcherRun(
         );
       },
       shouldCancel: async () => {
-        const current = await pool.query<{ status: string }>(
-          "SELECT status FROM dispatcher_runs WHERE id = $1",
+        const current = await pool.query<{
+          status: string;
+          agent_thread_id: string | null;
+          agent_thread_generation: number;
+          ownership_generation: number | null;
+        }>(
+          `SELECT dispatcher_runs.status,
+                  dispatcher_runs.agent_thread_id,
+                  dispatcher_runs.agent_thread_generation,
+                  agent_threads.ownership_generation
+           FROM dispatcher_runs
+           LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+           WHERE dispatcher_runs.id = $1`,
           [job.id]
         );
-        return current.rows[0]?.status === "cancel_requested";
+        const row = current.rows[0];
+        return Boolean(
+          row &&
+            (row.status === "cancel_requested" ||
+              (row.agent_thread_id !== null && row.agent_thread_generation !== row.ownership_generation))
+        );
       },
       nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
@@ -734,8 +1321,9 @@ export async function processOneDispatcherRun(
       }
     }
     exitCode = turn.exitCode;
-    finalStatus =
-      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    finalStatus = ownershipLost
+      ? "cancelled"
+      : turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
     if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
@@ -753,6 +1341,9 @@ export async function processOneDispatcherRun(
        WHERE id = $1`,
       [job.id, finalStatus, stdout, stderr, exitCode]
     );
+    if (job.message_delivery_id) {
+      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
+    }
     await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
     if (job.agent_thread_id) {
       await pool.query(
@@ -760,72 +1351,79 @@ export async function processOneDispatcherRun(
         [job.agent_thread_id]
       );
     }
-    if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
-    }
   }
+  return true;
 }
 
-async function processOneRunJob(pool: DbPool): Promise<void> {
-  const result = await pool.query<{ id: string }>(
-    `UPDATE task_runs
-     SET status = 'running', started_at = now(), updated_at = now()
-     WHERE id = (
-       SELECT candidate.id
-       FROM task_runs candidate
-       JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
-       JOIN projects candidate_project ON candidate_project.id = candidate_task.project_id
-       WHERE candidate.status = 'queued'
-         AND candidate.run_kind = 'worker'
-         AND (
-           candidate_project.workspace_mode <> 'direct'
-           OR NOT EXISTS (
-             SELECT 1
-             FROM task_runs active
-             JOIN tasks active_task ON active_task.id = active.task_id
-             WHERE active_task.project_id = candidate_task.project_id
-               AND active.status = 'running'
-           )
+export async function dispatcherRunStillOwned(
+  pool: DbPool,
+  job: Pick<DispatcherJob, "id" | "agent_thread_id" | "agent_thread_generation" | "task_id" | "agent_id">
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT dispatcher_runs.id
+     FROM dispatcher_runs
+     LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+     WHERE dispatcher_runs.id = $1
+       AND dispatcher_runs.status = 'running'
+       AND (dispatcher_runs.task_id IS NULL OR tasks.agent_id = $2)
+       AND (
+         dispatcher_runs.agent_thread_id IS NULL
+         OR (
+           dispatcher_runs.agent_thread_id = $3
+           AND dispatcher_runs.agent_thread_generation = $4
+           AND agent_threads.ownership_generation = $4
          )
-       ORDER BY candidate.queued_at ASC
-       LIMIT 1
-       FOR UPDATE SKIP LOCKED
-     )
-     RETURNING id`
+       )`,
+    [job.id, job.agent_id, job.agent_thread_id, job.agent_thread_generation]
   );
-  const picked = result.rows[0];
-  if (!picked) return;
+  return Boolean(result.rows[0]);
+}
+
+export async function processOneRunJob(pool: DbPool): Promise<boolean> {
+  const picked = await claimWorkerRun(pool);
+  if (!picked) return false;
   const detail = await pool.query<RunJob>(
     `SELECT task_runs.id,
             task_runs.task_id,
             task_runs.task_session_id,
             task_runs.agent_thread_id,
+            task_runs.agent_thread_generation,
+            task_runs.workspace_key,
             task_runs.prompt,
             task_runs.model,
             task_runs.model_options,
             task_runs.cwd,
             task_runs.branch,
             task_sessions.codex_home,
-            COALESCE(agent_threads.provider_thread_id, task_sessions.codex_thread_id) AS codex_thread_id,
-            projects.workspace_mode,
-            projects.source AS project_source,
+            CASE
+              WHEN task_runs.agent_thread_id IS NOT NULL THEN agent_threads.provider_thread_id
+              ELSE task_sessions.codex_thread_id
+            END AS codex_thread_id,
+            task_runs.workspace_mode,
+            task_runs.workspace_source,
             task_runs.skills_snapshot,
-            tasks.agent_id,
+            COALESCE(agent_threads.agent_id, tasks.agent_id) AS agent_id,
+            agent_threads.ownership_generation,
             agent_threads.coordination_thread_id
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
      JOIN tasks ON tasks.id = task_runs.task_id
-     JOIN projects ON projects.id = tasks.project_id
      WHERE task_runs.id = $1`,
     [picked.id]
   );
   const job = mustRow(detail.rows[0]);
+  if (job.agent_thread_id && job.agent_thread_generation !== job.ownership_generation) {
+    await cancelMismatchedWorkerRun(pool, job.id);
+    return true;
+  }
 
   let stdout = "";
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  let ownershipLost = false;
 
   try {
     const cwd = await prepareWorkspace(pool, job);
@@ -838,6 +1436,12 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
+    if (!(await workerRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
       taskRunId: job.id,
@@ -847,6 +1451,12 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
+    if (!(await workerRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd,
@@ -870,26 +1480,56 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       secrets: [...codexAuth.redactionSecrets, toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
-        await pool.query(
-          `UPDATE task_sessions SET codex_thread_id = $2, updated_at = now() WHERE id = $1`,
-          [job.task_session_id, threadId]
-        );
+        if (!job.agent_thread_id) {
+          await pool.query(
+            `UPDATE task_sessions SET codex_thread_id = $2, updated_at = now() WHERE id = $1`,
+            [job.task_session_id, threadId]
+          );
+        }
         await pool.query("UPDATE task_runs SET codex_thread_id = $2 WHERE id = $1", [job.id, threadId]);
         if (job.agent_thread_id) {
           await pool.query(
             `UPDATE agent_threads
              SET provider_thread_id = $2, last_activity_at = now(), updated_at = now()
-             WHERE id = $1`,
-            [job.agent_thread_id, threadId]
+             WHERE id = $1 AND ownership_generation = $3`,
+            [job.agent_thread_id, threadId, job.agent_thread_generation]
           );
         }
       },
+      onBeforeTurnStart: async () => {
+        const fence = await acquireRunLaunchFence(pool, {
+          kind: "worker",
+          runId: job.id,
+          taskId: job.task_id,
+          agentThreadId: job.agent_thread_id,
+          agentThreadGeneration: job.agent_thread_generation,
+          agentId: job.agent_id
+        });
+        if (!fence) ownershipLost = true;
+        return fence;
+      },
       shouldCancel: async () => {
-        const current = await pool.query<{ status: string }>(
-          "SELECT status FROM task_runs WHERE id = $1",
+        const current = await pool.query<{
+          status: string;
+          agent_thread_id: string | null;
+          agent_thread_generation: number;
+          ownership_generation: number | null;
+        }>(
+          `SELECT task_runs.status,
+                  task_runs.agent_thread_id,
+                  task_runs.agent_thread_generation,
+                  agent_threads.ownership_generation
+           FROM task_runs
+           LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+           WHERE task_runs.id = $1`,
           [job.id]
         );
-        return current.rows[0]?.status === "cancel_requested";
+        const row = current.rows[0];
+        return Boolean(
+          row &&
+            (row.status === "cancel_requested" ||
+              (row.agent_thread_id !== null && row.agent_thread_generation !== row.ownership_generation))
+        );
       },
       nextInput: () => claimAgentTurnInput(pool, "worker", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
@@ -911,8 +1551,9 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       }
     }
     exitCode = turn.exitCode;
-    finalStatus =
-      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    finalStatus = ownershipLost
+      ? "cancelled"
+      : turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
     if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
@@ -922,6 +1563,7 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
       runId: job.id,
       taskId: job.task_id,
       agentThreadId: job.agent_thread_id,
+      agentThreadGeneration: job.agent_thread_generation,
       coordinationThreadId: job.coordination_thread_id,
       finalStatus,
       stdout,
@@ -930,6 +1572,154 @@ async function processOneRunJob(pool: DbPool): Promise<void> {
     });
     await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
   }
+  return true;
+}
+
+export async function workerRunStillOwned(
+  pool: DbPool,
+  job: Pick<RunJob, "id" | "agent_id" | "agent_thread_id" | "agent_thread_generation">
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT task_runs.id
+     FROM task_runs
+     JOIN tasks ON tasks.id = task_runs.task_id
+     LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+     WHERE task_runs.id = $1
+       AND task_runs.status = 'running'
+       AND tasks.agent_id = $2
+       AND (
+         task_runs.agent_thread_id IS NULL
+         OR (
+           task_runs.agent_thread_id = $3
+           AND task_runs.agent_thread_generation = $4
+           AND agent_threads.ownership_generation = $4
+         )
+       )`,
+    [job.id, job.agent_id, job.agent_thread_id, job.agent_thread_generation]
+  );
+  return Boolean(result.rows[0]);
+}
+
+interface RunLaunchFenceInput {
+  kind: "worker" | "dispatcher";
+  runId: string;
+  taskId: string | null;
+  agentThreadId: string | null;
+  agentThreadGeneration: number;
+  agentId: string;
+}
+
+export async function acquireRunLaunchFence(
+  pool: DbPool,
+  input: RunLaunchFenceInput
+): Promise<(() => Promise<void>) | null> {
+  const client = await pool.connect();
+  let transactionOpen = false;
+  const rollbackAndRelease = async (): Promise<void> => {
+    if (transactionOpen) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      transactionOpen = false;
+    }
+    client.release();
+  };
+
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+
+    let taskAgentId: string | null = null;
+    if (input.taskId) {
+      const task = await client.query<{ id: string; agent_id: string }>(
+        "SELECT id, agent_id FROM tasks WHERE id = $1 FOR UPDATE",
+        [input.taskId]
+      );
+      taskAgentId = task.rows[0]?.agent_id ?? null;
+      if (!task.rows[0]) {
+        await rollbackAndRelease();
+        return null;
+      }
+    }
+
+    let threadAgentId: string | null = null;
+    let threadGeneration: number | null = null;
+    if (input.agentThreadId) {
+      const thread = await client.query<{ id: string; agent_id: string; ownership_generation: number }>(
+        "SELECT id, agent_id, ownership_generation FROM agent_threads WHERE id = $1 FOR UPDATE",
+        [input.agentThreadId]
+      );
+      threadAgentId = thread.rows[0]?.agent_id ?? null;
+      threadGeneration = thread.rows[0]?.ownership_generation ?? null;
+      if (!thread.rows[0]) {
+        await rollbackAndRelease();
+        return null;
+      }
+    }
+
+    const runTable = input.kind === "worker" ? "task_runs" : "dispatcher_runs";
+    const run = await client.query<{
+      id: string;
+      status: string;
+      task_id: string | null;
+      agent_thread_id: string | null;
+      agent_thread_generation: number;
+    }>(
+      `SELECT id, status, task_id, agent_thread_id, agent_thread_generation
+       FROM ${runTable}
+       WHERE id = $1
+       FOR UPDATE`,
+      [input.runId]
+    );
+    const row = run.rows[0];
+    const ownsCurrentRows = Boolean(
+      row &&
+        row.status === "running" &&
+        row.task_id === input.taskId &&
+        row.agent_thread_id === input.agentThreadId &&
+        (!input.taskId || taskAgentId === input.agentId) &&
+        (!input.agentThreadId ||
+          (threadAgentId === input.agentId &&
+            threadGeneration === input.agentThreadGeneration &&
+            row.agent_thread_generation === input.agentThreadGeneration))
+    );
+    if (!ownsCurrentRows) {
+      await rollbackAndRelease();
+      return null;
+    }
+
+    let released = false;
+    return async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      try {
+        await client.query("COMMIT");
+        transactionOpen = false;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        transactionOpen = false;
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+  } catch (error) {
+    await rollbackAndRelease();
+    throw error;
+  }
+}
+
+async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<void> {
+  const error = "The worker turn was cancelled because thread ownership changed before it started";
+  const updated = await pool.query(
+    `UPDATE task_runs
+     SET status = 'cancelled',
+         error = $2,
+         finished_at = now(),
+         updated_at = now()
+     WHERE id = $1 AND status = 'running'
+     RETURNING id`,
+    [runId, error]
+  );
+  if (updated.rows[0]) await failPendingAgentTurnInputs(pool, "worker", runId, "cancelled");
 }
 
 export async function finalizeWorkerRunState(
@@ -938,6 +1728,7 @@ export async function finalizeWorkerRunState(
     runId: string;
     taskId: string;
     agentThreadId: string | null;
+    agentThreadGeneration?: number | null;
     coordinationThreadId: string | null;
     finalStatus: "succeeded" | "failed" | "cancelled";
     stdout: string;
@@ -948,6 +1739,15 @@ export async function finalizeWorkerRunState(
   const taskStatus = input.finalStatus === "succeeded" ? "completed" : "needs_attention";
   const threadStatus = input.finalStatus === "succeeded" ? "completed" : "blocked";
   await withTransaction(pool, async (client) => {
+    await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
+    let ownsCurrentThread = true;
+    if (input.agentThreadId && input.agentThreadGeneration !== null && input.agentThreadGeneration !== undefined) {
+      const ownership = await client.query<{ ownership_generation: number }>(
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1 FOR UPDATE",
+        [input.agentThreadId]
+      );
+      ownsCurrentThread = ownership.rows[0]?.ownership_generation === input.agentThreadGeneration;
+    }
     await client.query(
       `UPDATE task_runs
        SET status = $2::run_status,
@@ -960,6 +1760,7 @@ export async function finalizeWorkerRunState(
        WHERE id = $1`,
       [input.runId, input.finalStatus, input.stdout, input.stderr, input.exitCode]
     );
+    if (!ownsCurrentThread) return;
     await client.query(
       `UPDATE tasks
        SET status = $2,
@@ -981,8 +1782,11 @@ export async function finalizeWorkerRunState(
     }
     if (input.agentThreadId) {
       await client.query(
-        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
-        [input.agentThreadId]
+        `UPDATE agent_threads
+         SET last_activity_at = now(), updated_at = now()
+         WHERE id = $1
+           AND ($2::integer IS NULL OR ownership_generation = $2)`,
+        [input.agentThreadId, input.agentThreadGeneration ?? null]
       );
     }
   });
@@ -1078,7 +1882,7 @@ function authFileRedactionSecrets(value: string): string[] {
 }
 
 async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
-  if (job.project_source !== "github" || !job.branch) return job.cwd;
+  if (job.workspace_source !== "github" || !job.branch) return job.cwd;
 
   if (job.workspace_mode === "git_worktree") {
     const worktreePath = managedWorktreePath(env.managedRoot, job.task_id, job.branch);
@@ -1156,10 +1960,12 @@ async function persistCodexLine(pool: DbPool, job: RunJob, line: string, seq: nu
   const normalized = normalizeCodexEvent(raw);
   const threadId = extractThreadId(normalized);
   if (threadId) {
-    await pool.query(
-      `UPDATE task_sessions SET codex_thread_id = $2, updated_at = now() WHERE id = $1`,
-      [job.task_session_id, threadId]
-    );
+    if (!job.agent_thread_id) {
+      await pool.query(
+        `UPDATE task_sessions SET codex_thread_id = $2, updated_at = now() WHERE id = $1`,
+        [job.task_session_id, threadId]
+      );
+    }
     await pool.query("UPDATE task_runs SET codex_thread_id = $2 WHERE id = $1", [job.id, threadId]);
   }
   await pool.query(
@@ -1201,14 +2007,18 @@ export async function finishMessageDelivery(
   error: string,
   promptMayHaveBeenPresented = false
 ): Promise<void> {
-  if (!job.message_delivery_id) return;
+  const messageDeliveryId = job.message_delivery_id;
+  if (!messageDeliveryId) return;
   if (status === "succeeded") {
-    await pool.query(
-      `UPDATE message_deliveries
-       SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
-       WHERE id = $1 AND status = 'running'`,
-      [job.message_delivery_id]
-    );
+    await withTransaction(pool, async (client) => {
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [messageDeliveryId]
+      );
+      await cancelQueuedDeliveryRuns(client, messageDeliveryId, "Delivery completed");
+    });
     return;
   }
 
@@ -1218,11 +2028,17 @@ export async function finishMessageDelivery(
         status: string;
         attempt_count: number;
         presented_at: Date | null;
+        agent_thread_id: string | null;
+        agent_thread_generation: number;
+        ownership_generation: number | null;
         provider_thread_id: string | null;
       }>(
         `SELECT delivery.status,
                 delivery.attempt_count,
                 delivery.presented_at,
+                source_run.agent_thread_id,
+                source_run.agent_thread_generation,
+                agent_threads.ownership_generation,
                 COALESCE(agent_threads.provider_thread_id, source_run.codex_thread_id) AS provider_thread_id
          FROM message_deliveries delivery
          LEFT JOIN dispatcher_runs source_run
@@ -1230,18 +2046,51 @@ export async function finishMessageDelivery(
          LEFT JOIN agent_threads ON agent_threads.id = source_run.agent_thread_id
          WHERE delivery.id = $1
          FOR UPDATE OF delivery`,
-        [job.message_delivery_id, job.id]
+        [messageDeliveryId, job.id]
       );
       const delivery = result.rows[0];
       if (!delivery || delivery.status !== "running") return;
+
+      if (delivery.agent_thread_id) {
+        const ownership = await client.query<{
+          ownership_generation: number;
+          provider_thread_id: string | null;
+        }>(
+          `SELECT ownership_generation, provider_thread_id
+           FROM agent_threads
+           WHERE id = $1
+           FOR UPDATE`,
+          [delivery.agent_thread_id]
+        );
+        const currentOwnership = ownership.rows[0];
+        delivery.ownership_generation = currentOwnership?.ownership_generation ?? null;
+        delivery.provider_thread_id = currentOwnership?.provider_thread_id ?? null;
+      }
 
       if (status !== "failed" || delivery.attempt_count >= 3) {
         await client.query(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
            WHERE id = $1 AND status = 'running'`,
-          [job.message_delivery_id, error]
+          [messageDeliveryId, error]
         );
+        await cancelQueuedDeliveryRuns(client, messageDeliveryId, error || "Delivery failed");
+        return;
+      }
+
+      if (
+        delivery.agent_thread_id &&
+        delivery.agent_thread_generation !== delivery.ownership_generation
+      ) {
+        const ownershipError =
+          "Automatic delivery retry suppressed because thread ownership changed before the failed turn could be retried";
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [messageDeliveryId, ownershipError]
+        );
+        await cancelQueuedDeliveryRuns(client, messageDeliveryId, ownershipError);
         return;
       }
 
@@ -1254,19 +2103,20 @@ export async function finishMessageDelivery(
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
           [
-            job.message_delivery_id,
+            messageDeliveryId,
             `Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`
           ]
         );
+        await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionReason);
         return;
       }
 
       const retry = await client.query<{ id: string }>(
         `INSERT INTO dispatcher_runs
-           (task_id, trigger, scope, agent_thread_id, message_delivery_id, status, cwd, codex_home,
+           (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
             codex_thread_id, model, model_options, prompt, skills_snapshot)
          SELECT source_run.task_id, 'retry', source_run.scope, source_run.agent_thread_id,
-                source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+                source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
                 source_run.codex_thread_id, source_run.model, source_run.model_options,
                 source_run.prompt, source_run.skills_snapshot
          FROM dispatcher_runs source_run
@@ -1280,23 +2130,18 @@ export async function finishMessageDelivery(
                AND overlapping_run.status IN ('queued', 'running', 'cancel_requested')
            )
          RETURNING id`,
-        [job.id, job.message_delivery_id]
+        [job.id, messageDeliveryId]
       );
       if (!retry.rows[0]) {
         const suppressionError =
           `Automatic delivery retry suppressed: the source run was unavailable or another run for this coordination message was already queued or active.${error ? ` Original error: ${error}` : ""}`;
         await client.query(
-          `UPDATE dispatcher_runs
-           SET status = 'cancelled', finished_at = now(), error = $2, updated_at = now()
-           WHERE message_delivery_id = $1 AND status = 'queued'`,
-          [job.message_delivery_id, suppressionError]
-        );
-        await client.query(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
-          [job.message_delivery_id, suppressionError]
+           [messageDeliveryId, suppressionError]
         );
+        await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionError);
         return;
       }
 
@@ -1305,22 +2150,71 @@ export async function finishMessageDelivery(
          SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
              error = NULLIF($3, ''), updated_at = now()
          WHERE id = $1 AND status = 'running'`,
-        [job.message_delivery_id, delivery.attempt_count, error]
+        [messageDeliveryId, delivery.attempt_count, error]
       );
     });
   } catch (retryError) {
     const retryMessage = retryError instanceof Error ? retryError.message : String(retryError);
-    await pool.query(
-      `UPDATE message_deliveries
-       SET status = 'failed', completed_at = now(),
-           error = $2, updated_at = now()
-       WHERE id = $1 AND status = 'running'`,
-      [
-        job.message_delivery_id,
-        `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`
-      ]
-    );
+    await withTransaction(pool, async (client) => {
+      const finalError =
+        `Could not enqueue delivery retry: ${retryMessage}${error ? `. Original error: ${error}` : ""}`;
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'failed', completed_at = now(),
+             error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [messageDeliveryId, finalError]
+      );
+      await cancelQueuedDeliveryRuns(client, messageDeliveryId, finalError);
+    });
   }
+}
+
+async function cancelMismatchedDispatcherRun(
+  pool: DbPool,
+  job: Pick<DispatcherJob, "id" | "message_delivery_id">
+): Promise<void> {
+  const error = "The dispatcher turn was cancelled because thread ownership changed before it started";
+  await withTransaction(pool, async (client) => {
+    const updated = await client.query(
+      `UPDATE dispatcher_runs
+       SET status = 'cancelled',
+           error = $2,
+           finished_at = now(),
+           updated_at = now()
+       WHERE id = $1 AND status = 'running'
+       RETURNING id`,
+      [job.id, error]
+    );
+    if (!updated.rows[0]) return;
+    if (job.message_delivery_id) {
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+         WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+        [job.message_delivery_id, error]
+      );
+      await cancelQueuedDeliveryRuns(client, job.message_delivery_id, error);
+    }
+  });
+  await failPendingAgentTurnInputs(pool, "dispatcher", job.id, "cancelled");
+}
+
+async function cancelQueuedDeliveryRuns(
+  queryable: Pick<DbPool, "query">,
+  messageDeliveryId: string,
+  error: string
+): Promise<void> {
+  await queryable.query(
+    `UPDATE dispatcher_runs
+     SET status = 'cancelled',
+         finished_at = COALESCE(finished_at, now()),
+         error = COALESCE(error, $2),
+         updated_at = now()
+     WHERE message_delivery_id = $1
+       AND (status = 'queued' OR status = 'cancel_requested')`,
+    [messageDeliveryId, error]
+  );
 }
 
 async function createAgentToolToken(
@@ -1370,43 +2264,144 @@ async function writeAgentTool(
   return { binDir, tokenFile };
 }
 
-async function claimAgentTurnInput(
+export async function claimAgentTurnInput(
   pool: DbPool,
   kind: "worker" | "dispatcher",
   runId: string
 ): Promise<AppServerTurnInput | null> {
   const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
-  const result = await pool.query<AppServerTurnInput>(
-    `UPDATE agent_turn_inputs
-     SET status = 'delivering', updated_at = now()
-     WHERE id = (
-       SELECT id
-       FROM agent_turn_inputs
-       WHERE ${runColumn} = $1 AND status = 'queued'
-       ORDER BY created_at ASC
-       LIMIT 1
-       FOR UPDATE SKIP LOCKED
-     )
-     RETURNING id, message`,
-    [runId]
-  );
-  return result.rows[0] ?? null;
+  return withTransaction(pool, async (client) => {
+    const result = await client.query<AppServerTurnInput & { message_delivery_id: string | null }>(
+      `UPDATE agent_turn_inputs
+       SET status = 'delivering', updated_at = now()
+       WHERE id = (
+         SELECT id
+         FROM agent_turn_inputs
+         WHERE ${runColumn} = $1
+           AND status = 'queued'
+           AND (
+             message_delivery_id IS NULL
+             OR EXISTS (
+               SELECT 1 FROM message_deliveries
+               WHERE message_deliveries.id = agent_turn_inputs.message_delivery_id
+                 AND message_deliveries.status IN ('queued', 'retrying')
+             )
+           )
+         ORDER BY created_at ASC
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED
+       )
+       RETURNING id, message, message_delivery_id`,
+      [runId]
+    );
+    const input = result.rows[0];
+    if (!input) return null;
+    if (input.message_delivery_id) {
+      const delivery = await client.query(
+        `UPDATE message_deliveries
+         SET status = 'running',
+             attempt_count = attempt_count + 1,
+             updated_at = now()
+         WHERE id = $1 AND status IN ('queued', 'retrying')
+         RETURNING id`,
+        [input.message_delivery_id]
+      );
+      if (!delivery.rows[0]) {
+        await client.query(
+          `UPDATE agent_turn_inputs
+           SET status = 'failed',
+               error = 'The message delivery was already terminal',
+               updated_at = now()
+           WHERE id = $1 AND status = 'delivering'`,
+          [input.id]
+        );
+        return null;
+      }
+    }
+    return {
+      id: input.id,
+      message: input.message,
+      messageDeliveryId: input.message_delivery_id
+    };
+  });
 }
 
-async function finishAgentTurnInput(
+export async function finishAgentTurnInput(
   pool: DbPool,
   input: AppServerTurnInput,
   error?: string
 ): Promise<void> {
-  await pool.query(
-    `UPDATE agent_turn_inputs
-     SET status = $2,
-         error = $3,
-         delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END,
-         updated_at = now()
-     WHERE id = $1`,
-    [input.id, error ? "failed" : "delivered", error ?? null]
-  );
+  await withTransaction(pool, async (client) => {
+    const result = await client.query<{ message_delivery_id: string | null }>(
+      `UPDATE agent_turn_inputs
+       SET status = $2,
+           error = $3,
+           delivered_at = CASE WHEN $2 = 'delivered' THEN now() ELSE delivered_at END,
+           updated_at = now()
+       WHERE id = $1 AND status = 'delivering'
+       RETURNING message_delivery_id`,
+      [input.id, error ? "failed" : "delivered", error ?? null]
+    );
+    const deliveryId = result.rows[0]?.message_delivery_id ?? input.messageDeliveryId;
+    if (!deliveryId) return;
+    if (error) {
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [deliveryId, error]
+      );
+      await cancelQueuedDeliveryRuns(client, deliveryId, error);
+    } else {
+      await client.query(
+        `UPDATE message_deliveries
+         SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
+         WHERE id = $1 AND status = 'running'`,
+        [deliveryId]
+      );
+      await cancelQueuedDeliveryRuns(client, deliveryId, "Delivery completed");
+    }
+  });
+}
+
+async function failPendingAgentTurnInputsInTransaction(
+  client: Pick<DbPool, "query">,
+  kind: "worker" | "dispatcher",
+  runId: string,
+  finalStatus: "succeeded" | "failed" | "cancelled"
+): Promise<void> {
+  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  const result = await client.query<{ message_delivery_id: string | null }>(
+      `UPDATE agent_turn_inputs
+       SET status = 'failed',
+           error = $2,
+           updated_at = now()
+       WHERE ${runColumn} = $1 AND status IN ('queued', 'delivering')
+       RETURNING message_delivery_id`,
+      [
+        runId,
+        finalStatus === "cancelled"
+          ? "The turn was stopped before this message could be delivered"
+          : "The turn finished before this message could be delivered"
+      ]
+    );
+    const deliveryIds = result.rows
+      .map((row) => row.message_delivery_id)
+      .filter((id): id is string => Boolean(id));
+  if (deliveryIds.length === 0) return;
+  const deliveryError =
+    finalStatus === "cancelled"
+      ? "The turn was stopped before this message could be delivered"
+      : "The turn finished before this message could be delivered";
+  await client.query(
+      `UPDATE message_deliveries
+       SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+       WHERE id = ANY($1::uuid[]) AND status IN ('queued', 'retrying', 'running')`,
+      [deliveryIds, deliveryError]
+    );
+  for (const deliveryId of deliveryIds) {
+    await cancelQueuedDeliveryRuns(client, deliveryId, deliveryError);
+  }
 }
 
 async function failPendingAgentTurnInputs(
@@ -1415,20 +2410,9 @@ async function failPendingAgentTurnInputs(
   runId: string,
   finalStatus: "succeeded" | "failed" | "cancelled"
 ): Promise<void> {
-  const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
-  await pool.query(
-    `UPDATE agent_turn_inputs
-     SET status = 'failed',
-         error = $2,
-         updated_at = now()
-     WHERE ${runColumn} = $1 AND status IN ('queued', 'delivering')`,
-    [
-      runId,
-      finalStatus === "cancelled"
-        ? "The turn was stopped before this message could be delivered"
-        : "The turn finished before this message could be delivered"
-    ]
-  );
+  await withTransaction(pool, async (client) => {
+    await failPendingAgentTurnInputsInTransaction(client, kind, runId, finalStatus);
+  });
 }
 
 export async function getDispatcherAgent(pool: DbPool, codexHome: string): Promise<{
@@ -1629,6 +2613,11 @@ function mustRow<T>(row: T | undefined): T {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function positiveNumber(value: string | undefined, fallback: number, maximum = Number.MAX_SAFE_INTEGER): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

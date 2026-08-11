@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS agent_threads (
   branch text,
   runtime_home text NOT NULL,
   provider_thread_id text,
+  ownership_generation integer NOT NULL DEFAULT 0,
   last_activity_at timestamptz NOT NULL DEFAULT now(),
   created_at timestamptz NOT NULL DEFAULT now(),
   updated_at timestamptz NOT NULL DEFAULT now()
@@ -223,6 +224,10 @@ CREATE TABLE IF NOT EXISTS task_runs (
   trigger text NOT NULL DEFAULT 'manual',
   parent_run_id uuid,
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  agent_thread_generation integer NOT NULL DEFAULT 0,
+  workspace_key text NOT NULL DEFAULT '',
+  workspace_mode text NOT NULL DEFAULT 'unknown',
+  workspace_source text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
@@ -251,6 +256,10 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   trigger text NOT NULL DEFAULT 'heartbeat',
   scope text NOT NULL DEFAULT 'heartbeat',
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  agent_thread_generation integer NOT NULL DEFAULT 0,
+  workspace_key text NOT NULL DEFAULT '',
+  workspace_mode text NOT NULL DEFAULT 'unknown',
+  workspace_source text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   codex_home text NOT NULL,
@@ -380,7 +389,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 `;
 
-const additiveSql = `
+export const additiveSql = `
 ALTER TYPE run_status ADD VALUE IF NOT EXISTS 'draft' BEFORE 'queued';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
@@ -409,16 +418,92 @@ ALTER TABLE agents ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffo
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS ownership_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
+WITH task_workspace_projects AS (
+  SELECT task_runs.id,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.id::text) END AS workspace_key,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.workspace_mode::text) END AS workspace_mode,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.source::text) END AS workspace_source
+  FROM task_runs
+  LEFT JOIN projects
+    ON projects.id::text = NULLIF(task_runs.workspace_key, '')
+    OR projects.local_path = task_runs.cwd
+  GROUP BY task_runs.id
+)
+UPDATE task_runs
+SET workspace_key = CASE
+      WHEN task_runs.workspace_key = '' THEN COALESCE(task_workspace_projects.workspace_key, '')
+      ELSE task_runs.workspace_key
+    END,
+    workspace_mode = CASE
+      WHEN task_runs.workspace_mode = 'unknown' THEN COALESCE(task_workspace_projects.workspace_mode, 'unknown')
+      ELSE task_runs.workspace_mode
+    END,
+    workspace_source = CASE
+      WHEN task_runs.workspace_source = 'unknown' THEN COALESCE(task_workspace_projects.workspace_source, 'unknown')
+      ELSE task_runs.workspace_source
+    END
+FROM task_workspace_projects
+WHERE task_runs.id = task_workspace_projects.id
+  AND EXISTS (SELECT 1 FROM tasks WHERE tasks.id = task_runs.task_id)
+  AND (
+    task_runs.workspace_key = ''
+    OR task_runs.workspace_mode = 'unknown'
+    OR task_runs.workspace_source = 'unknown'
+  );
+WITH dispatcher_workspace_projects AS (
+  SELECT dispatcher_runs.id,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.id::text) END AS workspace_key,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.workspace_mode::text) END AS workspace_mode,
+         CASE WHEN count(DISTINCT projects.id) = 1 THEN max(projects.source::text) END AS workspace_source
+  FROM dispatcher_runs
+  LEFT JOIN projects
+    ON projects.id::text = NULLIF(dispatcher_runs.workspace_key, '')
+    OR projects.local_path = dispatcher_runs.cwd
+  GROUP BY dispatcher_runs.id
+)
+UPDATE dispatcher_runs
+SET workspace_key = CASE
+      WHEN dispatcher_runs.workspace_key = '' THEN COALESCE(dispatcher_workspace_projects.workspace_key, '')
+      ELSE dispatcher_runs.workspace_key
+    END,
+    workspace_mode = CASE
+      WHEN dispatcher_runs.workspace_mode = 'unknown' THEN COALESCE(dispatcher_workspace_projects.workspace_mode, 'unknown')
+      ELSE dispatcher_runs.workspace_mode
+    END,
+    workspace_source = CASE
+      WHEN dispatcher_runs.workspace_source = 'unknown' THEN COALESCE(dispatcher_workspace_projects.workspace_source, 'unknown')
+      ELSE dispatcher_runs.workspace_source
+    END
+FROM dispatcher_workspace_projects
+WHERE dispatcher_runs.id = dispatcher_workspace_projects.id
+  AND (
+    dispatcher_runs.workspace_key = ''
+    OR dispatcher_runs.workspace_mode = 'unknown'
+    OR dispatcher_runs.workspace_source = 'unknown'
+  );
+CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
+ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
+ON dispatcher_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
@@ -762,10 +847,21 @@ CREATE TABLE IF NOT EXISTS agent_turn_inputs (
   CHECK ((task_run_id IS NOT NULL)::integer + (dispatcher_run_id IS NOT NULL)::integer = 1)
 );
 
+ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
+
 CREATE INDEX IF NOT EXISTS agent_turn_inputs_task_run_idx
 ON agent_turn_inputs(task_run_id, status, created_at) WHERE task_run_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS agent_turn_inputs_dispatcher_run_idx
 ON agent_turn_inputs(dispatcher_run_id, status, created_at) WHERE dispatcher_run_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS agent_turn_inputs_delivery_idx
+ON agent_turn_inputs(message_delivery_id) WHERE message_delivery_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS agent_turn_inputs_delivery_unique
+ON agent_turn_inputs(message_delivery_id) WHERE message_delivery_id IS NOT NULL;
+
+DO $$ BEGIN
+  ALTER TABLE agent_turn_inputs ADD CONSTRAINT agent_turn_inputs_message_delivery_id_fkey
+    FOREIGN KEY (message_delivery_id) REFERENCES message_deliveries(id) ON DELETE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 
 DO $$ BEGIN
   ALTER TABLE tasks ADD CONSTRAINT tasks_coordination_thread_id_fkey

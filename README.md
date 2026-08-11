@@ -44,6 +44,12 @@ pnpm dev
 Open `http://localhost:5173`. The API listens on `http://localhost:8787`.
 The default local `.env` stores managed workspaces and Codex homes under `.aisevak-managed/`.
 
+The host runner allows independent turns to make progress in parallel. Configure the
+bounded pool with `RUNNER_MAX_CONCURRENCY` (default `4`) and its polling cadence with
+`RUNNER_POLL_MS` (default `1500`). The concurrency setting is capped at `32` per runner
+process. Turns belonging to one agent thread remain strictly
+serialized, while direct-mode projects keep their existing single-run safety.
+
 After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
 
 ## GitHub projects

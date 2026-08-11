@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { assertThreadCanFinalize, coordinationPrompt } from "./coordination.js";
+import { assertThreadCanFinalize, coordinationIncrementalPrompt, coordinationPrompt, reopenTask } from "./coordination.js";
+import type { DbPool } from "@aisevak/core";
 
 const thread = {
   number: 12,
@@ -43,6 +44,12 @@ describe("coordination delivery prompts", () => {
     expect(prompt).toContain("aisevak threads send THREAD-12 --body-stdin");
     expect(prompt).not.toContain("Completion instruction:");
   });
+
+  it("uses only the new message body after a provider session is established", () => {
+    expect(coordinationIncrementalPrompt({ body: "Follow up with the requested checks." })).toBe(
+      "Follow up with the requested checks."
+    );
+  });
 });
 
 describe("thread finalization policy", () => {
@@ -60,5 +67,80 @@ describe("thread finalization policy", () => {
     expect(() => assertThreadCanFinalize({ ...thread, status }, "child-agent")).toThrowError(
       new RegExp(`THREAD-12 is already ${status}`)
     );
+  });
+});
+
+describe("task reopening ownership", () => {
+  it("locks and re-reads the task before creating its reopening delivery", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const task = {
+      id: "task-id",
+      number: 42,
+      title: "Transferred task",
+      agent_id: "new-agent",
+      coordination_thread_id: "thread-id",
+      body: "",
+      content_preview: "",
+      content_total_bytes: 0
+    };
+    const query = async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
+      if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      if (sql.includes("INSERT INTO thread_messages")) return { rows: [{ id: "message-id" }] };
+      if (sql.includes("UPDATE tasks") || sql.includes("UPDATE coordination_threads")) return { rows: [] };
+      throw new Error(`Unexpected query: ${sql}`);
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await reopenTask(pool, {
+      taskId: "task-id",
+      senderAgentId: "new-agent",
+      body: "Please continue after the transfer.",
+      managedRoot: "/managed"
+    });
+
+    const firstApplicationQuery = queries.find(({ sql }) => !["BEGIN", "COMMIT", "ROLLBACK"].includes(sql));
+    expect(firstApplicationQuery?.sql).toContain("SELECT id FROM tasks WHERE id = $1 FOR UPDATE");
+    const message = queries.find(({ sql }) => sql.includes("INSERT INTO thread_messages"));
+    expect(message?.params).toEqual([
+      "thread-id",
+      "new-agent",
+      "new-agent",
+      null,
+      "task.reopened",
+      "Please continue after the transfer.",
+      null
+    ]);
+  });
+
+  it("rejects an old provider token after the task has been transferred", async () => {
+    const task = {
+      id: "task-id",
+      number: 42,
+      title: "Transferred task",
+      agent_id: "new-agent",
+      coordination_thread_id: "thread-id",
+      body: "",
+      content_preview: "",
+      content_total_bytes: 0
+    };
+    const query = async (sql: string) => {
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
+      if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      throw new Error(`Unexpected query: ${sql}`);
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await expect(reopenTask(pool, {
+      taskId: "task-id",
+      senderAgentId: "old-agent",
+      body: "stale reopen",
+      managedRoot: "/managed"
+    })).rejects.toMatchObject({ statusCode: 403 });
   });
 });

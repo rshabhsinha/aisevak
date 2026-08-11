@@ -256,6 +256,7 @@ export const agentThreads = pgTable(
     branch: text("branch"),
     runtimeHome: text("runtime_home").notNull(),
     providerThreadId: text("provider_thread_id"),
+    ownershipGeneration: integer("ownership_generation").notNull().default(0),
     coordinationThreadId: uuid("coordination_thread_id"),
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
     createdAt,
@@ -295,6 +296,10 @@ export const taskRuns = pgTable("task_runs", {
   trigger: text("trigger").notNull().default("manual"),
   parentRunId: uuid("parent_run_id"),
   agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
+  agentThreadGeneration: integer("agent_thread_generation").notNull().default(0),
+  workspaceKey: text("workspace_key").notNull().default(""),
+  workspaceMode: text("workspace_mode").notNull().default("unknown"),
+  workspaceSource: text("workspace_source").notNull().default("unknown"),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   branch: text("branch"),
@@ -321,6 +326,10 @@ export const dispatcherRuns = pgTable("dispatcher_runs", {
   trigger: text("trigger").notNull().default("heartbeat"),
   scope: text("scope").notNull().default("heartbeat"),
   agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
+  agentThreadGeneration: integer("agent_thread_generation").notNull().default(0),
+  workspaceKey: text("workspace_key").notNull().default(""),
+  workspaceMode: text("workspace_mode").notNull().default("unknown"),
+  workspaceSource: text("workspace_source").notNull().default("unknown"),
   messageDeliveryId: uuid("message_delivery_id"),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
@@ -411,6 +420,9 @@ export const agentTurnInputs = pgTable("agent_turn_inputs", {
   }),
   taskRunId: uuid("task_run_id").references(() => taskRuns.id, { onDelete: "cascade" }),
   dispatcherRunId: uuid("dispatcher_run_id").references(() => dispatcherRuns.id, {
+    onDelete: "cascade"
+  }),
+  messageDeliveryId: uuid("message_delivery_id").references(() => messageDeliveries.id, {
     onDelete: "cascade"
   }),
   message: text("message").notNull(),

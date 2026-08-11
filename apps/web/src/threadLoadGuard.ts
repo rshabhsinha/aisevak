@@ -3,8 +3,8 @@ export interface ThreadLoadGuard {
   begin(threadId: string): () => boolean;
 }
 
-export function createThreadLoadGuard(): ThreadLoadGuard {
-  let selectedThreadId: string | null = null;
+export function createThreadLoadGuard(initialThreadId: string | null = null): ThreadLoadGuard {
+  let selectedThreadId: string | null = initialThreadId;
   let revision = 0;
 
   return {
@@ -13,6 +13,7 @@ export function createThreadLoadGuard(): ThreadLoadGuard {
       revision += 1;
     },
     begin(threadId) {
+      if (selectedThreadId !== threadId) return () => false;
       const requestRevision = ++revision;
       return () => selectedThreadId === threadId && revision === requestRevision;
     }
