@@ -137,6 +137,7 @@ async function main(): Promise<void> {
   await mkdir(env.managedRoot, { recursive: true });
   await recoverInterruptedGithubJobs(pool);
   await recoverInterruptedCoordinationRuns(pool);
+  await recoverStaleAgentThreadRuns(pool);
 
   const beginShutdown = () => {
     shuttingDown = true;
@@ -327,6 +328,64 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       );
       await cancelQueuedDeliveryRuns(client, deliveryId, inputError ?? "Delivery completed");
     });
+  }
+}
+
+export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
+  const error = "The queued turn was cancelled because thread ownership changed before it started";
+  const staleWorkers = await pool.query<{ id: string }>(
+    `UPDATE task_runs
+     SET status = 'cancelled',
+         error = $1,
+         finished_at = now(),
+         updated_at = now()
+     WHERE status = 'queued'
+       AND agent_thread_id IS NOT NULL
+       AND agent_thread_generation <> (
+         SELECT ownership_generation
+         FROM agent_threads
+         WHERE agent_threads.id = task_runs.agent_thread_id
+       )
+     RETURNING id`,
+    [error]
+  );
+  for (const run of staleWorkers.rows) {
+    await failPendingAgentTurnInputs(pool, "worker", run.id, "cancelled");
+  }
+
+  const staleDispatchers = await pool.query<{
+    id: string;
+    message_delivery_id: string | null;
+  }>(
+    `UPDATE dispatcher_runs
+     SET status = 'cancelled',
+         error = $1,
+         finished_at = now(),
+         updated_at = now()
+     WHERE status = 'queued'
+       AND agent_thread_id IS NOT NULL
+       AND agent_thread_generation <> (
+         SELECT ownership_generation
+         FROM agent_threads
+         WHERE agent_threads.id = dispatcher_runs.agent_thread_id
+       )
+     RETURNING id, message_delivery_id`,
+    [error]
+  );
+  for (const run of staleDispatchers.rows) {
+    const deliveryId = run.message_delivery_id;
+    if (deliveryId) {
+      await withTransaction(pool, async (client) => {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [deliveryId, error]
+        );
+        await cancelQueuedDeliveryRuns(client, deliveryId, error);
+      });
+    }
+    await failPendingAgentTurnInputs(pool, "dispatcher", run.id, "cancelled");
   }
 }
 

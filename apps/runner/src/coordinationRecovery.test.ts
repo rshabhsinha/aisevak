@@ -1,6 +1,6 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { recoverInterruptedCoordinationRuns } from "./index.js";
+import { recoverInterruptedCoordinationRuns, recoverStaleAgentThreadRuns } from "./index.js";
 
 describe("coordination startup recovery", () => {
   it("fails closed for ambiguous runs and terminalizes queued and delivering inputs", async () => {
@@ -67,5 +67,28 @@ describe("coordination startup recovery", () => {
     expect(
       queries.filter((entry) => entry.sql.includes("status = 'queued' OR status = 'cancel_requested'"))
     ).not.toHaveLength(0);
+  });
+
+  it("cancels stale queued generations instead of promoting them after restart", async () => {
+    const queries: string[] = [];
+    const query = async (sql: string) => {
+      queries.push(sql);
+      if (sql.includes("UPDATE task_runs") && sql.includes("RETURNING id")) {
+        return { rows: [{ id: "stale-worker" }] };
+      }
+      if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id, message_delivery_id")) {
+        return { rows: [{ id: "stale-dispatcher", message_delivery_id: null }] };
+      }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await recoverStaleAgentThreadRuns(pool);
+
+    expect(queries[0]).toContain("status = 'cancelled'");
+    expect(queries[0]).toContain("agent_thread_generation <>");
+    expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs"))).toContain("status = 'cancelled'");
+    expect(queries.every((sql) => !sql.includes("SET agent_thread_generation ="))).toBe(true);
   });
 });

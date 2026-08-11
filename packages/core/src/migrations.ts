@@ -425,16 +425,6 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT N
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
-UPDATE task_runs
-SET agent_thread_generation = agent_threads.ownership_generation
-FROM agent_threads
-WHERE task_runs.agent_thread_id = agent_threads.id
-  AND task_runs.status = 'queued';
-UPDATE dispatcher_runs
-SET agent_thread_generation = agent_threads.ownership_generation
-FROM agent_threads
-WHERE dispatcher_runs.agent_thread_id = agent_threads.id
-  AND dispatcher_runs.status = 'queued';
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx

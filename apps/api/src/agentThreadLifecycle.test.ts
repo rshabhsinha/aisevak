@@ -1,6 +1,6 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { transferTaskAgentThread } from "./coordination.js";
+import { cancelStaleQueuedAgentThreadRuns, transferTaskAgentThread } from "./coordination.js";
 import {
   ensureTaskAgentThread,
   getTaskSessionTimeline,
@@ -99,6 +99,7 @@ describe("coordinated task agent threads", () => {
 
     expect(queries[0]?.sql).toContain("title, agent_id, task_id, project_id");
     expect(queries[0]?.sql).toContain("task_id = EXCLUDED.task_id");
+    expect(queries[0]?.sql).toContain("ELSE NULL");
     expect(queries[0]?.params?.[2]).toBe("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
     expect(thread.runtime_home).toBe("/runtime/coordinated-thread");
     expect(thread.provider_thread_id).toBe("provider-thread-id");
@@ -127,6 +128,83 @@ describe("coordinated task agent threads", () => {
       "/runtime/coordinated-thread",
       "provider-thread-id"
     ]);
+  });
+
+  it("cancels queued turns from the previous ownership generation", async () => {
+    const queries: string[] = [];
+    const pool = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql.includes("UPDATE task_runs") && sql.includes("RETURNING id")) {
+          return { rows: [{ id: "stale-worker" }] };
+        }
+        if (sql.includes("UPDATE dispatcher_runs") && sql.includes("RETURNING id")) {
+          return { rows: [{ id: "stale-dispatcher", message_delivery_id: null }] };
+        }
+        return { rows: [] };
+      }
+    } as unknown as DbPool;
+
+    await cancelStaleQueuedAgentThreadRuns(pool, "thread-id", 8);
+
+    expect(queries[0]).toContain("status = 'cancelled'");
+    expect(queries[0]).toContain("agent_thread_generation <> $2");
+    expect(queries.find((sql) => sql.includes("scope <> 'coordination'"))).toContain("scope <> 'coordination'");
+    expect(queries.every((sql) => !sql.includes("SET agent_thread_generation = $2"))).toBe(true);
+  });
+
+  it("clears a cached provider thread when a task owner changes", async () => {
+    const queries: string[] = [];
+    const pool = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql.includes("INSERT INTO agent_threads")) {
+          return {
+            rows: [{
+              id: "thread-id",
+              model: "gpt-test",
+              model_options: [],
+              runtime_home: "/runtime/task",
+              provider_thread_id: null,
+              ownership_generation: 3
+            }]
+          };
+        }
+        return { rows: [] };
+      }
+    } as unknown as DbPool;
+
+    const thread = await ensureTaskAgentThread(pool, {
+      task: {
+        id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        number: 1,
+        title: "Transferred task",
+        body: "",
+        coordination_thread_id: null,
+        project_id: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        agent_id: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        agent_kind: "worker",
+        source: "local_path",
+        local_path: "/workspace",
+        workspace_mode: "direct",
+        default_branch: null,
+        agent_name: "Builder",
+        agent_description: "Builds",
+        agent_model: "gpt-test",
+        agent_model_options: [],
+        agent_instructions: "Build it"
+      },
+      runtimeHome: "/runtime/task",
+      providerThreadId: "old-provider-thread",
+      model: "gpt-test",
+      modelOptions: [],
+      cwd: "/workspace",
+      branch: null
+    });
+
+    expect(thread.provider_thread_id).toBeNull();
+    expect(queries[0]).toContain("agent_threads.agent_id = EXCLUDED.agent_id");
+    expect(queries[0]).toContain("ELSE NULL");
   });
 
   it("detaches a task from a thread that contains unrelated provider runs", async () => {

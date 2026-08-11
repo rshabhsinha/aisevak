@@ -45,7 +45,13 @@ import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
-import { registerCoordinationRoutes, requireAgent, requireCapability, type AgentContext } from "./coordination.js";
+import {
+  cancelStaleQueuedAgentThreadRuns,
+  registerCoordinationRoutes,
+  requireAgent,
+  requireCapability,
+  type AgentContext
+} from "./coordination.js";
 import { agentDeletionBlockReason } from "./agents.js";
 
 interface AuthUser {
@@ -2567,7 +2573,7 @@ export async function ensureTaskAgentThread(
                WHEN agent_threads.task_id = EXCLUDED.task_id
                  AND agent_threads.runtime_home = EXCLUDED.runtime_home
                  THEN COALESCE(agent_threads.provider_thread_id, EXCLUDED.provider_thread_id)
-               ELSE EXCLUDED.provider_thread_id
+               ELSE NULL
              END,
              ownership_generation = agent_threads.ownership_generation + CASE
                WHEN agent_threads.task_id IS DISTINCT FROM EXCLUDED.task_id
@@ -2593,7 +2599,7 @@ export async function ensureTaskAgentThread(
       ]
     );
     const session = mustRow(coordinated.rows[0]);
-    await refreshQueuedAgentThreadRunGenerations(pool, session.id, session.ownership_generation);
+    await cancelStaleQueuedAgentThreadRuns(pool, session.id, session.ownership_generation);
     return session;
   }
   const result = await pool.query<{
@@ -2626,7 +2632,7 @@ export async function ensureTaskAgentThread(
              WHEN agent_threads.agent_id = EXCLUDED.agent_id
                AND agent_threads.runtime_home = EXCLUDED.runtime_home
                THEN COALESCE(EXCLUDED.provider_thread_id, agent_threads.provider_thread_id)
-             ELSE EXCLUDED.provider_thread_id
+             ELSE NULL
            END,
            ownership_generation = agent_threads.ownership_generation + CASE
              WHEN agent_threads.agent_id IS DISTINCT FROM EXCLUDED.agent_id
@@ -2651,7 +2657,7 @@ export async function ensureTaskAgentThread(
     ]
   );
   const session = mustRow(result.rows[0]);
-  await refreshQueuedAgentThreadRunGenerations(pool, session.id, session.ownership_generation);
+  await cancelStaleQueuedAgentThreadRuns(pool, session.id, session.ownership_generation);
   return session;
 }
 
@@ -2708,7 +2714,7 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
     );
     await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
     const thread = await getAgentThread(pool, existing.rows[0].id);
-    await refreshQueuedAgentThreadRunGenerations(pool, thread.id, thread.ownership_generation);
+    await cancelStaleQueuedAgentThreadRuns(pool, thread.id, thread.ownership_generation);
     return thread;
   }
 
@@ -2795,27 +2801,6 @@ async function linkTaskRunsToThread(pool: DbPool, taskId: string, threadId: stri
            updated_at = now()
        WHERE task_id = $1 AND agent_thread_id IS NULL`,
       [taskId, threadId]
-    )
-  ]);
-}
-
-async function refreshQueuedAgentThreadRunGenerations(
-  pool: DbPool,
-  agentThreadId: string,
-  ownershipGeneration: number
-): Promise<void> {
-  await Promise.all([
-    pool.query(
-      `UPDATE task_runs
-       SET agent_thread_generation = $2, updated_at = now()
-       WHERE agent_thread_id = $1 AND status = 'queued'`,
-      [agentThreadId, ownershipGeneration]
-    ),
-    pool.query(
-      `UPDATE dispatcher_runs
-       SET agent_thread_generation = $2, updated_at = now()
-       WHERE agent_thread_id = $1 AND status = 'queued' AND scope <> 'coordination'`,
-      [agentThreadId, ownershipGeneration]
     )
   ]);
 }
@@ -3182,7 +3167,7 @@ async function queueDispatcherMessage(
       previous?.scope ?? (options.taskId ? "task" : "heartbeat"),
       normalizeRunPath(previous?.cwd) ?? normalizeRunPath(thread?.cwd) ?? env.managedRoot,
       codexHome,
-      previous?.codex_thread_id ?? thread?.provider_thread_id ?? null,
+      threadId ? thread?.provider_thread_id ?? null : previous?.codex_thread_id ?? null,
       options.modelSelection?.model ?? previous?.model ?? thread?.model ?? dispatcher?.model,
       JSON.stringify(
         options.modelSelection?.options ??

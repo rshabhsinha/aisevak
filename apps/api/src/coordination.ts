@@ -57,7 +57,7 @@ export interface AgentContext {
   capabilities: string[];
 }
 
-type Queryable = DbPool | PoolClient;
+export type Queryable = DbPool | PoolClient;
 
 interface AgentThreadSession {
   id: string;
@@ -1178,23 +1178,85 @@ async function addParticipants(client: PoolClient, threadId: string, participant
   }
 }
 
-async function refreshQueuedAgentThreadRunGenerations(
+export async function cancelStaleQueuedAgentThreadRuns(
   queryable: Queryable,
   agentThreadId: string,
   ownershipGeneration: number
 ): Promise<void> {
-  await queryable.query(
+  const error = "The queued turn was cancelled because thread ownership changed before it started";
+  const workerRuns = await queryable.query<{ id: string }>(
     `UPDATE task_runs
-     SET agent_thread_generation = $2, updated_at = now()
-     WHERE agent_thread_id = $1 AND status = 'queued'`,
-    [agentThreadId, ownershipGeneration]
+     SET status = 'cancelled',
+         error = $3,
+         finished_at = now(),
+         updated_at = now()
+     WHERE agent_thread_id = $1
+       AND status = 'queued'
+       AND agent_thread_generation <> $2
+     RETURNING id`,
+    [agentThreadId, ownershipGeneration, error]
   );
-  await queryable.query(
+  const dispatcherRuns = await queryable.query<{ id: string; message_delivery_id: string | null }>(
     `UPDATE dispatcher_runs
-     SET agent_thread_generation = $2, updated_at = now()
-     WHERE agent_thread_id = $1 AND status = 'queued' AND scope <> 'coordination'`,
-    [agentThreadId, ownershipGeneration]
+     SET status = 'cancelled',
+         error = $3,
+         finished_at = now(),
+         updated_at = now()
+     WHERE agent_thread_id = $1
+       AND status = 'queued'
+       AND scope <> 'coordination'
+       AND agent_thread_generation <> $2
+     RETURNING id, message_delivery_id`,
+    [agentThreadId, ownershipGeneration, error]
   );
+
+  for (const run of workerRuns.rows) {
+    await failStaleQueuedRunInputs(queryable, "task_run_id", run.id, null, error);
+  }
+  for (const run of dispatcherRuns.rows) {
+    await failStaleQueuedRunInputs(queryable, "dispatcher_run_id", run.id, run.message_delivery_id, error);
+  }
+}
+
+async function failStaleQueuedRunInputs(
+  queryable: Queryable,
+  runColumn: "task_run_id" | "dispatcher_run_id",
+  runId: string,
+  fallbackDeliveryId: string | null,
+  error: string
+): Promise<void> {
+  const inputs = await queryable.query<{ message_delivery_id: string | null }>(
+    `UPDATE agent_turn_inputs
+     SET status = 'failed', error = $2, updated_at = now()
+     WHERE ${runColumn} = $1
+       AND status IN ('queued', 'delivering')
+     RETURNING message_delivery_id`,
+    [runId, error]
+  );
+  const deliveryIds = new Set(
+    inputs.rows
+      .map((input) => input.message_delivery_id)
+      .filter((id): id is string => Boolean(id))
+  );
+  if (fallbackDeliveryId) deliveryIds.add(fallbackDeliveryId);
+  for (const deliveryId of deliveryIds) {
+    await queryable.query(
+      `UPDATE message_deliveries
+       SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+       WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+      [deliveryId, error]
+    );
+    await queryable.query(
+      `UPDATE dispatcher_runs
+       SET status = 'cancelled',
+           finished_at = COALESCE(finished_at, now()),
+           error = COALESCE(error, $2),
+           updated_at = now()
+       WHERE message_delivery_id = $1
+         AND status IN ('queued', 'cancel_requested')`,
+      [deliveryId, error]
+    );
+  }
 }
 
 async function queueDelivery(client: PoolClient, managedRoot: string, threadId: string, messageId: string, recipientAgentId: string): Promise<void> {
@@ -1236,7 +1298,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     );
     session = updated.rows[0];
     if (session) {
-      await refreshQueuedAgentThreadRunGenerations(client, session.id, session.ownership_generation);
+      await cancelStaleQueuedAgentThreadRuns(client, session.id, session.ownership_generation);
     }
   }
   if (!session && linkedTaskId) {
@@ -1479,7 +1541,7 @@ export async function transferTaskAgentThread(
     ]
   );
   if (result.rows[0]) {
-    await refreshQueuedAgentThreadRunGenerations(queryable, result.rows[0].id, result.rows[0].ownership_generation);
+    await cancelStaleQueuedAgentThreadRuns(queryable, result.rows[0].id, result.rows[0].ownership_generation);
   }
   return result.rows[0];
 }
