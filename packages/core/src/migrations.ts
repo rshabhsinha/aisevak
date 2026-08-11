@@ -227,6 +227,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   agent_thread_generation integer NOT NULL DEFAULT 0,
   workspace_key text NOT NULL DEFAULT '',
   workspace_mode text NOT NULL DEFAULT 'unknown',
+  workspace_source text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
@@ -258,6 +259,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   agent_thread_generation integer NOT NULL DEFAULT 0,
   workspace_key text NOT NULL DEFAULT '',
   workspace_mode text NOT NULL DEFAULT 'unknown',
+  workspace_source text NOT NULL DEFAULT 'unknown',
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   codex_home text NOT NULL,
@@ -387,7 +389,7 @@ CREATE TABLE IF NOT EXISTS pull_requests (
 );
 `;
 
-const additiveSql = `
+export const additiveSql = `
 ALTER TYPE run_status ADD VALUE IF NOT EXISTS 'draft' BEFORE 'queued';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
@@ -424,6 +426,7 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES a
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
@@ -433,21 +436,72 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFAULT 'unknown';
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
 UPDATE task_runs
-SET workspace_key = tasks.project_id::text,
-    workspace_mode = projects.workspace_mode
+SET workspace_key = CASE
+      WHEN task_runs.workspace_key = '' THEN tasks.project_id::text
+      ELSE task_runs.workspace_key
+    END,
+    workspace_mode = CASE
+      WHEN task_runs.workspace_mode = 'unknown' THEN projects.workspace_mode
+      ELSE task_runs.workspace_mode
+    END,
+    workspace_source = CASE
+      WHEN task_runs.workspace_source = 'unknown' THEN projects.source
+      ELSE task_runs.workspace_source
+    END
 FROM tasks
 JOIN projects ON projects.id = tasks.project_id
-WHERE task_runs.workspace_key = '';
+WHERE task_runs.task_id = tasks.id
+  AND (
+    task_runs.workspace_key = ''
+    OR task_runs.workspace_mode = 'unknown'
+    OR task_runs.workspace_source = 'unknown'
+  );
 UPDATE dispatcher_runs
-SET workspace_key = COALESCE(agent_threads.project_id, tasks.project_id)::text,
-    workspace_mode = COALESCE(thread_projects.workspace_mode, task_projects.workspace_mode, 'unknown')
-FROM agent_threads
-LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
-LEFT JOIN projects task_projects ON task_projects.id = tasks.project_id
-LEFT JOIN projects thread_projects ON thread_projects.id = agent_threads.project_id
-WHERE dispatcher_runs.agent_thread_id = agent_threads.id
-  AND dispatcher_runs.workspace_key = '';
+SET workspace_key = CASE
+      WHEN dispatcher_runs.workspace_key = '' THEN COALESCE(
+        (SELECT agent_threads.project_id::text
+         FROM agent_threads
+         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
+        (SELECT tasks.project_id::text
+         FROM tasks
+         WHERE tasks.id = dispatcher_runs.task_id),
+        ''
+      )
+      ELSE dispatcher_runs.workspace_key
+    END,
+    workspace_mode = CASE
+      WHEN dispatcher_runs.workspace_mode = 'unknown' THEN COALESCE(
+        (SELECT projects.workspace_mode
+         FROM agent_threads
+         JOIN projects ON projects.id = agent_threads.project_id
+         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
+        (SELECT projects.workspace_mode
+         FROM tasks
+         JOIN projects ON projects.id = tasks.project_id
+         WHERE tasks.id = dispatcher_runs.task_id),
+        'unknown'
+      )
+      ELSE dispatcher_runs.workspace_mode
+    END,
+    workspace_source = CASE
+      WHEN dispatcher_runs.workspace_source = 'unknown' THEN COALESCE(
+        (SELECT projects.source
+         FROM agent_threads
+         JOIN projects ON projects.id = agent_threads.project_id
+         WHERE agent_threads.id = dispatcher_runs.agent_thread_id),
+        (SELECT projects.source
+         FROM tasks
+         JOIN projects ON projects.id = tasks.project_id
+         WHERE tasks.id = dispatcher_runs.task_id),
+        'unknown'
+      )
+      ELSE dispatcher_runs.workspace_source
+    END
+WHERE dispatcher_runs.workspace_key = ''
+   OR dispatcher_runs.workspace_mode = 'unknown'
+   OR dispatcher_runs.workspace_source = 'unknown';
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
