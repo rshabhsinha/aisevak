@@ -73,6 +73,13 @@ import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
 import { createTaskAndQueueRun } from "./taskCreation";
 import { createThreadLoadGuard } from "./threadLoadGuard";
+import {
+  threadDetailFailed,
+  threadDetailIdle,
+  threadDetailLoading,
+  threadDetailReady,
+  type ThreadDetailState
+} from "./threadDetailState";
 
 interface User {
   id: string;
@@ -380,6 +387,7 @@ export function App() {
   const [draftThread, setDraftThread] = useState(!initialRoute.threadId);
   const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
   const [agentThreadEvents, setAgentThreadEvents] = useState<RunEvent[]>([]);
+  const [threadDetailState, setThreadDetailState] = useState<ThreadDetailState>(threadDetailIdle());
   const [composerSelection, setComposerSelection] = useState<ModelSelection | null>(null);
   const [pendingThreadMessages, setPendingThreadMessages] = useState<AgentRunChatMessage[]>([]);
   const [query, setQuery] = useState("");
@@ -492,6 +500,7 @@ export function App() {
       setDraftThread(!route.threadId);
       setSelectedThreadRun(null);
       setAgentThreadEvents([]);
+      setThreadDetailState(route.threadId ? threadDetailLoading() : threadDetailIdle());
       setPendingThreadMessages([]);
     };
     window.addEventListener("popstate", handlePopState);
@@ -534,6 +543,7 @@ export function App() {
     if (!selectedThreadId) {
       setSelectedThreadRun(null);
       setAgentThreadEvents([]);
+      setThreadDetailState(threadDetailIdle());
       return;
     }
     void loadAgentThread(selectedThreadId);
@@ -679,15 +689,27 @@ export function App() {
 
   async function loadAgentThread(threadId: string) {
     const isCurrentRequest = threadLoadGuardRef.current.begin(threadId);
-    const data = await api<{
+    setThreadDetailState(threadDetailLoading());
+    let data: {
       thread: AgentThread;
       run?: AgentRunTimelineRun | null;
       events: RunEvent[];
-    }>(`/api/agent-threads/${threadId}`);
+    };
+    try {
+      data = await api<{
+        thread: AgentThread;
+        run?: AgentRunTimelineRun | null;
+        events: RunEvent[];
+      }>(`/api/agent-threads/${threadId}`);
+    } catch (error) {
+      if (isCurrentRequest()) setThreadDetailState(threadDetailFailed(error));
+      return;
+    }
     if (!isCurrentRequest()) return;
     setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
     setSelectedThreadRun(data.run ?? null);
     setAgentThreadEvents(data.events);
+    setThreadDetailState(threadDetailReady());
   }
 
   function selectAgentThread(threadId: string) {
@@ -696,6 +718,7 @@ export function App() {
     setDraftThread(false);
     setSelectedThreadRun(null);
     setAgentThreadEvents([]);
+    setThreadDetailState(threadDetailLoading());
     setPendingThreadMessages([]);
     navigateToView("runs", threadId);
   }
@@ -714,6 +737,7 @@ export function App() {
     setDraftThread(true);
     setSelectedThreadRun(null);
     setAgentThreadEvents([]);
+    setThreadDetailState(threadDetailIdle());
     setPendingThreadMessages([]);
     setComposerSelection(provider ? readStickyModelSelection(provider) : null);
     navigateToView("runs");
@@ -938,11 +962,15 @@ export function App() {
               draft={draftThread}
               run={selectedThreadRun}
               events={agentThreadEvents}
+              detailState={threadDetailState}
               pendingMessages={pendingThreadMessages}
               providers={providerInstances}
               selection={composerSelection}
               onSelectionChange={selectComposerModel}
               onSendMessage={sendAgentThreadMessage}
+              onRetry={() => {
+                if (selectedThreadId) void loadAgentThread(selectedThreadId);
+              }}
               onCancel={async () => {
                 if (!selectedThreadId) return;
                 try {
@@ -1629,11 +1657,13 @@ function AgentChatsView(props: {
   draft: boolean;
   run: AgentRunTimelineRun | null;
   events: RunEvent[];
+  detailState: ThreadDetailState;
   pendingMessages: AgentRunChatMessage[];
   providers: ProviderInstance[];
   selection: ModelSelection | null;
   onSelectionChange: (selection: ModelSelection) => Promise<void>;
   onSendMessage: (message: string, selection: ModelSelection) => Promise<void>;
+  onRetry: () => void;
   onCancel: () => Promise<void>;
 }) {
   const timelineRef = useRef<HTMLDivElement>(null);
@@ -1646,6 +1676,7 @@ function AgentChatsView(props: {
   const projectName = props.thread?.project_name ?? "Aisevak workspace";
   const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
   const threadKey = props.thread?.id ?? (props.draft ? "draft" : "loading");
+  const hasTimelineData = Boolean(props.run || props.events.length || props.pendingMessages.length);
 
   useLayoutEffect(() => {
     if (previousThreadRef.current !== threadKey) {
@@ -1710,6 +1741,22 @@ function AgentChatsView(props: {
             <h2>What should Codex work on?</h2>
             <p>Start a durable thread. You can switch models before sending or between turns.</p>
           </div>
+        ) : props.detailState.status === "loading" && !hasTimelineData ? (
+          <div className="agent-chat-detail-state" aria-busy="true">
+            <Loader2 className="spin" size={18} />
+            <span>Loading thread…</span>
+          </div>
+        ) : props.detailState.status === "error" && !hasTimelineData ? (
+          <div className="agent-chat-detail-state agent-chat-detail-error" role="alert">
+            <CircleAlert size={18} weight="fill" />
+            <div>
+              <strong>Could not load this thread</strong>
+              <p>{props.detailState.error}</p>
+              <Button variant="secondary" size="sm" onClick={props.onRetry}>
+                <RefreshCw size={13} /> Retry
+              </Button>
+            </div>
+          </div>
         ) : (
           <div
             className="agent-chat-timeline-wrap"
@@ -1729,6 +1776,16 @@ function AgentChatsView(props: {
               events={props.events}
               pendingMessages={props.pendingMessages}
             />
+            {props.detailState.status === "error" ? (
+              <div className="agent-run-failure" role="alert">
+                <span className="agent-run-failure-icon"><CircleAlert size={15} weight="fill" /></span>
+                <span>
+                  <strong>Thread details could not be refreshed</strong>
+                  <small>{props.detailState.error}</small>
+                  <Button variant="ghost" size="sm" onClick={props.onRetry}>Retry</Button>
+                </span>
+              </div>
+            ) : null}
             {latestError ? (
               <div className="agent-run-failure" role="status">
                 <span className="agent-run-failure-icon"><CircleAlert size={15} weight="fill" /></span>

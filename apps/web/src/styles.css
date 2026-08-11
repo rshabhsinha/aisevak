@@ -1376,6 +1376,39 @@ select:disabled {
   flex-direction: column;
 }
 
+.agent-chat-detail-state {
+  margin: auto;
+  padding: 28px;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 10px;
+  color: var(--muted-foreground);
+  font-size: 11px;
+  text-align: left;
+}
+
+.agent-chat-detail-error {
+  max-width: 360px;
+  color: var(--foreground);
+}
+
+.agent-chat-detail-error > svg {
+  flex: 0 0 auto;
+  color: var(--destructive);
+}
+
+.agent-chat-detail-error > div {
+  display: grid;
+  gap: 7px;
+}
+
+.agent-chat-detail-error p {
+  margin: 0;
+  color: var(--muted-foreground);
+  line-height: 1.45;
+}
+
 .agent-chat-timeline-wrap {
   min-height: 0;
   padding: 30px max(24px, calc((100% - 820px) / 2)) 18px;
