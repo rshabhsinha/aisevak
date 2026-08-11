@@ -282,7 +282,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     }
     if (message.method === "thread/start" && process.env.FAKE_CLOSE_STDIN_AFTER_THREAD_START === "1") {
       setInterval(() => {}, 1000);
-      setTimeout(() => process.stdin.destroy(), 10);
+      setTimeout(() => fs.closeSync(0), 10);
     }
     return;
   }
