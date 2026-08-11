@@ -1128,10 +1128,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         events: withSyntheticUserMessages(runResult.rows, eventsResult.rows)
       };
     }
-    const source = await pool.query<{ task_id: string }>("SELECT task_id FROM task_runs WHERE id = $1", [
-      params.id
-    ]);
-    return getTaskSessionTimeline(pool, mustRow(source.rows[0]).task_id);
+    const source = await pool.query<{ task_id: string; agent_thread_id: string | null }>(
+      "SELECT task_id, agent_thread_id FROM task_runs WHERE id = $1",
+      [params.id]
+    );
+    const sourceRun = mustRow(source.rows[0]);
+    return getTaskSessionTimeline(pool, sourceRun.task_id, sourceRun.agent_thread_id ?? undefined);
   });
 
   app.post("/api/agent-runs/:kind/:id/messages", async (request) => {
@@ -2184,7 +2186,7 @@ async function updateAgentThread(
   return getAgentThread(pool, id);
 }
 
-async function cancelAgentThread(
+export async function cancelAgentThread(
   pool: DbPool,
   id: string
 ): Promise<{ turn: { id: string; kind: "worker" | "dispatcher"; status: string } | null }> {
@@ -2193,13 +2195,23 @@ async function cancelAgentThread(
     `WITH latest AS (
        SELECT id, kind
        FROM (
-         SELECT id, 'worker'::text AS kind, queued_at FROM task_runs
+       SELECT id, 'worker'::text AS kind, status, queued_at, started_at, created_at FROM task_runs
          WHERE agent_thread_id = $1 AND status IN ('queued', 'running', 'cancel_requested')
          UNION ALL
-         SELECT id, 'dispatcher'::text AS kind, queued_at FROM dispatcher_runs
+         SELECT id, 'dispatcher'::text AS kind, status, queued_at, started_at, created_at FROM dispatcher_runs
          WHERE agent_thread_id = $1 AND status IN ('queued', 'running', 'cancel_requested')
        ) turns
-       ORDER BY queued_at DESC
+       ORDER BY CASE
+                  WHEN status IN ('running', 'cancel_requested') THEN 0
+                  WHEN status = 'queued' THEN 1
+                  ELSE 2
+                END,
+                CASE
+                  WHEN status IN ('running', 'cancel_requested') THEN started_at
+                  ELSE queued_at
+                END DESC NULLS LAST,
+                created_at DESC,
+                id DESC
        LIMIT 1
      ), updated_worker AS (
        UPDATE task_runs
@@ -2234,38 +2246,57 @@ export async function queueAgentTurnInput(
   message: string
 ): Promise<{ input: Record<string, unknown> }> {
   await getAgentThread(pool, threadId);
-  const active = await pool.query<{ id: string; kind: "worker" | "dispatcher" }>(
-    `SELECT id, kind
-     FROM (
-       SELECT id, 'worker'::text AS kind, started_at
-       FROM task_runs
-       WHERE agent_thread_id = $1 AND status = 'running'
-       UNION ALL
-       SELECT id, 'dispatcher'::text AS kind, started_at
-       FROM dispatcher_runs
-       WHERE agent_thread_id = $1 AND status = 'running'
-     ) active_turns
-     ORDER BY started_at DESC NULLS LAST
-     LIMIT 1`,
-    [threadId]
-  );
-  const turn = active.rows[0];
-  if (!turn) throwBadRequest("This thread does not have an active turn to steer");
-  const result = await pool.query(
-    `INSERT INTO agent_turn_inputs
-       (agent_thread_id, task_run_id, dispatcher_run_id, message)
-     SELECT $1, $2, $3, $4
-     WHERE EXISTS (
-       SELECT 1 FROM task_runs WHERE id = $2 AND status = 'running'
-       UNION ALL
-       SELECT 1 FROM dispatcher_runs WHERE id = $3 AND status = 'running'
-     )
-     RETURNING *`,
-    [threadId, turn.kind === "worker" ? turn.id : null, turn.kind === "dispatcher" ? turn.id : null, message]
-  );
-  const input = result.rows[0];
-  if (!input) throwBadRequest("This thread does not have an active turn to steer");
-  return { input };
+  return withTransaction(pool, async (client) => {
+    await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
+    const active = await client.query<{ id: string; kind: "worker" | "dispatcher" }>(
+      `SELECT id, kind
+       FROM (
+         SELECT task_runs.id, 'worker'::text AS kind, task_runs.started_at
+         FROM task_runs
+         JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+         WHERE task_runs.agent_thread_id = $1
+           AND task_runs.agent_thread_generation = agent_threads.ownership_generation
+           AND task_runs.status = 'running'
+         UNION ALL
+         SELECT dispatcher_runs.id, 'dispatcher'::text AS kind, dispatcher_runs.started_at
+         FROM dispatcher_runs
+         JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+         WHERE dispatcher_runs.agent_thread_id = $1
+           AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+           AND dispatcher_runs.status = 'running'
+       ) active_turns
+       ORDER BY started_at DESC NULLS LAST
+       LIMIT 1`,
+      [threadId]
+    );
+    const turn = active.rows[0];
+    if (!turn) throwBadRequest("This thread does not have an active turn to steer");
+    const result = await client.query(
+      `INSERT INTO agent_turn_inputs
+         (agent_thread_id, task_run_id, dispatcher_run_id, message)
+       SELECT $1, $2, $3, $4
+       WHERE EXISTS (
+         SELECT 1
+         FROM task_runs
+         JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+         WHERE task_runs.id = $2
+           AND task_runs.status = 'running'
+           AND task_runs.agent_thread_generation = agent_threads.ownership_generation
+         UNION ALL
+         SELECT 1
+         FROM dispatcher_runs
+         JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+         WHERE dispatcher_runs.id = $3
+           AND dispatcher_runs.status = 'running'
+           AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+       )
+       RETURNING *`,
+      [threadId, turn.kind === "worker" ? turn.id : null, turn.kind === "dispatcher" ? turn.id : null, message]
+    );
+    const input = result.rows[0];
+    if (!input) throwBadRequest("This thread does not have an active turn to steer");
+    return { input };
+  });
 }
 
 type AgentTurnKind = "worker" | "dispatcher";
@@ -2317,7 +2348,10 @@ async function appendIncrementalAgentTurnInput(
               NULL::text AS scope,
               task_runs.queued_at
        FROM task_runs
-       WHERE task_runs.agent_thread_id = $1 AND task_runs.status = 'queued'
+       JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+       WHERE task_runs.agent_thread_id = $1
+         AND task_runs.agent_thread_generation = agent_threads.ownership_generation
+         AND task_runs.status = 'queued'
        UNION ALL
        SELECT dispatcher_runs.id,
               'dispatcher'::text AS kind,
@@ -2327,7 +2361,10 @@ async function appendIncrementalAgentTurnInput(
               dispatcher_runs.scope,
               dispatcher_runs.queued_at
        FROM dispatcher_runs
-       WHERE dispatcher_runs.agent_thread_id = $1 AND dispatcher_runs.status = 'queued'
+       JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+       WHERE dispatcher_runs.agent_thread_id = $1
+         AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+         AND dispatcher_runs.status = 'queued'
      ) turns
      WHERE id <> $2
        AND ($3::text IS NULL OR kind = $3)
@@ -2436,7 +2473,9 @@ async function selectThreadTurn(
               task_runs.queued_at,
               task_runs.started_at
        FROM task_runs
+       JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
        WHERE task_runs.agent_thread_id = $1
+         AND task_runs.agent_thread_generation = agent_threads.ownership_generation
          AND task_runs.status IN ('queued', 'running')
        UNION ALL
        SELECT dispatcher_runs.id,
@@ -2448,7 +2487,9 @@ async function selectThreadTurn(
               dispatcher_runs.queued_at,
               dispatcher_runs.started_at
        FROM dispatcher_runs
+       JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
        WHERE dispatcher_runs.agent_thread_id = $1
+         AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
          AND dispatcher_runs.status IN ('queued', 'running')
      ) turns
      WHERE ($2::text IS NULL OR kind = $2)
@@ -2500,6 +2541,7 @@ export async function ensureTaskAgentThread(
   model_options: unknown;
   runtime_home: string;
   provider_thread_id: string | null;
+  ownership_generation: number;
 }> {
   if (input.task.coordination_thread_id) {
     const coordinated = await pool.query<{
@@ -2508,6 +2550,7 @@ export async function ensureTaskAgentThread(
       model_options: unknown;
       runtime_home: string;
       provider_thread_id: string | null;
+      ownership_generation: number;
     }>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
@@ -2534,7 +2577,7 @@ export async function ensureTaskAgentThread(
              END,
              last_activity_at = now(),
              updated_at = now()
-       RETURNING id, model, model_options, runtime_home, provider_thread_id`,
+       RETURNING id, model, model_options, runtime_home, provider_thread_id, ownership_generation`,
       [
         input.task.title,
         input.task.agent_id,
@@ -2549,7 +2592,9 @@ export async function ensureTaskAgentThread(
         input.task.coordination_thread_id
       ]
     );
-    return mustRow(coordinated.rows[0]);
+    const session = mustRow(coordinated.rows[0]);
+    await refreshQueuedAgentThreadRunGenerations(pool, session.id, session.ownership_generation);
+    return session;
   }
   const result = await pool.query<{
     id: string;
@@ -2557,6 +2602,7 @@ export async function ensureTaskAgentThread(
     model_options: unknown;
     runtime_home: string;
     provider_thread_id: string | null;
+    ownership_generation: number;
   }>(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
@@ -2590,7 +2636,7 @@ export async function ensureTaskAgentThread(
            END,
            last_activity_at = now(),
            updated_at = now()
-     RETURNING id, model, model_options, runtime_home, provider_thread_id`,
+     RETURNING id, model, model_options, runtime_home, provider_thread_id, ownership_generation`,
     [
       input.task.title,
       input.task.agent_id,
@@ -2604,7 +2650,9 @@ export async function ensureTaskAgentThread(
       input.providerThreadId
     ]
   );
-  return mustRow(result.rows[0]);
+  const session = mustRow(result.rows[0]);
+  await refreshQueuedAgentThreadRunGenerations(pool, session.id, session.ownership_generation);
+  return session;
 }
 
 async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise<AgentThreadRow> {
@@ -2659,7 +2707,9 @@ async function ensureTaskNavigationThread(pool: DbPool, taskId: string): Promise
       ]
     );
     await linkTaskRunsToThread(pool, taskId, existing.rows[0].id);
-    return getAgentThread(pool, existing.rows[0].id);
+    const thread = await getAgentThread(pool, existing.rows[0].id);
+    await refreshQueuedAgentThreadRunGenerations(pool, thread.id, thread.ownership_generation);
+    return thread;
   }
 
   const created = await pool.query<{ id: string }>(
@@ -2731,12 +2781,41 @@ export async function isolateTaskNavigationThread(
 async function linkTaskRunsToThread(pool: DbPool, taskId: string, threadId: string): Promise<void> {
   await Promise.all([
     pool.query(
-      "UPDATE task_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
+      `UPDATE task_runs
+       SET agent_thread_id = $2,
+           agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
+           updated_at = now()
+       WHERE task_id = $1 AND agent_thread_id IS NULL`,
       [taskId, threadId]
     ),
     pool.query(
-      "UPDATE dispatcher_runs SET agent_thread_id = $2, updated_at = now() WHERE task_id = $1 AND agent_thread_id IS NULL",
+      `UPDATE dispatcher_runs
+       SET agent_thread_id = $2,
+           agent_thread_generation = (SELECT ownership_generation FROM agent_threads WHERE id = $2),
+           updated_at = now()
+       WHERE task_id = $1 AND agent_thread_id IS NULL`,
       [taskId, threadId]
+    )
+  ]);
+}
+
+async function refreshQueuedAgentThreadRunGenerations(
+  pool: DbPool,
+  agentThreadId: string,
+  ownershipGeneration: number
+): Promise<void> {
+  await Promise.all([
+    pool.query(
+      `UPDATE task_runs
+       SET agent_thread_generation = $2, updated_at = now()
+       WHERE agent_thread_id = $1 AND status = 'queued'`,
+      [agentThreadId, ownershipGeneration]
+    ),
+    pool.query(
+      `UPDATE dispatcher_runs
+       SET agent_thread_generation = $2, updated_at = now()
+       WHERE agent_thread_id = $1 AND status = 'queued' AND scope <> 'coordination'`,
+      [agentThreadId, ownershipGeneration]
     )
   ]);
 }
@@ -2934,9 +3013,9 @@ async function queueWorkerRun(
   }
   const runResult = await pool.query(
     `INSERT INTO task_runs
-       (task_id, task_session_id, agent_thread_id, run_kind, trigger, status, cwd, branch,
+       (task_id, task_session_id, agent_thread_id, agent_thread_generation, run_kind, trigger, status, cwd, branch,
         model, model_options, prompt, skills_snapshot)
-     VALUES ($1, $2, $3, 'worker', $4, 'queued', $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, (SELECT ownership_generation FROM agent_threads WHERE id = $3), 'worker', $4, 'queued', $5, $6, $7, $8, $9, $10)
      RETURNING *`,
     [
       task.id,
@@ -3312,8 +3391,9 @@ export async function getTaskSessionTimeline(
        FROM task_comments
        WHERE task_comments.task_id = $1
          AND $2::boolean
+         AND $3::uuid IS NULL
        ORDER BY task_comments.created_at ASC`,
-      [taskId, includeTaskComments]
+      [taskId, includeTaskComments, agentThreadId ?? null]
     )
   ]);
   const runs = runsResult.rows;

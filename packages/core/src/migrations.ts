@@ -224,6 +224,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   trigger text NOT NULL DEFAULT 'manual',
   parent_run_id uuid,
   agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL,
+  agent_thread_generation integer NOT NULL DEFAULT 0,
   status run_status NOT NULL DEFAULT 'queued',
   cwd text NOT NULL,
   branch text,
@@ -416,6 +417,7 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'w
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
@@ -423,6 +425,16 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT N
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
+UPDATE task_runs
+SET agent_thread_generation = agent_threads.ownership_generation
+FROM agent_threads
+WHERE task_runs.agent_thread_id = agent_threads.id
+  AND task_runs.status = 'queued';
+UPDATE dispatcher_runs
+SET agent_thread_generation = agent_threads.ownership_generation
+FROM agent_threads
+WHERE dispatcher_runs.agent_thread_id = agent_threads.id
+  AND dispatcher_runs.status = 'queued';
 CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx

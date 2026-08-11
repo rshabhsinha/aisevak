@@ -93,5 +93,7 @@ describe("bounded runner execution", () => {
       "active_project_turns.project_id = COALESCE(candidate_thread.project_id, candidate_task.project_id)"
     );
     expect(dispatcherClaim).toContain("candidate.agent_thread_generation = candidate_thread.ownership_generation");
+    expect(workerClaim).toContain("candidate.agent_thread_generation = candidate_thread.ownership_generation");
+
   });
 });

@@ -89,4 +89,34 @@ describe("worker run finalization", () => {
     expect(taskUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'open'/);
     expect(threadUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'active'/);
   });
+
+  it("does not let a stale worker finalize the transferred task", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const client = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        if (sql.includes("SELECT ownership_generation")) return { rows: [{ ownership_generation: 8 }] };
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id",
+      taskId: "task-id",
+      agentThreadId: "agent-thread-id",
+      agentThreadGeneration: 7,
+      coordinationThreadId: "coordination-thread-id",
+      finalStatus: "succeeded",
+      stdout: "stale",
+      stderr: "",
+      exitCode: 0
+    });
+
+    expect(queries.some((query) => query.sql.includes("UPDATE task_runs"))).toBe(true);
+    expect(queries.some((query) => query.sql.includes("UPDATE tasks"))).toBe(false);
+    expect(queries.some((query) => query.sql.includes("UPDATE coordination_threads"))).toBe(false);
+    expect(queries.some((query) => query.sql.includes("UPDATE agent_threads"))).toBe(false);
+  });
 });

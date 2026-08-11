@@ -1178,6 +1178,25 @@ async function addParticipants(client: PoolClient, threadId: string, participant
   }
 }
 
+async function refreshQueuedAgentThreadRunGenerations(
+  queryable: Queryable,
+  agentThreadId: string,
+  ownershipGeneration: number
+): Promise<void> {
+  await queryable.query(
+    `UPDATE task_runs
+     SET agent_thread_generation = $2, updated_at = now()
+     WHERE agent_thread_id = $1 AND status = 'queued'`,
+    [agentThreadId, ownershipGeneration]
+  );
+  await queryable.query(
+    `UPDATE dispatcher_runs
+     SET agent_thread_generation = $2, updated_at = now()
+     WHERE agent_thread_id = $1 AND status = 'queued' AND scope <> 'coordination'`,
+    [agentThreadId, ownershipGeneration]
+  );
+}
+
 async function queueDelivery(client: PoolClient, managedRoot: string, threadId: string, messageId: string, recipientAgentId: string): Promise<void> {
   const delivery = await client.query<{ id: string; status: string }>(
     `INSERT INTO message_deliveries (message_id, recipient_agent_id) VALUES ($1, $2)
@@ -1216,6 +1235,9 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       [session.id, linkedTaskId, thread.project_id, runtimeHome, ownershipTransferUnsafe ? 1 : 0]
     );
     session = updated.rows[0];
+    if (session) {
+      await refreshQueuedAgentThreadRunGenerations(client, session.id, session.ownership_generation);
+    }
   }
   if (!session && linkedTaskId) {
     ownershipTransferUnsafe = true;
@@ -1456,6 +1478,9 @@ export async function transferTaskAgentThread(
       input.runtimeHome
     ]
   );
+  if (result.rows[0]) {
+    await refreshQueuedAgentThreadRunGenerations(queryable, result.rows[0].id, result.rows[0].ownership_generation);
+  }
   return result.rows[0];
 }
 

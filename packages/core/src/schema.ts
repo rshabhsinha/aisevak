@@ -296,6 +296,7 @@ export const taskRuns = pgTable("task_runs", {
   trigger: text("trigger").notNull().default("manual"),
   parentRunId: uuid("parent_run_id"),
   agentThreadId: uuid("agent_thread_id").references(() => agentThreads.id, { onDelete: "set null" }),
+  agentThreadGeneration: integer("agent_thread_generation").notNull().default(0),
   status: runStatusEnum("status").notNull().default("queued"),
   cwd: text("cwd").notNull(),
   branch: text("branch"),

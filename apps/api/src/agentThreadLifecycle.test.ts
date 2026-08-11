@@ -5,6 +5,7 @@ import {
   ensureTaskAgentThread,
   getTaskSessionTimeline,
   isolateTaskNavigationThread,
+  cancelAgentThread,
   synchronizeTaskSessionRuntime
 } from "./server.js";
 
@@ -153,6 +154,28 @@ describe("coordinated task agent threads", () => {
     ]);
   });
 
+  it("cancels the displayed active turn before a newer queued replacement", async () => {
+    const queries: string[] = [];
+    const pool = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql.includes("WITH latest")) {
+          return { rows: [{ id: "running-run", kind: "dispatcher", status: "cancel_requested" }] };
+        }
+        return { rows: [{}] };
+      }
+    } as unknown as DbPool;
+
+    await expect(cancelAgentThread(pool, "thread-id")).resolves.toEqual({
+      turn: { id: "running-run", kind: "dispatcher", status: "cancel_requested" }
+    });
+
+    const cancellation = queries.find((query) => query.includes("WITH latest"));
+    expect(cancellation).toContain("WHEN status IN ('running', 'cancel_requested') THEN 0");
+    expect(cancellation).toContain("WHEN status = 'queued' THEN 1");
+    expect(cancellation).toContain("WHEN status IN ('running', 'cancel_requested') THEN started_at");
+  });
+
   it("filters task-linked conversation runs to the selected agent thread", async () => {
     const queries: Array<{ sql: string; params: unknown[] | undefined }> = [];
     const pool = {
@@ -180,7 +203,8 @@ describe("coordinated task agent threads", () => {
     expect(queries[2]?.sql).toContain("AND $2::boolean");
     expect(queries[2]?.params).toEqual([
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      false
+      false,
+      "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
     ]);
     expect(timeline).toEqual({ run: null, events: [] });
   });

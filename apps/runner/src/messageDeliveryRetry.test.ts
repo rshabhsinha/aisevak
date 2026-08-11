@@ -8,6 +8,9 @@ interface RetryPoolOptions {
   overlappingRun?: boolean;
   presentedAt?: Date | null;
   providerThreadId?: string | null;
+  agentThreadId?: string | null;
+  agentThreadGeneration?: number;
+  ownershipGeneration?: number | null;
 }
 
 function retryPool(options: RetryPoolOptions = {}): {
@@ -29,6 +32,21 @@ function retryPool(options: RetryPoolOptions = {}): {
               options.presentedAt === undefined
                 ? new Date("2026-08-11T00:00:00Z")
                 : options.presentedAt,
+            agent_thread_id: options.agentThreadId ?? null,
+            agent_thread_generation: options.agentThreadGeneration ?? 0,
+            ownership_generation:
+              options.ownershipGeneration === undefined ? 0 : options.ownershipGeneration,
+            provider_thread_id: options.providerThreadId ?? null
+          }
+        ]
+      };
+    }
+    if (sql.includes("SELECT ownership_generation, provider_thread_id")) {
+      return {
+        rows: [
+          {
+            ownership_generation:
+              options.ownershipGeneration === undefined ? 0 : options.ownershipGeneration,
             provider_thread_id: options.providerThreadId ?? null
           }
         ]
@@ -113,6 +131,35 @@ describe("message delivery retry", () => {
 
     expect(queries.filter((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toHaveLength(1);
     expect(queries.some((query) => query.sql.includes("SET status = 'retrying'"))).toBe(true);
+  });
+
+  it("fails a retry explicitly when ownership changed before failure handling", async () => {
+    const { pool, queries } = retryPool({
+      presentedAt: null,
+      agentThreadId: "agent-thread",
+      agentThreadGeneration: 2,
+      ownershipGeneration: 3
+    });
+
+    await finishMessageDelivery(
+      pool,
+      { id: "dispatcher-run", message_delivery_id: "delivery" },
+      "failed",
+      "setup failure"
+    );
+
+    expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+    expect(
+      queries.some(
+        (query) =>
+          query.sql.includes("SELECT ownership_generation, provider_thread_id") &&
+          query.sql.includes("FOR UPDATE")
+      )
+    ).toBe(true);
+    expect(queries.find((query) => query.sql.includes("SET status = 'failed'"))?.params).toEqual([
+      "delivery",
+      "Automatic delivery retry suppressed because thread ownership changed before the failed turn could be retried"
+    ]);
   });
 
   it("fails closed when turn/start was sent but its acceptance is unknown", async () => {
