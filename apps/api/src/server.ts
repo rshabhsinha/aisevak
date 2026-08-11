@@ -3292,7 +3292,7 @@ interface DispatcherRunSnapshot {
   skills_snapshot: CodexSkillSnapshot[];
 }
 
-async function queueDispatcherMessage(
+export async function queueDispatcherMessage(
   pool: DbPool,
   options: {
     sourceRunId?: string;
@@ -3305,6 +3305,41 @@ async function queueDispatcherMessage(
   return withTransaction(pool, async (client) => {
     if (options.taskId) {
       await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [options.taskId]);
+    }
+    const sourceSnapshot = options.sourceRunId
+      ? await client.query<DispatcherRunSnapshot>(
+          `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, workspace_key, workspace_mode, workspace_source, model, model_options, prompt, status::text, skills_snapshot
+           FROM dispatcher_runs
+           WHERE id = $1`,
+          [options.sourceRunId]
+        )
+      : null;
+    const sourceSnapshotRow = sourceSnapshot?.rows[0];
+    if (options.sourceRunId && !sourceSnapshotRow) {
+      throw new Error("Dispatcher run was not found");
+    }
+
+    const currentTaskId = options.taskId ?? sourceSnapshotRow?.task_id ?? null;
+    if (currentTaskId && !options.taskId) {
+      await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [currentTaskId]);
+    }
+    const taskSnapshot = currentTaskId
+      ? await getTaskJoin(client, currentTaskId)
+      : null;
+    const taskThread = taskSnapshot
+      ? await ensureTaskNavigationThreadInTransaction(client, taskSnapshot)
+      : null;
+    if (taskSnapshot && taskSnapshot.agent_kind !== "dispatcher") {
+      throw new Error("The task is assigned to a worker; queue a worker turn instead");
+    }
+    if (taskThread && options.agentThreadId && options.agentThreadId !== taskThread.id) {
+      throw new Error("The dispatcher agent thread changed while queueing the turn");
+    }
+    const threadId = taskThread?.id ?? options.agentThreadId ?? sourceSnapshotRow?.agent_thread_id ?? null;
+    let thread = taskThread && taskThread.id === threadId ? taskThread : null;
+    if (threadId && !thread) {
+      await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
+      thread = await getAgentThread(client, threadId);
     }
     const existing = options.sourceRunId
       ? await client.query<DispatcherRunSnapshot>(
@@ -3329,28 +3364,12 @@ async function queueDispatcherMessage(
     if (options.sourceRunId && !previous) {
       throw new Error("Dispatcher run was not found");
     }
-
-    const currentTaskId = options.taskId ?? previous?.task_id ?? null;
-    if (currentTaskId && !options.taskId) {
-      await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [currentTaskId]);
-    }
-    const taskSnapshot = currentTaskId
-      ? await getTaskJoin(client, currentTaskId)
-      : null;
-    const taskThread = taskSnapshot
-      ? await ensureTaskNavigationThreadInTransaction(client, taskSnapshot)
-      : null;
-    if (taskSnapshot && taskSnapshot.agent_kind !== "dispatcher") {
-      throw new Error("The task is assigned to a worker; queue a worker turn instead");
-    }
-    if (taskThread && options.agentThreadId && options.agentThreadId !== taskThread.id) {
-      throw new Error("The dispatcher agent thread changed while queueing the turn");
-    }
-    const threadId = taskThread?.id ?? options.agentThreadId ?? previous?.agent_thread_id ?? null;
-    let thread = taskThread && taskThread.id === threadId ? taskThread : null;
-    if (threadId && !thread) {
-      await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
-      thread = await getAgentThread(client, threadId);
+    if (
+      options.sourceRunId &&
+      (previous?.task_id !== sourceSnapshotRow?.task_id ||
+        previous?.agent_thread_id !== sourceSnapshotRow?.agent_thread_id)
+    ) {
+      throw new Error("Dispatcher run ownership changed while queueing the follow-up");
     }
     if (thread && options.modelSelection) {
       await client.query(
