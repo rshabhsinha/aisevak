@@ -1257,9 +1257,16 @@ export async function processOneDispatcherRun(
         }
       },
       onBeforeTurnStart: async () => {
-        const owned = await dispatcherRunStillOwned(pool, job);
-        ownershipLost ||= !owned;
-        return owned;
+        const fence = await acquireRunLaunchFence(pool, {
+          kind: "dispatcher",
+          runId: job.id,
+          taskId: job.task_id,
+          agentThreadId: job.agent_thread_id,
+          agentThreadGeneration: job.agent_thread_generation,
+          agentId: job.agent_id
+        });
+        if (!fence) ownershipLost = true;
+        return fence;
       },
       onTurnAccepted: async () => {
         if (!job.message_delivery_id) return;
@@ -1490,9 +1497,16 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
         }
       },
       onBeforeTurnStart: async () => {
-        const owned = await workerRunStillOwned(pool, job);
-        ownershipLost ||= !owned;
-        return owned;
+        const fence = await acquireRunLaunchFence(pool, {
+          kind: "worker",
+          runId: job.id,
+          taskId: job.task_id,
+          agentThreadId: job.agent_thread_id,
+          agentThreadGeneration: job.agent_thread_generation,
+          agentId: job.agent_id
+        });
+        if (!fence) ownershipLost = true;
+        return fence;
       },
       shouldCancel: async () => {
         const current = await pool.query<{
@@ -1584,6 +1598,113 @@ export async function workerRunStillOwned(
     [job.id, job.agent_id, job.agent_thread_id, job.agent_thread_generation]
   );
   return Boolean(result.rows[0]);
+}
+
+interface RunLaunchFenceInput {
+  kind: "worker" | "dispatcher";
+  runId: string;
+  taskId: string | null;
+  agentThreadId: string | null;
+  agentThreadGeneration: number;
+  agentId: string;
+}
+
+export async function acquireRunLaunchFence(
+  pool: DbPool,
+  input: RunLaunchFenceInput
+): Promise<(() => Promise<void>) | null> {
+  const client = await pool.connect();
+  let transactionOpen = false;
+  const rollbackAndRelease = async (): Promise<void> => {
+    if (transactionOpen) {
+      await client.query("ROLLBACK").catch(() => undefined);
+      transactionOpen = false;
+    }
+    client.release();
+  };
+
+  try {
+    await client.query("BEGIN");
+    transactionOpen = true;
+
+    let taskAgentId: string | null = null;
+    if (input.taskId) {
+      const task = await client.query<{ id: string; agent_id: string }>(
+        "SELECT id, agent_id FROM tasks WHERE id = $1 FOR UPDATE",
+        [input.taskId]
+      );
+      taskAgentId = task.rows[0]?.agent_id ?? null;
+      if (!task.rows[0]) {
+        await rollbackAndRelease();
+        return null;
+      }
+    }
+
+    let threadAgentId: string | null = null;
+    let threadGeneration: number | null = null;
+    if (input.agentThreadId) {
+      const thread = await client.query<{ id: string; agent_id: string; ownership_generation: number }>(
+        "SELECT id, agent_id, ownership_generation FROM agent_threads WHERE id = $1 FOR UPDATE",
+        [input.agentThreadId]
+      );
+      threadAgentId = thread.rows[0]?.agent_id ?? null;
+      threadGeneration = thread.rows[0]?.ownership_generation ?? null;
+      if (!thread.rows[0]) {
+        await rollbackAndRelease();
+        return null;
+      }
+    }
+
+    const runTable = input.kind === "worker" ? "task_runs" : "dispatcher_runs";
+    const run = await client.query<{
+      id: string;
+      status: string;
+      task_id: string | null;
+      agent_thread_id: string | null;
+      agent_thread_generation: number;
+    }>(
+      `SELECT id, status, task_id, agent_thread_id, agent_thread_generation
+       FROM ${runTable}
+       WHERE id = $1
+       FOR UPDATE`,
+      [input.runId]
+    );
+    const row = run.rows[0];
+    const ownsCurrentRows = Boolean(
+      row &&
+        row.status === "running" &&
+        row.task_id === input.taskId &&
+        row.agent_thread_id === input.agentThreadId &&
+        (!input.taskId || taskAgentId === input.agentId) &&
+        (!input.agentThreadId ||
+          (threadAgentId === input.agentId &&
+            threadGeneration === input.agentThreadGeneration &&
+            row.agent_thread_generation === input.agentThreadGeneration))
+    );
+    if (!ownsCurrentRows) {
+      await rollbackAndRelease();
+      return null;
+    }
+
+    let released = false;
+    return async (): Promise<void> => {
+      if (released) return;
+      released = true;
+      try {
+        await client.query("COMMIT");
+        transactionOpen = false;
+      } catch (error) {
+        await client.query("ROLLBACK").catch(() => undefined);
+        transactionOpen = false;
+        throw error;
+      } finally {
+        client.release();
+      }
+    };
+  } catch (error) {
+    await rollbackAndRelease();
+    throw error;
+  }
 }
 
 async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<void> {

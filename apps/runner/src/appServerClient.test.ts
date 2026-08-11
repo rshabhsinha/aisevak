@@ -177,7 +177,7 @@ describe("persistent Codex app-server", () => {
       ...turnOptions(fixture, "ownership-changed"),
       onBeforeTurnStart: async () => {
         checks += 1;
-        return false;
+        return null;
       }
     });
 

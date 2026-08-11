@@ -1,6 +1,7 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import {
+  acquireRunLaunchFence,
   dispatcherRunStillOwned,
   processOneDispatcherRun,
   processOneRunJob,
@@ -134,5 +135,54 @@ describe("bounded runner execution", () => {
     expect(queries[1]?.sql).toContain("task_runs.status = 'running'");
     expect(queries[1]?.sql).toContain("tasks.agent_id = $2");
     expect(queries[1]?.sql).toContain("agent_threads.ownership_generation = $4");
+  });
+
+  it("holds task and thread locks through the provider turn/start write", async () => {
+    const queries: string[] = [];
+    const client = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql === "BEGIN" || sql === "COMMIT" || sql === "ROLLBACK") return { rows: [] };
+        if (sql.includes("FROM tasks") && sql.includes("FOR UPDATE")) {
+          return { rows: [{ id: "task-id", agent_id: "agent-id" }] };
+        }
+        if (sql.includes("FROM agent_threads") && sql.includes("FOR UPDATE")) {
+          return { rows: [{ id: "thread-id", agent_id: "agent-id", ownership_generation: 7 }] };
+        }
+        if (sql.includes("FROM task_runs") && sql.includes("FOR UPDATE")) {
+          return {
+            rows: [{
+              id: "run-id",
+              status: "running",
+              task_id: "task-id",
+              agent_thread_id: "thread-id",
+              agent_thread_generation: 7
+            }]
+          };
+        }
+        throw new Error(`Unexpected query: ${sql}`);
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+
+    const release = await acquireRunLaunchFence(pool, {
+      kind: "worker",
+      runId: "run-id",
+      taskId: "task-id",
+      agentThreadId: "thread-id",
+      agentThreadGeneration: 7,
+      agentId: "agent-id"
+    });
+
+    expect(release).toBeTypeOf("function");
+    expect(queries.findIndex((sql) => sql.includes("FROM tasks"))).toBeLessThan(
+      queries.findIndex((sql) => sql.includes("FROM agent_threads"))
+    );
+    expect(queries.findIndex((sql) => sql.includes("FROM agent_threads"))).toBeLessThan(
+      queries.findIndex((sql) => sql.includes("FROM task_runs"))
+    );
+    await release?.();
+    expect(queries.at(-1)).toBe("COMMIT");
   });
 });

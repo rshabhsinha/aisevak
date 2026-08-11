@@ -38,10 +38,11 @@ export interface AppServerTurnOptions {
   onLine: (line: string, seq: number) => Promise<void>;
   onThreadId: (threadId: string) => Promise<void>;
   /**
-   * Revalidate the run immediately before the provider turn is sent. Returning
-   * false keeps a stale ownership generation from presenting its prompt.
+   * Acquire a short-lived ownership fence immediately before the provider turn
+   * is sent. The returned release function runs after the request is written.
+   * Returning null keeps a stale ownership generation from presenting its prompt.
    */
-  onBeforeTurnStart?: () => Promise<boolean>;
+  onBeforeTurnStart?: () => Promise<(() => Promise<void>) | null>;
   onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
   nextInput?: () => Promise<AppServerTurnInput | null>;
@@ -224,7 +225,8 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
-      if (options.onBeforeTurnStart && !(await options.onBeforeTurnStart())) {
+      const releaseTurnStartFence = await options.onBeforeTurnStart?.();
+      if (options.onBeforeTurnStart && !releaseTurnStartFence) {
         return {
           status: "interrupted",
           threadId: state.threadId,
@@ -237,18 +239,23 @@ class PersistentAppServer {
         };
       }
 
-      const turnRequest = this.request("turn/start", {
-        threadId: state.threadId,
-        input: [{ type: "text", text: options.prompt, text_elements: [] }],
-        cwd: options.cwd,
-        model: explicitModel(options.model),
-        ...(stringModelOption(options.modelOptions, "reasoningEffort")
-          ? { effort: stringModelOption(options.modelOptions, "reasoningEffort") }
-          : {}),
-        approvalPolicy: "never",
-        sandboxPolicy: { type: "dangerFullAccess" }
-      });
-      state.promptMayHaveBeenPresented = true;
+      let turnRequest: Promise<Record<string, unknown>>;
+      try {
+        turnRequest = this.request("turn/start", {
+          threadId: state.threadId,
+          input: [{ type: "text", text: options.prompt, text_elements: [] }],
+          cwd: options.cwd,
+          model: explicitModel(options.model),
+          ...(stringModelOption(options.modelOptions, "reasoningEffort")
+            ? { effort: stringModelOption(options.modelOptions, "reasoningEffort") }
+            : {}),
+          approvalPolicy: "never",
+          sandboxPolicy: { type: "dangerFullAccess" }
+        });
+        state.promptMayHaveBeenPresented = true;
+      } finally {
+        await releaseTurnStartFence?.();
+      }
       let turnResponse: Record<string, unknown>;
       try {
         turnResponse = await turnRequest;
