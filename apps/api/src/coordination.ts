@@ -1448,7 +1448,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     `INSERT INTO dispatcher_runs
        (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
         codex_thread_id, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13)
+     VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13, $14)
      RETURNING id`,
     [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "",
       workspaceMode,

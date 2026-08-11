@@ -57,7 +57,8 @@ else
 fi
 
 log "Creating directories"
-mkdir -p "${APP_DIR}" "${RELEASES_DIR}" "${BACKUP_DIR}"
+install -d -o root -g "${RUNNER_USER}" -m 0750 "${APP_DIR}" "${RELEASES_DIR}"
+install -d -o root -g root -m 0700 "${BACKUP_DIR}"
 install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" "${WORKSPACE_DIR}"
 install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/workspaces" \
@@ -491,7 +492,7 @@ prune_releases() {
 }
 
 log "Staging release ${RELEASE_DIR}"
-mkdir -p "${RELEASE_DIR}"
+install -d -o root -g "${RUNNER_USER}" -m 0750 "${RELEASE_DIR}"
 rsync -a --delete \
   --exclude node_modules \
   --exclude dist \
@@ -500,6 +501,11 @@ rsync -a --delete \
   --exclude .env.local \
   --exclude .DS_Store \
   "${SOURCE_DIR}/" "${RELEASE_DIR}/"
+# rsync preserves the source directory ownership and mode. Deployment staging
+# directories are intentionally private, but the host runner must be able to
+# traverse the activated release as its unprivileged service user.
+chown root:"${RUNNER_USER}" "${RELEASE_DIR}"
+chmod 0750 "${RELEASE_DIR}"
 printf "%s\n" "${GIT_SHA}" > "${RELEASE_DIR}/REVISION"
 
 if [[ ! -f "${ENV_FILE}" ]]; then
