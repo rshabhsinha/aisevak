@@ -139,11 +139,22 @@ class PersistentAppServer {
       });
     });
 
+    this.child.stdin.on("error", (error) => {
+      this.quarantine(error);
+    });
+
     this.child.stdout.on("data", (chunk) => {
       this.stdoutBuffer += String(chunk);
       const lines = this.stdoutBuffer.split(/\r?\n/);
       this.stdoutBuffer = lines.pop() ?? "";
-      for (const line of lines) this.handleLine(line);
+      for (const line of lines) {
+        try {
+          this.handleLine(line);
+        } catch (error) {
+          this.quarantine(error);
+          break;
+        }
+      }
     });
     this.child.stderr.on("data", (chunk) => {
       this.rawStderr += redactText(String(chunk), [...this.redactionSecrets]);
@@ -545,6 +556,13 @@ class PersistentAppServer {
 
   private rejectPending(error: Error): void {
     for (const id of [...this.pending.keys()]) this.rejectOne(id, error);
+  }
+
+  private quarantine(error: unknown): void {
+    if (this.closed) return;
+    const reason = error instanceof Error ? error : new Error(String(error));
+    this.rejectPending(reason);
+    void this.close().catch(() => undefined);
   }
 
   private addSecrets(secrets: Array<string | null | undefined>): void {

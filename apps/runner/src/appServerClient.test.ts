@@ -188,8 +188,10 @@ describe("persistent Codex app-server", () => {
 
   it("replaces the provider session when the post-launch ownership fence fails", async () => {
     const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "wait-for-steer");
+    options.env.FAKE_REQUEST_ON_SIGTERM = "1";
     const first = await runCodexAppServerTurn({
-      ...turnOptions(fixture, "wait-for-steer"),
+      ...options,
       onBeforeTurnStart: async () => async () => {
         throw new Error("ownership fence commit failed");
       }
@@ -219,6 +221,22 @@ describe("persistent Codex app-server", () => {
     expect(result.promptMayHaveBeenPresented).toBe(false);
     expect(result.error).toMatch(/stdin is closed|app-server exited/);
   });
+
+  it("quarantines asynchronous provider stdin failures", async () => {
+    const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "write-after-stdin-close");
+    options.env.FAKE_CLOSE_STDIN_AFTER_THREAD_START = "1";
+    options.onThreadId = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    };
+
+    const first = await runCodexAppServerTurn(options);
+    const second = await runCodexAppServerTurn(turnOptions(fixture, "second", first.threadId));
+
+    expect(first.status).toBe("failed");
+    expect(second.status).toBe("completed");
+    expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
+  });
 });
 
 interface FakeFixture {
@@ -240,6 +258,13 @@ const readline = require("node:readline");
 fs.appendFileSync(process.env.FAKE_STARTS_FILE, process.pid + "\\n");
 let turn = 0;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+process.on("SIGTERM", () => {
+  if (process.env.FAKE_REQUEST_ON_SIGTERM === "1") {
+    send({ id: "late-approval", method: "item/commandExecution/requestApproval", params: {} });
+    return setTimeout(() => process.exit(0), 10);
+  }
+  process.exit(0);
+});
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialized") return;
@@ -254,6 +279,10 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     send({ id: message.id, result: { thread: { id: message.params.threadId || "thread-1" } } });
     if (message.method === "thread/start" && process.env.FAKE_EXIT_AFTER_THREAD_START === "1") {
       setTimeout(() => process.exit(0), 10);
+    }
+    if (message.method === "thread/start" && process.env.FAKE_CLOSE_STDIN_AFTER_THREAD_START === "1") {
+      setInterval(() => {}, 1000);
+      setTimeout(() => process.stdin.destroy(), 10);
     }
     return;
   }
