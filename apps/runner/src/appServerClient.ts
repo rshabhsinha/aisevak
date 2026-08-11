@@ -37,6 +37,11 @@ export interface AppServerTurnOptions {
   secrets: Array<string | null | undefined>;
   onLine: (line: string, seq: number) => Promise<void>;
   onThreadId: (threadId: string) => Promise<void>;
+  /**
+   * Revalidate the run immediately before the provider turn is sent. Returning
+   * false keeps a stale ownership generation from presenting its prompt.
+   */
+  onBeforeTurnStart?: () => Promise<boolean>;
   onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
   nextInput?: () => Promise<AppServerTurnInput | null>;
@@ -218,6 +223,19 @@ class PersistentAppServer {
       if (!state.threadId) throw new Error("app-server did not return a thread id");
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
+
+      if (options.onBeforeTurnStart && !(await options.onBeforeTurnStart())) {
+        return {
+          status: "interrupted",
+          threadId: state.threadId,
+          turnId: null,
+          rawStdout: state.rawStdout,
+          rawStderr: this.rawStderr.slice(state.stderrStart),
+          exitCode: null,
+          error: "provider turn cancelled because run ownership changed before launch",
+          promptMayHaveBeenPresented: false
+        };
+      }
 
       const turnRequest = this.request("turn/start", {
         threadId: state.threadId,

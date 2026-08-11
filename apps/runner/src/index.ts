@@ -1183,6 +1183,7 @@ export async function processOneDispatcherRun(
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
   let promptMayHaveBeenPresented = false;
+  let ownershipLost = false;
 
   try {
     await mkdir(job.codex_home, { recursive: true });
@@ -1190,6 +1191,12 @@ export async function processOneDispatcherRun(
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
+    if (!(await dispatcherRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const toolToken = await createAgentToolToken(pool, {
       role: job.agent_kind ?? "dispatcher",
       dispatcherRunId: job.id,
@@ -1199,6 +1206,12 @@ export async function processOneDispatcherRun(
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
+    if (!(await dispatcherRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const turn = await runTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
@@ -1242,6 +1255,11 @@ export async function processOneDispatcherRun(
             [job.agent_thread_id, threadId, job.agent_thread_generation]
           );
         }
+      },
+      onBeforeTurnStart: async () => {
+        const owned = await dispatcherRunStillOwned(pool, job);
+        ownershipLost ||= !owned;
+        return owned;
       },
       onTurnAccepted: async () => {
         if (!job.message_delivery_id) return;
@@ -1296,8 +1314,9 @@ export async function processOneDispatcherRun(
       }
     }
     exitCode = turn.exitCode;
-    finalStatus =
-      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    finalStatus = ownershipLost
+      ? "cancelled"
+      : turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
     if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
@@ -1327,6 +1346,31 @@ export async function processOneDispatcherRun(
     }
   }
   return true;
+}
+
+export async function dispatcherRunStillOwned(
+  pool: DbPool,
+  job: Pick<DispatcherJob, "id" | "agent_thread_id" | "agent_thread_generation" | "task_id" | "agent_id">
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT dispatcher_runs.id
+     FROM dispatcher_runs
+     LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+     WHERE dispatcher_runs.id = $1
+       AND dispatcher_runs.status = 'running'
+       AND (dispatcher_runs.task_id IS NULL OR tasks.agent_id = $2)
+       AND (
+         dispatcher_runs.agent_thread_id IS NULL
+         OR (
+           dispatcher_runs.agent_thread_id = $3
+           AND dispatcher_runs.agent_thread_generation = $4
+           AND agent_threads.ownership_generation = $4
+         )
+       )`,
+    [job.id, job.agent_id, job.agent_thread_id, job.agent_thread_generation]
+  );
+  return Boolean(result.rows[0]);
 }
 
 export async function processOneRunJob(pool: DbPool): Promise<boolean> {
@@ -1372,6 +1416,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  let ownershipLost = false;
 
   try {
     const cwd = await prepareWorkspace(pool, job);
@@ -1384,6 +1429,12 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth = await materializeCodexAuth(pool, job.codex_home);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
+    if (!(await workerRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const toolToken = await createAgentToolToken(pool, {
       role: "worker",
       taskRunId: job.id,
@@ -1393,6 +1444,12 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       coordinationThreadId: job.coordination_thread_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
+    if (!(await workerRunStillOwned(pool, job))) {
+      ownershipLost = true;
+      finalStatus = "cancelled";
+      stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      return true;
+    }
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd,
@@ -1431,6 +1488,11 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             [job.agent_thread_id, threadId, job.agent_thread_generation]
           );
         }
+      },
+      onBeforeTurnStart: async () => {
+        const owned = await workerRunStillOwned(pool, job);
+        ownershipLost ||= !owned;
+        return owned;
       },
       shouldCancel: async () => {
         const current = await pool.query<{
@@ -1475,8 +1537,9 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       }
     }
     exitCode = turn.exitCode;
-    finalStatus =
-      turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
+    finalStatus = ownershipLost
+      ? "cancelled"
+      : turn.status === "interrupted" ? "cancelled" : turn.status === "completed" ? "succeeded" : "failed";
     if (turn.error) stderr += `\n${turn.error}`;
   } catch (error) {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
@@ -1496,6 +1559,31 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
   }
   return true;
+}
+
+export async function workerRunStillOwned(
+  pool: DbPool,
+  job: Pick<RunJob, "id" | "agent_id" | "agent_thread_id" | "agent_thread_generation">
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT task_runs.id
+     FROM task_runs
+     JOIN tasks ON tasks.id = task_runs.task_id
+     LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+     WHERE task_runs.id = $1
+       AND task_runs.status = 'running'
+       AND tasks.agent_id = $2
+       AND (
+         task_runs.agent_thread_id IS NULL
+         OR (
+           task_runs.agent_thread_id = $3
+           AND task_runs.agent_thread_generation = $4
+           AND agent_threads.ownership_generation = $4
+         )
+       )`,
+    [job.id, job.agent_id, job.agent_thread_id, job.agent_thread_generation]
+  );
+  return Boolean(result.rows[0]);
 }
 
 async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<void> {

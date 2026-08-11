@@ -1,6 +1,13 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { processOneDispatcherRun, processOneRunJob, startAvailableRunJobs, waitForRunJobs } from "./index.js";
+import {
+  dispatcherRunStillOwned,
+  processOneDispatcherRun,
+  processOneRunJob,
+  startAvailableRunJobs,
+  waitForRunJobs,
+  workerRunStillOwned
+} from "./index.js";
 
 interface Deferred {
   promise: Promise<void>;
@@ -97,5 +104,35 @@ describe("bounded runner execution", () => {
     expect(dispatcherClaim).toContain("candidate.agent_thread_generation = candidate_thread.ownership_generation");
     expect(workerClaim).toContain("candidate.agent_thread_generation = candidate_thread.ownership_generation");
 
+  });
+
+  it("revalidates the run and task ownership immediately before provider launch", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const pool = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        return { rows: [{ id: "still-owned" }] };
+      }
+    } as unknown as DbPool;
+
+    await expect(dispatcherRunStillOwned(pool, {
+      id: "dispatcher-run",
+      agent_thread_id: "thread-id",
+      agent_thread_generation: 7,
+      task_id: null,
+      agent_id: "agent-id"
+    })).resolves.toBe(true);
+    await expect(workerRunStillOwned(pool, {
+      id: "worker-run",
+      agent_thread_id: "thread-id",
+      agent_thread_generation: 7,
+      agent_id: "agent-id"
+    })).resolves.toBe(true);
+
+    expect(queries[0]?.sql).toContain("dispatcher_runs.status = 'running'");
+    expect(queries[0]?.sql).toContain("agent_threads.ownership_generation = $4");
+    expect(queries[1]?.sql).toContain("task_runs.status = 'running'");
+    expect(queries[1]?.sql).toContain("tasks.agent_id = $2");
+    expect(queries[1]?.sql).toContain("agent_threads.ownership_generation = $4");
   });
 });

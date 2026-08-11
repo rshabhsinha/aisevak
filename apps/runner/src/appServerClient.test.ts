@@ -169,6 +169,22 @@ describe("persistent Codex app-server", () => {
     expect(result.promptMayHaveBeenPresented).toBe(true);
     expect(acceptedCount).toBe(1);
   });
+
+  it("does not send turn/start after the ownership gate rejects the run", async () => {
+    const fixture = await fakeAppServerFixture();
+    let checks = 0;
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "ownership-changed"),
+      onBeforeTurnStart: async () => {
+        checks += 1;
+        return false;
+      }
+    });
+
+    expect(result.status).toBe("interrupted");
+    expect(result.promptMayHaveBeenPresented).toBe(false);
+    expect(checks).toBe(1);
+  });
 });
 
 interface FakeFixture {
