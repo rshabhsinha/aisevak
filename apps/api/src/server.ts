@@ -2282,7 +2282,7 @@ interface IncrementalTurnOptions {
   messageDeliveryId?: string;
 }
 
-async function queueIncrementalAgentTurnInput(
+export async function queueIncrementalAgentTurnInput(
   pool: DbPool,
   threadId: string,
   message: string,
@@ -2353,8 +2353,8 @@ async function appendIncrementalAgentTurnInput(
          ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
         [
           threadId,
-          stale.kind === "worker" ? stale.id : null,
-          stale.kind === "dispatcher" ? stale.id : null,
+          turn.kind === "worker" ? turn.id : null,
+          turn.kind === "dispatcher" ? turn.id : null,
           stale.message_delivery_id,
           inputMessage
         ]
