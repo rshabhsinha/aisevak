@@ -185,6 +185,25 @@ describe("persistent Codex app-server", () => {
     expect(result.promptMayHaveBeenPresented).toBe(false);
     expect(checks).toBe(1);
   });
+
+  it("replaces the provider session when the post-launch ownership fence fails", async () => {
+    const fixture = await fakeAppServerFixture();
+    const first = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "wait-for-steer"),
+      onBeforeTurnStart: async () => async () => {
+        throw new Error("ownership fence commit failed");
+      }
+    });
+
+    expect(first.status).toBe("failed");
+    expect(first.error).toBe("ownership fence commit failed");
+    expect(first.promptMayHaveBeenPresented).toBe(true);
+
+    const second = await runCodexAppServerTurn(turnOptions(fixture, "second", first.threadId));
+
+    expect(second.status).toBe("completed");
+    expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
+  });
 });
 
 interface FakeFixture {

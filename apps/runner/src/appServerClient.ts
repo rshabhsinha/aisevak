@@ -253,8 +253,22 @@ class PersistentAppServer {
           sandboxPolicy: { type: "dangerFullAccess" }
         });
         state.promptMayHaveBeenPresented = true;
-      } finally {
-        await releaseTurnStartFence?.();
+        try {
+          await releaseTurnStartFence?.();
+        } catch (error) {
+          // turn/start has already crossed the presentation boundary. If the
+          // ownership fence cannot be released cleanly, the database outcome
+          // is ambiguous and this provider process must never be reused for a
+          // replacement turn.
+          await this.close().catch(() => undefined);
+          await turnRequest.catch(() => undefined);
+          throw error;
+        }
+      } catch (error) {
+        // A synchronous request/write failure still needs to release the
+        // ownership locks, but it has not presented a provider turn.
+        if (!state.promptMayHaveBeenPresented) await releaseTurnStartFence?.();
+        throw error;
       }
       let turnResponse: Record<string, unknown>;
       try {
