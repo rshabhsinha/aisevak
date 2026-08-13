@@ -5,25 +5,31 @@ export interface AgentAvatarCell {
 
 export interface AgentAvatarDescriptor {
   background: string;
-  color: string;
   cells: AgentAvatarCell[];
+  color: string;
   size: number;
 }
 
-const AVATAR_COLORS = [
-  "#ef4444",
-  "#f97316",
-  "#d97706",
-  "#65a30d",
-  "#16a34a",
-  "#0d9488",
-  "#0891b2",
-  "#2563eb",
-  "#4f46e5",
-  "#7c3aed",
-  "#a855f7",
-  "#db2777"
-];
+// Sparse 5x5 glyphs inspired by the ExtraChess identicon set. Each number is
+// one row of the portrait, encoded left-to-right as a five-bit mask.
+const PORTRAIT_PATTERNS = [
+  [0b00100, 0b00100, 0b11111, 0b00100, 0b00100],
+  [0b01000, 0b01000, 0b11111, 0b01000, 0b01000],
+  [0b10101, 0b10101, 0b00100, 0b00100, 0b00100],
+  [0b10001, 0b01010, 0b00100, 0b01010, 0b10001],
+  [0b00100, 0b01010, 0b10001, 0b01010, 0b00100],
+  [0b10001, 0b01010, 0b10001, 0b01010, 0b00100],
+  [0b10101, 0b00100, 0b01110, 0b00100, 0b10101],
+  [0b00001, 0b00010, 0b00100, 0b01000, 0b10000],
+  [0b10000, 0b01000, 0b00100, 0b00010, 0b00001],
+  [0b01010, 0b10001, 0b10001, 0b01010, 0b00100],
+  [0b00100, 0b01110, 0b10101, 0b00100, 0b00100],
+  [0b00100, 0b00100, 0b10101, 0b01110, 0b00100],
+  [0b01110, 0b10001, 0b10000, 0b10001, 0b01110],
+  [0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
+  [0b10001, 0b01010, 0b00100, 0b00100, 0b00100],
+  [0b10001, 0b10001, 0b01010, 0b01010, 0b00100]
+] as const;
 
 function hashSeed(seed: string, salt: number): number {
   let hash = (2166136261 ^ salt) >>> 0;
@@ -34,56 +40,60 @@ function hashSeed(seed: string, salt: number): number {
   return hash;
 }
 
-function uuidBits(agentId: string): number[] | null {
-  const normalized = agentId.replace(/-/g, "").toLowerCase();
-  if (!/^[0-9a-f]{32}$/.test(normalized)) return null;
-
-  return [...normalized].flatMap((character) => {
-    const nibble = Number.parseInt(character, 16);
-    return [3, 2, 1, 0].map((shift) => (nibble >>> shift) & 1);
-  });
+function seedBytes(agentId: string): number[] {
+  const seed = agentId || "unsaved-agent";
+  const bytes: number[] = [];
+  for (let salt = 0; salt < 4; salt += 1) {
+    const hash = hashSeed(seed, 0x9e3779b9 ^ Math.imul(salt + 1, 0x85ebca6b));
+    bytes.push(hash >>> 24, (hash >>> 16) & 0xff, (hash >>> 8) & 0xff, hash & 0xff);
+  }
+  return bytes;
 }
 
-/**
- * Produces a stable, ExtraChess-style pixel identicon for an agent.
- * Every bit of a UUID is encoded into a mirrored 16x16 bitmap. Because the
- * mapping is lossless, two distinct persisted agent ids cannot render the
- * same profile picture. No remote avatar service is required.
- */
-export function describeAgentAvatar(agentId: string): AgentAvatarDescriptor {
-  const seed = agentId || "unsaved-agent";
-  const colorHash = hashSeed(seed, 0x9e3779b9);
-  const backgroundHash = hashSeed(seed, 0x85ebca6b);
-  const cells: AgentAvatarCell[] = [];
-  const bits = uuidBits(agentId);
-  const size = bits ? 16 : 5;
+function vividColor(first: number, second: number, third: number): string {
+  const hue = ((((first << 8) | second) * 360) / 65_536).toFixed(3);
+  const saturation = 58 + (third >>> 4);
+  // Keep every hue dark enough to remain legible against the pale background.
+  // Highly saturated yellows have much higher perceived luminance than other
+  // hues at the same HSL lightness, so the narrow 18-21% range is deliberate.
+  const lightness = 18 + (third & 0x03);
+  return `hsl(${hue} ${saturation}% ${lightness}%)`;
+}
 
-  if (bits) {
-    // Encode 128 UUID bits down the left half, then mirror the bitmap.
-    for (let index = 0; index < bits.length; index += 1) {
-      if (bits[index] === 0) continue;
-      const x = index % 8;
-      const y = Math.floor(index / 8);
-      cells.push({ x, y }, { x: 15 - x, y });
-    }
-  } else {
-    // Unsaved agent drafts do not have a UUID yet, so render a stable preview.
-    for (let y = 0; y < 5; y += 1) {
-      const rowHash = hashSeed(seed, 0xc2b2ae35 ^ y);
-      for (let x = 0; x < 3; x += 1) {
-        if (((rowHash >>> (x * 7)) & 1) === 0) continue;
-        cells.push({ x, y });
-        if (x !== 2) cells.push({ x: 4 - x, y });
-      }
+function softBackground(first: number, second: number, third: number): string {
+  const hue = ((((first << 8) | second) * 360) / 65_536).toFixed(3);
+  const saturation = 16 + (third >>> 4);
+  const lightness = (88 + (third & 0x0f) * 0.35).toFixed(2);
+  return `hsl(${hue} ${saturation}% ${lightness}%)`;
+}
+
+function portraitCells(pattern: number): AgentAvatarCell[] {
+  const cells: AgentAvatarCell[] = [];
+  const rows = PORTRAIT_PATTERNS[pattern >>> 4]!;
+
+  for (let y = 0; y < rows.length; y += 1) {
+    for (let x = 0; x < 5; x += 1) {
+      if (((rows[y]! >>> (4 - x)) & 1) === 1) cells.push({ x, y });
     }
   }
 
-  if (cells.length === 0) cells.push({ x: 2, y: 2 });
+  return cells;
+}
+
+/**
+ * Produces a stable, sparse profile picture in the style used by ExtraChess:
+ * a simple 5x5 monochrome glyph on a soft background.
+ *
+ * The complete agent id is mixed into the glyph, foreground, and background,
+ * keeping profiles distinct without turning the portrait into a dense bitmap.
+ */
+export function describeAgentAvatar(agentId: string): AgentAvatarDescriptor {
+  const bytes = seedBytes(agentId);
 
   return {
-    color: AVATAR_COLORS[colorHash % AVATAR_COLORS.length]!,
-    background: `hsl(${backgroundHash % 360} 28% 92%)`,
-    cells,
-    size
+    background: softBackground(bytes[3]!, bytes[4]!, bytes[5]!),
+    cells: portraitCells(bytes[6]!),
+    color: vividColor(bytes[0]!, bytes[1]!, bytes[2]!),
+    size: 5
   };
 }

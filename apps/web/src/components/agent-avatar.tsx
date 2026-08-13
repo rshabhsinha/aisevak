@@ -14,20 +14,21 @@ export function AgentAvatar(props: {
       className={cn("agent-avatar", props.className)}
       data-agent-avatar={props.agentId}
       role="img"
-      shapeRendering="crispEdges"
-      viewBox={`0 0 ${avatar.size} ${avatar.size}`}
+      viewBox="0 0 5 5"
     >
-      <rect width={avatar.size} height={avatar.size} fill={avatar.background} />
-      {avatar.cells.map((cell) => (
-        <rect
-          fill={avatar.color}
-          height="1"
-          key={`${cell.x}-${cell.y}`}
-          width="1"
-          x={cell.x}
-          y={cell.y}
-        />
-      ))}
+      <rect width="5" height="5" fill={avatar.background} />
+      <g shapeRendering="crispEdges">
+        {avatar.cells.map((cell) => (
+          <rect
+            fill={avatar.color}
+            height="1"
+            key={`${cell.x}-${cell.y}`}
+            width="1"
+            x={cell.x}
+            y={cell.y}
+          />
+        ))}
+      </g>
     </svg>
   );
 }
