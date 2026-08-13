@@ -53,7 +53,10 @@ function seedBytes(agentId: string): number[] {
 function vividColor(first: number, second: number, third: number): string {
   const hue = ((((first << 8) | second) * 360) / 65_536).toFixed(3);
   const saturation = 58 + (third >>> 4);
-  const lightness = 40 + (third & 0x0f);
+  // Keep every hue dark enough to remain legible against the pale background.
+  // Highly saturated yellows have much higher perceived luminance than other
+  // hues at the same HSL lightness, so the narrow 18-21% range is deliberate.
+  const lightness = 18 + (third & 0x03);
   return `hsl(${hue} ${saturation}% ${lightness}%)`;
 }
 
