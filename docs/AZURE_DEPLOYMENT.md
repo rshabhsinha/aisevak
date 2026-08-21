@@ -131,6 +131,10 @@ After the first deployment, sign in as an owner and open **Manage → ChatGPT**.
 
 ## Common operations
 
+For trusted agents that need AWS resource, CloudWatch, log, or controlled EC2
+access, follow [AWS access for live Aisevak agents](AWS_ACCESS.md). AWS
+credentials remain in `/srv/aisevak/aws` and are never included in releases.
+
 View container state:
 
 ```bash

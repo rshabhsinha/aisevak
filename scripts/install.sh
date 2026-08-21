@@ -64,8 +64,10 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/workspaces" \
   "${WORKSPACE_DIR}/workspaces/github" \
   "${WORKSPACE_DIR}/codex-homes" \
+  "${WORKSPACE_DIR}/aws" \
   "${WORKSPACE_DIR}/skills" \
   "${WORKSPACE_DIR}/worktrees"
+chmod 0700 "${WORKSPACE_DIR}/aws"
 # Older API releases created Codex homes as root from inside the container.
 # The host-native runner is the only process that writes their runtime files.
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/codex-homes"
