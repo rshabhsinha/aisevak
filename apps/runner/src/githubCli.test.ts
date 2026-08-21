@@ -22,13 +22,26 @@ describe("GitHub CLI runtime", () => {
     const value = safeChildEnvironment({
       PATH: "/bin",
       HTTPS_PROXY: "http://proxy.test",
+      AWS_SHARED_CREDENTIALS_FILE: "/srv/aisevak/aws/credentials",
+      AWS_CONFIG_FILE: "/srv/aisevak/aws/config",
+      AWS_PROFILE: "aisevak-reader",
+      AWS_REGION: "us-east-1",
+      AWS_ACCESS_KEY_ID: "must-not-pass",
+      AWS_SECRET_ACCESS_KEY: "must-not-pass",
       DATABASE_URL: "postgres://secret",
       SECRET_KEY: "encryption-key",
       COOKIE_SECRET: "cookie-key",
       OPENAI_API_KEY: "openai-key"
     });
 
-    expect(value).toEqual({ PATH: "/bin", HTTPS_PROXY: "http://proxy.test" });
+    expect(value).toEqual({
+      PATH: "/bin",
+      HTTPS_PROXY: "http://proxy.test",
+      AWS_SHARED_CREDENTIALS_FILE: "/srv/aisevak/aws/credentials",
+      AWS_CONFIG_FILE: "/srv/aisevak/aws/config",
+      AWS_PROFILE: "aisevak-reader",
+      AWS_REGION: "us-east-1"
+    });
   });
 
   it("parses every paginated repository response", () => {
