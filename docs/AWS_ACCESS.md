@@ -14,7 +14,7 @@ This document contains no credentials, account IDs, VM addresses, or instance ID
 
 An operating-system shell is not read-only. An agent using `embedr-ec2-shell` can alter the selected VM. Use that profile only when host-level investigation is necessary.
 
-Agents run with unrestricted host access as the `aisevak` service user. Passing credential-file paths instead of secret environment variables prevents accidental environment dumps, but a trusted agent can still read the credential file. This is an intentional trust boundary of the live Aisevak VM.
+Agents run with unrestricted host access as the `aisevak` service user. Passing credential-file paths instead of secret environment variables prevents accidental environment dumps, but a trusted agent can still read the credential file. This is an intentional trust boundary of the live Aisevak VM. The API container is a separate, unprivileged trust boundary: it receives only the shared skills directory and never mounts `/srv/aisevak/aws`, workspaces, Codex homes, or runner state.
 
 ## Connect to the live AWS VM
 
@@ -147,6 +147,8 @@ The first command should identify `aisevak-observability-reader`. The resource a
 Before starting a shell, list and manually review eligible nodes:
 
 ```bash
+AWS_SHARED_CREDENTIALS_FILE=/srv/aisevak/aws/credentials \
+AWS_CONFIG_FILE=/srv/aisevak/aws/config \
 AWS_PROFILE=aisevak-reader aws ec2 describe-instances \
   --region us-east-1 \
   --filters Name=tag:Name,Values=embedr-prod-shared-worker,embedr-newsletter Name=instance-state-name,Values=running \
@@ -156,6 +158,8 @@ AWS_PROFILE=aisevak-reader aws ec2 describe-instances \
 Then use the separate role profile with the reviewed target:
 
 ```bash
+AWS_SHARED_CREDENTIALS_FILE=/srv/aisevak/aws/credentials \
+AWS_CONFIG_FILE=/srv/aisevak/aws/config \
 AWS_PROFILE=embedr-ec2-shell aws ssm start-session \
   --region us-east-1 \
   --target '<reviewed-instance-id>' \

@@ -42,7 +42,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
 import { AgentAvatar } from "./components/agent-avatar";
-import { AgentOrb, ThinkingReasoning, FileDiff } from "./components/aicss";
+import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
@@ -881,6 +881,18 @@ export function App() {
           </div>
 
           <div className="sidebar-agent-runs">
+            {view === "runs" ? (
+              <div className="sidebar-thread-search">
+                <Search size={12} />
+                <input
+                  value={query}
+                  placeholder="Search tasks"
+                  aria-label="Search agent tasks"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+            ) : null}
+
             {draftThread && view === "runs" ? (
               <button
                 type="button"
@@ -897,7 +909,7 @@ export function App() {
               </button>
             ) : null}
 
-            {agentThreads.slice(0, 15).map((thread) => {
+            {(view === "runs" ? filteredThreads : agentThreads).map((thread) => {
               const isSelected = view === "runs" && selectedThreadId === thread.id;
               return (
                 <button
@@ -918,18 +930,36 @@ export function App() {
                   <div className="sidebar-run-copy">
                     <span className="sidebar-run-title">{thread.title || "Untitled task"}</span>
                     <span className="sidebar-run-meta">
-                      {thread.agent_name || formatSidebarRunTime(thread.last_activity_at)}
+                      <span className="sidebar-run-agent truncate">{thread.agent_name || "Agent"}</span>
+                      <span className="sidebar-run-dot">·</span>
+                      <span className="sidebar-run-time shrink-0">{formatSidebarRunTime(thread.last_activity_at)}</span>
                     </span>
                   </div>
                   {isActiveRun(thread.latest_status) ? (
-                    <Loader2 className="spin text-primary shrink-0" size={11} />
+                    <DotMatrixLoader size={11} className="text-primary shrink-0" />
                   ) : null}
                 </button>
               );
             })}
 
-            {agentThreads.length === 0 && !draftThread ? (
-              <div className="sidebar-runs-empty">No threads yet</div>
+            {(view === "runs" ? filteredThreads : agentThreads).length === 0 && !draftThread ? (
+              <div className="sidebar-runs-empty">
+                {view === "runs" && query ? "No matching threads" : "No threads yet"}
+              </div>
+            ) : null}
+
+            {nextThreadCursor ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="agent-thread-load-more"
+                disabled={loadingOlderThreads}
+                onClick={() => void loadOlderAgentThreads()}
+              >
+                {loadingOlderThreads ? <Loader2 className="spin" size={12} /> : <ChevronDown size={12} />}
+                Load older threads
+              </Button>
             ) : null}
           </div>
         </nav>
@@ -1211,36 +1241,64 @@ function ActivityView(props: { reports: ActivityReport[]; onOpenThread: (threadI
       <div className="resource-card-list">
         {props.reports.map((report) => (
           <article className="resource-card" key={report.id}>
-            <div className="resource-card-header">
-              <div className="resource-card-heading">
-                <div className="resource-card-badges">
-                  <span className="task-key">REPORT-{report.number}</span>
-                  <TaskStatus status={report.status} />
+            <div className="agent-report-author-bar">
+              <div className="agent-report-author-info">
+                <AgentAvatar
+                  agentId={report.author_agent_id || "default"}
+                  agentName={report.author_agent_name || "Agent"}
+                  className="agent-report-avatar"
+                />
+                <div className="agent-report-author-text">
+                  <div className="agent-report-author-name-row">
+                    <strong>{report.author_agent_name || "Agent"}</strong>
+                    {report.project_name ? <span className="agent-report-project">{report.project_name}</span> : null}
+                    {report.agent_thread_id ? (
+                      <button
+                        type="button"
+                        className="agent-report-thread-chip"
+                        onClick={() => props.onOpenThread(report.agent_thread_id!)}
+                      >
+                        Thread #{report.thread_number ?? ""}
+                        <ChevronRight size={10} />
+                      </button>
+                    ) : null}
+                  </div>
+                  <span className="agent-report-time">{formatDateTime(report.updated_at)}</span>
                 </div>
-                <h3>{report.title}</h3>
-                {report.description ? <p>{report.description}</p> : null}
               </div>
-              <span className="resource-card-time">{formatDateTime(report.updated_at)}</span>
+
+              <div className="agent-report-badges">
+                <span className="task-key">REPORT-{report.number}</span>
+                <TaskStatus status={report.status} />
+              </div>
             </div>
 
-            <div className="resource-card-meta">
-              <ResourceAgentIdentity
-                agentId={report.author_agent_id}
-                agentName={report.author_agent_name}
-                fallback="Agent unavailable"
-                prefix="By "
-              />
-              {report.project_name ? <span>{report.project_name}</span> : null}
-              <span>v{report.current_revision}</span>
-              <ResourceThreadLink
-                agentThreadId={report.agent_thread_id}
-                threadNumber={report.thread_number}
-                onOpenThread={props.onOpenThread}
-              />
+            <div className="agent-report-content">
+              <h3 className="agent-report-title">{report.title}</h3>
+              {report.description && report.description !== report.title ? (
+                <p className="agent-report-summary">{report.description}</p>
+              ) : null}
+
+              {report.markdown ? (
+                <div className="agent-report-body">
+                  <CollapsibleText text={cleanReportMarkdown(report.markdown, report.title)} />
+                </div>
+              ) : null}
             </div>
 
-            <div className="resource-card-markdown">
-              <CollapsibleText text={report.markdown} />
+            <div className="agent-report-footer">
+              <span className="agent-report-version">Revision v{report.current_revision}</span>
+              {report.agent_thread_id ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="agent-report-open-btn"
+                  onClick={() => props.onOpenThread(report.agent_thread_id!)}
+                >
+                  <span>View Thread</span>
+                  <ChevronRight size={12} />
+                </Button>
+              ) : null}
             </div>
           </article>
         ))}
@@ -1269,47 +1327,71 @@ function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: 
       <div className="resource-card-list">
         {props.incidents.map((incident) => (
           <article className={`resource-card incident severity-${incident.severity}`} key={incident.id}>
-            <div className="resource-card-header">
-              <div className="resource-card-heading">
-                <div className="resource-card-badges">
-                  <span className="task-key">INC-{incident.number}</span>
-                  <Badge variant={incidentSeverityVariant(incident.severity)} className="font-mono text-[10.5px] uppercase tracking-wide">{incident.severity}</Badge>
-                  <TaskStatus status={incident.status} />
-                </div>
-                <h3>{incident.title}</h3>
-                {incident.description ? <p>{incident.description}</p> : null}
-              </div>
-              <span className="resource-card-time">{formatDateTime(incident.updated_at)}</span>
-            </div>
-
-            <div className="resource-card-meta">
-              <ResourceAgentIdentity
-                agentId={incident.created_by_agent_id}
-                agentName={incident.created_by_agent_name}
-                fallback="Reporter unavailable"
-                prefix="Reported by "
-              />
-              {incident.commander_agent_name ? (
-                <ResourceAgentIdentity
-                  agentId={incident.commander_agent_id}
-                  agentName={incident.commander_agent_name}
-                  fallback="Owner unavailable"
-                  prefix="Owner "
+            <div className="agent-report-author-bar">
+              <div className="agent-report-author-info">
+                <AgentAvatar
+                  agentId={incident.created_by_agent_id || "default"}
+                  agentName={incident.created_by_agent_name || "Agent"}
+                  className="agent-report-avatar"
                 />
-              ) : null}
-              {incident.project_name ? <span>{incident.project_name}</span> : null}
-              <ResourceThreadLink
-                agentThreadId={incident.agent_thread_id}
-                threadNumber={incident.thread_number}
-                onOpenThread={props.onOpenThread}
-              />
+                <div className="agent-report-author-text">
+                  <div className="agent-report-author-name-row">
+                    <strong>{incident.created_by_agent_name || "Reporter"}</strong>
+                    {incident.commander_agent_name ? (
+                      <span className="agent-report-commander">Lead: {incident.commander_agent_name}</span>
+                    ) : null}
+                    {incident.project_name ? <span className="agent-report-project">{incident.project_name}</span> : null}
+                    {incident.agent_thread_id ? (
+                      <button
+                        type="button"
+                        className="agent-report-thread-chip"
+                        onClick={() => props.onOpenThread(incident.agent_thread_id!)}
+                      >
+                        Thread #{incident.thread_number ?? ""}
+                        <ChevronRight size={10} />
+                      </button>
+                    ) : null}
+                  </div>
+                  <span className="agent-report-time">{formatDateTime(incident.updated_at)}</span>
+                </div>
+              </div>
+
+              <div className="agent-report-badges">
+                <span className="task-key">INC-{incident.number}</span>
+                <Badge variant={incidentSeverityVariant(incident.severity)} className="text-[10.5px] uppercase tracking-wide font-medium">
+                  {incident.severity}
+                </Badge>
+                <TaskStatus status={incident.status} />
+              </div>
             </div>
 
-            {incident.markdown ? (
-              <div className="resource-card-markdown">
-                <CollapsibleText text={incident.markdown} />
-              </div>
-            ) : null}
+            <div className="agent-report-content">
+              <h3 className="agent-report-title">{incident.title}</h3>
+              {incident.description && incident.description !== incident.title ? (
+                <p className="agent-report-summary">{incident.description}</p>
+              ) : null}
+
+              {incident.markdown ? (
+                <div className="agent-report-body">
+                  <CollapsibleText text={cleanReportMarkdown(incident.markdown, incident.title)} />
+                </div>
+              ) : null}
+            </div>
+
+            <div className="agent-report-footer">
+              <span className="agent-report-version">Incident status: {incident.status}</span>
+              {incident.agent_thread_id ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="agent-report-open-btn"
+                  onClick={() => props.onOpenThread(incident.agent_thread_id!)}
+                >
+                  <span>Investigation Thread</span>
+                  <ChevronRight size={12} />
+                </Button>
+              ) : null}
+            </div>
           </article>
         ))}
         {props.incidents.length === 0 ? (
@@ -1322,7 +1404,7 @@ function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: 
       </div>
     </div>
   );
-}
+};
 
 function ResourceAgentIdentity(props: {
   agentId: string | null;
@@ -1821,6 +1903,11 @@ function SchedulesView(props: {
     schedule?: Schedule;
     thread?: AgentThread;
   } | null>(null);
+  const [calendarOverflow, setCalendarOverflow] = useState<{
+    date: Date;
+    schedules: Schedule[];
+    threads: AgentThread[];
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -2038,13 +2125,7 @@ function SchedulesView(props: {
                       <button
                         type="button"
                         className="calendar-more-events"
-                        onClick={() => {
-                          if (daySchedules[0]) {
-                            setSelectedEventDetails({ type: "schedule", schedule: daySchedules[0] });
-                          } else if (dayThreads[0]) {
-                            void props.onOpenThread(dayThreads[0].id);
-                          }
-                        }}
+                        onClick={() => setCalendarOverflow({ date, schedules: daySchedules, threads: dayThreads })}
                       >
                         +{allEventsCount - maxDisplay} more
                       </button>
@@ -2151,6 +2232,76 @@ function SchedulesView(props: {
                 props.onEditingScheduleChange(null);
               }}
             />
+          </div>
+        </div>
+      ) : null}
+
+      {calendarOverflow ? (
+        <div className="calendar-modal-backdrop" onClick={() => setCalendarOverflow(null)}>
+          <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="p-5 flex flex-col gap-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-mono text-muted-foreground uppercase tracking-wider">
+                    Calendar day
+                  </div>
+                  <h3 className="text-[15px] font-semibold text-foreground mt-0.5">
+                    {calendarOverflow.date.toLocaleDateString(undefined, {
+                      weekday: "long",
+                      month: "long",
+                      day: "numeric",
+                      year: "numeric"
+                    })}
+                  </h3>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Close calendar day"
+                  onClick={() => setCalendarOverflow(null)}
+                >
+                  <CircleX size={15} />
+                </Button>
+              </div>
+
+              <div className="calendar-overflow-list">
+                {calendarOverflow.schedules.map((schedule) => (
+                  <button
+                    type="button"
+                    className={`calendar-event-chip scheduled ${!schedule.enabled ? "paused" : ""}`}
+                    key={`schedule-${schedule.id}`}
+                    onClick={() => {
+                      setCalendarOverflow(null);
+                      setSelectedEventDetails({ type: "schedule", schedule });
+                    }}
+                  >
+                    <AgentAvatar agentId={schedule.agent_id} agentName={schedule.agent_name} className="chip-avatar" />
+                    <span className="chip-time">{formatTimestamp(schedule.next_run_at)}</span>
+                    <span className="chip-title">{schedule.title}</span>
+                  </button>
+                ))}
+                {calendarOverflow.threads.map((thread) => (
+                  <button
+                    type="button"
+                    className={`calendar-event-chip ran status-${thread.latest_status ?? "running"}`}
+                    key={`thread-${thread.id}`}
+                    onClick={() => {
+                      setCalendarOverflow(null);
+                      void props.onOpenThread(thread.id);
+                    }}
+                  >
+                    <AgentAvatar
+                      agentId={thread.agent_id || "default"}
+                      agentName={thread.agent_name || "Agent"}
+                      className="chip-avatar"
+                    />
+                    <span className="chip-time">{formatTimestamp(thread.last_activity_at)}</span>
+                    <span className="chip-title">{thread.title || thread.agent_name || "Task"}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
           </div>
         </div>
       ) : null}
@@ -2470,7 +2621,7 @@ function AgentChatsView(props: {
           </div>
         ) : props.detailState.status === "loading" && !hasTimelineData ? (
           <div className="agent-chat-detail-state" aria-busy="true">
-            <Loader2 className="spin" size={18} />
+            <DotMatrixLoader size={20} className="text-primary" />
             <span>Loading thread…</span>
           </div>
         ) : props.detailState.status === "error" && !hasTimelineData ? (
@@ -4163,19 +4314,44 @@ function WorkingTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind:
   );
 }
 
+function cleanReportMarkdown(markdown: string, title?: string): string {
+  if (!markdown) return "";
+  let clean = markdown.trim();
+  if (title) {
+    const cleanTitle = title.replace(/[—–-].*$/, "").trim().toLowerCase();
+    const lines = clean.split("\n");
+    const firstLine = (lines[0] || "").replace(/^#+\s*/, "").trim().toLowerCase();
+    if (firstLine && (firstLine.includes(cleanTitle) || cleanTitle.includes(firstLine))) {
+      clean = lines.slice(1).join("\n").trim();
+    }
+  }
+  return clean;
+}
+
 function CollapsibleText({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
-  const shouldCollapse = text.length > 600 || text.split("\n").length > 8;
+  const shouldCollapse = text.length > 500 || text.split("\n").length > 7;
   const collapsed = shouldCollapse && !expanded;
 
   return (
-    <div>
+    <div className="agent-collapsible-container">
       <div className={`collapsible-message ${collapsed ? "collapsed" : ""}`}>
         <MarkdownContent text={text} plain />
       </div>
       {shouldCollapse ? (
-        <button className="text-button" type="button" onClick={() => setExpanded((value) => !value)}>
-          {expanded ? "Show less" : "Show full message"}
+        <button
+          className="collapsible-toggle-btn"
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span>{expanded ? "Show less" : "Show full report"}</span>
+          <ChevronDown
+            size={12}
+            style={{
+              transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+              transition: "transform 140ms ease"
+            }}
+          />
         </button>
       ) : null}
     </div>
@@ -4352,7 +4528,7 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
 function Splash() {
   return (
     <div className="auth-container">
-      <Loader2 className="spin" size={24} style={{ color: "var(--text-muted)" }} />
+      <DotMatrixLoader size={26} className="text-primary" />
     </div>
   );
 }
@@ -4516,9 +4692,14 @@ function viewTitle(view: View): string {
 function formatSidebarRunTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  const today = new Date();
-  if (date.toDateString() === today.toDateString()) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return "just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24 && date.toDateString() === now.toDateString()) {
+    return `${diffHours}h ago`;
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }

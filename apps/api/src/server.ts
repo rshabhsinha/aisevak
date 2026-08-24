@@ -17,10 +17,10 @@ import {
   resolveCodexBinary,
   removeInstalledSkill,
   normalizeCodexSkillSnapshots,
-  DEFAULT_CODEX_MODEL,
   applyCodexModelDefaults,
   CODEX_HARNESS_MODELS,
   defaultCodexModelOptions,
+  resolveCodexDefaultModel,
   runMigrations,
   serializeCodexSkillSnapshots,
   synchronizeInstalledSkills,
@@ -75,7 +75,7 @@ const env = {
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
-  codexDefaultModel: DEFAULT_CODEX_MODEL,
+  codexDefaultModel: resolveCodexDefaultModel(),
   githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
 const skillsRoot = installedSkillsRoot(env.managedRoot);

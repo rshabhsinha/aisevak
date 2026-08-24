@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
 import { installedSkillsRoot, migrateAndSynchronizeInstalledSkills } from "./installedSkills.js";
-import { DEFAULT_CODEX_MODEL } from "./models.js";
+import { resolveCodexDefaultModel } from "./models.js";
 
 const enumSql = `
 DO $$ BEGIN CREATE TYPE user_role AS ENUM ('owner', 'admin', 'member'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -991,67 +991,6 @@ CREATE TABLE IF NOT EXISTS app_migrations (
   applied_at timestamptz NOT NULL DEFAULT now()
 );
 
-DO $$ BEGIN
-  IF current_setting('aisevak.default_model', true) = 'gpt-5.6-luna'
-     AND NOT EXISTS (
-       SELECT 1 FROM app_migrations WHERE name = '20260809_luna_max_agent_default'
-     ) THEN
-    WITH migrated AS (
-      UPDATE agents
-      SET model = 'gpt-5.6-luna',
-          model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-          updated_at = now()
-      WHERE model IN ('gpt-5.5', 'gpt-5.6-sol')
-        AND model_options = '[]'::jsonb
-      RETURNING id, name, description, model, model_options, instructions
-    )
-    INSERT INTO agent_versions
-      (agent_id, name, description, model, model_options, instructions, created_by)
-    SELECT id, name, description, model, model_options, instructions, NULL
-    FROM migrated;
-
-    INSERT INTO app_migrations (name) VALUES ('20260809_luna_max_agent_default');
-  END IF;
-END $$;
-
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM app_migrations WHERE name = '20260822_luna_max_everywhere'
-  ) THEN
-    UPDATE agents
-    SET model = 'gpt-5.6-luna',
-        model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-        updated_at = now()
-    WHERE model IS DISTINCT FROM 'gpt-5.6-luna'
-       OR model_options IS DISTINCT FROM '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
-
-    UPDATE agent_threads
-    SET model = 'gpt-5.6-luna',
-        model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-        updated_at = now()
-    WHERE model IS DISTINCT FROM 'gpt-5.6-luna'
-       OR model_options IS DISTINCT FROM '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
-
-    UPDATE task_runs
-    SET model = 'gpt-5.6-luna',
-        model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-        updated_at = now()
-    WHERE status IN ('draft', 'queued', 'running', 'cancel_requested')
-      AND (model IS DISTINCT FROM 'gpt-5.6-luna'
-           OR model_options IS DISTINCT FROM '[{"id":"reasoningEffort","value":"max"}]'::jsonb);
-
-    UPDATE dispatcher_runs
-    SET model = 'gpt-5.6-luna',
-        model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-        updated_at = now()
-    WHERE status IN ('draft', 'queued', 'running', 'cancel_requested')
-      AND (model IS DISTINCT FROM 'gpt-5.6-luna'
-           OR model_options IS DISTINCT FROM '[{"id":"reasoningEffort","value":"max"}]'::jsonb);
-
-    INSERT INTO app_migrations (name) VALUES ('20260822_luna_max_everywhere');
-  END IF;
-END $$;
-
 INSERT INTO coordination_threads
   (title, description, purpose, status, project_id, task_id, primary_agent_id, completion_instructions,
    last_activity_at, created_at, updated_at)
@@ -1213,7 +1152,7 @@ WHERE agent_threads.coordination_thread_id = coordination_threads.id
 
 export async function runMigrations(pool: Pool): Promise<void> {
   await pool.query("SELECT set_config('aisevak.default_model', $1, false)", [
-    DEFAULT_CODEX_MODEL
+    resolveCodexDefaultModel()
   ]);
   await pool.query("SELECT set_config('aisevak.managed_root', $1, false)", [
     process.env.MANAGED_ROOT ?? "/srv/aisevak"

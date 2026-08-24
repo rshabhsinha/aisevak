@@ -29,4 +29,9 @@ describe("run snapshot migration", () => {
     expect(sql).toContain("''");
     expect(sql).not.toMatch(/FROM dispatcher_runs[\s\S]*LEFT JOIN tasks ON tasks\.id = dispatcher_runs\.task_id/);
   });
+
+  it("does not rewrite existing model selections during startup", () => {
+    expect(additiveSql).not.toContain("20260822_luna_max_everywhere");
+    expect(additiveSql).not.toContain("UPDATE agent_threads\n    SET model = 'gpt-5.6-luna'");
+  });
 });

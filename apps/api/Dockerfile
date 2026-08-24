@@ -16,5 +16,7 @@ COPY --from=build /app/package.json /app/pnpm-workspace.yaml ./
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/packages/core ./packages/core
 COPY --from=build /app/apps/api ./apps/api
+RUN install -d -o node -g node /srv/aisevak/skills /srv/aisevak/probe-schema
+USER node
 EXPOSE 8787
 CMD ["node", "apps/api/dist/server.js"]

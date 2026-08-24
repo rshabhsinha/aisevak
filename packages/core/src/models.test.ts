@@ -2,7 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   applyCodexModelDefaults,
   defaultCodexModelOptions,
-  normalizeCodexModel
+  normalizeCodexModel,
+  resolveCodexDefaultModel
 } from "./models.js";
 
 describe("Codex model defaults", () => {
@@ -44,5 +45,11 @@ describe("Codex model defaults", () => {
 
   it("provides max reasoning for newly created Luna agents", () => {
     expect(defaultCodexModelOptions()).toEqual([{ id: "reasoningEffort", value: "max" }]);
+  });
+
+  it("accepts a supported configured default and rejects unknown values", () => {
+    expect(resolveCodexDefaultModel("gpt-5.6-terra")).toBe("gpt-5.6-terra");
+    expect(resolveCodexDefaultModel("not-a-model")).toBe("gpt-5.6-luna");
+    expect(resolveCodexDefaultModel("auto")).toBe("gpt-5.6-luna");
   });
 });

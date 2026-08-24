@@ -729,6 +729,38 @@ select:disabled {
   margin-top: 4px;
 }
 
+.sidebar-thread-search {
+  min-height: 28px;
+  border: 1px solid var(--sidebar-border);
+  border-radius: 7px;
+  padding: 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 3px;
+  color: var(--muted-foreground);
+  background: color-mix(in srgb, var(--sidebar-accent) 35%, transparent);
+}
+
+.sidebar-thread-search:focus-within {
+  border-color: var(--ring);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--ring) 20%, transparent);
+}
+
+.sidebar-thread-search input {
+  width: 100%;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--sidebar-foreground);
+  font-size: 11px;
+}
+
+.sidebar-thread-search input::placeholder {
+  color: var(--muted-foreground);
+}
+
 .sidebar-run-item {
   width: 100%;
   min-width: 0;
@@ -831,13 +863,32 @@ select:disabled {
 }
 
 .sidebar-run-meta {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: var(--muted-foreground);
   font-size: 10.5px;
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
+}
+
+.sidebar-run-agent {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sidebar-run-dot {
+  opacity: 0.45;
+  flex-shrink: 0;
+  font-size: 9px;
+}
+
+.sidebar-run-time {
+  opacity: 0.85;
+  flex-shrink: 0;
 }
 
 .sidebar-runs-empty {
@@ -2726,14 +2777,17 @@ select:disabled {
   position: relative;
   border: 1px solid var(--border);
   border-radius: 12px;
-  overflow: hidden;
   background: var(--card);
   box-shadow: var(--shadow-xs);
-  transition: border-color 120ms ease;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
 }
 
 .resource-card:hover {
   border-color: var(--border-strong);
+  box-shadow: var(--shadow-sm);
 }
 
 .resource-card.incident::before {
@@ -2741,9 +2795,10 @@ select:disabled {
   top: 0;
   bottom: 0;
   left: 0;
-  width: 3px;
+  width: 3.5px;
   background: var(--warning);
   content: "";
+  z-index: 1;
 }
 
 .resource-card.incident.severity-high::before,
@@ -2751,111 +2806,184 @@ select:disabled {
   background: var(--destructive);
 }
 
-.resource-card-header {
-  padding: 16px 18px 12px;
+.agent-report-author-bar {
+  padding: 12px 18px;
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: 14px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--secondary) 45%, var(--card));
 }
 
-.resource-card-heading {
+.agent-report-author-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   min-width: 0;
 }
 
-.resource-card-heading h3 {
-  margin: 6px 0 2px;
-  color: var(--foreground);
-  font-size: 14px;
-  font-weight: 600;
-  letter-spacing: -0.015em;
-  line-height: 1.4;
+.agent-report-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 
-.resource-card-heading > p {
-  margin: 2px 0 0;
-  color: var(--muted-foreground);
-  font-size: 12.5px;
-  line-height: 1.5;
+.agent-report-author-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1.5px;
+  min-width: 0;
 }
 
-.resource-card-badges,
-.resource-card-meta {
+.agent-report-author-name-row {
   display: flex;
   align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--foreground);
   flex-wrap: wrap;
 }
 
-.resource-card-badges {
-  gap: 6px;
+.agent-report-author-name-row strong {
+  font-weight: 600;
+  color: var(--foreground);
 }
 
-.resource-card-time {
-  flex: 0 0 auto;
-  color: var(--muted-foreground);
+.agent-report-commander {
   font-size: 11px;
-  font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-}
-
-.resource-card-meta {
-  min-height: 32px;
-  border-top: 1px solid var(--border);
-  border-bottom: 1px solid var(--border);
-  padding: 6px 18px;
-  gap: 0;
-  background: color-mix(in srgb, var(--secondary) 50%, transparent);
   color: var(--muted-foreground);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
+  font-weight: 500;
 }
 
-.resource-card-meta > * {
+.agent-report-project {
+  font-size: 10.5px;
+  color: var(--muted-foreground);
+  background: var(--secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.5px 6px;
+}
+
+.agent-report-thread-chip {
+  border: 1px solid var(--border);
+  background: var(--card);
+  color: var(--muted-foreground);
+  font-size: 10.5px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 4px;
   display: inline-flex;
   align-items: center;
-}
-
-.resource-card-agent {
-  gap: 6px;
-}
-
-.resource-card-agent-avatar {
-  width: 18px;
-  height: 18px;
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  overflow: hidden;
-}
-
-.resource-card-meta > * + *::before {
-  margin: 0 8px;
-  color: color-mix(in srgb, var(--muted-foreground) 46%, transparent);
-  content: "·";
-}
-
-.resource-thread-link {
-  border: 0;
-  padding: 0;
-  gap: 2px;
-  background: transparent;
-  color: var(--foreground);
-  font: inherit;
-  font-weight: 550;
+  gap: 3px;
   cursor: pointer;
-  transition: color 120ms ease;
+  transition: all 120ms ease;
 }
 
-.resource-thread-link:hover {
-  color: var(--primary);
+.agent-report-thread-chip:hover {
+  color: var(--foreground);
+  background: var(--secondary);
 }
 
-.resource-card-markdown {
-  padding: 14px 18px 16px;
+.agent-report-time {
+  color: var(--muted-foreground);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.8;
 }
 
-.resource-card-markdown .basic-markdown {
+.agent-report-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.agent-report-content {
+  padding: 16px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.agent-report-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 650;
+  letter-spacing: -0.015em;
+  color: var(--foreground);
+  line-height: 1.4;
+}
+
+.agent-report-summary {
+  margin: 0;
+  color: var(--muted-foreground);
+  font-size: 12.5px;
+  line-height: 1.55;
+  background: color-mix(in srgb, var(--secondary) 40%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--primary) 50%, var(--border));
+  padding: 6px 12px;
+  border-radius: 0 6px 6px 0;
+}
+
+.agent-report-body {
+  margin-top: 4px;
+  color: var(--foreground);
   font-size: 13px;
   line-height: 1.6;
+}
+
+.agent-report-body .basic-markdown {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.agent-report-footer {
+  padding: 7px 18px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--secondary) 25%, transparent);
+  font-size: 11px;
+  color: var(--muted-foreground);
+}
+
+.agent-report-version {
+  font-variant-numeric: tabular-nums;
+}
+
+.agent-report-open-btn {
+  height: 26px;
+  padding: 0 8px;
+  font-size: 11.5px;
+  gap: 4px;
+  color: var(--muted-foreground);
+}
+
+.agent-report-open-btn:hover {
+  color: var(--foreground);
+}
+
+.collapsible-toggle-btn {
+  border: 0;
+  background: transparent;
+  color: var(--primary);
+  font-size: 11.5px;
+  font-weight: 550;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  padding: 4px 0 2px;
+  margin-top: 6px;
+  transition: opacity 120ms ease;
+}
+
+.collapsible-toggle-btn:hover {
+  opacity: 0.8;
+  text-decoration: underline;
 }
 
 .resource-feed-empty {
@@ -3686,6 +3814,19 @@ label {
 .calendar-more-events:hover {
   color: var(--foreground);
   background: var(--secondary);
+}
+
+.calendar-overflow-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 360px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.calendar-overflow-list .calendar-event-chip {
+  width: 100%;
 }
 
 /* Agenda list */
@@ -4832,9 +4973,48 @@ label {
   position: absolute;
   width: 3.5px;
   height: 3.5px;
-  border-radius: 9999px;
+  border-radius: 1px;
   background: currentColor;
   animation: aicss-orb-wave 1.6s infinite ease-in-out;
+}
+
+/* Square Dot Matrix Loader (ASIC style) */
+.aicss-matrix-loader {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  flex-shrink: 0;
+  line-height: 0;
+}
+
+.aicss-matrix-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+}
+
+.aicss-matrix-dot {
+  background: currentColor;
+  border-radius: 1px;
+  width: 100%;
+  height: 100%;
+  animation: aicss-matrix-pulse 1.3s infinite cubic-bezier(0.4, 0, 0.2, 1);
+  opacity: 0.18;
+}
+
+@keyframes aicss-matrix-pulse {
+  0%, 100% {
+    opacity: 0.15;
+    transform: scale(0.8);
+  }
+  35%, 65% {
+    opacity: 1;
+    transform: scale(1);
+  }
 }
 
 /* Thinking & Reasoning Component */

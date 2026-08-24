@@ -26,15 +26,28 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
-    env_file: .env
+    user: "${AISEVAK_RUNNER_UID:-1000}:${AISEVAK_RUNNER_GID:-1000}"
     environment:
+      NODE_ENV: ${NODE_ENV:-production}
       DATABASE_URL: postgres://aisevak:aisevak@postgres:5432/aisevak
       API_HOST: 0.0.0.0
       API_PORT: 8787
+      APP_ORIGIN: ${APP_ORIGIN:-http://localhost:5173}
+      COOKIE_SECRET: ${COOKIE_SECRET:?COOKIE_SECRET must be set}
+      SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
+      MANAGED_ROOT: /srv/aisevak
+      CODEX_BINARY: ${CODEX_BINARY:-auto}
+      CODEX_DEFAULT_MODEL: ${CODEX_DEFAULT_MODEL:-gpt-5.6-luna}
+      CODEX_OAUTH_CLIENT_ID: ${CODEX_OAUTH_CLIENT_ID:-}
+      GITHUB_HOST: ${GITHUB_HOST:-github.com}
     ports:
       - "127.0.0.1:8787:8787"
     volumes:
-      - /srv/aisevak:/srv/aisevak
+      # The API only needs the shared skill catalog and its disposable probe
+      # output. AWS credentials, workspaces, Codex homes, and runner state
+      # remain host-runner-only.
+      - /srv/aisevak/skills:/srv/aisevak/skills
+      - /srv/aisevak/probe-schema:/srv/aisevak/probe-schema
 
   web:
     build:

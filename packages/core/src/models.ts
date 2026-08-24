@@ -89,6 +89,16 @@ export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
   }
 ];
 
+export function resolveCodexDefaultModel(value = process.env.CODEX_DEFAULT_MODEL): string {
+  const configured = value?.trim();
+  if (!configured || ["default", "auto", "codex-default"].includes(configured.toLowerCase())) {
+    return DEFAULT_CODEX_MODEL;
+  }
+  return CODEX_HARNESS_MODELS.some((model) => model.id === configured)
+    ? configured
+    : DEFAULT_CODEX_MODEL;
+}
+
 export function normalizeCodexModel(model: string | null | undefined): string {
   if (!model || ["default", "auto", "codex-default"].includes(model.trim().toLowerCase())) {
     return DEFAULT_CODEX_MODEL;
