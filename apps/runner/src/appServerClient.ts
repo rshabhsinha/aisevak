@@ -45,6 +45,7 @@ export interface AppServerTurnOptions {
   onBeforeTurnStart?: () => Promise<(() => Promise<void>) | null>;
   onTurnAccepted?: () => Promise<void>;
   shouldCancel: () => Promise<boolean>;
+  cancelGraceMs?: number;
   nextInput?: () => Promise<AppServerTurnInput | null>;
   onInputHandled?: (input: AppServerTurnInput, error?: string) => Promise<void>;
 }
@@ -71,6 +72,7 @@ interface TurnState {
   completed: boolean;
   finalStatus: AppServerTurnResult["status"] | null;
   finalError: string | null;
+  cancelRequested: boolean;
   eventChain: Promise<void>;
   resolveCompleted: () => void;
   completedPromise: Promise<void>;
@@ -79,6 +81,7 @@ interface TurnState {
 const sessions = new Map<string, PersistentAppServer>();
 const idleSessionMs = positiveNumber(process.env.CODEX_APP_SERVER_IDLE_MS, 60 * 60 * 1000);
 const backgroundRecheckMs = Math.min(idleSessionMs, 10 * 60 * 1000);
+const defaultCancelGraceMs = positiveNumber(process.env.CODEX_APP_SERVER_CANCEL_GRACE_MS, 15_000);
 
 export async function runCodexAppServerTurn(options: AppServerTurnOptions): Promise<AppServerTurnResult> {
   let session = sessions.get(options.codexHome);
@@ -192,6 +195,7 @@ class PersistentAppServer {
       completed: false,
       finalStatus: null,
       finalError: null,
+      cancelRequested: false,
       eventChain: Promise.resolve(),
       resolveCompleted,
       completedPromise
@@ -199,7 +203,10 @@ class PersistentAppServer {
     this.activeTurn = state;
 
     let monitor: NodeJS.Timeout | null = null;
+    let cancellationTimer: NodeJS.Timeout | null = null;
     let monitorTask: Promise<void> = Promise.resolve();
+    const cancellationGraceMs =
+      options.cancelGraceMs && options.cancelGraceMs > 0 ? options.cancelGraceMs : defaultCancelGraceMs;
     try {
       await this.initialize();
       const threadParams = {
@@ -303,7 +310,13 @@ class PersistentAppServer {
         monitorBusy = true;
         monitorTask = this.monitorTurn(state, interruptSent)
           .then((interrupted) => {
-            interruptSent ||= interrupted;
+            if (!interrupted || interruptSent) return;
+            interruptSent = true;
+            state.cancelRequested = true;
+            cancellationTimer = setTimeout(() => {
+              if (state.completed || this.activeTurn !== state) return;
+              void this.close().catch(() => undefined);
+            }, cancellationGraceMs);
           })
           .finally(() => {
             monitorBusy = false;
@@ -332,7 +345,7 @@ class PersistentAppServer {
     } catch (error) {
       await state.eventChain.catch(() => undefined);
       return {
-        status: "failed",
+        status: state.cancelRequested ? "interrupted" : "failed",
         threadId: state.threadId ?? "",
         turnId: state.turnId,
         rawStdout: state.rawStdout,
@@ -343,6 +356,7 @@ class PersistentAppServer {
       };
     } finally {
       if (monitor) clearInterval(monitor);
+      if (cancellationTimer) clearTimeout(cancellationTimer);
       await monitorTask.catch(() => undefined);
       if (state.turnId && this.turnStates.get(state.turnId) === state) {
         this.turnStates.delete(state.turnId);

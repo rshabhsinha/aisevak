@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   recoverAmbiguousWorkspaceRuns,
   recoverInterruptedCoordinationRuns,
+  recoverInterruptedDispatcherRuns,
   recoverStaleAgentThreadRuns
 } from "./index.js";
 
@@ -146,6 +147,42 @@ describe("coordination startup recovery", () => {
     expect(queries.find((sql) => sql.includes("agent_thread_generation <>"))).toContain("agent_thread_generation <>");
     expect(queries.find((sql) => sql.includes("UPDATE dispatcher_runs"))).toContain("status = 'cancelled'");
     expect(queries.every((sql) => !sql.includes("SET agent_thread_generation ="))).toBe(true);
+  });
+
+  it("terminalizes interrupted non-coordination dispatcher runs after restart", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const query = async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      const normalized = sql.trim();
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(normalized)) return { rows: [] };
+      if (normalized.startsWith("SELECT id, status::text, message_delivery_id, agent_thread_id")) {
+        return {
+          rows: [{
+            id: "scheduled-run",
+            status: "cancel_requested",
+            message_delivery_id: null,
+            agent_thread_id: "scheduled-thread"
+          }]
+        };
+      }
+      if (normalized.startsWith("SELECT message_delivery_id, status::text")) {
+        return { rows: [{ message_delivery_id: null, status: "cancel_requested" }] };
+      }
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    const pool = { query, async connect() { return client; } } as unknown as DbPool;
+
+    await recoverInterruptedDispatcherRuns(pool);
+
+    const update = queries.find((entry) => entry.sql.includes("UPDATE dispatcher_runs"));
+    expect(update?.sql).toContain("status = $2::run_status");
+    expect(update?.params).toEqual([
+      "scheduled-run",
+      "cancelled",
+      "The dispatcher turn was cancelled when the runner stopped"
+    ]);
+    expect(queries.some((entry) => entry.sql.includes("UPDATE agent_threads"))).toBe(true);
   });
 
   it("completes a successful coordination run's stranded initial delivery", async () => {
