@@ -3422,19 +3422,19 @@ label {
 }
 
 .legend-pill .legend-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  display: inline-block;
+  flex-shrink: 0;
 }
 
 .legend-pill.scheduled .legend-dot {
   background: var(--primary);
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 25%, transparent);
 }
 
 .legend-pill.activity .legend-dot {
   background: #10b981;
-  box-shadow: 0 0 0 2px rgba(16, 185, 129, 0.25);
 }
 
 .legend-pill .legend-count {
