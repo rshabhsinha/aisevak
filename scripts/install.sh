@@ -64,8 +64,11 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/workspaces" \
   "${WORKSPACE_DIR}/workspaces/github" \
   "${WORKSPACE_DIR}/codex-homes" \
+  "${WORKSPACE_DIR}/aws" \
   "${WORKSPACE_DIR}/skills" \
+  "${WORKSPACE_DIR}/probe-schema" \
   "${WORKSPACE_DIR}/worktrees"
+chmod 0700 "${WORKSPACE_DIR}/aws"
 # Older API releases created Codex homes as root from inside the container.
 # The host-native runner is the only process that writes their runtime files.
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/codex-homes"
@@ -106,6 +109,16 @@ compose_current() {
 
 compose_release() {
   docker compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${RELEASE_DIR}/docker-compose.yml" "$@"
+}
+
+set_env_value() {
+  local key="$1"
+  local value="$2"
+  if grep -q "^${key}=" "${ENV_FILE}"; then
+    sed -i "s#^${key}=.*#${key}=${value}#" "${ENV_FILE}"
+  else
+    printf "%s=%s\n" "${key}" "${value}" >> "${ENV_FILE}"
+  fi
 }
 
 backup_database() {
@@ -518,6 +531,12 @@ if [[ ! -f "${ENV_FILE}" ]]; then
   sed -i "s#^MANAGED_ROOT=.*#MANAGED_ROOT=${WORKSPACE_DIR}#g" "${ENV_FILE}"
   chmod 0600 "${ENV_FILE}"
 fi
+
+# Compose runs the API with the same numeric identity that owns the shared
+# skill catalog. Keep that bind mount writable without exposing the runner's
+# AWS credentials or other managed workspace files to the API container.
+set_env_value AISEVAK_RUNNER_UID "$(id -u "${RUNNER_USER}")"
+set_env_value AISEVAK_RUNNER_GID "$(id -g "${RUNNER_USER}")"
 
 ln -sf "${ENV_FILE}" "${RELEASE_DIR}/.env"
 

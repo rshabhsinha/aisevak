@@ -1,0 +1,104 @@
+import { useState, type ReactElement } from "react";
+import { CheckCircle2, Copy } from "../icons";
+
+interface FileDiffProps {
+  filename: string;
+  diff: string;
+  additions?: number;
+  deletions?: number;
+  className?: string;
+  defaultExpanded?: boolean;
+}
+
+export function FileDiff({
+  filename,
+  diff,
+  additions,
+  deletions,
+  className = "",
+  defaultExpanded = true
+}: FileDiffProps): ReactElement {
+  const [copied, setCopied] = useState(false);
+  const [expanded, setExpanded] = useState(defaultExpanded);
+
+  const lines = diff.split("\n");
+
+  // Calculate additions/deletions if not explicitly provided
+  let computedAdds = additions ?? 0;
+  let computedDels = deletions ?? 0;
+  if (additions === undefined && deletions === undefined) {
+    for (const line of lines) {
+      if (line.startsWith("+") && !line.startsWith("+++")) computedAdds++;
+      if (line.startsWith("-") && !line.startsWith("---")) computedDels++;
+    }
+  }
+
+  const handleCopy = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(diff);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1600);
+    } catch {
+      // fallback if clipboard fails
+    }
+  };
+
+  return (
+    <div className={`aicss-diff-card ${className}`}>
+      <div
+        className="aicss-diff-header cursor-pointer select-none"
+        onClick={() => setExpanded(!expanded)}
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+      >
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="font-medium text-foreground truncate">{filename}</span>
+          {(computedAdds > 0 || computedDels > 0) && (
+            <span className="flex items-center gap-1 text-[10.5px] font-mono">
+              {computedAdds > 0 && <span className="text-emerald-500">+{computedAdds}</span>}
+              {computedDels > 0 && <span className="text-rose-500">-{computedDels}</span>}
+            </span>
+          )}
+        </div>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded transition-colors"
+            onClick={handleCopy}
+            title="Copy diff"
+          >
+            {copied ? <CheckCircle2 size={12} className="text-emerald-500" /> : <Copy size={12} />}
+            <span>{copied ? "Copied" : "Copy"}</span>
+          </button>
+        </div>
+      </div>
+
+      {expanded && (
+        <div className="aicss-diff-body">
+          {lines.map((line, idx) => {
+            const isAdd = line.startsWith("+") && !line.startsWith("+++");
+            const isDel = line.startsWith("-") && !line.startsWith("---");
+            const isHunk = line.startsWith("@@");
+
+            let lineClass = "aicss-diff-line aicss-diff-line-ctx";
+            if (isAdd) lineClass = "aicss-diff-line aicss-diff-line-add";
+            else if (isDel) lineClass = "aicss-diff-line aicss-diff-line-del";
+            else if (isHunk) lineClass = "aicss-diff-line text-muted-foreground opacity-60 bg-muted/30";
+
+            return (
+              <div key={idx} className={lineClass}>
+                <span className="select-none w-6 text-right pr-2 text-muted-foreground/50 opacity-60 text-[10px]">
+                  {idx + 1}
+                </span>
+                <span className="whitespace-pre flex-1">{line}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}

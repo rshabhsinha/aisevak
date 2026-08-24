@@ -1,34 +1,32 @@
-import { describeAgentAvatar } from "../agentAvatar";
+import { Blobatar } from "@blobatar/react";
+import { agentAvatarSeed } from "../agentAvatar";
 import { cn } from "../lib/utils";
+import { AgentOrb, type OrbVariant } from "./aicss/agent-orbs";
 
 export function AgentAvatar(props: {
   agentId: string;
   agentName: string;
   className?: string;
+  motion?: "hover" | "always";
+  orbVariant?: OrbVariant;
 }) {
-  const avatar = describeAgentAvatar(props.agentId);
+  const seed = agentAvatarSeed(props.agentId, props.agentName);
+  const label = `${props.agentName || "Agent"} profile picture`;
 
   return (
-    <svg
-      aria-label={`${props.agentName} profile picture`}
-      className={cn("agent-avatar", props.className)}
-      data-agent-avatar={props.agentId}
-      role="img"
-      viewBox="0 0 5 5"
-    >
-      <rect width="5" height="5" fill={avatar.background} />
-      <g shapeRendering="crispEdges">
-        {avatar.cells.map((cell) => (
-          <rect
-            fill={avatar.color}
-            height="1"
-            key={`${cell.x}-${cell.y}`}
-            width="1"
-            x={cell.x}
-            y={cell.y}
-          />
-        ))}
-      </g>
-    </svg>
+    <div className="relative inline-flex shrink-0">
+      <Blobatar
+        animate={props.motion ?? "hover"}
+        className={cn("agent-avatar", props.className)}
+        data-agent-avatar={seed}
+        name={seed}
+        title={label}
+      />
+      {props.orbVariant && props.orbVariant !== "idle" && (
+        <span className="absolute -bottom-0.5 -right-0.5 flex items-center justify-center p-0.5 rounded-full bg-card border border-border shadow-xs">
+          <AgentOrb variant={props.orbVariant} size={9} color="var(--primary)" />
+        </span>
+      )}
+    </div>
   );
 }

@@ -1,6 +1,6 @@
 import type { Pool } from "pg";
 import { installedSkillsRoot, migrateAndSynchronizeInstalledSkills } from "./installedSkills.js";
-import { normalizeCodexModel } from "./models.js";
+import { resolveCodexDefaultModel } from "./models.js";
 
 const enumSql = `
 DO $$ BEGIN CREATE TYPE user_role AS ENUM ('owner', 'admin', 'member'); EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -189,7 +189,7 @@ CREATE TABLE IF NOT EXISTS agent_threads (
   project_id uuid REFERENCES projects(id) ON DELETE SET NULL,
   provider_instance_id text NOT NULL REFERENCES provider_instances(id) ON DELETE RESTRICT,
   model text NOT NULL,
-  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  model_options jsonb NOT NULL DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
   cwd text NOT NULL,
   branch text,
   runtime_home text NOT NULL,
@@ -234,7 +234,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
   worktree_path text,
   codex_thread_id text,
   model text NOT NULL,
-  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  model_options jsonb NOT NULL DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
   prompt text NOT NULL,
   skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
@@ -265,7 +265,7 @@ CREATE TABLE IF NOT EXISTS dispatcher_runs (
   codex_home text NOT NULL,
   codex_thread_id text,
   model text NOT NULL,
-  model_options jsonb NOT NULL DEFAULT '[]'::jsonb,
+  model_options jsonb NOT NULL DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
   prompt text NOT NULL,
   skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb,
   raw_stdout text NOT NULL DEFAULT '',
@@ -419,6 +419,7 @@ ALTER TABLE tasks ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE tasks ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS ownership_generation integer NOT NULL DEFAULT 0;
+ALTER TABLE agent_threads ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS run_kind text NOT NULL DEFAULT 'worker';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS trigger text NOT NULL DEFAULT 'manual';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS parent_run_id uuid;
@@ -429,9 +430,11 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_mode text NOT NULL DEFA
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS workspace_source text NOT NULL DEFAULT 'unknown';
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE task_runs ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS skills_snapshot jsonb NOT NULL DEFAULT '[]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS model_options jsonb NOT NULL DEFAULT '[]'::jsonb;
+ALTER TABLE dispatcher_runs ALTER COLUMN model_options SET DEFAULT '[{"id":"reasoningEffort","value":"max"}]'::jsonb;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS message_delivery_id uuid;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS agent_thread_generation integer NOT NULL DEFAULT 0;
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS workspace_key text NOT NULL DEFAULT '';
@@ -504,6 +507,10 @@ CREATE INDEX IF NOT EXISTS task_runs_agent_thread_status_idx
 ON task_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_status_idx
 ON dispatcher_runs(agent_thread_id, status, queued_at) WHERE agent_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS run_events_run_seq_idx
+ON run_events(run_id, seq, created_at);
+CREATE INDEX IF NOT EXISTS dispatcher_run_events_run_seq_idx
+ON dispatcher_run_events(dispatcher_run_id, seq, created_at);
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
@@ -984,29 +991,6 @@ CREATE TABLE IF NOT EXISTS app_migrations (
   applied_at timestamptz NOT NULL DEFAULT now()
 );
 
-DO $$ BEGIN
-  IF current_setting('aisevak.default_model', true) = 'gpt-5.6-luna'
-     AND NOT EXISTS (
-       SELECT 1 FROM app_migrations WHERE name = '20260809_luna_max_agent_default'
-     ) THEN
-    WITH migrated AS (
-      UPDATE agents
-      SET model = 'gpt-5.6-luna',
-          model_options = '[{"id":"reasoningEffort","value":"max"}]'::jsonb,
-          updated_at = now()
-      WHERE model IN ('gpt-5.5', 'gpt-5.6-sol')
-        AND model_options = '[]'::jsonb
-      RETURNING id, name, description, model, model_options, instructions
-    )
-    INSERT INTO agent_versions
-      (agent_id, name, description, model, model_options, instructions, created_by)
-    SELECT id, name, description, model, model_options, instructions, NULL
-    FROM migrated;
-
-    INSERT INTO app_migrations (name) VALUES ('20260809_luna_max_agent_default');
-  END IF;
-END $$;
-
 INSERT INTO coordination_threads
   (title, description, purpose, status, project_id, task_id, primary_agent_id, completion_instructions,
    last_activity_at, created_at, updated_at)
@@ -1168,7 +1152,7 @@ WHERE agent_threads.coordination_thread_id = coordination_threads.id
 
 export async function runMigrations(pool: Pool): Promise<void> {
   await pool.query("SELECT set_config('aisevak.default_model', $1, false)", [
-    normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL)
+    resolveCodexDefaultModel()
   ]);
   await pool.query("SELECT set_config('aisevak.managed_root', $1, false)", [
     process.env.MANAGED_ROOT ?? "/srv/aisevak"

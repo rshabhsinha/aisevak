@@ -5,20 +5,25 @@ import {
   BookOpen,
   Bot,
   Calendar,
+  Check,
   CheckCircle2,
   ChevronDown,
+  ChevronLeft,
   ChevronRight,
   Circle,
   CircleAlert,
   CircleDashed,
   CircleX,
+  Clock,
   Copy,
   Eye,
   FolderGit2,
   Github,
   Hammer,
+  Info,
   KeyRound,
   LayoutDashboard,
+  ListIcon,
   Loader2,
   LockKeyhole,
   LogOut,
@@ -27,6 +32,7 @@ import {
   Plus,
   RefreshCw,
   Search,
+  SettingsIcon,
   Square,
   Terminal,
   Trash2,
@@ -36,6 +42,7 @@ import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
 import { AnimatedIcon } from "./components/animated-icon";
 import { AgentAvatar } from "./components/agent-avatar";
+import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
@@ -387,9 +394,16 @@ export function App() {
   const [draftThread, setDraftThread] = useState(!initialRoute.threadId);
   const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
   const [agentThreadEvents, setAgentThreadEvents] = useState<RunEvent[]>([]);
+  const [agentThreadEventsTruncated, setAgentThreadEventsTruncated] = useState(false);
   const [threadDetailState, setThreadDetailState] = useState<ThreadDetailState>(threadDetailIdle());
   const [composerSelection, setComposerSelection] = useState<ModelSelection | null>(null);
   const [pendingThreadMessages, setPendingThreadMessages] = useState<AgentRunChatMessage[]>([]);
+  const [taskComposerOpen, setTaskComposerOpen] = useState(false);
+  const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
+  const [editingSkill, setEditingSkill] = useState<Skill | null>(null);
+  const [scheduleComposerOpen, setScheduleComposerOpen] = useState(false);
+  const [scheduleComposerDate, setScheduleComposerDate] = useState<Date | null>(null);
+  const [scheduleToEdit, setScheduleToEdit] = useState<Schedule | null>(null);
   const [query, setQuery] = useState("");
   const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -664,9 +678,7 @@ export function App() {
       `/api/agent-threads${suffix}`
     );
     setAgentThreads((current) => {
-      if (!cursor) return mergeRefreshedAgentThreads(current, data.threads);
-      const seen = new Set(current.map((thread) => thread.id));
-      return [...current, ...data.threads.filter((thread) => !seen.has(thread.id))];
+      return mergeRefreshedAgentThreads(current, data.threads);
     });
     setNextThreadCursor(data.nextCursor);
     return data.threads;
@@ -695,12 +707,14 @@ export function App() {
       thread: AgentThread;
       run?: AgentRunTimelineRun | null;
       events: RunEvent[];
+      eventsTruncated?: boolean;
     };
     try {
       data = await api<{
         thread: AgentThread;
         run?: AgentRunTimelineRun | null;
         events: RunEvent[];
+        eventsTruncated?: boolean;
       }>(`/api/agent-threads/${threadId}`);
     } catch (error) {
       if (isCurrentRequest()) setThreadDetailState(threadDetailFailed(error));
@@ -710,6 +724,7 @@ export function App() {
     setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
     setSelectedThreadRun(data.run ?? null);
     setAgentThreadEvents(data.events);
+    setAgentThreadEventsTruncated(Boolean(data.eventsTruncated));
     setThreadDetailState(threadDetailReady());
   }
 
@@ -719,6 +734,7 @@ export function App() {
     setDraftThread(false);
     setSelectedThreadRun(null);
     setAgentThreadEvents([]);
+    setAgentThreadEventsTruncated(false);
     setThreadDetailState(threadDetailLoading());
     setPendingThreadMessages([]);
     navigateToView("runs", threadId);
@@ -738,6 +754,7 @@ export function App() {
     setDraftThread(true);
     setSelectedThreadRun(null);
     setAgentThreadEvents([]);
+    setAgentThreadEventsTruncated(false);
     setThreadDetailState(threadDetailIdle());
     setPendingThreadMessages([]);
     setComposerSelection(provider ? readStickyModelSelection(provider) : null);
@@ -760,7 +777,7 @@ export function App() {
       const thread = (await api<{ thread: AgentThread }>(`/api/tasks/${task.id}/agent-thread`, {
         method: "POST"
       })).thread;
-      setAgentThreads((current) => [thread, ...current.filter((entry) => entry.id !== thread.id)]);
+      setAgentThreads((current) => updateAgentThreadInPlace(current, thread));
       selectAgentThread(thread.id);
       setMessage(null);
       await loadAgentThread(thread.id);
@@ -779,7 +796,7 @@ export function App() {
           method: "POST",
           body: payload
         });
-        setAgentThreads((current) => [data.thread, ...current.filter((thread) => thread.id !== data.thread.id)]);
+        setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
         selectAgentThread(data.thread.id);
         setMessage(null);
         writeStickyModelSelection(selection);
@@ -798,9 +815,7 @@ export function App() {
           `/api/agent-threads/${selectedThreadId}/messages`,
           { method: "POST", body: payload }
         );
-        setAgentThreads((current) =>
-          current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
-        );
+        setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
         setMessage(null);
         writeStickyModelSelection(selection);
         await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads(), reloadTasks()]);
@@ -821,9 +836,7 @@ export function App() {
       method: "PATCH",
       body: JSON.stringify({ modelSelection: selection })
     });
-    setAgentThreads((current) =>
-      current.map((thread) => (thread.id === data.thread.id ? data.thread : thread))
-    );
+    setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
   }
 
   if (hasAdmin === null) return <Splash />;
@@ -833,7 +846,7 @@ export function App() {
   return (
     <TooltipProvider delayDuration={220}>
     <div className="app-layout">
-      <aside className={`sidebar ${view === "runs" ? "is-chat-sidebar" : ""}`}>
+      <aside className="sidebar">
         <div className="sidebar-brand">
           <span className="brand-mark">
             <Terminal size={17} weight="fill" />
@@ -852,18 +865,103 @@ export function App() {
           <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => navigateToView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => navigateToView("skills")} />
           <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
-          <span className="nav-label nav-label-spaced">Manage</span>
-          {user.role !== "member" ? (
-            <NavButton icon={<OpenAILogo />} label="ChatGPT" active={view === "codex"} onClick={() => navigateToView("codex")} />
-          ) : null}
-          <NavButton icon={<KeyRound />} label="API" active={view === "api"} onClick={() => navigateToView("api")} />
-          {user.role !== "member" ? (
-            <NavButton icon={<LockKeyhole />} label="Credentials" active={view === "credentials"} onClick={() => navigateToView("credentials")} />
-          ) : null}
-          <NavButton icon={<FolderGit2 />} label="Projects" active={view === "projects"} onClick={() => navigateToView("projects")} />
-          <NavButton icon={<Github />} label="Connectors" active={view === "connectors"} onClick={() => navigateToView("connectors")} />
-          <span className="nav-label nav-label-spaced">Agents</span>
-          <NavButton icon={<Terminal />} label="Threads" active={view === "runs"} onClick={() => navigateToView("runs", draftThread ? null : selectedThreadId)} />
+
+          <div className="sidebar-agent-heading">
+            <span className="nav-label">Agents</span>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="sidebar-new-thread"
+              title="New thread"
+              aria-label="New thread"
+              onClick={createAgentThread}
+            >
+              <Plus size={13} weight="bold" />
+            </Button>
+          </div>
+
+          <div className="sidebar-agent-runs">
+            {view === "runs" ? (
+              <div className="sidebar-thread-search">
+                <Search size={12} />
+                <input
+                  value={query}
+                  placeholder="Search tasks"
+                  aria-label="Search agent tasks"
+                  onChange={(event) => setQuery(event.target.value)}
+                />
+              </div>
+            ) : null}
+
+            {draftThread && view === "runs" ? (
+              <button
+                type="button"
+                className="sidebar-run-item selected"
+                onClick={() => navigateToView("runs", null)}
+              >
+                <div className="sidebar-run-avatar">
+                  <Plus size={12} weight="bold" />
+                </div>
+                <div className="sidebar-run-copy">
+                  <span className="sidebar-run-title">New thread</span>
+                  <span className="sidebar-run-meta">Draft</span>
+                </div>
+              </button>
+            ) : null}
+
+            {(view === "runs" ? filteredThreads : agentThreads).map((thread) => {
+              const isSelected = view === "runs" && selectedThreadId === thread.id;
+              return (
+                <button
+                  type="button"
+                  className={`sidebar-run-item ${isSelected ? "selected" : ""}`}
+                  key={thread.id}
+                  onClick={async () => {
+                    selectAgentThread(thread.id);
+                    await loadAgentThread(thread.id);
+                  }}
+                  title={`${thread.title || "Untitled"} (${thread.agent_name || "Agent"})`}
+                >
+                  <AgentAvatar
+                    agentId={thread.agent_id || "default"}
+                    agentName={thread.agent_name || "Agent"}
+                    className="sidebar-run-avatar"
+                  />
+                  <div className="sidebar-run-copy">
+                    <span className="sidebar-run-title">{thread.title || "Untitled task"}</span>
+                    <span className="sidebar-run-meta">
+                      <span className="sidebar-run-agent truncate">{thread.agent_name || "Agent"}</span>
+                      <span className="sidebar-run-dot">·</span>
+                      <span className="sidebar-run-time shrink-0">{formatSidebarRunTime(thread.last_activity_at)}</span>
+                    </span>
+                  </div>
+                  {isActiveRun(thread.latest_status) ? (
+                    <DotMatrixLoader size={11} className="text-primary shrink-0" />
+                  ) : null}
+                </button>
+              );
+            })}
+
+            {(view === "runs" ? filteredThreads : agentThreads).length === 0 && !draftThread ? (
+              <div className="sidebar-runs-empty">
+                {view === "runs" && query ? "No matching threads" : "No threads yet"}
+              </div>
+            ) : null}
+
+            {nextThreadCursor ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="agent-thread-load-more"
+                disabled={loadingOlderThreads}
+                onClick={() => void loadOlderAgentThreads()}
+              >
+                {loadingOlderThreads ? <Loader2 className="spin" size={12} /> : <ChevronDown size={12} />}
+                Load older threads
+              </Button>
+            ) : null}
+          </div>
         </nav>
 
         <div className="sidebar-footer">
@@ -874,42 +972,103 @@ export function App() {
               <small>{user.role}</small>
             </span>
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Log out"
-            aria-label="Log out"
-            onClick={async () => {
-              await api("/api/logout", { method: "POST" });
-              setUser(null);
-            }}
-          >
-            <LogOut size={14} />
-          </Button>
+          <div className="sidebar-footer-actions">
+            <Button
+              variant={isSettingsView(view) ? "secondary" : "ghost"}
+              size="icon"
+              className="sidebar-footer-btn"
+              title="Settings"
+              aria-label="Settings"
+              onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")}
+            >
+              <SettingsIcon size={15} />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="sidebar-footer-btn"
+              title="Log out"
+              aria-label="Log out"
+              onClick={async () => {
+                await api("/api/logout", { method: "POST" });
+                setUser(null);
+              }}
+            >
+              <LogOut size={14} />
+            </Button>
+          </div>
         </div>
       </aside>
-
-      {view === "runs" ? (
-        <AgentThreadSidebar
-          draft={draftThread}
-          threads={filteredThreads}
-          selectedThreadId={selectedThreadId}
-          query={query}
-          hasMore={Boolean(nextThreadCursor) && !query.trim()}
-          loadingMore={loadingOlderThreads}
-          onQueryChange={setQuery}
-          onNewThread={createAgentThread}
-          onLoadMore={() => void loadOlderAgentThreads()}
-          onSelectThread={(threadId) => {
-            selectAgentThread(threadId);
-          }}
-        />
-      ) : null}
 
       <div className={`main-content ${view === "runs" ? "agent-chat-mode" : ""}`}>
         {view !== "runs" ? <header className="top-header">
           <div className="header-title">{viewTitle(view)}</div>
           <div className="header-actions">
+            {view === "tasks" ? (
+              <Popover open={taskComposerOpen} onOpenChange={setTaskComposerOpen}>
+                <PopoverTrigger asChild>
+                  <Button size="sm" className="gap-1.5 font-medium">
+                    <Plus size={14} />
+                    <span>New task</span>
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent
+                  className="task-composer-popover"
+                  side="bottom"
+                  align="end"
+                  sideOffset={8}
+                >
+                  <TaskComposer
+                    projects={projects}
+                    agents={agents}
+                    onCreate={async (payload) => {
+                      const result = await createTaskAndQueueRun<Task>(api, payload);
+                      await Promise.all([reloadTasks(), reloadAgentThreads()]);
+                      if (result.enqueueError) {
+                        setMessage(`Task created, but it could not be started: ${friendlyError(result.enqueueError.message)}`);
+                      } else {
+                        setMessage(null);
+                      }
+                      setTaskComposerOpen(false);
+                    }}
+                  />
+                </PopoverContent>
+              </Popover>
+            ) : null}
+            {view === "agents" ? (
+              <Button
+                size="sm"
+                className="gap-1.5 font-medium"
+                onClick={() => setEditingAgent(emptyAgent(defaultModel, models))}
+              >
+                <Plus size={14} />
+                <span>New agent</span>
+              </Button>
+            ) : null}
+            {view === "skills" ? (
+              <Button
+                size="sm"
+                className="gap-1.5 font-medium"
+                onClick={() => setEditingSkill(emptySkill())}
+              >
+                <Plus size={14} />
+                <span>New skill</span>
+              </Button>
+            ) : null}
+            {view === "schedules" ? (
+              <Button
+                size="sm"
+                className="gap-1.5 font-medium"
+                onClick={() => {
+                  setScheduleComposerDate(null);
+                  setScheduleToEdit(null);
+                  setScheduleComposerOpen(true);
+                }}
+              >
+                <Plus size={14} />
+                <span>New schedule</span>
+              </Button>
+            ) : null}
             <div className="search-bar">
               <Search size={14} className="text-muted" />
               <Input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${viewTitle(view).toLowerCase()}`} />
@@ -928,17 +1087,6 @@ export function App() {
           {view === "tasks" ? (
             <TasksView
               tasks={filteredTasks}
-              agents={agents}
-              projects={projects}
-              onCreate={async (payload) => {
-                const result = await createTaskAndQueueRun<Task>(api, payload);
-                await Promise.all([reloadTasks(), reloadAgentThreads()]);
-                if (result.enqueueError) {
-                  setMessage(`Task created, but it could not be started: ${friendlyError(result.enqueueError.message)}`);
-                } else {
-                  setMessage(null);
-                }
-              }}
               onSelect={(task) => void openTaskThread(task)}
             />
           ) : null}
@@ -963,6 +1111,7 @@ export function App() {
               draft={draftThread}
               run={selectedThreadRun}
               events={agentThreadEvents}
+              eventsTruncated={agentThreadEventsTruncated}
               detailState={threadDetailState}
               pendingMessages={pendingThreadMessages}
               providers={providerInstances}
@@ -991,6 +1140,8 @@ export function App() {
               tasks={tasks}
               models={models}
               defaultModel={defaultModel}
+              editing={editingAgent}
+              onSelectAgent={setEditingAgent}
               onSaved={reloadAgents}
             />
           ) : null}
@@ -998,9 +1149,16 @@ export function App() {
           {view === "schedules" ? (
             <SchedulesView
               schedules={filteredSchedules}
+              threads={agentThreads}
               agents={agents}
               skills={skills}
               tasks={tasks}
+              composerOpen={scheduleComposerOpen}
+              onComposerOpenChange={setScheduleComposerOpen}
+              composerDate={scheduleComposerDate}
+              onComposerDateChange={setScheduleComposerDate}
+              editingSchedule={scheduleToEdit}
+              onEditingScheduleChange={setScheduleToEdit}
               onSaved={reloadSchedules}
               onOpenThread={async (threadId) => {
                 selectAgentThread(threadId);
@@ -1014,36 +1172,49 @@ export function App() {
               skills={filteredSkills}
               root={skillsRoot}
               errors={skillCatalogErrors}
+              editing={editingSkill}
+              onSelectSkill={setEditingSkill}
               onSaved={reloadSkills}
             />
           ) : null}
 
-          {view === "api" ? <ApiView apiKeys={apiKeys} onSaved={reloadApiKeys} /> : null}
-
-          {view === "codex" ? <CodexConnectionView /> : null}
-
-          {view === "credentials" ? <CredentialsView credentials={credentials} onSaved={reloadCredentials} /> : null}
-
-          {view === "projects" ? <ProjectsView projects={projects} onSaved={reloadProjects} /> : null}
-
-          {view === "connectors" ? (
-            <ConnectorsView
+          {isSettingsView(view) ? (
+            <SettingsView
+              activeTab={
+                view === "api"
+                  ? "api"
+                  : view === "credentials"
+                  ? "credentials"
+                  : view === "projects"
+                  ? "projects"
+                  : view === "connectors"
+                  ? "connectors"
+                  : "codex"
+              }
+              onTabChange={(tab) => navigateToView(tab)}
+              userRole={user.role}
+              apiKeys={apiKeys}
+              onSavedApiKeys={reloadApiKeys}
+              credentials={credentials}
+              onSavedCredentials={reloadCredentials}
+              projects={projects}
+              onSavedProjects={reloadProjects}
               repos={repos}
               connection={githubConnection}
               hostname={githubHostname}
-              onConnect={async (token) => {
+              onConnectGithub={async (token) => {
                 await api("/api/github/connect", { method: "POST", body: JSON.stringify({ token }) });
                 await reloadGithub();
               }}
-              onRefresh={async () => {
+              onRefreshGithub={async () => {
                 await api("/api/github/sync", { method: "POST" });
                 await reloadGithub();
               }}
-              onDisconnect={async () => {
+              onDisconnectGithub={async () => {
                 await api("/api/github/connection", { method: "DELETE" });
                 await reloadGithub();
               }}
-              onImport={async (repoId) => {
+              onImportGithub={async (repoId) => {
                 await api(`/api/github/repositories/${repoId}/import`, { method: "POST" });
                 setMessage("Import queued");
                 await reloadGithub();
@@ -1062,46 +1233,81 @@ function ActivityView(props: { reports: ActivityReport[]; onOpenThread: (threadI
     <div className="resource-feed-view">
       <div className="resource-feed-intro">
         <div>
-          <span className="eyebrow">CLI reports</span>
-          <h2>Agent activity</h2>
-          <p>Durable Markdown reports created by agents, newest first.</p>
+          <h2>Activity</h2>
+          <p>Recent execution reports, summaries, and updates generated by agents.</p>
         </div>
-        <Badge variant="secondary">{props.reports.length}</Badge>
       </div>
 
       <div className="resource-card-list">
         {props.reports.map((report) => (
           <article className="resource-card" key={report.id}>
-            <div className="resource-card-header">
-              <div className="resource-card-heading">
-                <div className="resource-card-badges">
-                  <Badge variant="outline">REPORT-{report.number}</Badge>
-                  <TaskStatus status={report.status} />
+            <div className="agent-report-author-bar">
+              <div className="agent-report-author-info">
+                <AgentAvatar
+                  agentId={report.author_agent_id || "default"}
+                  agentName={report.author_agent_name || "Agent"}
+                  className="agent-report-avatar"
+                />
+                <div className="agent-report-author-text">
+                  <div className="agent-report-author-name-row">
+                    <strong>{report.author_agent_name || "Agent"}</strong>
+                    {report.project_name ? <span className="agent-report-project">{report.project_name}</span> : null}
+                    {report.agent_thread_id ? (
+                      <button
+                        type="button"
+                        className="agent-report-thread-chip"
+                        onClick={() => props.onOpenThread(report.agent_thread_id!)}
+                      >
+                        Thread #{report.thread_number ?? ""}
+                        <ChevronRight size={10} />
+                      </button>
+                    ) : null}
+                  </div>
+                  <span className="agent-report-time">{formatDateTime(report.updated_at)}</span>
                 </div>
-                <h3>{report.title}</h3>
-                {report.description ? <p>{report.description}</p> : null}
               </div>
-              <span className="resource-card-time">{formatDateTime(report.updated_at)}</span>
+
+              <div className="agent-report-badges">
+                <span className="task-key">REPORT-{report.number}</span>
+                <TaskStatus status={report.status} />
+              </div>
             </div>
 
-            <div className="resource-card-meta">
-              <span>{report.author_agent_name ? `By ${report.author_agent_name}` : "Agent unavailable"}</span>
-              {report.project_name ? <span>{report.project_name}</span> : null}
-              <span>Revision {report.current_revision}</span>
-              <ResourceThreadLink
-                agentThreadId={report.agent_thread_id}
-                threadNumber={report.thread_number}
-                onOpenThread={props.onOpenThread}
-              />
+            <div className="agent-report-content">
+              <h3 className="agent-report-title">{report.title}</h3>
+              {report.description && report.description !== report.title ? (
+                <p className="agent-report-summary">{report.description}</p>
+              ) : null}
+
+              {report.markdown ? (
+                <div className="agent-report-body">
+                  <CollapsibleText text={cleanReportMarkdown(report.markdown, report.title)} />
+                </div>
+              ) : null}
             </div>
 
-            <div className="resource-card-markdown">
-              <CollapsibleText text={report.markdown} />
+            <div className="agent-report-footer">
+              <span className="agent-report-version">Revision v{report.current_revision}</span>
+              {report.agent_thread_id ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="agent-report-open-btn"
+                  onClick={() => props.onOpenThread(report.agent_thread_id!)}
+                >
+                  <span>View Thread</span>
+                  <ChevronRight size={12} />
+                </Button>
+              ) : null}
             </div>
           </article>
         ))}
         {props.reports.length === 0 ? (
-          <div className="resource-feed-empty">No activity reports match this view.</div>
+          <div className="resource-feed-empty">
+            <Activity size={24} className="empty-icon" />
+            <strong>No recent activity</strong>
+            <p>Agent reports, execution logs, and summaries will appear here as tasks run.</p>
+          </div>
         ) : null}
       </div>
     </div>
@@ -1113,52 +1319,114 @@ function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: 
     <div className="resource-feed-view">
       <div className="resource-feed-intro">
         <div>
-          <span className="eyebrow">CLI incidents</span>
           <h2>Incidents</h2>
-          <p>Operational issues declared by agents with their latest Markdown update.</p>
+          <p>Operational alerts, blockers, and issues flagged during agent execution.</p>
         </div>
-        <Badge variant="secondary">{props.incidents.length}</Badge>
       </div>
 
       <div className="resource-card-list">
         {props.incidents.map((incident) => (
           <article className={`resource-card incident severity-${incident.severity}`} key={incident.id}>
-            <div className="resource-card-header">
-              <div className="resource-card-heading">
-                <div className="resource-card-badges">
-                  <Badge variant="outline">INC-{incident.number}</Badge>
-                  <Badge variant={incidentSeverityVariant(incident.severity)}>{incident.severity}</Badge>
-                  <TaskStatus status={incident.status} />
+            <div className="agent-report-author-bar">
+              <div className="agent-report-author-info">
+                <AgentAvatar
+                  agentId={incident.created_by_agent_id || "default"}
+                  agentName={incident.created_by_agent_name || "Agent"}
+                  className="agent-report-avatar"
+                />
+                <div className="agent-report-author-text">
+                  <div className="agent-report-author-name-row">
+                    <strong>{incident.created_by_agent_name || "Reporter"}</strong>
+                    {incident.commander_agent_name ? (
+                      <span className="agent-report-commander">Lead: {incident.commander_agent_name}</span>
+                    ) : null}
+                    {incident.project_name ? <span className="agent-report-project">{incident.project_name}</span> : null}
+                    {incident.agent_thread_id ? (
+                      <button
+                        type="button"
+                        className="agent-report-thread-chip"
+                        onClick={() => props.onOpenThread(incident.agent_thread_id!)}
+                      >
+                        Thread #{incident.thread_number ?? ""}
+                        <ChevronRight size={10} />
+                      </button>
+                    ) : null}
+                  </div>
+                  <span className="agent-report-time">{formatDateTime(incident.updated_at)}</span>
                 </div>
-                <h3>{incident.title}</h3>
-                {incident.description ? <p>{incident.description}</p> : null}
               </div>
-              <span className="resource-card-time">{formatDateTime(incident.updated_at)}</span>
+
+              <div className="agent-report-badges">
+                <span className="task-key">INC-{incident.number}</span>
+                <Badge variant={incidentSeverityVariant(incident.severity)} className="text-[10.5px] uppercase tracking-wide font-medium">
+                  {incident.severity}
+                </Badge>
+                <TaskStatus status={incident.status} />
+              </div>
             </div>
 
-            <div className="resource-card-meta">
-              <span>{incident.created_by_agent_name ? `Reported by ${incident.created_by_agent_name}` : "Reporter unavailable"}</span>
-              {incident.commander_agent_name ? <span>Owner {incident.commander_agent_name}</span> : null}
-              {incident.project_name ? <span>{incident.project_name}</span> : null}
-              <ResourceThreadLink
-                agentThreadId={incident.agent_thread_id}
-                threadNumber={incident.thread_number}
-                onOpenThread={props.onOpenThread}
-              />
+            <div className="agent-report-content">
+              <h3 className="agent-report-title">{incident.title}</h3>
+              {incident.description && incident.description !== incident.title ? (
+                <p className="agent-report-summary">{incident.description}</p>
+              ) : null}
+
+              {incident.markdown ? (
+                <div className="agent-report-body">
+                  <CollapsibleText text={cleanReportMarkdown(incident.markdown, incident.title)} />
+                </div>
+              ) : null}
             </div>
 
-            {incident.markdown ? (
-              <div className="resource-card-markdown">
-                <CollapsibleText text={incident.markdown} />
-              </div>
-            ) : null}
+            <div className="agent-report-footer">
+              <span className="agent-report-version">Incident status: {incident.status}</span>
+              {incident.agent_thread_id ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="agent-report-open-btn"
+                  onClick={() => props.onOpenThread(incident.agent_thread_id!)}
+                >
+                  <span>Investigation Thread</span>
+                  <ChevronRight size={12} />
+                </Button>
+              ) : null}
+            </div>
           </article>
         ))}
         {props.incidents.length === 0 ? (
-          <div className="resource-feed-empty">No incidents match this view.</div>
+          <div className="resource-feed-empty">
+            <CheckCircle2 size={24} className="empty-icon" />
+            <strong>No open incidents</strong>
+            <p>All agent operations and background workflows are running normally.</p>
+          </div>
         ) : null}
       </div>
     </div>
+  );
+};
+
+function ResourceAgentIdentity(props: {
+  agentId: string | null;
+  agentName: string | null;
+  fallback: string;
+  prefix: string;
+}) {
+  const agentId = props.agentId?.trim() ?? "";
+  const agentName = props.agentName?.trim() ?? "";
+  const hasAvatar = Boolean(agentId && agentName);
+
+  return (
+    <span className="resource-card-agent">
+      {hasAvatar ? (
+        <AgentAvatar
+          agentId={agentId}
+          agentName={agentName}
+          className="resource-card-agent-avatar"
+        />
+      ) : null}
+      <span>{agentName ? `${props.prefix}${agentName}` : props.fallback}</span>
+    </span>
   );
 }
 
@@ -1189,17 +1457,11 @@ function incidentSeverityVariant(severity: Incident["severity"]): "secondary" | 
 
 function TasksView(props: {
   tasks: Task[];
-  projects: Project[];
-  agents: Agent[];
-  onCreate: (payload: Record<string, unknown>) => Promise<void>;
   onSelect: (task: Task) => void;
 }) {
   return (
     <div className="board-layout">
       <div className="board-main">
-        <div className="board-toolbar">
-          <TaskForm projects={props.projects} agents={props.agents} onCreate={props.onCreate} />
-        </div>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
             const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
@@ -1236,55 +1498,383 @@ function TasksView(props: {
   );
 }
 
-function TaskForm(props: {
+function TaskComposer(props: {
   projects: Project[];
   agents: Agent[];
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
-  const [title, setTitle] = useState("");
-  const [body, setBody] = useState("");
+  const [prompt, setPrompt] = useState("");
   const [projectId, setProjectId] = useState("");
   const [agentId, setAgentId] = useState("auto");
+  const [submitting, setSubmitting] = useState(false);
   const workerAgents = props.agents.filter((agent) => agent.kind !== "dispatcher");
+
+  async function handleSubmit() {
+    const trimmed = prompt.trim();
+    if (!trimmed || submitting) return;
+    setSubmitting(true);
+    try {
+      const lines = trimmed.split("\n");
+      const title = lines[0]?.trim() || trimmed;
+      const body = lines.slice(1).join("\n").trim();
+
+      await props.onCreate({
+        title,
+        body,
+        ...(projectId ? { projectId } : {}),
+        ...(agentId === "auto" ? {} : { agentId })
+      });
+      setPrompt("");
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <form
-      className="task-create-form"
-      onSubmit={async (event) => {
+      className="task-composer"
+      onSubmit={(event) => {
         event.preventDefault();
-        await props.onCreate({
-          title,
-          body,
-          ...(projectId ? { projectId } : {}),
-          ...(agentId === "auto" ? {} : { agentId })
-        });
-        setTitle("");
-        setBody("");
-        setAgentId("auto");
+        void handleSubmit();
       }}
     >
-      <div className="inline-create">
-        <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="What needs to be done?" required />
-        <Input value={body} onChange={(event) => setBody(event.target.value)} placeholder="Add a short brief" />
-        <NativeSelect value={projectId} onChange={(event) => setProjectId(event.target.value)}>
-          <option value="">No project</option>
-          {props.projects.map((project) => (
-            <option value={project.id} key={project.id}>
-              {project.name}
-            </option>
-          ))}
-        </NativeSelect>
-        <NativeSelect value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
-          <option value="auto">Auto-route</option>
-          {workerAgents.map((agent) => (
-            <option value={agent.id} key={agent.id}>
-              {agent.name}
-            </option>
-          ))}
-        </NativeSelect>
-        <Button type="submit">
-          <Plus size={15} />
-          New task
+      <div className="task-composer-surface">
+        <Textarea
+          autoFocus
+          value={prompt}
+          disabled={submitting}
+          rows={3}
+          placeholder="Assign a task or prompt to an agent… (e.g. Audit codebase, implement auth, refactor UI)"
+          onChange={(event) => setPrompt(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" && (event.metaKey || event.ctrlKey || !event.shiftKey)) {
+              if (event.shiftKey) return;
+              event.preventDefault();
+              void handleSubmit();
+            }
+          }}
+        />
+        <div className="task-composer-footer">
+          <div className="task-composer-controls">
+            <div className="task-control-item">
+              <Bot size={13} className="control-icon" />
+              <NativeSelect
+                value={agentId}
+                onChange={(event) => setAgentId(event.target.value)}
+                disabled={submitting}
+                className="task-control-select"
+                aria-label="Select agent"
+              >
+                <option value="auto">Auto-route agent</option>
+                {workerAgents.map((agent) => (
+                  <option value={agent.id} key={agent.id}>
+                    {agent.name}
+                  </option>
+                ))}
+              </NativeSelect>
+            </div>
+
+            <div className="task-control-item">
+              <FolderGit2 size={13} className="control-icon" />
+              <NativeSelect
+                value={projectId}
+                onChange={(event) => setProjectId(event.target.value)}
+                disabled={submitting}
+                className="task-control-select"
+                aria-label="Select project"
+              >
+                <option value="">No project</option>
+                {props.projects.map((project) => (
+                  <option value={project.id} key={project.id}>
+                    {project.name}
+                  </option>
+                ))}
+              </NativeSelect>
+            </div>
+          </div>
+
+          <div className="task-composer-actions">
+            <span className="composer-hint">↵ to create</span>
+            <Button
+              type="submit"
+              size="sm"
+              disabled={!prompt.trim() || submitting}
+              className="task-composer-submit"
+            >
+              {submitting ? <Loader2 className="spin" size={13} /> : <Plus size={13} />}
+              <span>Create task</span>
+            </Button>
+          </div>
+        </div>
+      </div>
+    </form>
+  );
+}
+
+function getCalendarMonthDays(year: number, month: number): Array<{ date: Date; isCurrentMonth: boolean; key: string }> {
+  const firstDay = new Date(year, month, 1);
+  const lastDay = new Date(year, month + 1, 0);
+  const startDayOfWeek = firstDay.getDay();
+  const daysInMonth = lastDay.getDate();
+  const result: Array<{ date: Date; isCurrentMonth: boolean; key: string }> = [];
+
+  const prevMonthLastDay = new Date(year, month, 0).getDate();
+  for (let i = startDayOfWeek - 1; i >= 0; i--) {
+    const day = prevMonthLastDay - i;
+    const d = new Date(year, month - 1, day);
+    result.push({
+      date: d,
+      isCurrentMonth: false,
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+    });
+  }
+
+  for (let day = 1; day <= daysInMonth; day++) {
+    const d = new Date(year, month, day);
+    result.push({
+      date: d,
+      isCurrentMonth: true,
+      key: `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}`
+    });
+  }
+
+  const totalNeeded = result.length <= 35 ? 35 : 42;
+  const daysToAdd = totalNeeded - result.length;
+  for (let day = 1; day <= daysToAdd; day++) {
+    const d = new Date(year, month + 1, day);
+    result.push({
+      date: d,
+      isCurrentMonth: false,
+      key: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+    });
+  }
+
+  return result;
+}
+
+function toDateKey(date: Date | string | null | undefined): string {
+  if (!date) return "";
+  const d = typeof date === "string" ? new Date(date) : date;
+  if (Number.isNaN(d.getTime())) return "";
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+
+function ScheduleComposer(props: {
+  agents: Agent[];
+  skills: Skill[];
+  tasks: Task[];
+  initialDate?: Date | null;
+  scheduleToEdit?: Schedule | null;
+  onSaved: () => Promise<void>;
+  onCancel: () => void;
+}) {
+  const enabledAgents = props.agents.filter((agent) => agent.enabled);
+  const [title, setTitle] = useState(props.scheduleToEdit?.title ?? "");
+  const [prompt, setPrompt] = useState(props.scheduleToEdit?.prompt ?? "");
+  const [agentId, setAgentId] = useState(
+    props.scheduleToEdit?.agent_id ?? enabledAgents[0]?.id ?? ""
+  );
+  const [scheduleKind, setScheduleKind] = useState<"once" | "interval">(
+    props.scheduleToEdit?.schedule_kind ?? "once"
+  );
+  const [nextRunAt, setNextRunAt] = useState(() => {
+    if (props.scheduleToEdit?.next_run_at) {
+      return localDateTimeInput(new Date(props.scheduleToEdit.next_run_at));
+    }
+    if (props.initialDate) {
+      const d = new Date(props.initialDate);
+      const now = new Date();
+      d.setHours(now.getHours(), now.getMinutes() + 5, 0, 0);
+      return localDateTimeInput(d);
+    }
+    return defaultScheduleDateTime();
+  });
+  const [intervalValue, setIntervalValue] = useState(() => {
+    if (props.scheduleToEdit?.interval_seconds) {
+      const s = props.scheduleToEdit.interval_seconds;
+      if (s % 86400 === 0) return s / 86400;
+      if (s % 3600 === 0) return s / 3600;
+      return Math.max(1, Math.round(s / 60));
+    }
+    return 1;
+  });
+  const [intervalUnit, setIntervalUnit] = useState<"minutes" | "hours" | "days">(() => {
+    if (props.scheduleToEdit?.interval_seconds) {
+      const s = props.scheduleToEdit.interval_seconds;
+      if (s % 86400 === 0) return "days";
+      if (s % 3600 === 0) return "hours";
+      return "minutes";
+    }
+    return "hours";
+  });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabledAgents.some((agent) => agent.id === agentId)) {
+      setAgentId(enabledAgents[0]?.id ?? "");
+    }
+  }, [props.agents, agentId]);
+
+  return (
+    <form
+      className="schedule-composer-form stack"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        if (!agentId || !title.trim() || !prompt.trim()) return;
+        setBusy(true);
+        setError(null);
+        const unitSeconds = intervalUnit === "minutes" ? 60 : intervalUnit === "hours" ? 3600 : 86_400;
+        try {
+          if (props.scheduleToEdit) {
+            await api(`/api/schedules/${props.scheduleToEdit.id}`, {
+              method: "PATCH",
+              body: JSON.stringify({
+                title,
+                prompt,
+                agentId,
+                scheduleKind,
+                nextRunAt: new Date(nextRunAt).toISOString(),
+                intervalSeconds: scheduleKind === "interval" ? intervalValue * unitSeconds : null
+              })
+            });
+          } else {
+            await api("/api/schedules", {
+              method: "POST",
+              body: JSON.stringify({
+                title,
+                prompt,
+                agentId,
+                scheduleKind,
+                nextRunAt: new Date(nextRunAt).toISOString(),
+                intervalSeconds: scheduleKind === "interval" ? intervalValue * unitSeconds : null
+              })
+            });
+          }
+          await props.onSaved();
+        } catch (saveError) {
+          setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save schedule."));
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <div className="schedule-composer-header">
+        <div className="flex items-center gap-2">
+          <Calendar size={16} className="text-primary" />
+          <span className="font-semibold text-[13.5px] text-foreground">
+            {props.scheduleToEdit ? "Edit schedule" : "Schedule an agent"}
+          </span>
+        </div>
+      </div>
+
+      <div className="p-4 flex flex-col gap-3">
+        <label className="text-[12px] font-medium text-foreground">
+          Title
+          <Input
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+            placeholder="e.g. Daily workspace brief, Nightly integration tests"
+            required
+            className="mt-1"
+          />
+        </label>
+
+        <div className="grid grid-cols-2 gap-2.5">
+          <label className="text-[12px] font-medium text-foreground">
+            Agent
+            <NativeSelect
+              value={agentId}
+              onChange={(e) => setAgentId(e.target.value)}
+              required
+              className="mt-1"
+            >
+              {enabledAgents.map((agent) => (
+                <option value={agent.id} key={agent.id}>
+                  {agent.name}
+                </option>
+              ))}
+            </NativeSelect>
+          </label>
+
+          <label className="text-[12px] font-medium text-foreground">
+            Frequency
+            <NativeSelect
+              value={scheduleKind}
+              onChange={(e) => setScheduleKind(e.target.value as "once" | "interval")}
+              className="mt-1"
+            >
+              <option value="once">One time</option>
+              <option value="interval">Repeating interval</option>
+            </NativeSelect>
+          </label>
+        </div>
+
+        <div className="grid grid-cols-1 gap-2.5">
+          <label className="text-[12px] font-medium text-foreground">
+            {scheduleKind === "once" ? "Run at" : "First run"}
+            <Input
+              type="datetime-local"
+              value={nextRunAt}
+              onChange={(e) => setNextRunAt(e.target.value)}
+              required
+              className="mt-1 font-mono text-[12px]"
+            />
+          </label>
+
+          {scheduleKind === "interval" ? (
+            <label className="text-[12px] font-medium text-foreground">
+              Repeat every
+              <div className="flex gap-2 mt-1">
+                <Input
+                  type="number"
+                  min={1}
+                  max={10_000}
+                  value={intervalValue}
+                  onChange={(e) => setIntervalValue(Math.max(1, Number(e.target.value)))}
+                  required
+                  style={{ width: "90px" }}
+                  className="font-mono text-[12px]"
+                />
+                <NativeSelect
+                  value={intervalUnit}
+                  onChange={(e) => setIntervalUnit(e.target.value as typeof intervalUnit)}
+                  className="flex-1"
+                >
+                  <option value="minutes">Minutes</option>
+                  <option value="hours">Hours</option>
+                  <option value="days">Days</option>
+                </NativeSelect>
+              </div>
+            </label>
+          ) : null}
+        </div>
+
+        <div className="flex flex-col gap-1 mt-1">
+          <span className="text-[12px] font-medium text-foreground">Task instructions</span>
+          <PromptComposer
+            value={prompt}
+            onChange={setPrompt}
+            agents={props.agents}
+            skills={props.skills}
+            tasks={props.tasks}
+            minHeight={120}
+            ariaLabel="Scheduled prompt"
+            placeholder="What should the agent do on schedule? Type / to attach skills or reference tasks."
+            disabled={busy}
+          />
+        </div>
+
+        {error ? <div className="notice error">{error}</div> : null}
+      </div>
+
+      <div className="schedule-composer-footer">
+        <Button type="button" variant="ghost" size="sm" onClick={props.onCancel} disabled={busy}>
+          Cancel
+        </Button>
+        <Button type="submit" size="sm" disabled={busy || !agentId || !title.trim() || !prompt.trim()}>
+          {busy ? <Loader2 className="spin" size={14} /> : <Calendar size={14} />}
+          <span>{props.scheduleToEdit ? "Save changes" : "Schedule agent"}</span>
         </Button>
       </div>
     </form>
@@ -1293,29 +1883,84 @@ function TaskForm(props: {
 
 function SchedulesView(props: {
   schedules: Schedule[];
+  threads: AgentThread[];
   agents: Agent[];
   skills: Skill[];
   tasks: Task[];
+  composerOpen: boolean;
+  onComposerOpenChange: (open: boolean) => void;
+  composerDate: Date | null;
+  onComposerDateChange: (date: Date | null) => void;
+  editingSchedule: Schedule | null;
+  onEditingScheduleChange: (schedule: Schedule | null) => void;
   onSaved: () => Promise<void>;
   onOpenThread: (threadId: string) => Promise<void>;
 }) {
-  const enabledAgents = props.agents.filter((agent) => agent.enabled);
-  const [title, setTitle] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [agentId, setAgentId] = useState(enabledAgents[0]?.id ?? "");
-  const [scheduleKind, setScheduleKind] = useState<"once" | "interval">("once");
-  const [nextRunAt, setNextRunAt] = useState(() => defaultScheduleDateTime());
-  const [intervalValue, setIntervalValue] = useState(1);
-  const [intervalUnit, setIntervalUnit] = useState<"minutes" | "hours" | "days">("hours");
+  const [currentDate, setCurrentDate] = useState(() => new Date());
+  const [viewMode, setViewMode] = useState<"calendar" | "agenda">("calendar");
+  const [selectedEventDetails, setSelectedEventDetails] = useState<{
+    type: "schedule" | "thread";
+    schedule?: Schedule;
+    thread?: AgentThread;
+  } | null>(null);
+  const [calendarOverflow, setCalendarOverflow] = useState<{
+    date: Date;
+    schedules: Schedule[];
+    threads: AgentThread[];
+  } | null>(null);
   const [busy, setBusy] = useState(false);
   const [deleteArmed, setDeleteArmed] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    if (!enabledAgents.some((agent) => agent.id === agentId)) {
-      setAgentId(enabledAgents[0]?.id ?? "");
+  const year = currentDate.getFullYear();
+  const month = currentDate.getMonth();
+
+  const calendarDays = useMemo(() => getCalendarMonthDays(year, month), [year, month]);
+
+  const monthLabel = useMemo(() => {
+    return currentDate.toLocaleString("default", { month: "long", year: "numeric" });
+  }, [currentDate]);
+
+  const scheduledByDay = useMemo(() => {
+    const map = new Map<string, Schedule[]>();
+    for (const schedule of props.schedules) {
+      if (!schedule.enabled && !schedule.next_run_at) continue;
+      const key = toDateKey(schedule.next_run_at);
+      if (key) {
+        const existing = map.get(key) ?? [];
+        existing.push(schedule);
+        map.set(key, existing);
+      }
     }
-  }, [props.agents, agentId]);
+    return map;
+  }, [props.schedules]);
+
+  const threadsByDay = useMemo(() => {
+    const map = new Map<string, AgentThread[]>();
+    for (const thread of props.threads) {
+      const key = toDateKey(thread.last_activity_at);
+      if (key) {
+        const existing = map.get(key) ?? [];
+        existing.push(thread);
+        map.set(key, existing);
+      }
+    }
+    return map;
+  }, [props.threads]);
+
+  const todayKey = useMemo(() => toDateKey(new Date()), []);
+
+  function handlePrevMonth() {
+    setCurrentDate((d) => new Date(d.getFullYear(), d.getMonth() - 1, 1));
+  }
+
+  function handleNextMonth() {
+    setCurrentDate((d) => new Date(d.getFullYear(), d.getMonth() + 1, 1));
+  }
+
+  function handleToday() {
+    setCurrentDate(new Date());
+  }
 
   async function updateSchedule(id: string, payload: Record<string, unknown>) {
     setBusy(true);
@@ -1330,212 +1975,406 @@ function SchedulesView(props: {
     }
   }
 
+  async function deleteSchedule(id: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/schedules/${id}`, { method: "DELETE" });
+      setDeleteArmed(null);
+      setSelectedEventDetails(null);
+      await props.onSaved();
+    } catch (deleteErr) {
+      setError(friendlyError(deleteErr instanceof Error ? deleteErr.message : "Could not delete schedule."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
-    <div className="schedule-layout">
-      <section className="schedule-create-card">
-        <div className="section-heading">
-          <div>
-            <h2>Schedule an agent</h2>
-            <p>A fresh agent task is created for every run, with its result preserved in Threads.</p>
-          </div>
-          <span className="schedule-heading-icon"><Calendar size={20} /></span>
-        </div>
-        <form
-          className="schedule-form stack"
-          onSubmit={async (event) => {
-            event.preventDefault();
-            if (!agentId) return;
-            setBusy(true);
-            setError(null);
-            const unitSeconds = intervalUnit === "minutes" ? 60 : intervalUnit === "hours" ? 3600 : 86_400;
-            try {
-              await api("/api/schedules", {
-                method: "POST",
-                body: JSON.stringify({
-                  title,
-                  prompt,
-                  agentId,
-                  scheduleKind,
-                  nextRunAt: new Date(nextRunAt).toISOString(),
-                  intervalSeconds: scheduleKind === "interval" ? intervalValue * unitSeconds : null
-                })
-              });
-              setTitle("");
-              setPrompt("");
-              setNextRunAt(defaultScheduleDateTime());
-              await props.onSaved();
-            } catch (createError) {
-              setError(friendlyError(createError instanceof Error ? createError.message : "Could not create schedule."));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          <div className="schedule-form-grid">
-            <label>
-              Title
-              <Input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="Daily workspace brief" required />
-            </label>
-            <label>
-              Agent
-              <NativeSelect value={agentId} onChange={(event) => setAgentId(event.target.value)} required>
-                {enabledAgents.map((agent) => (
-                  <option value={agent.id} key={agent.id}>{agent.name}</option>
-                ))}
-              </NativeSelect>
-            </label>
-            <label>
-              Frequency
-              <NativeSelect value={scheduleKind} onChange={(event) => setScheduleKind(event.target.value as "once" | "interval")}>
-                <option value="once">One time</option>
-                <option value="interval">Repeating interval</option>
-              </NativeSelect>
-            </label>
-            <label>
-              {scheduleKind === "once" ? "Run at" : "First run"}
-              <Input
-                type="datetime-local"
-                value={nextRunAt}
-                min={defaultScheduleDateTime(1)}
-                onChange={(event) => setNextRunAt(event.target.value)}
-                required
-              />
-            </label>
-          </div>
-          {scheduleKind === "interval" ? (
-            <label className="schedule-interval-field">
-              Repeat every
-              <span className="schedule-interval-inputs">
-                <Input
-                  type="number"
-                  min={1}
-                  max={10_000}
-                  value={intervalValue}
-                  onChange={(event) => setIntervalValue(Math.max(1, Number(event.target.value)))}
-                  required
-                />
-                <NativeSelect value={intervalUnit} onChange={(event) => setIntervalUnit(event.target.value as typeof intervalUnit)}>
-                  <option value="minutes">Minutes</option>
-                  <option value="hours">Hours</option>
-                  <option value="days">Days</option>
-                </NativeSelect>
-              </span>
-            </label>
-          ) : null}
-          <div className="field-group">
-            <span>Prompt</span>
-            <PromptComposer
-              value={prompt}
-              onChange={setPrompt}
-              agents={props.agents}
-              skills={props.skills}
-              tasks={props.tasks}
-              minHeight={220}
-              ariaLabel="Scheduled prompt"
-              placeholder="What should the agent do? Type / to attach a skill or reference an agent or task."
-              disabled={busy}
-            />
-          </div>
-          {error ? <div className="notice error">{error}</div> : null}
-          <div className="schedule-form-actions">
-            <span>Times use your local timezone.</span>
-            <Button type="submit" disabled={busy || !agentId || !title.trim() || !prompt.trim()}>
-              <Calendar size={15} />
-              Create schedule
+    <div className="schedules-calendar-view">
+      <div className="calendar-toolbar">
+        <div className="calendar-nav-group">
+          <Button variant="outline" size="sm" onClick={handleToday} className="h-8 px-3 text-[12px] font-medium">
+            Today
+          </Button>
+          <div className="calendar-chevron-buttons">
+            <Button variant="ghost" size="icon" onClick={handlePrevMonth} className="h-8 w-8" aria-label="Previous month">
+              <ChevronLeft size={16} />
+            </Button>
+            <Button variant="ghost" size="icon" onClick={handleNextMonth} className="h-8 w-8" aria-label="Next month">
+              <ChevronRight size={16} />
             </Button>
           </div>
-        </form>
-      </section>
+          <h2 className="calendar-month-title">{monthLabel}</h2>
+        </div>
 
-      <section className="schedule-list-section">
-        <div className="schedule-list-heading">
-          <div>
-            <h3>Schedules</h3>
-            <p>{props.schedules.length} configured</p>
+        <div className="calendar-toolbar-right">
+          <div className="calendar-legend-pills">
+            <span className="legend-pill scheduled">
+              <span className="legend-dot" />
+              <span>Scheduled</span>
+              <span className="legend-count">{props.schedules.length}</span>
+            </span>
+            <span className="legend-pill activity">
+              <span className="legend-dot" />
+              <span>Activity</span>
+              <span className="legend-count">{props.threads.length}</span>
+            </span>
+          </div>
+
+          <div className="calendar-view-toggle">
+            <button
+              type="button"
+              className={`toggle-btn ${viewMode === "calendar" ? "active" : ""}`}
+              onClick={() => setViewMode("calendar")}
+            >
+              <Calendar size={13} />
+              <span>Month</span>
+            </button>
+            <button
+              type="button"
+              className={`toggle-btn ${viewMode === "agenda" ? "active" : ""}`}
+              onClick={() => setViewMode("agenda")}
+            >
+              <ListIcon size={13} />
+              <span>Agenda</span>
+            </button>
           </div>
         </div>
-        <div className="schedule-list">
-          {props.schedules.length === 0 ? (
-            <div className="empty-state schedule-empty">No schedules yet</div>
-          ) : props.schedules.map((schedule) => {
-            const completedOnce = schedule.schedule_kind === "once" && Boolean(schedule.last_run_at);
-            return (
-              <article className="schedule-card" key={schedule.id}>
-                <div className="schedule-card-top">
-                  <AgentAvatar
-                    agentId={schedule.agent_id}
-                    agentName={schedule.agent_name}
-                    className="schedule-agent-avatar"
-                  />
-                  <div className="schedule-card-title">
-                    <strong>{schedule.title}</strong>
-                    <span>{schedule.agent_name} · {formatScheduleCadence(schedule)}</span>
+      </div>
+
+      {viewMode === "calendar" ? (
+        <div className="calendar-grid-container">
+          <div className="calendar-weekdays-row">
+            {["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => (
+              <div className="calendar-weekday-header" key={day}>
+                {day}
+              </div>
+            ))}
+          </div>
+
+          <div className="calendar-month-grid">
+            {calendarDays.map(({ date, isCurrentMonth, key }) => {
+              const daySchedules = scheduledByDay.get(key) ?? [];
+              const dayThreads = threadsByDay.get(key) ?? [];
+              const isToday = key === todayKey;
+              const allEventsCount = daySchedules.length + dayThreads.length;
+              const maxDisplay = 3;
+
+              return (
+                <div
+                  className={`calendar-day-cell ${!isCurrentMonth ? "other-month" : ""} ${isToday ? "today" : ""}`}
+                  key={key}
+                >
+                  <div className="day-cell-top">
+                    <span className={`day-number ${isToday ? "today-badge" : ""}`}>
+                      {date.getDate()}
+                    </span>
+                    <button
+                      type="button"
+                      className="day-add-button"
+                      title={`Schedule run for ${date.toLocaleDateString()}`}
+                      onClick={() => {
+                        props.onEditingScheduleChange(null);
+                        props.onComposerDateChange(date);
+                        props.onComposerOpenChange(true);
+                      }}
+                    >
+                      <Plus size={12} />
+                    </button>
                   </div>
-                  <Badge variant={schedule.enabled ? "success" : completedOnce ? "secondary" : "warning"}>
-                    {schedule.enabled ? "Scheduled" : completedOnce ? "Completed" : "Paused"}
-                  </Badge>
+
+                  <div className="day-events-list">
+                    {daySchedules.slice(0, maxDisplay).map((schedule) => (
+                      <button
+                        type="button"
+                        className={`calendar-event-chip scheduled ${!schedule.enabled ? "paused" : ""}`}
+                        key={schedule.id}
+                        onClick={() => setSelectedEventDetails({ type: "schedule", schedule })}
+                        title={`${schedule.title} (${schedule.agent_name})`}
+                      >
+                        <AgentAvatar
+                          agentId={schedule.agent_id}
+                          agentName={schedule.agent_name}
+                          className="chip-avatar"
+                        />
+                        <span className="chip-time">{formatTimestamp(schedule.next_run_at)}</span>
+                        <span className="chip-title">{schedule.title}</span>
+                      </button>
+                    ))}
+
+                    {dayThreads.slice(0, Math.max(0, maxDisplay - daySchedules.length)).map((thread) => (
+                      <button
+                        type="button"
+                        className={`calendar-event-chip ran status-${thread.latest_status ?? "running"}`}
+                        key={thread.id}
+                        onClick={() => void props.onOpenThread(thread.id)}
+                        title={`Ran thread: ${thread.title || "Agent task"} (${thread.latest_status ?? "active"})`}
+                      >
+                        <AgentAvatar
+                          agentId={thread.agent_id || "default"}
+                          agentName={thread.agent_name || "Agent"}
+                          className="chip-avatar"
+                        />
+                        <span className="chip-time">{formatTimestamp(thread.last_activity_at)}</span>
+                        <span className="chip-title">{thread.title || thread.agent_name || "Task"}</span>
+                      </button>
+                    ))}
+
+                    {allEventsCount > maxDisplay ? (
+                      <button
+                        type="button"
+                        className="calendar-more-events"
+                        onClick={() => setCalendarOverflow({ date, schedules: daySchedules, threads: dayThreads })}
+                      >
+                        +{allEventsCount - maxDisplay} more
+                      </button>
+                    ) : null}
+                  </div>
                 </div>
-                <p className="schedule-prompt-preview">{schedule.prompt}</p>
-                <div className="schedule-card-meta">
-                  <span>{schedule.enabled ? "Next" : "Last"}: {formatDateTime(schedule.enabled ? schedule.next_run_at : schedule.last_run_at ?? schedule.next_run_at)}</span>
-                  <span>{schedule.run_count} run{schedule.run_count === 1 ? "" : "s"}</span>
-                  {schedule.last_run_status ? <TaskStatus status={schedule.last_run_status} /> : null}
-                </div>
-                <div className="schedule-card-actions">
-                  {schedule.last_agent_thread_id ? (
-                    <Button type="button" variant="secondary" size="sm" onClick={() => void props.onOpenThread(schedule.last_agent_thread_id!)}>
-                      <Activity size={14} />
-                      Open latest task
-                    </Button>
-                  ) : null}
-                  {!completedOnce ? (
+              );
+            })}
+          </div>
+        </div>
+      ) : (
+        <div className="calendar-agenda-view">
+          {props.schedules.length === 0 && props.threads.length === 0 ? (
+            <div className="resource-feed-empty">
+              <Calendar size={24} className="empty-icon" />
+              <strong>No scheduled runs or thread activity</strong>
+              <p>Create a schedule to automate agent workflows on a recurring cadence.</p>
+            </div>
+          ) : (
+            <div className="agenda-list">
+              {props.schedules.map((schedule) => (
+                <article className="schedule-card" key={schedule.id}>
+                  <div className="schedule-card-top">
+                    <AgentAvatar
+                      agentId={schedule.agent_id}
+                      agentName={schedule.agent_name}
+                      className="schedule-agent-avatar"
+                    />
+                    <div className="schedule-card-title">
+                      <strong>{schedule.title}</strong>
+                      <span>{schedule.agent_name} · {formatScheduleCadence(schedule)}</span>
+                    </div>
+                    <Badge variant={schedule.enabled ? "success" : "secondary"}>
+                      {schedule.enabled ? "Scheduled" : "Paused"}
+                    </Badge>
+                  </div>
+                  <p className="schedule-prompt-preview">{schedule.prompt}</p>
+                  <div className="schedule-card-meta">
+                    <span>Next run: {formatDateTime(schedule.next_run_at)}</span>
+                    <span>{schedule.run_count} run{schedule.run_count === 1 ? "" : "s"}</span>
+                    {schedule.last_run_status ? <TaskStatus status={schedule.last_run_status} /> : null}
+                  </div>
+                  <div className="schedule-card-actions">
+                    {schedule.last_agent_thread_id ? (
+                      <Button type="button" variant="secondary" size="sm" onClick={() => void props.onOpenThread(schedule.last_agent_thread_id!)}>
+                        <Activity size={13} />
+                        Open latest thread
+                      </Button>
+                    ) : null}
                     <Button
                       type="button"
                       variant="ghost"
                       size="sm"
-                      disabled={busy}
+                      onClick={() => {
+                        props.onEditingScheduleChange(schedule);
+                        props.onComposerDateChange(null);
+                        props.onComposerOpenChange(true);
+                      }}
+                    >
+                      Edit
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
                       onClick={() => void updateSchedule(schedule.id, { enabled: !schedule.enabled })}
                     >
                       {schedule.enabled ? <Pause size={13} /> : <Play size={13} />}
                       {schedule.enabled ? "Pause" : "Resume"}
                     </Button>
-                  ) : null}
-                  {deleteArmed === schedule.id ? (
-                    <>
-                      <Button type="button" variant="ghost" size="sm" onClick={() => setDeleteArmed(null)}>Cancel</Button>
-                      <Button
-                        type="button"
-                        variant="destructive"
-                        size="sm"
-                        disabled={busy}
-                        onClick={async () => {
-                          setBusy(true);
-                          setError(null);
-                          try {
-                            await api(`/api/schedules/${schedule.id}`, { method: "DELETE" });
-                            setDeleteArmed(null);
-                            await props.onSaved();
-                          } catch (deleteError) {
-                            setError(friendlyError(deleteError instanceof Error ? deleteError.message : "Could not delete schedule."));
-                          } finally {
-                            setBusy(false);
-                          }
-                        }}
-                      >
-                        Confirm delete
-                      </Button>
-                    </>
-                  ) : (
-                    <Button type="button" variant="ghost" size="icon" aria-label={`Delete ${schedule.title}`} onClick={() => setDeleteArmed(schedule.id)}>
-                      <Trash2 size={14} />
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      aria-label="Delete schedule"
+                      onClick={() => deleteSchedule(schedule.id)}
+                    >
+                      <Trash2 size={13} />
                     </Button>
-                  )}
-                </div>
-              </article>
-            );
-          })}
+                  </div>
+                </article>
+              ))}
+            </div>
+          )}
         </div>
-      </section>
+      )}
+
+      {props.composerOpen ? (
+        <div className="calendar-modal-backdrop" onClick={() => props.onComposerOpenChange(false)}>
+          <div className="calendar-modal-content" onClick={(e) => e.stopPropagation()}>
+            <ScheduleComposer
+              agents={props.agents}
+              skills={props.skills}
+              tasks={props.tasks}
+              initialDate={props.composerDate}
+              scheduleToEdit={props.editingSchedule}
+              onSaved={async () => {
+                await props.onSaved();
+                props.onComposerOpenChange(false);
+                props.onEditingScheduleChange(null);
+              }}
+              onCancel={() => {
+                props.onComposerOpenChange(false);
+                props.onEditingScheduleChange(null);
+              }}
+            />
+          </div>
+        </div>
+      ) : null}
+
+      {calendarOverflow ? (
+        <div className="calendar-modal-backdrop" onClick={() => setCalendarOverflow(null)}>
+          <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="p-5 flex flex-col gap-3">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-mono text-muted-foreground uppercase tracking-wider">
+                    Calendar day
+                  </div>
+                  <h3 className="text-[15px] font-semibold text-foreground mt-0.5">
+                    {calendarOverflow.date.toLocaleDateString(undefined, {
+                      weekday: "long",
+                      month: "long",
+                      day: "numeric",
+                      year: "numeric"
+                    })}
+                  </h3>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon"
+                  aria-label="Close calendar day"
+                  onClick={() => setCalendarOverflow(null)}
+                >
+                  <CircleX size={15} />
+                </Button>
+              </div>
+
+              <div className="calendar-overflow-list">
+                {calendarOverflow.schedules.map((schedule) => (
+                  <button
+                    type="button"
+                    className={`calendar-event-chip scheduled ${!schedule.enabled ? "paused" : ""}`}
+                    key={`schedule-${schedule.id}`}
+                    onClick={() => {
+                      setCalendarOverflow(null);
+                      setSelectedEventDetails({ type: "schedule", schedule });
+                    }}
+                  >
+                    <AgentAvatar agentId={schedule.agent_id} agentName={schedule.agent_name} className="chip-avatar" />
+                    <span className="chip-time">{formatTimestamp(schedule.next_run_at)}</span>
+                    <span className="chip-title">{schedule.title}</span>
+                  </button>
+                ))}
+                {calendarOverflow.threads.map((thread) => (
+                  <button
+                    type="button"
+                    className={`calendar-event-chip ran status-${thread.latest_status ?? "running"}`}
+                    key={`thread-${thread.id}`}
+                    onClick={() => {
+                      setCalendarOverflow(null);
+                      void props.onOpenThread(thread.id);
+                    }}
+                  >
+                    <AgentAvatar
+                      agentId={thread.agent_id || "default"}
+                      agentName={thread.agent_name || "Agent"}
+                      className="chip-avatar"
+                    />
+                    <span className="chip-time">{formatTimestamp(thread.last_activity_at)}</span>
+                    <span className="chip-title">{thread.title || thread.agent_name || "Task"}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {selectedEventDetails && selectedEventDetails.schedule ? (
+        <div className="calendar-modal-backdrop" onClick={() => setSelectedEventDetails(null)}>
+          <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
+            <div className="p-5 flex flex-col gap-4">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="text-[11px] font-mono text-muted-foreground uppercase tracking-wider">
+                    Scheduled Agent Run
+                  </div>
+                  <h3 className="text-[15px] font-semibold text-foreground mt-0.5">
+                    {selectedEventDetails.schedule.title}
+                  </h3>
+                </div>
+                <Badge variant={selectedEventDetails.schedule.enabled ? "success" : "secondary"}>
+                  {selectedEventDetails.schedule.enabled ? "Scheduled" : "Paused"}
+                </Badge>
+              </div>
+
+              <div className="bg-secondary/40 rounded-lg p-3 text-[12px] flex flex-col gap-1.5 font-mono text-muted-foreground">
+                <div>Agent: <span className="text-foreground font-medium">{selectedEventDetails.schedule.agent_name}</span></div>
+                <div>Next run: <span className="text-foreground">{formatDateTime(selectedEventDetails.schedule.next_run_at)}</span></div>
+                <div>Cadence: <span className="text-foreground">{formatScheduleCadence(selectedEventDetails.schedule)}</span></div>
+                <div>Total runs: <span className="text-foreground">{selectedEventDetails.schedule.run_count}</span></div>
+              </div>
+
+              <div className="text-[12.5px] text-muted-foreground bg-card border border-border rounded-lg p-3 max-h-36 overflow-y-auto whitespace-pre-wrap">
+                {selectedEventDetails.schedule.prompt}
+              </div>
+
+              <div className="flex items-center justify-between pt-2 border-t border-border">
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      const s = selectedEventDetails.schedule!;
+                      setSelectedEventDetails(null);
+                      props.onEditingScheduleChange(s);
+                      props.onComposerDateChange(null);
+                      props.onComposerOpenChange(true);
+                    }}
+                  >
+                    Edit
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={async () => {
+                      const s = selectedEventDetails.schedule!;
+                      await updateSchedule(s.id, { enabled: !s.enabled });
+                      setSelectedEventDetails(null);
+                    }}
+                  >
+                    {selectedEventDetails.schedule.enabled ? "Pause" : "Resume"}
+                  </Button>
+                </div>
+                <Button
+                  variant="destructive"
+                  size="sm"
+                  onClick={() => deleteSchedule(selectedEventDetails.schedule!.id)}
+                >
+                  <Trash2 size={13} />
+                  Delete
+                </Button>
+              </div>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }
@@ -1658,6 +2497,7 @@ function AgentChatsView(props: {
   draft: boolean;
   run: AgentRunTimelineRun | null;
   events: RunEvent[];
+  eventsTruncated: boolean;
   detailState: ThreadDetailState;
   pendingMessages: AgentRunChatMessage[];
   providers: ProviderInstance[];
@@ -1678,6 +2518,8 @@ function AgentChatsView(props: {
   const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
   const threadKey = props.thread?.id ?? (props.draft ? "draft" : "loading");
   const hasTimelineData = Boolean(props.run || props.events.length || props.pendingMessages.length);
+
+  const [draftMessage, setDraftMessage] = useState("");
 
   useLayoutEffect(() => {
     if (previousThreadRef.current !== threadKey) {
@@ -1710,15 +2552,13 @@ function AgentChatsView(props: {
     <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
       <header className="agent-chat-header">
         <div className="agent-chat-heading">
-          {props.thread?.display_agent_identity ? (
-            <AgentAvatar
-              agentId={props.thread.agent_id}
-              agentName={props.thread.agent_name}
-              className="agent-chat-avatar"
-            />
-          ) : (
-            <div className="agent-chat-avatar"><OpenAILogo size={16} /></div>
-          )}
+          <AgentAvatar
+            agentId={props.thread?.agent_id || "default"}
+            agentName={agentName || "Agent"}
+            className="agent-chat-avatar"
+            motion="always"
+            orbVariant={active ? "working" : undefined}
+          />
           <div className="agent-chat-title-group">
             <div className="agent-chat-breadcrumb">{projectName} <span>/</span> {agentName}</div>
             <h1>{title}</h1>
@@ -1738,13 +2578,50 @@ function AgentChatsView(props: {
       <div className="agent-chat-stage">
         {props.draft && props.events.length === 0 && props.pendingMessages.length === 0 ? (
           <div className="agent-chat-hero">
-            <div className="hero-mark"><OpenAILogo size={20} /></div>
-            <h2>What should Codex work on?</h2>
-            <p>Start a durable thread. You can switch models before sending or between turns.</p>
+            <div className="hero-mark">
+              <AgentOrb variant="thinking" size={20} color="var(--primary)" />
+            </div>
+            <h2>What should your agent build?</h2>
+            <p>Start a durable thread to assign tasks, inspect code, or coordinate multi-agent workflows.</p>
+
+            <div className="hero-prompt-grid">
+              <button
+                type="button"
+                className="hero-prompt-card"
+                onClick={() => setDraftMessage("Audit repository dependencies & check for security vulnerabilities")}
+              >
+                <strong>Audit repository security</strong>
+                <span>Inspect dependencies, auth boundaries, and vulnerabilities</span>
+              </button>
+              <button
+                type="button"
+                className="hero-prompt-card"
+                onClick={() => setDraftMessage("Write automated unit and integration tests with vitest")}
+              >
+                <strong>Generate automated test suite</strong>
+                <span>Create unit and integration test coverage for core modules</span>
+              </button>
+              <button
+                type="button"
+                className="hero-prompt-card"
+                onClick={() => setDraftMessage("Refactor UI components to a clean, minimal, accessible design")}
+              >
+                <strong>Refactor UI components</strong>
+                <span>Modernize layouts to clean, minimal, accessible design</span>
+              </button>
+              <button
+                type="button"
+                className="hero-prompt-card"
+                onClick={() => setDraftMessage("Analyze performance bottlenecks and optimize query speed")}
+              >
+                <strong>Analyze performance</strong>
+                <span>Identify slow queries, redundant rerenders, and bundle size</span>
+              </button>
+            </div>
           </div>
         ) : props.detailState.status === "loading" && !hasTimelineData ? (
           <div className="agent-chat-detail-state" aria-busy="true">
-            <Loader2 className="spin" size={18} />
+            <DotMatrixLoader size={20} className="text-primary" />
             <span>Loading thread…</span>
           </div>
         ) : props.detailState.status === "error" && !hasTimelineData ? (
@@ -1772,6 +2649,11 @@ function AgentChatsView(props: {
               setShowScrollDown(!nearBottom);
             }}
           >
+            {props.eventsTruncated ? (
+              <div className="text-muted" style={{ padding: "12px 18px", textAlign: "center", fontSize: 12 }}>
+                Showing the latest 2,000 events to keep this thread responsive.
+              </div>
+            ) : null}
             <CodexSessionTimeline
               run={props.run}
               events={props.events}
@@ -1816,6 +2698,8 @@ function AgentChatsView(props: {
             active={active}
             providers={props.providers}
             selection={props.selection}
+            message={draftMessage}
+            onMessageChange={setDraftMessage}
             onSelectionChange={props.onSelectionChange}
             onSend={props.onSendMessage}
             onCancel={props.onCancel}
@@ -1830,11 +2714,15 @@ function AgentChatComposer(props: {
   active: boolean;
   providers: ProviderInstance[];
   selection: ModelSelection | null;
+  message?: string;
+  onMessageChange?: (msg: string) => void;
   onSelectionChange: (selection: ModelSelection) => Promise<void>;
   onSend: (message: string, selection: ModelSelection) => Promise<void>;
   onCancel: () => Promise<void>;
 }) {
-  const [message, setMessage] = useState("");
+  const [internalMessage, setInternalMessage] = useState("");
+  const message = props.message !== undefined ? props.message : internalMessage;
+  const setMessage = props.onMessageChange ?? setInternalMessage;
   const [sending, setSending] = useState(false);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [modelQuery, setModelQuery] = useState("");
@@ -1911,19 +2799,9 @@ function AgentChatComposer(props: {
                 className="agent-model-popover"
                 side="top"
                 align="start"
-                sideOffset={9}
-                aria-label="Choose a Codex model"
+                sideOffset={8}
+                aria-label="Choose a model"
               >
-                <div className="model-picker-heading">
-                  <span className="model-harness-mark"><OpenAILogo size={14} /></span>
-                  <div>
-                    <strong>{provider?.display_name ?? "Codex"} models</strong>
-                    <span className={`model-catalog-source is-${provider?.modelSource ?? "fallback"}`}>
-                      <Circle size={6} weight="fill" />
-                      {provider?.modelSource === "live" ? "Live catalog" : "Offline catalog"}
-                    </span>
-                  </div>
-                </div>
                 <Command>
                   <CommandInput
                     autoFocus
@@ -1933,27 +2811,31 @@ function AgentChatComposer(props: {
                   />
                   <CommandList>
                     <CommandEmpty>No matching models.</CommandEmpty>
-                    <CommandGroup heading="Models">
-                      {(provider?.models ?? []).map((entry) => (
-                        <CommandItem
-                          value={`${entry.label} ${entry.id} ${entry.description}`}
-                          className={entry.id === selection?.model ? "is-selected" : ""}
-                          key={entry.id}
-                          onSelect={() => {
-                            if (!provider) return;
-                            void props.onSelectionChange(selectionForModel(provider, entry, selection));
-                            setPickerOpen(false);
-                            setModelQuery("");
-                          }}
-                        >
-                          <span className="model-row-copy">
-                            <strong>{entry.label}</strong>
-                            <small>{entry.description}</small>
-                          </span>
-                          {entry.badge ? <span className="model-badge">{entry.badge}</span> : null}
-                          {entry.id === selection?.model ? <CheckCircle2 size={15} weight="fill" /> : null}
-                        </CommandItem>
-                      ))}
+                    <CommandGroup>
+                      {(provider?.models ?? []).map((entry) => {
+                        const isSelected = entry.id === selection?.model;
+                        return (
+                          <CommandItem
+                            value={`${entry.label} ${entry.id} ${entry.description}`}
+                            className={isSelected ? "is-selected" : ""}
+                            key={entry.id}
+                            onSelect={() => {
+                              if (!provider) return;
+                              void props.onSelectionChange(selectionForModel(provider, entry, selection));
+                              setPickerOpen(false);
+                              setModelQuery("");
+                            }}
+                          >
+                            <div className="model-row-copy flex-1 min-w-0">
+                              <span className="font-medium text-[13px] text-foreground truncate block">{entry.label}</span>
+                              {entry.description ? (
+                                <span className="text-[11.5px] text-muted-foreground line-clamp-1 block mt-0.5">{entry.description}</span>
+                              ) : null}
+                            </div>
+                            {isSelected ? <Check size={14} className="text-primary shrink-0 ml-2" /> : null}
+                          </CommandItem>
+                        );
+                      })}
                     </CommandGroup>
                   </CommandList>
                 </Command>
@@ -2016,26 +2898,20 @@ function AgentsView(props: {
   tasks: Task[];
   models: CodexModel[];
   defaultModel: string;
+  editing: Agent | null;
+  onSelectAgent: (agent: Agent | null) => void;
   onSaved: () => Promise<void>;
 }) {
-  const [editing, setEditing] = useState<Agent | null>(props.agents[0] ?? null);
+  const { editing, onSelectAgent: setEditing } = props;
   useEffect(() => {
-    setEditing((selected) => reconcileSelectedAgent(selected, props.agents));
+    setEditing(reconcileSelectedAgent(editing, props.agents));
   }, [props.agents]);
 
   return (
     <div className="master-detail">
       <aside className="master-list">
-        <div className="master-header flex-between">
+        <div className="master-header">
           <h3>Agents</h3>
-          <Button
-            variant="ghost"
-            size="icon"
-            onClick={() => setEditing(emptyAgent(props.defaultModel, props.models))}
-            aria-label="New agent"
-          >
-            <Plus size={14} />
-          </Button>
         </div>
         <div className="list-scroll">
           {props.agents.map((agent) => (
@@ -2137,6 +3013,7 @@ function AgentEditor(props: {
           agentId={draft.id}
           agentName={draft.name}
           className="agent-editor-avatar"
+          motion="always"
         />
         <div>
           <h2>{draft.name || "New Agent"}</h2>
@@ -2386,7 +3263,6 @@ function CodexConnectionView() {
         <div className="codex-connection-heading">
           <div className="codex-connection-mark"><OpenAILogo size={25} /></div>
           <div>
-            <span className="eyebrow">Codex authentication</span>
             <h4>Connect ChatGPT to Aisevak</h4>
             <p>One browser sign-in powers every Orchestrator and worker thread. The shared credential is encrypted in Aisevak’s database.</p>
           </div>
@@ -2412,8 +3288,7 @@ function CodexConnectionView() {
       {login ? (
         <section className="codex-login-panel">
           <div>
-            <span className="eyebrow">Finish in ChatGPT</span>
-            <h4>Enter this one-time code</h4>
+            <h4>Enter one-time code</h4>
             <p>The page will detect authorization automatically. The refresh token never enters browser storage.</p>
           </div>
           <button
@@ -2441,7 +3316,7 @@ function CodexConnectionView() {
             <p>
               {status.chatgptConnected
                 ? "Codex refreshes this session automatically, and Aisevak carries the refreshed login into future runs."
-                : "Aisevak uses OpenAI’s device-code flow so authentication can finish in your browser while the runner stays on Azure."}
+                : "Aisevak uses OpenAI’s device-code flow so authentication can finish in your browser while the runner stays on AWS."}
             </p>
           </div>
           <div className="row-actions">
@@ -2777,9 +3652,11 @@ function SkillsView(props: {
   skills: Skill[];
   root: string;
   errors: SkillCatalogError[];
+  editing: Skill | null;
+  onSelectSkill: (skill: Skill | null) => void;
   onSaved: () => Promise<void>;
 }) {
-  const [editing, setEditing] = useState<Skill | null>(props.skills[0] ?? null);
+  const { editing, onSelectSkill: setEditing } = props;
   useEffect(() => {
     if (!editing) {
       if (props.skills[0]) setEditing(props.skills[0]);
@@ -2792,13 +3669,9 @@ function SkillsView(props: {
   return (
     <div className="master-detail">
       <aside className="master-list">
-        <div className="master-header flex-between">
+        <div className="master-header">
           <h3>Skills</h3>
-          <Button variant="ghost" size="icon" onClick={() => setEditing(emptySkill())} title="New skill" aria-label="New skill">
-            <Plus size={14} />
-          </Button>
         </div>
-        {props.root ? <div className="skill-catalog-path" title={props.root}>{props.root}</div> : null}
         {props.errors.length > 0 ? (
           <div className="skill-catalog-errors" title={props.errors.map((error) => `${error.directory}: ${error.message}`).join("\n")}>
             {props.errors.length} invalid skill {props.errors.length === 1 ? "directory" : "directories"}
@@ -2876,15 +3749,22 @@ function SkillEditor(props: { skill: Skill; root: string; onSaved: () => Promise
         }
       }}
     >
-      {props.root ? (
-        <div className="notice">
-          Installed at <code>{props.root}/{draft.name}</code>.
-          {draft.platform_managed ? " Aisevak updates this skill with application releases." : " Changes here are written back to the installed-skill directory."}
-        </div>
-      ) : null}
-      {draft.platform_managed ? (
-        <div className="notice">
-          This skill is available to every agent by default. Only its availability can be changed.
+      {props.root || draft.platform_managed ? (
+        <div className="info-callout">
+          <Info size={15} className="shrink-0 text-muted-foreground mt-0.5" />
+          <div className="flex flex-col gap-1">
+            {props.root ? (
+              <div>
+                Installed at <code>{props.root}/{draft.name}</code>.
+                {draft.platform_managed ? " Aisevak updates this skill automatically with application releases." : " Changes here sync back to the local installed directory."}
+              </div>
+            ) : null}
+            {draft.platform_managed ? (
+              <div className="text-[11.5px] opacity-80">
+                This skill is available to every agent by default. Only its availability can be changed.
+              </div>
+            ) : null}
+          </div>
         </div>
       ) : null}
       <div className="form-grid">
@@ -3175,6 +4055,81 @@ function githubConnectionStatus(status: GithubConnection["status"]): string {
   }
 }
 
+type SettingsTab = "codex" | "api" | "credentials" | "projects" | "connectors";
+
+function SettingsView(props: {
+  activeTab: SettingsTab;
+  onTabChange: (tab: SettingsTab) => void;
+  userRole: string;
+  apiKeys: ExternalApiKey[];
+  onSavedApiKeys: () => Promise<void>;
+  credentials: Credential[];
+  onSavedCredentials: () => Promise<void>;
+  projects: Project[];
+  onSavedProjects: () => Promise<void>;
+  repos: GithubRepository[];
+  connection: GithubConnection | null;
+  hostname: string;
+  onConnectGithub: (token: string) => Promise<void>;
+  onRefreshGithub: () => Promise<void>;
+  onDisconnectGithub: () => Promise<void>;
+  onImportGithub: (repoId: string) => Promise<void>;
+}) {
+  const tabs: Array<{ id: SettingsTab; label: string; icon: ReactElement; restricted?: boolean }> = [
+    { id: "codex", label: "ChatGPT", icon: <OpenAILogo size={14} />, restricted: true },
+    { id: "api", label: "API Keys", icon: <KeyRound size={14} /> },
+    { id: "credentials", label: "Credentials", icon: <LockKeyhole size={14} />, restricted: true },
+    { id: "projects", label: "Projects", icon: <FolderGit2 size={14} /> },
+    { id: "connectors", label: "Connectors", icon: <Github size={14} /> }
+  ];
+
+  const visibleTabs = tabs.filter((t) => !t.restricted || props.userRole !== "member");
+
+  return (
+    <div className="settings-container">
+      <div className="settings-tabs-bar">
+        {visibleTabs.map((tab) => (
+          <button
+            key={tab.id}
+            type="button"
+            className={`settings-tab-btn ${props.activeTab === tab.id ? "active" : ""}`}
+            onClick={() => props.onTabChange(tab.id)}
+          >
+            {tab.icon}
+            <span>{tab.label}</span>
+          </button>
+        ))}
+      </div>
+
+      <div className="settings-content-pane">
+        {props.activeTab === "codex" && props.userRole !== "member" ? (
+          <CodexConnectionView />
+        ) : null}
+        {props.activeTab === "api" ? (
+          <ApiView apiKeys={props.apiKeys} onSaved={props.onSavedApiKeys} />
+        ) : null}
+        {props.activeTab === "credentials" && props.userRole !== "member" ? (
+          <CredentialsView credentials={props.credentials} onSaved={props.onSavedCredentials} />
+        ) : null}
+        {props.activeTab === "projects" ? (
+          <ProjectsView projects={props.projects} onSaved={props.onSavedProjects} />
+        ) : null}
+        {props.activeTab === "connectors" ? (
+          <ConnectorsView
+            repos={props.repos}
+            connection={props.connection}
+            hostname={props.hostname}
+            onConnect={props.onConnectGithub}
+            onRefresh={props.onRefreshGithub}
+            onDisconnect={props.onDisconnectGithub}
+            onImport={props.onImportGithub}
+          />
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function CodexSessionTimeline({
   run,
   events,
@@ -3304,6 +4259,12 @@ function SimpleWorkEntryRow({ workEntry }: { workEntry: AgentRunWorkLogEntry }) 
   const preview = workEntryPreview(workEntry);
   const displayText = preview ? `${heading} - ${preview}` : heading;
   const hasDetail = Boolean(workEntry.detail?.trim());
+  const isDiff = Boolean(
+    workEntry.detail &&
+      (workEntry.detail.includes("--- a/") ||
+        workEntry.detail.includes("+++ b/") ||
+        (workEntry.detail.includes("@@") && workEntry.detail.includes("\n+")))
+  );
 
   return (
     <div className={`work-entry ${workEntry.tone}`}>
@@ -3326,37 +4287,71 @@ function SimpleWorkEntryRow({ workEntry }: { workEntry: AgentRunWorkLogEntry }) 
           </span>
         ) : null}
       </button>
-      {expanded && hasDetail ? <pre className="work-entry-detail">{workEntry.detail}</pre> : null}
+      {expanded && hasDetail ? (
+        isDiff ? (
+          <div className="px-2 pb-2">
+            <FileDiff filename={preview || heading} diff={workEntry.detail!} defaultExpanded={true} />
+          </div>
+        ) : (
+          <pre className="work-entry-detail">{workEntry.detail}</pre>
+        )
+      ) : null}
     </div>
   );
 }
 
 function WorkingTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "working" }> }) {
   return (
-    <div className="working-row">
-      <span className="working-dots">
-        <i />
-        <i />
-        <i />
-      </span>
-      <span>{row.createdAt ? <>Working for <LiveElapsed createdAt={row.createdAt} /></> : "Working..."}</span>
+    <div className="working-row py-1 max-w-fit">
+      <ThinkingReasoning
+        label="Agent active"
+        isStreaming={true}
+        defaultExpanded={false}
+        liveElapsed={row.createdAt ? <LiveElapsed createdAt={row.createdAt} /> : undefined}
+        rawText={row.createdAt ? `Run in progress · Started at ${new Date(row.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : undefined}
+      />
     </div>
   );
 }
 
+function cleanReportMarkdown(markdown: string, title?: string): string {
+  if (!markdown) return "";
+  let clean = markdown.trim();
+  if (title) {
+    const cleanTitle = title.replace(/[—–-].*$/, "").trim().toLowerCase();
+    const lines = clean.split("\n");
+    const firstLine = (lines[0] || "").replace(/^#+\s*/, "").trim().toLowerCase();
+    if (firstLine && (firstLine.includes(cleanTitle) || cleanTitle.includes(firstLine))) {
+      clean = lines.slice(1).join("\n").trim();
+    }
+  }
+  return clean;
+}
+
 function CollapsibleText({ text }: { text: string }) {
   const [expanded, setExpanded] = useState(false);
-  const shouldCollapse = text.length > 600 || text.split("\n").length > 8;
+  const shouldCollapse = text.length > 500 || text.split("\n").length > 7;
   const collapsed = shouldCollapse && !expanded;
 
   return (
-    <div>
+    <div className="agent-collapsible-container">
       <div className={`collapsible-message ${collapsed ? "collapsed" : ""}`}>
         <MarkdownContent text={text} plain />
       </div>
       {shouldCollapse ? (
-        <button className="text-button" type="button" onClick={() => setExpanded((value) => !value)}>
-          {expanded ? "Show less" : "Show full message"}
+        <button
+          className="collapsible-toggle-btn"
+          type="button"
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span>{expanded ? "Show less" : "Show full report"}</span>
+          <ChevronDown
+            size={12}
+            style={{
+              transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
+              transition: "transform 140ms ease"
+            }}
+          />
         </button>
       ) : null}
     </div>
@@ -3404,7 +4399,7 @@ function TimelineMeta(props: {
   return (
     <span className="timeline-meta">
       {formatTimestamp(props.createdAt)}
-      {duration ? ` - ${duration}` : ""}
+      {duration ? ` · ${duration}` : ""}
     </span>
   );
 }
@@ -3415,7 +4410,11 @@ function LiveElapsed({ createdAt }: { createdAt: string }) {
     const id = window.setInterval(() => setNow(new Date().toISOString()), 1000);
     return () => window.clearInterval(id);
   }, []);
-  return <span>{formatElapsed(createdAt, now) ?? "0s"}</span>;
+  return (
+    <span className="font-mono text-[10.5px] text-muted-foreground/75 tabular-nums">
+      {formatElapsed(createdAt, now) ?? "0s"}
+    </span>
+  );
 }
 
 function workEntryIcon(workEntry: AgentRunWorkLogEntry) {
@@ -3449,7 +4448,12 @@ function workEntryPreview(workEntry: AgentRunWorkLogEntry): string | null {
 function TaskStatus({ status }: { status?: string | null }) {
   const bucket = runBucket(status);
   const variant = bucket === "completed" ? "success" : bucket === "running" ? "warning" : bucket === "failed" ? "destructive" : "secondary";
-  return <Badge className={`status ${bucket}`} variant={variant}>{statusLabel(status)}</Badge>;
+  return (
+    <Badge className={`status ${bucket} inline-flex items-center gap-1.5`} variant={variant}>
+      {bucket === "running" ? <AgentOrb variant="thinking" size={9} color="currentColor" /> : null}
+      <span>{statusLabel(status)}</span>
+    </Badge>
+  );
 }
 
 function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
@@ -3524,7 +4528,7 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
 function Splash() {
   return (
     <div className="auth-container">
-      <Loader2 className="spin" size={24} style={{ color: "var(--text-muted)" }} />
+      <DotMatrixLoader size={26} className="text-primary" />
     </div>
   );
 }
@@ -3662,7 +4666,12 @@ function apiKeyStatus(key: ExternalApiKey): string {
   return "active";
 }
 
+function isSettingsView(view: View): boolean {
+  return ["settings", "codex", "api", "credentials", "projects", "connectors"].includes(view);
+}
+
 function viewTitle(view: View): string {
+  if (isSettingsView(view)) return "Settings";
   return {
     tasks: "Tasks",
     runs: "Threads",
@@ -3671,20 +4680,26 @@ function viewTitle(view: View): string {
     agents: "Agents",
     skills: "Skills",
     schedules: "Schedule",
-    codex: "ChatGPT",
-    api: "API",
-    credentials: "Credentials",
-    projects: "Projects",
-    connectors: "Connectors"
+    settings: "Settings",
+    codex: "Settings",
+    api: "Settings",
+    credentials: "Settings",
+    projects: "Settings",
+    connectors: "Settings"
   }[view];
 }
 
 function formatSidebarRunTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  const today = new Date();
-  if (date.toDateString() === today.toDateString()) {
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  if (diffMins < 1) return "just now";
+  if (diffMins < 60) return `${diffMins}m ago`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24 && date.toDateString() === now.toDateString()) {
+    return `${diffHours}h ago`;
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }
@@ -3734,7 +4749,7 @@ function normalizeComposerOptions(value: unknown): ModelOptionSelection[] {
 
 function readStickyModelSelection(provider: ProviderInstance): ModelSelection {
   try {
-    const raw = window.localStorage.getItem("aisevak.agent-model-selection");
+    const raw = window.localStorage.getItem("aisevak.agent-model-selection.v2");
     if (raw) {
       const parsed = JSON.parse(raw) as ModelSelection;
       const selectedProvider = parsed.providerInstanceId === provider.id ? provider : null;
@@ -3753,7 +4768,7 @@ function readStickyModelSelection(provider: ProviderInstance): ModelSelection {
 
 function writeStickyModelSelection(selection: ModelSelection): void {
   try {
-    window.localStorage.setItem("aisevak.agent-model-selection", JSON.stringify(selection));
+    window.localStorage.setItem("aisevak.agent-model-selection.v2", JSON.stringify(selection));
   } catch {
     // Local preferences are optional; server-backed thread state remains authoritative.
   }

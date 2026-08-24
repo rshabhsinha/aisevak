@@ -68,17 +68,29 @@ The installer creates app directories under `/opt/aisevak` and managed workspace
 
 ## Host updates
 
-Keep a checkout of this repository on the deployment host, then update from the deploy branch:
+Keep a checkout of this repository locally and fast-forward it before staging
+an AWS release:
 
 ```bash
-./scripts/update.sh main
+git fetch origin main
+git checkout main
+git pull --ff-only origin main
 ```
 
-The update script fast-forwards the checkout and runs the installer with sudo. Each install is staged under `/opt/aisevak/releases`, built before activation, then switched into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak` workspaces, and the Compose Postgres volume are preserved. Volume preservation alone does not make PostgreSQL layouts compatible: when upgrading an existing Aisevak deployment to the PostgreSQL 18 parent mount, the installer stops database writers, requires a backup, places or verifies the stopped cluster in PostgreSQL 18's `18/docker` subdirectory, validates it, and aborts before activation if migration fails.
+Then follow [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) to stage the
+checkout through AWS Systems Manager and run the installer. Each install is
+staged under `/opt/aisevak/releases`, built before activation, then switched
+into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak`
+workspaces, and the Compose Postgres volume are preserved. Volume preservation
+alone does not make PostgreSQL layouts compatible: when upgrading an existing
+Aisevak deployment to the PostgreSQL 18 parent mount, the installer stops
+database writers, requires a backup, places or verifies the stopped cluster in
+PostgreSQL 18's `18/docker` subdirectory, validates it, and aborts before
+activation if migration fails.
 
 When an active Postgres container exists, the installer writes a compressed backup to `/opt/aisevak/backups` before restarting services. Set `AISEVAK_REQUIRE_BACKUP=1` to abort updates if a backup cannot be created, or `AISEVAK_SKIP_BACKUP=1` to skip backups intentionally.
 
-The sanitized Azure deployment runbook, which keeps host-specific values outside the repository, is documented in [docs/AZURE_DEPLOYMENT.md](docs/AZURE_DEPLOYMENT.md).
+The sanitized AWS deployment runbook, which keeps host-specific values outside the repository, is documented in [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md). Production is served at https://aisevak.embedr.dev; host operations use AWS Systems Manager rather than public SSH.
 
 ## Security model
 

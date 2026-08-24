@@ -25,7 +25,14 @@ const SAFE_ENVIRONMENT_KEYS = [
   "all_proxy",
   "SSL_CERT_FILE",
   "SSL_CERT_DIR",
-  "NODE_EXTRA_CA_CERTS"
+  "NODE_EXTRA_CA_CERTS",
+  "AWS_SHARED_CREDENTIALS_FILE",
+  "AWS_CONFIG_FILE",
+  "AWS_PROFILE",
+  "AWS_REGION",
+  "AWS_DEFAULT_REGION",
+  "AWS_CA_BUNDLE",
+  "AWS_PAGER"
 ] as const;
 
 export interface GithubCliPaths {

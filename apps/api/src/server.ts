@@ -17,10 +17,10 @@ import {
   resolveCodexBinary,
   removeInstalledSkill,
   normalizeCodexSkillSnapshots,
-  normalizeCodexModel,
   applyCodexModelDefaults,
   CODEX_HARNESS_MODELS,
   defaultCodexModelOptions,
+  resolveCodexDefaultModel,
   runMigrations,
   serializeCodexSkillSnapshots,
   synchronizeInstalledSkills,
@@ -75,10 +75,11 @@ const env = {
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
-  codexDefaultModel: normalizeCodexModel(process.env.CODEX_DEFAULT_MODEL),
+  codexDefaultModel: resolveCodexDefaultModel(),
   githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
 const skillsRoot = installedSkillsRoot(env.managedRoot);
+const MAX_AGENT_THREAD_EVENTS = 2_000;
 
 let codexModelCache:
   | { expiresAt: number; models: typeof CODEX_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
@@ -527,7 +528,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.name,
         body.description ?? "",
         model,
-        JSON.stringify(body.modelOptions ?? defaultCodexModelOptions(model)),
+        JSON.stringify(modelOptionsFor(model, body.modelOptions)),
         JSON.stringify(body.capabilities ?? []),
         body.instructions
       ]
@@ -731,7 +732,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          ORDER BY agent_threads.last_activity_at DESC, agent_threads.id DESC
          LIMIT 1
        ) author_thread ON true
-       ORDER BY reports.updated_at DESC, reports.id DESC
+       ORDER BY reports.updated_at DESC, reports.number DESC, reports.id DESC
        LIMIT 200`
     );
     return { reports: result.rows };
@@ -770,7 +771,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          ORDER BY incident_updates.created_at DESC, incident_updates.id DESC
          LIMIT 1
        ) latest ON true
-       ORDER BY incidents.updated_at DESC, incidents.id DESC
+       ORDER BY incidents.updated_at DESC, incidents.number DESC, incidents.id DESC
        LIMIT 200`
     );
     return { incidents: result.rows };
@@ -1709,6 +1710,10 @@ interface TimelineEventRow {
   created_at?: string | Date | null;
 }
 
+interface TimelineEventQueryRow extends TimelineEventRow {
+  total_count?: string | number;
+}
+
 type ModelSelectionInput = z.infer<typeof modelSelectionSchema>;
 type ThreadMessageInput = z.infer<typeof threadMessageSchema>;
 
@@ -1968,7 +1973,10 @@ async function insertAgentVersion(pool: DbPool, agent: Record<string, unknown>, 
       agent.name,
       agent.description,
       agent.model,
-      JSON.stringify(normalizeModelOptions(agent.model_options)),
+      JSON.stringify(modelOptionsFor(
+        typeof agent.model === "string" ? agent.model : env.codexDefaultModel,
+        agent.model_options
+      )),
       agent.instructions,
       userId
     ]
@@ -2085,6 +2093,7 @@ async function getAgentThreadTimeline(pool: DbPool, id: string): Promise<{
   thread: AgentThreadRow;
   run: TimelineRunRow | null;
   events: TimelineEventRow[];
+  eventsTruncated?: boolean;
 }> {
   const thread = await getAgentThread(pool, id);
   const timeline = await getTaskSessionTimeline(pool, thread.task_id, id, false);
@@ -2600,10 +2609,11 @@ async function resolveModelSelection(
   const instance = mustRow(provider.rows[0]);
   if (!instance.enabled) throwBadRequest("The selected harness is disabled");
   if (instance.driver !== "codex") throwBadRequest("Only the Codex harness is currently supported");
+  const model = input?.model ?? fallbackModel;
   return {
     providerInstanceId,
-    model: input?.model ?? fallbackModel,
-    options: input?.options ?? normalizeModelOptions(thread?.model_options)
+    model,
+    options: modelOptionsFor(model, input?.options ?? thread?.model_options)
   };
 }
 
@@ -2654,6 +2664,7 @@ async function ensureTaskAgentThreadInTransaction(
     branch: string | null;
   }
 ): Promise<EnsureTaskAgentThreadResult> {
+  const modelOptions = modelOptionsFor(input.model, input.modelOptions);
   if (input.task.coordination_thread_id) {
     const coordinated = await client.query<{
       id: string;
@@ -2701,7 +2712,7 @@ async function ensureTaskAgentThreadInTransaction(
         input.task.id,
         input.task.project_id,
         input.model,
-        JSON.stringify(input.modelOptions),
+        JSON.stringify(modelOptions),
         input.cwd,
         input.branch,
         input.runtimeHome,
@@ -2766,7 +2777,7 @@ async function ensureTaskAgentThreadInTransaction(
       input.task.id,
       input.task.project_id,
       input.model,
-      JSON.stringify(input.modelOptions),
+      JSON.stringify(modelOptions),
       input.cwd,
       input.branch,
       input.runtimeHome,
@@ -2840,7 +2851,7 @@ async function ensureTaskNavigationThreadInTransaction(
         task.agent_id,
         task.project_id,
         task.agent_model,
-        JSON.stringify(normalizeModelOptions(task.agent_model_options)),
+        JSON.stringify(modelOptionsFor(task.agent_model, task.agent_model_options)),
         task.local_path ?? env.managedRoot,
         runtimeHome,
         task.id,
@@ -2866,7 +2877,7 @@ async function ensureTaskNavigationThreadInTransaction(
       task.id,
       task.project_id,
       task.agent_model,
-      JSON.stringify(normalizeModelOptions(task.agent_model_options)),
+      JSON.stringify(modelOptionsFor(task.agent_model, task.agent_model_options)),
       task.local_path ?? env.managedRoot,
       null,
       runtimeHome,
@@ -3026,8 +3037,14 @@ function normalizeModelOptions(value: unknown): ModelSelectionInput["options"] {
     const entry = item as Record<string, unknown>;
     if (typeof entry.id !== "string") return [];
     if (!["string", "number", "boolean"].includes(typeof entry.value)) return [];
+    if (typeof entry.value === "string" && !entry.value.trim()) return [];
     return [{ id: entry.id, value: entry.value as string | number | boolean }];
   });
+}
+
+function modelOptionsFor(model: string | null | undefined, value: unknown): ModelSelectionInput["options"] {
+  const normalized = normalizeModelOptions(value);
+  return normalized.length ? normalized : defaultCodexModelOptions(model ?? env.codexDefaultModel);
 }
 
 function threadTitleFromMessage(message: string): string {
@@ -3188,7 +3205,7 @@ async function queueWorkerRun(
       name: task.agent_name,
       description: task.agent_description,
       model: task.agent_model,
-      modelOptions: normalizeModelOptions(task.agent_model_options),
+      modelOptions: modelOptionsFor(task.agent_model, task.agent_model_options),
       instructions: task.agent_instructions
     };
     const session = await upsertTaskSession(client, task.id, codexHome, agentSnapshot);
@@ -3197,7 +3214,10 @@ async function queueWorkerRun(
       runtimeHome: codexHome,
       providerThreadId: session.codex_thread_id,
       model: options.modelSelection?.model ?? task.agent_model,
-      modelOptions: options.modelSelection?.options ?? normalizeModelOptions(task.agent_model_options),
+      modelOptions: modelOptionsFor(
+        options.modelSelection?.model ?? task.agent_model,
+        options.modelSelection?.options ?? task.agent_model_options
+      ),
       cwd: projectPath,
       branch
     });
@@ -3208,7 +3228,10 @@ async function queueWorkerRun(
       thread.provider_thread_id
     );
     const model = options.modelSelection?.model ?? thread.model;
-    const modelOptions = options.modelSelection?.options ?? normalizeModelOptions(thread.model_options);
+    const modelOptions = modelOptionsFor(
+      options.modelSelection?.model ?? thread.model,
+      options.modelSelection?.options ?? thread.model_options
+    );
     if (options.promptOverride && options.allowQueuedFollowUp) {
       const incremental = await appendIncrementalAgentTurnInput(client, thread.id, options.promptOverride, {
         kind: "worker"
@@ -3267,7 +3290,7 @@ async function createDispatcherThread(pool: DbPool): Promise<Record<string, unkn
       env.managedRoot,
       codexHome,
       dispatcher.model,
-      JSON.stringify(normalizeModelOptions(dispatcher.model_options)),
+      JSON.stringify(modelOptionsFor(dispatcher.model, dispatcher.model_options)),
       serializeCodexSkillSnapshots(skillsSnapshot)
     ]
   );
@@ -3466,10 +3489,10 @@ export async function queueDispatcherMessage(
         codexHome,
         thread?.provider_thread_id ?? previous?.codex_thread_id ?? null,
         options.modelSelection?.model ?? previous?.model ?? thread?.model ?? dispatcher?.model,
-        JSON.stringify(
-          options.modelSelection?.options ??
-          normalizeModelOptions(previous?.model_options ?? thread?.model_options ?? dispatcher?.model_options)
-        ),
+        JSON.stringify(modelOptionsFor(
+          options.modelSelection?.model ?? previous?.model ?? thread?.model ?? dispatcher?.model,
+          options.modelSelection?.options ?? previous?.model_options ?? thread?.model_options ?? dispatcher?.model_options
+        )),
         options.prompt,
         serializeCodexSkillSnapshots(skillsSnapshot)
       ]
@@ -3543,7 +3566,7 @@ async function queueDispatcherRun(
         thread?.cwd ?? env.managedRoot,
         codexHome,
         thread?.model ?? dispatcher.model,
-        JSON.stringify(normalizeModelOptions(thread?.model_options ?? dispatcher.model_options)),
+        JSON.stringify(modelOptionsFor(thread?.model ?? dispatcher.model, thread?.model_options ?? dispatcher.model_options)),
         prompt,
         serializeCodexSkillSnapshots(skillsSnapshot)
       ]
@@ -3562,6 +3585,7 @@ export async function getTaskSessionTimeline(
 ): Promise<{
   run: TimelineRunRow | null;
   events: TimelineEventRow[];
+  eventsTruncated?: boolean;
 }> {
   const [runsResult, eventsResult, commentsResult] = await Promise.all([
     pool.query<TimelineRunRow>(
@@ -3622,10 +3646,13 @@ export async function getTaskSessionTimeline(
        ORDER BY queued_at ASC, created_at ASC`,
       [taskId, agentThreadId ?? null]
     ),
-    pool.query<TimelineEventRow>(
-      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
+    pool.query<TimelineEventQueryRow>(
+      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at, total_count
        FROM (
-         SELECT run_events.id,
+         SELECT task_events.*,
+                COUNT(*) OVER () AS total_count
+         FROM (
+           SELECT run_events.id,
                 run_events.run_id,
                 NULL::uuid AS dispatcher_run_id,
                 run_events.seq,
@@ -3684,9 +3711,12 @@ export async function getTaskSessionTimeline(
                AND (task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)
              )
            )
-       ) task_events
+         ) task_events
+         ORDER BY queued_at DESC, created_at DESC, seq DESC
+         LIMIT $3
+       ) limited_task_events
        ORDER BY queued_at ASC, created_at ASC, seq ASC`,
-      [taskId, agentThreadId ?? null]
+      [taskId, agentThreadId ?? null, MAX_AGENT_THREAD_EVENTS]
     ),
     pool.query<TimelineEventRow>(
       `SELECT task_comments.id,
@@ -3707,9 +3737,13 @@ export async function getTaskSessionTimeline(
   ]);
   const runs = runsResult.rows;
   const latest = selectPreferredTimelineRun(runs);
+  const timelineEvents = eventsResult.rows.map(({ total_count: _totalCount, ...event }) => event);
+  const totalEvents = Number(eventsResult.rows[0]?.total_count ?? 0);
+  const eventsTruncated = totalEvents > timelineEvents.length;
   return {
     run: latest ? { ...latest, prompt: null } : null,
-    events: withSyntheticUserMessages(runs, [...eventsResult.rows, ...commentsResult.rows])
+    events: withSyntheticUserMessages(runs, [...timelineEvents, ...commentsResult.rows]),
+    ...(eventsTruncated ? { eventsTruncated: true } : {})
   };
 }
 

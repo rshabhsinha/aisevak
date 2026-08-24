@@ -20,11 +20,11 @@ afterEach(async () => {
 });
 
 describe("installed skills", () => {
-  it("loads the release-provided Aisevak CLI skill", async () => {
+  it("loads the release-provided default skills", async () => {
     const skills = await loadPlatformSkills();
 
     expect(platformSkillsSourceRoot()).toMatch(/packages\/core\/platform-skills\/?$/);
-    expect(skills).toHaveLength(1);
+    expect(skills).toHaveLength(3);
     expect(skills[0]).toMatchObject({
       name: "aisevak-cli",
       platformManaged: true,
@@ -34,6 +34,18 @@ describe("installed skills", () => {
     expect(skills[0]?.instructions).toContain("Do not call the CLI on every turn");
     expect(skills[0]?.files["agents/openai.yaml"]).toContain("$aisevak-cli");
     expect(skills[0]?.files["references/commands.md"]).toContain("aisevak threads create");
+    expect(skills[1]).toMatchObject({
+      name: "incident-writing",
+      platformManaged: true,
+      defaultForAgents: true
+    });
+    expect(skills[1]?.instructions).toContain("**Status:**");
+    expect(skills[2]).toMatchObject({
+      name: "report-writing",
+      platformManaged: true,
+      defaultForAgents: true
+    });
+    expect(skills[2]?.instructions).toContain("**Bottom line:**");
   });
 
   it("uses a persistent skills directory below the managed root", () => {
@@ -94,6 +106,27 @@ describe("installed skills", () => {
     expect(scan.presentNames).toEqual(["being-created"]);
     expect(scan.skills).toEqual([]);
     expect(scan.errors[0]?.directory).toBe("being-created");
+  });
+
+  it("ignores generated Python cache artifacts", async () => {
+    const root = await mkdtemp(join(tmpdir(), "aisevak-installed-skills-"));
+    cleanup.push(root);
+    await writeInstalledSkill(root, {
+      name: "background-terminals",
+      description: "Use for persistent background commands.",
+      instructions: "Run long-lived commands in detached tmux sessions.",
+      files: {}
+    });
+    await mkdir(join(root, "background-terminals", "__pycache__"));
+    await writeFile(
+      join(root, "background-terminals", "__pycache__", "helper.cpython-312.pyc"),
+      Buffer.from([0, 1, 2, 3])
+    );
+
+    const scan = await scanInstalledSkills(root);
+
+    expect(scan.errors).toEqual([]);
+    expect(scan.skills[0]?.files).toEqual({});
   });
 
   it("parses folded YAML block descriptions", async () => {

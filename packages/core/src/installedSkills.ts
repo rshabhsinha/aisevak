@@ -24,6 +24,16 @@ const platformManifests = [
     directory: "aisevak-cli",
     files: ["agents/openai.yaml", "references/commands.md"],
     defaultForAgents: true
+  },
+  {
+    directory: "incident-writing",
+    files: [],
+    defaultForAgents: true
+  },
+  {
+    directory: "report-writing",
+    files: [],
+    defaultForAgents: true
   }
 ] as const;
 
@@ -290,8 +300,10 @@ async function readSkillFiles(skillDirectory: string): Promise<Record<string, st
         throw new Error(`Symbolic links are not allowed in installed skills: ${relativePath}`);
       }
       if (entry.isDirectory()) {
+        if (entry.name === "__pycache__") continue;
         await visit(join(directory, entry.name), relativePath);
       } else if (entry.isFile() && relativePath !== "SKILL.md") {
+        if (relativePath.endsWith(".pyc")) continue;
         validateSkillFilePath(relativePath);
         const content = await readFile(join(directory, entry.name), "utf8");
         if (content.includes("\0")) throw new Error(`Installed skill file must contain text: ${relativePath}`);
