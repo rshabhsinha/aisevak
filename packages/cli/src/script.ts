@@ -61,6 +61,9 @@ function readSkillDirectory(directory) {
     fail("Skill directory must contain SKILL.md", "SKILL_INVALID");
   }
   const markdown = fs.readFileSync(markdownPath, "utf8");
+  if (!/^---\\r?\\n[\\s\\S]*?\\r?\\n---\\r?\\n/.test(markdown)) {
+    fail("SKILL.md must contain YAML frontmatter", "SKILL_INVALID");
+  }
   const files = {};
   let totalBytes = Buffer.byteLength(markdown);
   function visit(current, prefix) {
@@ -70,8 +73,9 @@ function readSkillDirectory(directory) {
       const info = fs.lstatSync(fullPath);
       if (info.isSymbolicLink()) fail("Symbolic links are not allowed in skills: " + relative, "SKILL_INVALID");
       if (info.isDirectory()) {
+        if (entry.name === "__pycache__") continue;
         visit(fullPath, relative);
-      } else if (info.isFile() && relative !== "SKILL.md") {
+      } else if (info.isFile() && relative !== "SKILL.md" && !relative.endsWith(".pyc")) {
         const data = fs.readFileSync(fullPath);
         if (data.includes(0)) fail("Skill files must contain text: " + relative, "SKILL_INVALID");
         const content = data.toString("utf8");

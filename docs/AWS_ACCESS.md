@@ -1,6 +1,6 @@
-# AWS access for live Aisevak agents
+# AWS access for the live Aisevak VM and agents
 
-The live Aisevak VM supplies a default read-only AWS profile to trusted agent processes. A separate role profile provides deliberate, temporary Session Manager shell access to opted-in Embedr EC2 instances.
+The live Aisevak VM is now an AWS EC2 instance. It supplies a default read-only AWS profile to trusted agent processes. External operators use AWS Systems Manager to inspect or open the VM; the old Azure VM and Azure public-IP bridge are no longer part of the production access path. A separate role profile provides deliberate, temporary Session Manager shell access to opted-in Embedr EC2 instances.
 
 This document contains no credentials, account IDs, VM addresses, or instance IDs. Keep those values in the existing private deployment configuration and on the VM.
 
@@ -16,21 +16,24 @@ An operating-system shell is not read-only. An agent using `embedr-ec2-shell` ca
 
 Agents run with unrestricted host access as the `aisevak` service user. Passing credential-file paths instead of secret environment variables prevents accidental environment dumps, but a trusted agent can still read the credential file. This is an intentional trust boundary of the live Aisevak VM.
 
-## Connect to the live VM
+## Connect to the live AWS VM
 
-Load the sanitized private connection variables and follow [Azure deployment operations](AZURE_DEPLOYMENT.md):
+Load the sanitized private AWS deployment variables:
 
 ```bash
-source "$HOME/Documents/aisevak-azure-deployment.env"
-chmod 600 "$AISEVAK_SSH_KEY"
-ssh -i "$AISEVAK_SSH_KEY" "$AISEVAK_SSH_USER@$AISEVAK_DEPLOY_HOST"
+source "$HOME/Documents/aisevak-aws-deployment.env"
+aws --profile "$AISEVAK_AWS_PROFILE" \
+  --region "$AISEVAK_AWS_REGION" \
+  ssm start-session \
+  --target "$AISEVAK_INSTANCE_ID" \
+  --document-name SSM-SessionManagerRunShell
 ```
 
-If SSH times out, update the Azure network security group's SSH source to the current public IP as described in that runbook. Do not open SSH to the internet.
+The production hostname is https://aisevak.embedr.dev. Use the AWS EC2 instance ID from the private deployment file rather than a public Azure IP. If SSM reports the target offline, check the EC2 state, SSM Agent, and instance IAM role in AWS. Do not open SSH to the internet or route operations through the former Azure VM.
 
 ## VM prerequisites
 
-The host, not an application container, needs AWS CLI v2. Session Manager also needs its local plugin.
+The operator workstation needs AWS CLI v2 and the Session Manager plugin. The live EC2 VM also needs AWS CLI v2 when trusted agent processes perform AWS resource or log inspection.
 
 ```bash
 aws --version

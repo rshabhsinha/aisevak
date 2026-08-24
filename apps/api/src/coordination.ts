@@ -1,6 +1,7 @@
 import {
   contentPage,
   decodePageCursor,
+  defaultCodexModelOptions,
   encodeCursor,
   hashToken,
   installedSkillsRoot,
@@ -608,7 +609,7 @@ export async function registerCoordinationRoutes(
         taskId: id,
         recipientAgentId: recipient.id,
         model: recipient.model,
-        modelOptions: recipient.model_options ?? [],
+        modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
         runtimeHome: managedCodexHome(options.managedRoot, id),
         preserveCoordination: recipient.id !== context.agentId
       });
@@ -1375,7 +1376,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       taskId: linkedTaskId,
       recipientAgentId,
       model: recipient.model,
-      modelOptions: recipient.model_options ?? [],
+      modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
       runtimeHome: managedCodexHome(managedRoot, linkedTaskId),
       preserveCoordination: true
     });
@@ -1418,7 +1419,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(recipient.model_options ?? []), desiredCwd, runtimeHome, threadId]
+      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), desiredCwd, runtimeHome, threadId]
     );
     session = created.rows[0]!;
   }
@@ -1454,7 +1455,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       workspaceMode,
       workspaceSource,
       delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
-      recipient.model, JSON.stringify(recipient.model_options ?? []), prompt, serializeCodexSkillSnapshots(skills)]
+      recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), prompt, serializeCodexSkillSnapshots(skills)]
   );
   await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
 }
@@ -1812,6 +1813,23 @@ function listResponse(rows: any[], limit: number, cursorColumn: string, map: (ro
 }
 function parseCursor(value?: string) { try { return decodePageCursor(value); } catch { badRequest("Invalid page cursor"); } }
 function iso(value: unknown): string { return value instanceof Date ? value.toISOString() : String(value); }
+
+function modelOptionsFor(
+  model: string,
+  value: unknown
+): Array<{ id: string; value: string | number | boolean }> {
+  const options = Array.isArray(value)
+    ? value.flatMap((item): Array<{ id: string; value: string | number | boolean }> => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+        const entry = item as Record<string, unknown>;
+        if (typeof entry.id !== "string") return [];
+        if (!["string", "number", "boolean"].includes(typeof entry.value)) return [];
+        if (typeof entry.value === "string" && !entry.value.trim()) return [];
+        return [{ id: entry.id, value: entry.value as string | number | boolean }];
+      })
+    : [];
+  return options.length ? options : defaultCodexModelOptions(model);
+}
 
 function unauthorized(message: string): never { throw httpError(401, message); }
 function forbidden(message: string): never { throw httpError(403, message); }

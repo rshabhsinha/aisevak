@@ -1,12 +1,12 @@
-# Aisevak Design Language
+# Aisevak Design Language: Frontier SF Startup System
 
-Aisevak is a calm control room for agent work. The interface should feel precise and dependable without looking industrial: quiet surfaces, clear state, compact controls, and motion that explains what changed.
+Aisevak is a calm, minimal control room for agent work. The interface embodies the **Frontier SF Startup** aesthetic: quiet surfaces, hairline micro-borders, crystalline typography, clear agent state, compact controls, and motion that explains what changed without decorative excess.
 
 ## Design principles
 
 ### Quiet by default
 
-The product is information-dense, so the chrome stays subdued. Warm neutral surfaces carry structure; violet is reserved for selection, focus, and primary actions. Color should communicate state, never decorate an otherwise clear screen.
+The product is information-dense, so the chrome stays subdued. Carbon obsidian and warm porcelain surfaces carry structure; luminous violet is reserved for selection, focus, and primary actions. Color communicates state, never decorating an otherwise clear screen.
 
 ### Work first
 
@@ -14,44 +14,59 @@ Every screen leads with the object being managed: tasks, runs, agents, skills, k
 
 ### One visual grammar
 
-Controls use the shadcn composition model: small reusable primitives, shared semantic tokens, consistent focus rings, and state-based variants. Avoid one-off colors, radii, or button treatments inside feature views.
+Controls use the shadcn composition model paired with AICSS agentic primitives: small reusable primitives, shared semantic tokens, hairline micro-borders (`0.5px`), consistent focus rings, and state-based variants.
 
 ### Motion confirms change
 
-Animation is functional and brief. Navigation icons move from outline to filled when selected. Theme icons rotate and resolve into the active mode. Loading, sending, expanding, and copying each have one restrained response. Motion must respect `prefers-reduced-motion`.
+Animation is functional and brief (150–200ms). AICSS quantum lattice orbs pulse and wave to reflect live agent thinking and working states. Thinking disclosures smoothly expand to reveal chain-of-thought streams. Motion respects `prefers-reduced-motion`.
+
+### Anti-patterns & Strict "Do Nots"
+
+- ❌ **NO decorative status dots**: Do not place green/amber/red indicator dots beside ordinary labels (e.g. no `● Live catalog`, `● Default`, etc.).
+- ❌ **NO noisy tag / pill badge designs**: Avoid bulky colored badges (e.g. no chunky `DEFAULT` purple pill tags).
+- ❌ **NO nested header boxes inside dropdowns**: Menus and popovers should open directly into their functional command search without redundant logos or banner headers.
+- ❌ **NO microscopic fonts**: Avoid cramped 8px/9px text. Minimum font size for metadata is 11px/11.5px (monospace), and standard body is 13px–14px.
 
 ## Foundations
 
 ### Color
 
-Both themes use the same semantic roles rather than independently chosen colors.
+Both themes use the same semantic roles with refined low-contrast surfaces.
 
-| Role | Light | Dark | Use |
+| Role | Light (Porcelain) | Dark (Obsidian) | Use |
 | --- | --- | --- | --- |
-| Background | warm off-white | near-black | app canvas |
-| Card | white | raised charcoal | panels, cards, inputs |
-| Muted | warm gray | soft charcoal | secondary surfaces |
-| Primary | soft violet | bright violet | primary action, focus, selection |
-| Success | evergreen | mint | completed and active-positive states |
-| Warning | amber | sand | running and attention states |
-| Destructive | rose | coral | failures and destructive actions |
+| Canvas Background | `#FAF9F7` (warm porcelain) | `#0A0A0C` (deep obsidian void) | app canvas |
+| Card / Panel | `#FFFFFF` | `#121215` (raised carbon) | panels, cards, inputs |
+| Hover / Muted | `#F5F4F0` | `#17171B` | secondary surfaces, row hover |
+| Primary | `#5B4DE3` (soft violet) | `#7C72FF` (luminous indigo) | primary action, focus, selection |
+| Success | `#16A34A` (forest) | `#34D399` (mint) | completed and active-positive states |
+| Warning | `#D97706` (amber) | `#FBBF24` (soft amber) | running and attention states |
+| Destructive | `#DC2626` (ruby) | `#F87171` (coral) | failures and destructive actions |
+| Border | `rgba(0,0,0,0.07)` | `rgba(255,255,255,0.08)` | 0.5px hairline dividers |
 
-All product code should consume semantic CSS tokens such as `--background`, `--card`, `--primary`, `--muted-foreground`, and `--border`. Do not add literal feature colors when a semantic token already describes the intent.
+All product code consumes semantic CSS tokens such as `--background`, `--card`, `--primary`, `--muted-foreground`, and `--border`.
 
 ### Typography
 
-- Interface: Inter, then the platform sans-serif stack.
-- Technical identifiers: JetBrains Mono, then the platform monospace stack.
-- Headings use the interface family with tighter tracking and weight, not a second display face.
-- Default interface text is compact. Size differences should be small; hierarchy comes from weight, tone, and spacing as much as scale.
+- **Interface**: `Geist Sans`, then `Inter`, then the platform sans-serif stack with tight optical tracking (`-0.015em` to `-0.025em`).
+- **Technical identifiers & Diffs**: `Geist Mono`, then `JetBrains Mono`, then the platform monospace stack with tabular figures (`tnum`, `zero`).
+- Headings use the interface family with tighter tracking and medium weight (`500`), avoiding heavy display faces.
+- Default interface text is compact (`13px`). Hierarchy comes from weight, tone, and spacing as much as scale.
 
 ### Shape and depth
 
-- Control radius: 7px.
-- Card and panel radius: 10px.
-- Elevated or authentication surfaces: 14px.
-- Pills are reserved for status, counts, models, and compact metadata.
-- Most structure uses a one-pixel semantic border. Shadows are subtle and reserved for cards on hover, overlays, and raised authentication surfaces.
+- Control radius: `6px`–`7px`.
+- Card and panel radius: `9px`–`10px`.
+- Elevated or authentication surfaces: `12px`–`14px`.
+- Structure uses `0.5px`–`1px` semantic hairline borders. Shadows are subtle and reserved for cards on hover, overlays, and raised surfaces.
+
+### AICSS Agentic Components
+
+1. **Thinking & Reasoning (`ThinkingReasoning`)**: Shimmering label state with collapsible chain-of-thought and latency/token counters.
+2. **Quantum Lattice Orbs (`AgentOrb`)**: 3x3 dot matrix micro-animations displaying live agent status (*Thinking*, *Working*, *Searching*, *Finalizing*).
+3. **File Diffs (`FileDiff`)**: Word/line level additions (`+`) and deletions (`-`) with one-click copy and clean monospace layout.
+4. **Approval Cards (`ApprovalCard`)**: Understated human-in-the-loop action confirmation cards with keyboard accelerators (`⌘↵` / `Esc`).
+5. **Task Progress (`TaskList`)**: Step-by-step checklists with live status indicators.
 
 ### Spacing
 

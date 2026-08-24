@@ -10,7 +10,8 @@ export type AppView =
   | "schedules"
   | "api"
   | "credentials"
-  | "codex";
+  | "codex"
+  | "settings";
 
 export interface AppRoute {
   view: AppView;
@@ -21,18 +22,25 @@ export interface AppRoute {
 const VIEW_PATHS: Record<Exclude<AppView, "runs">, string> = {
   tasks: "/tasks",
   agents: "/agents",
-  projects: "/projects",
-  connectors: "/connectors",
+  projects: "/settings/projects",
+  connectors: "/settings/connectors",
   activity: "/activity",
   incidents: "/incidents",
   skills: "/skills",
   schedules: "/schedules",
   api: "/settings/api",
   credentials: "/settings/credentials",
-  codex: "/settings/chatgpt"
+  codex: "/settings/chatgpt",
+  settings: "/settings"
 };
 
-const PATH_VIEWS = new Map(Object.entries(VIEW_PATHS).map(([view, path]) => [path, view as AppView]));
+const PATH_VIEWS = new Map<string, AppView>();
+for (const [view, path] of Object.entries(VIEW_PATHS)) {
+  PATH_VIEWS.set(path, view as AppView);
+}
+PATH_VIEWS.set("/projects", "projects");
+PATH_VIEWS.set("/connectors", "connectors");
+PATH_VIEWS.set("/settings", "codex");
 
 export function appPath(view: AppView, threadId: string | null = null): string {
   if (view === "runs") {
