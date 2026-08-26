@@ -43,3 +43,5 @@ export { X } from "@phosphor-icons/react/dist/icons/X";
 export { Moon } from "@phosphor-icons/react/dist/icons/Moon";
 export { Sun } from "@phosphor-icons/react/dist/icons/Sun";
 export { CaretDown } from "@phosphor-icons/react/dist/icons/CaretDown";
+export { ChatCircleDots as ChatsIcon } from "@phosphor-icons/react/dist/icons/ChatCircleDots";
+

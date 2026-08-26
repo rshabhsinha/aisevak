@@ -5,6 +5,7 @@ import {
   BookOpen,
   Bot,
   Calendar,
+  ChatsIcon,
   Check,
   CheckCircle2,
   ChevronDown,
@@ -36,7 +37,8 @@ import {
   Square,
   Terminal,
   Trash2,
-  Wrench
+  Wrench,
+  X
 } from "./components/icons";
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { FormEvent, ReactElement, ReactNode } from "react";
@@ -316,6 +318,7 @@ interface Run {
 }
 
 const SIDEBAR_THREAD_PAGE_SIZE = 10;
+const RESOURCE_FEED_PAGE_SIZE = 15;
 
 interface ExternalApiKey {
   id: string;
@@ -383,7 +386,13 @@ export function App() {
   const [credentials, setCredentials] = useState<Credential[]>([]);
   const [tasks, setTasks] = useState<Task[]>([]);
   const [activityReports, setActivityReports] = useState<ActivityReport[]>([]);
+  const [activityNextCursor, setActivityNextCursor] = useState<string | null>(null);
+  const [activityHasMore, setActivityHasMore] = useState(false);
+  const [loadingOlderActivity, setLoadingOlderActivity] = useState(false);
   const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [incidentsNextCursor, setIncidentsNextCursor] = useState<string | null>(null);
+  const [incidentsHasMore, setIncidentsHasMore] = useState(false);
+  const [loadingOlderIncidents, setLoadingOlderIncidents] = useState(false);
   const [schedules, setSchedules] = useState<Schedule[]>([]);
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [githubConnection, setGithubConnection] = useState<GithubConnection | null>(null);
@@ -537,6 +546,22 @@ export function App() {
   }, [user]);
 
   useEffect(() => {
+    if (!user) return;
+    if (view === "activity") {
+      const timer = setTimeout(() => {
+        void reloadActivityReports();
+      }, 250);
+      return () => clearTimeout(timer);
+    }
+    if (view === "incidents") {
+      const timer = setTimeout(() => {
+        void reloadIncidents();
+      }, 250);
+      return () => clearTimeout(timer);
+    }
+  }, [user, view, query]);
+
+  useEffect(() => {
     if (!user || user.role === "member") return;
     const connectionBusy = githubConnection
       ? ["pending", "sync_requested", "syncing", "disconnect_requested", "disconnecting"].includes(
@@ -655,14 +680,48 @@ export function App() {
     setTasks(data.tasks);
   }
 
-  async function reloadActivityReports() {
-    const data = await api<{ reports: ActivityReport[] }>("/api/reports");
-    setActivityReports(data.reports);
+  async function reloadActivityReports(cursor?: string, append = false) {
+    if (append) {
+      setLoadingOlderActivity(true);
+    }
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(RESOURCE_FEED_PAGE_SIZE));
+      if (cursor) params.set("cursor", cursor);
+      if (query.trim()) params.set("query", query.trim());
+      const data = await api<{ reports: ActivityReport[]; nextCursor: string | null; hasMore?: boolean }>(
+        `/api/reports?${params.toString()}`
+      );
+      setActivityReports((prev) => (append ? [...prev, ...data.reports] : data.reports));
+      setActivityNextCursor(data.nextCursor ?? null);
+      setActivityHasMore(Boolean(data.hasMore));
+    } finally {
+      if (append) {
+        setLoadingOlderActivity(false);
+      }
+    }
   }
 
-  async function reloadIncidents() {
-    const data = await api<{ incidents: Incident[] }>("/api/incidents");
-    setIncidents(data.incidents);
+  async function reloadIncidents(cursor?: string, append = false) {
+    if (append) {
+      setLoadingOlderIncidents(true);
+    }
+    try {
+      const params = new URLSearchParams();
+      params.set("limit", String(RESOURCE_FEED_PAGE_SIZE));
+      if (cursor) params.set("cursor", cursor);
+      if (query.trim()) params.set("query", query.trim());
+      const data = await api<{ incidents: Incident[]; nextCursor: string | null; hasMore?: boolean }>(
+        `/api/incidents?${params.toString()}`
+      );
+      setIncidents((prev) => (append ? [...prev, ...data.incidents] : data.incidents));
+      setIncidentsNextCursor(data.nextCursor ?? null);
+      setIncidentsHasMore(Boolean(data.hasMore));
+    } finally {
+      if (append) {
+        setLoadingOlderIncidents(false);
+      }
+    }
   }
 
   async function reloadSchedules() {
@@ -853,21 +912,22 @@ export function App() {
           </span>
           <div className="brand-copy">
             <strong>Aisevak</strong>
-            <small>Agent workspace</small>
           </div>
         </div>
 
         <nav className="sidebar-nav">
-          <span className="nav-label">Workspace</span>
+          <span className="nav-label">Overview</span>
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => navigateToView("tasks")} />
+          <NavButton className="nav-item-threads" icon={<ChatsIcon />} label="Threads" active={view === "runs"} onClick={() => navigateToView("runs")} />
           <NavButton icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => navigateToView("activity")} />
           <NavButton icon={<CircleAlert />} label="Incidents" active={view === "incidents"} onClick={() => navigateToView("incidents")} />
           <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => navigateToView("agents")} />
           <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => navigateToView("skills")} />
           <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
+          <NavButton className="nav-item-settings" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")} />
 
           <div className="sidebar-agent-heading">
-            <span className="nav-label">Agents</span>
+            <span className="nav-label">Threads</span>
             <Button
               variant="ghost"
               size="icon"
@@ -926,6 +986,8 @@ export function App() {
                     agentId={thread.agent_id || "default"}
                     agentName={thread.agent_name || "Agent"}
                     className="sidebar-run-avatar"
+                    motion={isActiveRun(thread.latest_status) ? "always" : "hover"}
+                    orbVariant={isActiveRun(thread.latest_status) ? "working" : undefined}
                   />
                   <div className="sidebar-run-copy">
                     <span className="sidebar-run-title">{thread.title || "Untitled task"}</span>
@@ -1094,6 +1156,11 @@ export function App() {
           {view === "activity" ? (
             <ActivityView
               reports={filteredActivityReports}
+              hasMore={activityHasMore}
+              loadingMore={loadingOlderActivity}
+              onLoadMore={() => {
+                if (activityNextCursor) void reloadActivityReports(activityNextCursor, true);
+              }}
               onOpenThread={selectAgentThread}
             />
           ) : null}
@@ -1101,36 +1168,96 @@ export function App() {
           {view === "incidents" ? (
             <IncidentsView
               incidents={filteredIncidents}
+              hasMore={incidentsHasMore}
+              loadingMore={loadingOlderIncidents}
+              onLoadMore={() => {
+                if (incidentsNextCursor) void reloadIncidents(incidentsNextCursor, true);
+              }}
               onOpenThread={selectAgentThread}
             />
           ) : null}
 
           {view === "runs" ? (
-            <AgentChatsView
-              thread={selectedThread}
-              draft={draftThread}
-              run={selectedThreadRun}
-              events={agentThreadEvents}
-              eventsTruncated={agentThreadEventsTruncated}
-              detailState={threadDetailState}
-              pendingMessages={pendingThreadMessages}
-              providers={providerInstances}
-              selection={composerSelection}
-              onSelectionChange={selectComposerModel}
-              onSendMessage={sendAgentThreadMessage}
-              onRetry={() => {
-                if (selectedThreadId) void loadAgentThread(selectedThreadId);
-              }}
-              onCancel={async () => {
-                if (!selectedThreadId) return;
-                try {
-                  await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
-                  await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
-                } catch (error) {
-                  setMessage(error instanceof Error ? error.message : "Failed to stop the active turn.");
-                }
-              }}
-            />
+            <>
+              <div className="mobile-threads-view">
+                {selectedThreadId || draftThread ? (
+                  <AgentChatsView
+                    thread={selectedThread}
+                    draft={draftThread}
+                    run={selectedThreadRun}
+                    events={agentThreadEvents}
+                    eventsTruncated={agentThreadEventsTruncated}
+                    detailState={threadDetailState}
+                    pendingMessages={pendingThreadMessages}
+                    providers={providerInstances}
+                    selection={composerSelection}
+                    onSelectionChange={selectComposerModel}
+                    onSendMessage={sendAgentThreadMessage}
+                    onBack={() => {
+                      selectAgentThread("");
+                      navigateToView("runs", null);
+                    }}
+                    onRetry={() => {
+                      if (selectedThreadId) void loadAgentThread(selectedThreadId);
+                    }}
+                    onCancel={async () => {
+                      if (!selectedThreadId) return;
+                      try {
+                        await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
+                        await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
+                      } catch (error) {
+                        setMessage(error instanceof Error ? error.message : "Failed to stop the active turn.");
+                      }
+                    }}
+                  />
+                ) : (
+                  <MobileThreadListView
+                    threads={filteredThreads}
+                    query={query}
+                    hasMore={Boolean(nextThreadCursor)}
+                    loadingMore={loadingOlderThreads}
+                    onQueryChange={setQuery}
+                    onLoadMore={() => void loadOlderAgentThreads()}
+                    onCreateThread={createAgentThread}
+                    onSelectThread={async (threadId) => {
+                      selectAgentThread(threadId);
+                      await loadAgentThread(threadId);
+                    }}
+                  />
+                )}
+              </div>
+              <div className="desktop-chat-stage">
+                <AgentChatsView
+                  thread={selectedThread}
+                  draft={draftThread}
+                  run={selectedThreadRun}
+                  events={agentThreadEvents}
+                  eventsTruncated={agentThreadEventsTruncated}
+                  detailState={threadDetailState}
+                  pendingMessages={pendingThreadMessages}
+                  providers={providerInstances}
+                  selection={composerSelection}
+                  onSelectionChange={selectComposerModel}
+                  onSendMessage={sendAgentThreadMessage}
+                  onBack={() => {
+                    selectAgentThread("");
+                    navigateToView("runs", null);
+                  }}
+                  onRetry={() => {
+                    if (selectedThreadId) void loadAgentThread(selectedThreadId);
+                  }}
+                  onCancel={async () => {
+                    if (!selectedThreadId) return;
+                    try {
+                      await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
+                      await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
+                    } catch (error) {
+                      setMessage(error instanceof Error ? error.message : "Failed to stop the active turn.");
+                    }
+                  }}
+                />
+              </div>
+            </>
           ) : null}
 
           {view === "agents" ? (
@@ -1228,7 +1355,31 @@ export function App() {
   );
 }
 
-function ActivityView(props: { reports: ActivityReport[]; onOpenThread: (threadId: string) => void }) {
+function ActivityView(props: {
+  reports: ActivityReport[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+  onOpenThread: (threadId: string) => void;
+}) {
+  const sentinelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!props.hasMore || props.loadingMore) return;
+    const el = sentinelRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          props.onLoadMore();
+        }
+      },
+      { rootMargin: "250px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [props.hasMore, props.loadingMore, props.onLoadMore]);
+
   return (
     <div className="resource-feed-view">
       <div className="resource-feed-intro">
@@ -1309,12 +1460,55 @@ function ActivityView(props: { reports: ActivityReport[]; onOpenThread: (threadI
             <p>Agent reports, execution logs, and summaries will appear here as tasks run.</p>
           </div>
         ) : null}
+
+        {props.hasMore ? (
+          <div className="resource-feed-footer" ref={sentinelRef}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={props.loadingMore}
+              onClick={props.onLoadMore}
+              className="gap-2 font-medium"
+            >
+              {props.loadingMore ? <DotMatrixLoader size={13} /> : <ArrowDown size={14} />}
+              <span>{props.loadingMore ? "Loading more activity..." : "Load more activity"}</span>
+            </Button>
+          </div>
+        ) : props.reports.length > 0 ? (
+          <div className="resource-feed-end-indicator">
+            <span>All activity loaded ({props.reports.length})</span>
+          </div>
+        ) : null}
       </div>
     </div>
   );
 }
 
-function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: string) => void }) {
+function IncidentsView(props: {
+  incidents: Incident[];
+  hasMore: boolean;
+  loadingMore: boolean;
+  onLoadMore: () => void;
+  onOpenThread: (threadId: string) => void;
+}) {
+  const sentinelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!props.hasMore || props.loadingMore) return;
+    const el = sentinelRef.current;
+    if (!el) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          props.onLoadMore();
+        }
+      },
+      { rootMargin: "250px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [props.hasMore, props.loadingMore, props.onLoadMore]);
+
   return (
     <div className="resource-feed-view">
       <div className="resource-feed-intro">
@@ -1401,6 +1595,25 @@ function IncidentsView(props: { incidents: Incident[]; onOpenThread: (threadId: 
             <p>All agent operations and background workflows are running normally.</p>
           </div>
         ) : null}
+
+        {props.hasMore ? (
+          <div className="resource-feed-footer" ref={sentinelRef}>
+            <Button
+              variant="secondary"
+              size="sm"
+              disabled={props.loadingMore}
+              onClick={props.onLoadMore}
+              className="gap-2 font-medium"
+            >
+              {props.loadingMore ? <DotMatrixLoader size={13} /> : <ArrowDown size={14} />}
+              <span>{props.loadingMore ? "Loading more incidents..." : "Load more incidents"}</span>
+            </Button>
+          </div>
+        ) : props.incidents.length > 0 ? (
+          <div className="resource-feed-end-indicator">
+            <span>All incidents loaded ({props.incidents.length})</span>
+          </div>
+        ) : null}
       </div>
     </div>
   );
@@ -1466,28 +1679,63 @@ function TasksView(props: {
           {BOARD_COLUMNS.map((column) => {
             const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
             return (
-              <div className="kanban-col" key={column.id}>
+              <div className={`kanban-col col-${column.id}`} key={column.id}>
                 <div className="kanban-head">
-                  <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    {column.icon} {column.title}
+                  <span className="kanban-head-title">
+                    {column.id === "running" ? (
+                      <AgentOrb variant="working" size={12} color="var(--primary)" />
+                    ) : (
+                      column.icon
+                    )}
+                    <span>{column.title}</span>
                   </span>
                   <span className="count-badge">{tasks.length}</span>
                 </div>
                 <div className="kanban-cards">
-                  {tasks.map((task) => (
-                    <button
-                      className="kanban-card"
-                      key={task.id}
-                      onClick={() => props.onSelect(task)}
-                    >
-                      <div className="card-top">
-                        <span className="task-key">TASK-{task.number}</span>
-                        <TaskStatus status={task.latest_run_status ?? task.status} />
-                      </div>
-                      <div className="card-title">{task.title}</div>
-                      <div className="card-desc">{task.project_name ?? "No project"}</div>
-                    </button>
-                  ))}
+                  {tasks.map((task) => {
+                    const status = task.latest_run_status ?? task.status;
+                    const isBlocked = status === "blocked";
+                    const isRunning = isActiveRun(status);
+                    return (
+                      <button
+                        className={`kanban-card ${isBlocked ? "is-blocked" : ""} ${isRunning ? "is-running" : ""}`}
+                        key={task.id}
+                        onClick={() => props.onSelect(task)}
+                      >
+                        <div className="card-top">
+                          <span className="task-key">TASK-{task.number}</span>
+                          <TaskStatus status={status} />
+                        </div>
+                        <div className="card-title">{task.title}</div>
+                        {task.body && task.body !== task.title ? (
+                          <div className="card-body-preview">{task.body}</div>
+                        ) : null}
+                        <div className="card-footer">
+                          <div className="card-agent-author">
+                            <AgentAvatar
+                              agentId={task.agent_id || "default"}
+                              agentName={task.agent_name || "Agent"}
+                              className="card-agent-avatar"
+                              motion={isRunning ? "always" : "hover"}
+                              orbVariant={isRunning ? "working" : undefined}
+                            />
+                            <span className="card-agent-name">{task.agent_name || "Agent"}</span>
+                          </div>
+                          {task.project_name ? (
+                            <span className="card-project-tag" title={task.project_name}>
+                              <FolderGit2 size={11} className="shrink-0" />
+                              <span className="truncate">{task.project_name}</span>
+                            </span>
+                          ) : null}
+                        </div>
+                      </button>
+                    );
+                  })}
+                  {tasks.length === 0 ? (
+                    <div className="kanban-column-empty">
+                      <span>No {column.title.toLowerCase()}</span>
+                    </div>
+                  ) : null}
                 </div>
               </div>
             );
@@ -1557,7 +1805,16 @@ function TaskComposer(props: {
         <div className="task-composer-footer">
           <div className="task-composer-controls">
             <div className="task-control-item">
-              <Bot size={13} className="control-icon" />
+              {agentId !== "auto" ? (
+                <AgentAvatar
+                  agentId={agentId}
+                  agentName={workerAgents.find((a) => a.id === agentId)?.name || "Agent"}
+                  className="w-4 h-4 rounded-full"
+                  motion="hover"
+                />
+              ) : (
+                <Bot size={13} className="control-icon" />
+              )}
               <NativeSelect
                 value={agentId}
                 onChange={(event) => setAgentId(event.target.value)}
@@ -1774,7 +2031,7 @@ function ScheduleComposer(props: {
           <Input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
-            placeholder="e.g. Daily workspace brief, Nightly integration tests"
+            placeholder="e.g. Daily operational brief, Nightly integration tests"
             required
             className="mt-1"
           />
@@ -2238,14 +2495,14 @@ function SchedulesView(props: {
 
       {calendarOverflow ? (
         <div className="calendar-modal-backdrop" onClick={() => setCalendarOverflow(null)}>
-          <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="p-5 flex flex-col gap-3">
-              <div className="flex items-start justify-between gap-3">
+          <div className="calendar-modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
+            <div className="p-6 flex flex-col gap-4">
+              <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
                 <div>
-                  <div className="text-[11px] font-mono text-muted-foreground uppercase tracking-wider">
-                    Calendar day
+                  <div className="text-[11.5px] font-medium text-muted-foreground">
+                    Day Overview
                   </div>
-                  <h3 className="text-[15px] font-semibold text-foreground mt-0.5">
+                  <h3 className="text-[16px] font-semibold text-foreground mt-0.5 tracking-tight">
                     {calendarOverflow.date.toLocaleDateString(undefined, {
                       weekday: "long",
                       month: "long",
@@ -2258,48 +2515,96 @@ function SchedulesView(props: {
                   type="button"
                   variant="ghost"
                   size="icon"
+                  className="h-7 w-7 text-muted-foreground hover:text-foreground"
                   aria-label="Close calendar day"
                   onClick={() => setCalendarOverflow(null)}
                 >
-                  <CircleX size={15} />
+                  <X size={15} />
                 </Button>
               </div>
 
-              <div className="calendar-overflow-list">
-                {calendarOverflow.schedules.map((schedule) => (
-                  <button
-                    type="button"
-                    className={`calendar-event-chip scheduled ${!schedule.enabled ? "paused" : ""}`}
-                    key={`schedule-${schedule.id}`}
-                    onClick={() => {
-                      setCalendarOverflow(null);
-                      setSelectedEventDetails({ type: "schedule", schedule });
-                    }}
-                  >
-                    <AgentAvatar agentId={schedule.agent_id} agentName={schedule.agent_name} className="chip-avatar" />
-                    <span className="chip-time">{formatTimestamp(schedule.next_run_at)}</span>
-                    <span className="chip-title">{schedule.title}</span>
-                  </button>
-                ))}
-                {calendarOverflow.threads.map((thread) => (
-                  <button
-                    type="button"
-                    className={`calendar-event-chip ran status-${thread.latest_status ?? "running"}`}
-                    key={`thread-${thread.id}`}
-                    onClick={() => {
-                      setCalendarOverflow(null);
-                      void props.onOpenThread(thread.id);
-                    }}
-                  >
-                    <AgentAvatar
-                      agentId={thread.agent_id || "default"}
-                      agentName={thread.agent_name || "Agent"}
-                      className="chip-avatar"
-                    />
-                    <span className="chip-time">{formatTimestamp(thread.last_activity_at)}</span>
-                    <span className="chip-title">{thread.title || thread.agent_name || "Task"}</span>
-                  </button>
-                ))}
+              <div className="calendar-modal-overflow-body flex flex-col gap-3 max-h-[380px] overflow-y-auto pr-1">
+                {calendarOverflow.schedules.length > 0 ? (
+                  <div className="calendar-modal-section">
+                    <div className="calendar-modal-section-title">
+                      Scheduled Runs ({calendarOverflow.schedules.length})
+                    </div>
+                    <div className="calendar-modal-items-list">
+                      {calendarOverflow.schedules.map((schedule) => (
+                        <div
+                          className="calendar-modal-card scheduled"
+                          key={`schedule-${schedule.id}`}
+                          onClick={() => {
+                            setCalendarOverflow(null);
+                            setSelectedEventDetails({ type: "schedule", schedule });
+                          }}
+                        >
+                          <AgentAvatar agentId={schedule.agent_id} agentName={schedule.agent_name} className="w-6 h-6 flex-shrink-0" />
+                          <div className="calendar-modal-card-text">
+                            <div className="calendar-modal-card-top">
+                              <strong>{schedule.title}</strong>
+                              <Badge variant={schedule.enabled ? "success" : "secondary"} className="text-[10px] py-0 px-1.5 font-medium">
+                                {schedule.enabled ? "Scheduled" : "Paused"}
+                              </Badge>
+                            </div>
+                            <div className="calendar-modal-card-sub">
+                              <span>{schedule.agent_name}</span>
+                              <span>·</span>
+                              <span>{formatDateTime(schedule.next_run_at)}</span>
+                              <span>·</span>
+                              <span>{formatScheduleCadence(schedule)}</span>
+                            </div>
+                          </div>
+                          <ChevronRight size={14} className="text-muted-foreground flex-shrink-0" />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {calendarOverflow.threads.length > 0 ? (
+                  <div className="calendar-modal-section">
+                    <div className="calendar-modal-section-title">
+                      Executed Tasks & Activity ({calendarOverflow.threads.length})
+                    </div>
+                    <div className="calendar-modal-items-list">
+                      {calendarOverflow.threads.map((thread) => (
+                        <div
+                          className="calendar-modal-card ran"
+                          key={`thread-${thread.id}`}
+                          onClick={() => {
+                            setCalendarOverflow(null);
+                            void props.onOpenThread(thread.id);
+                          }}
+                        >
+                          <AgentAvatar
+                            agentId={thread.agent_id || "default"}
+                            agentName={thread.agent_name || "Agent"}
+                            className="w-6 h-6 flex-shrink-0"
+                          />
+                          <div className="calendar-modal-card-text">
+                            <div className="calendar-modal-card-top">
+                              <strong>{thread.title || thread.agent_name || "Agent Task"}</strong>
+                              <TaskStatus status={thread.latest_status ?? "running"} />
+                            </div>
+                            <div className="calendar-modal-card-sub">
+                              <span>{thread.agent_name || "Agent"}</span>
+                              <span>·</span>
+                              <span>{formatDateTime(thread.last_activity_at)}</span>
+                            </div>
+                          </div>
+                          <ChevronRight size={14} className="text-muted-foreground flex-shrink-0" />
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {calendarOverflow.schedules.length === 0 && calendarOverflow.threads.length === 0 ? (
+                  <div className="text-center py-8 text-muted-foreground text-[13px]">
+                    No events or activity on this day.
+                  </div>
+                ) : null}
               </div>
             </div>
           </div>
@@ -2309,36 +2614,63 @@ function SchedulesView(props: {
       {selectedEventDetails && selectedEventDetails.schedule ? (
         <div className="calendar-modal-backdrop" onClick={() => setSelectedEventDetails(null)}>
           <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="p-5 flex flex-col gap-4">
-              <div className="flex items-start justify-between gap-3">
+            <div className="p-6 flex flex-col gap-4">
+              <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
                 <div>
-                  <div className="text-[11px] font-mono text-muted-foreground uppercase tracking-wider">
+                  <div className="text-[11.5px] font-medium text-muted-foreground">
                     Scheduled Agent Run
                   </div>
-                  <h3 className="text-[15px] font-semibold text-foreground mt-0.5">
+                  <h3 className="text-[16px] font-semibold text-foreground mt-0.5 tracking-tight">
                     {selectedEventDetails.schedule.title}
                   </h3>
                 </div>
-                <Badge variant={selectedEventDetails.schedule.enabled ? "success" : "secondary"}>
-                  {selectedEventDetails.schedule.enabled ? "Scheduled" : "Paused"}
-                </Badge>
+                <div className="flex items-center gap-2">
+                  <Badge variant={selectedEventDetails.schedule.enabled ? "success" : "secondary"} className="text-[10.5px] font-medium">
+                    {selectedEventDetails.schedule.enabled ? "Scheduled" : "Paused"}
+                  </Badge>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 text-muted-foreground hover:text-foreground"
+                    aria-label="Close details"
+                    onClick={() => setSelectedEventDetails(null)}
+                  >
+                    <X size={15} />
+                  </Button>
+                </div>
               </div>
 
-              <div className="bg-secondary/40 rounded-lg p-3 text-[12px] flex flex-col gap-1.5 font-mono text-muted-foreground">
-                <div>Agent: <span className="text-foreground font-medium">{selectedEventDetails.schedule.agent_name}</span></div>
-                <div>Next run: <span className="text-foreground">{formatDateTime(selectedEventDetails.schedule.next_run_at)}</span></div>
-                <div>Cadence: <span className="text-foreground">{formatScheduleCadence(selectedEventDetails.schedule)}</span></div>
-                <div>Total runs: <span className="text-foreground">{selectedEventDetails.schedule.run_count}</span></div>
+              <div className="bg-secondary/40 rounded-lg p-3 text-[12px] flex flex-col gap-1.5 text-muted-foreground border border-border">
+                <div className="flex justify-between items-center">
+                  <span>Agent</span>
+                  <span className="text-foreground font-semibold flex items-center gap-1.5">
+                    <AgentAvatar agentId={selectedEventDetails.schedule.agent_id} agentName={selectedEventDetails.schedule.agent_name} className="w-4 h-4" />
+                    {selectedEventDetails.schedule.agent_name}
+                  </span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Next run</span>
+                  <span className="text-foreground font-medium">{formatDateTime(selectedEventDetails.schedule.next_run_at)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Cadence</span>
+                  <span className="text-foreground font-medium">{formatScheduleCadence(selectedEventDetails.schedule)}</span>
+                </div>
+                <div className="flex justify-between">
+                  <span>Total runs</span>
+                  <span className="text-foreground font-medium">{selectedEventDetails.schedule.run_count}</span>
+                </div>
               </div>
 
-              <div className="text-[12.5px] text-muted-foreground bg-card border border-border rounded-lg p-3 max-h-36 overflow-y-auto whitespace-pre-wrap">
+              <div className="text-[12.5px] text-foreground bg-card border border-border rounded-lg p-3 max-h-36 overflow-y-auto whitespace-pre-wrap leading-relaxed">
                 {selectedEventDetails.schedule.prompt}
               </div>
 
               <div className="flex items-center justify-between pt-2 border-t border-border">
                 <div className="flex items-center gap-2">
                   <Button
-                    variant="ghost"
+                    variant="secondary"
                     size="sm"
                     onClick={() => {
                       const s = selectedEventDetails.schedule!;
@@ -2368,7 +2700,7 @@ function SchedulesView(props: {
                   onClick={() => deleteSchedule(selectedEventDetails.schedule!.id)}
                 >
                   <Trash2 size={13} />
-                  Delete
+                  <span>Delete</span>
                 </Button>
               </div>
             </div>
@@ -2392,11 +2724,11 @@ function AgentThreadSidebar(props: {
   onSelectThread: (threadId: string) => void;
 }) {
   return (
-    <aside className="agent-thread-sidebar" aria-label="Agent tasks">
+    <aside className="agent-thread-sidebar" aria-label="Agent threads">
       <div className="agent-thread-sidebar-header">
         <div>
-          <h2>Agents</h2>
-          <p>Codex tasks</p>
+          <h2>Threads</h2>
+          <p>Agent conversations</p>
         </div>
         <Tooltip>
           <TooltipTrigger asChild>
@@ -2492,6 +2824,116 @@ function AgentThreadSidebar(props: {
   );
 }
 
+function MobileThreadListView(props: {
+  threads: AgentThread[];
+  query: string;
+  hasMore: boolean;
+  loadingMore: boolean;
+  onQueryChange: (query: string) => void;
+  onLoadMore: () => void;
+  onCreateThread: () => void;
+  onSelectThread: (threadId: string) => void;
+}) {
+  return (
+    <div className="mobile-thread-list-view">
+      <div className="mobile-thread-list-header">
+        <div className="mobile-thread-list-title-row">
+          <div>
+            <h2>Threads</h2>
+            <p>Agent conversations & tasks</p>
+          </div>
+          <Button
+            size="sm"
+            className="gap-1.5 font-medium"
+            onClick={props.onCreateThread}
+          >
+            <Plus size={14} />
+            <span>New thread</span>
+          </Button>
+        </div>
+        <div className="mobile-thread-search-box">
+          <Search size={14} className="text-muted-foreground" />
+          <Input
+            value={props.query}
+            onChange={(e) => props.onQueryChange(e.target.value)}
+            placeholder="Search threads…"
+            aria-label="Search threads"
+          />
+        </div>
+      </div>
+
+      <div className="mobile-thread-list-scroll">
+        {props.threads.map((thread) => {
+          const active = isActiveRun(thread.latest_status);
+          return (
+            <button
+              type="button"
+              className="mobile-thread-item"
+              key={thread.id}
+              onClick={() => props.onSelectThread(thread.id)}
+            >
+              <AgentAvatar
+                agentId={thread.agent_id || "default"}
+                agentName={thread.agent_name || "Agent"}
+                className="mobile-thread-item-avatar"
+                motion={active ? "always" : "hover"}
+                orbVariant={active ? "working" : undefined}
+              />
+              <div className="mobile-thread-item-copy">
+                <div className="mobile-thread-item-top">
+                  <strong className="mobile-thread-item-title truncate">{thread.title || "Untitled task"}</strong>
+                  <span className="mobile-thread-item-time shrink-0">{formatSidebarRunTime(thread.last_activity_at)}</span>
+                </div>
+                <div className="mobile-thread-item-meta">
+                  <span className="mobile-thread-item-agent truncate">{thread.agent_name || "Agent"}</span>
+                  {thread.project_name ? (
+                    <>
+                      <span>·</span>
+                      <span className="mobile-thread-item-project truncate">{thread.project_name}</span>
+                    </>
+                  ) : null}
+                  {thread.latest_status ? <TaskStatus status={thread.latest_status} /> : null}
+                </div>
+              </div>
+              {active ? (
+                <DotMatrixLoader size={12} className="text-primary shrink-0" />
+              ) : (
+                <ChevronRight size={14} className="text-muted-foreground shrink-0" />
+              )}
+            </button>
+          );
+        })}
+
+        {props.threads.length === 0 ? (
+          <div className="resource-feed-empty">
+            <ChatsIcon size={24} className="empty-icon" />
+            <strong>{props.query ? "No matching threads" : "No threads yet"}</strong>
+            <p>Start a new thread to run tasks and coordinate agent workflows.</p>
+            <Button size="sm" onClick={props.onCreateThread} className="mt-2 gap-1.5">
+              <Plus size={14} /> New thread
+            </Button>
+          </div>
+        ) : null}
+
+        {props.hasMore ? (
+          <div className="mobile-thread-list-footer">
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={props.loadingMore}
+              onClick={props.onLoadMore}
+              className="gap-1.5"
+            >
+              {props.loadingMore ? <Loader2 className="spin" size={13} /> : <ChevronDown size={13} />}
+              <span>Load older threads</span>
+            </Button>
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
 function AgentChatsView(props: {
   thread: AgentThread | null;
   draft: boolean;
@@ -2504,6 +2946,7 @@ function AgentChatsView(props: {
   selection: ModelSelection | null;
   onSelectionChange: (selection: ModelSelection) => Promise<void>;
   onSendMessage: (message: string, selection: ModelSelection) => Promise<void>;
+  onBack?: () => void;
   onRetry: () => void;
   onCancel: () => Promise<void>;
 }) {
@@ -2514,7 +2957,7 @@ function AgentChatsView(props: {
   const active = isActiveRun(props.thread?.latest_status);
   const title = props.draft ? "New thread" : (props.thread?.title ?? "Agent thread");
   const agentName = props.thread?.agent_name ?? "Orchestrator";
-  const projectName = props.thread?.project_name ?? "Aisevak workspace";
+  const projectName = props.thread?.project_name ?? null;
   const latestError = props.thread?.latest_error ? friendlyError(props.thread.latest_error) : null;
   const threadKey = props.thread?.id ?? (props.draft ? "draft" : "loading");
   const hasTimelineData = Boolean(props.run || props.events.length || props.pendingMessages.length);
@@ -2552,6 +2995,18 @@ function AgentChatsView(props: {
     <div className={`agent-chat-view ${props.draft ? "is-draft" : ""}`}>
       <header className="agent-chat-header">
         <div className="agent-chat-heading">
+          {props.onBack ? (
+            <Button
+              variant="ghost"
+              size="icon"
+              className="agent-chat-mobile-back"
+              onClick={props.onBack}
+              title="Back to threads"
+              aria-label="Back to threads"
+            >
+              <ChevronLeft size={16} />
+            </Button>
+          ) : null}
           <AgentAvatar
             agentId={props.thread?.agent_id || "default"}
             agentName={agentName || "Agent"}
@@ -2560,7 +3015,15 @@ function AgentChatsView(props: {
             orbVariant={active ? "working" : undefined}
           />
           <div className="agent-chat-title-group">
-            <div className="agent-chat-breadcrumb">{projectName} <span>/</span> {agentName}</div>
+            <div className="agent-chat-breadcrumb">
+              {projectName ? (
+                <>
+                  <span className="agent-chat-crumb-project">{projectName}</span>
+                  <span>/</span>
+                </>
+              ) : null}
+              <span>{agentName}</span>
+            </div>
             <h1>{title}</h1>
           </div>
         </div>
@@ -2908,11 +3371,8 @@ function AgentsView(props: {
   }, [props.agents]);
 
   return (
-    <div className="master-detail">
+    <div className={`master-detail ${editing ? "has-selection" : ""}`}>
       <aside className="master-list">
-        <div className="master-header">
-          <h3>Agents</h3>
-        </div>
         <div className="list-scroll">
           {props.agents.map((agent) => (
             <button
@@ -2929,6 +3389,7 @@ function AgentsView(props: {
                 <span className="list-item-title">{agent.name}</span>
                 <span className="list-item-desc">{agentSummary(agent, props.models)}</span>
               </div>
+              <ChevronRight size={14} className="mobile-chevron-indicator" />
             </button>
           ))}
         </div>
@@ -2936,6 +3397,18 @@ function AgentsView(props: {
       <main className="detail-view">
         {editing ? (
           <div className="form-view">
+            <div className="mobile-master-back-bar">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="mobile-master-back-btn gap-1 text-muted-foreground hover:text-foreground"
+                onClick={() => setEditing(null)}
+              >
+                <ChevronLeft size={14} />
+                <span>Back to agents</span>
+              </Button>
+            </div>
             <AgentEditor
               agent={editing}
               agents={props.agents}
@@ -3667,11 +4140,8 @@ function SkillsView(props: {
   }, [props.skills]);
 
   return (
-    <div className="master-detail">
+    <div className={`master-detail ${editing ? "has-selection" : ""}`}>
       <aside className="master-list">
-        <div className="master-header">
-          <h3>Skills</h3>
-        </div>
         {props.errors.length > 0 ? (
           <div className="skill-catalog-errors" title={props.errors.map((error) => `${error.directory}: ${error.message}`).join("\n")}>
             {props.errors.length} invalid skill {props.errors.length === 1 ? "directory" : "directories"}
@@ -3692,6 +4162,7 @@ function SkillsView(props: {
                 <span className="list-item-desc">{skill.description}</span>
               </div>
               <TaskStatus status={skill.enabled ? (skill.default_for_agents ? "default" : "enabled") : "disabled"} />
+              <ChevronRight size={14} className="mobile-chevron-indicator" />
             </button>
           ))}
           {props.skills.length === 0 ? <div className="empty-list">No skills</div> : null}
@@ -3700,6 +4171,18 @@ function SkillsView(props: {
       <main className="detail-view">
         {editing ? (
           <div className="form-view">
+            <div className="mobile-master-back-bar">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="mobile-master-back-btn gap-1 text-muted-foreground hover:text-foreground"
+                onClick={() => setEditing(null)}
+              >
+                <ChevronLeft size={14} />
+                <span>Back to skills</span>
+              </Button>
+            </div>
             <SkillEditor skill={editing} root={props.root} onSaved={props.onSaved} />
           </div>
         ) : (
@@ -3908,7 +4391,7 @@ function ConnectorsView(props: {
   }
 
   return (
-    <div className="master-detail">
+    <div className="master-detail connectors-master-detail">
       <aside className="master-list">
         <div className="master-header">
           <h3>Connections</h3>
@@ -4480,11 +4963,11 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
             });
             await onDone();
           } catch (onboardingError) {
-            setError(onboardingError instanceof Error ? onboardingError.message : "Could not create workspace.");
+            setError(onboardingError instanceof Error ? onboardingError.message : "Could not create account.");
           }
         }}
       >
-        <h1>Create workspace</h1>
+        <h1>Set up Aisevak</h1>
         <p>Set up the first owner account.</p>
         <div className="stack">
           <Input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} placeholder="Your name" required />
@@ -4492,7 +4975,7 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
           <Input value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} placeholder="Password · 8+ characters" type="password" minLength={8} required />
           <Input value={form.openaiApiKey} onChange={(event) => setForm({ ...form, openaiApiKey: event.target.value })} placeholder="OpenAI API key · optional" type="password" />
           {error ? <div className="notice error">{friendlyError(error)}</div> : null}
-          <Button type="submit" size="lg" style={{ width: "100%" }}>Create workspace</Button>
+          <Button type="submit" size="lg" style={{ width: "100%" }}>Get started</Button>
         </div>
       </form>
     </div>
@@ -4533,11 +5016,11 @@ function Splash() {
   );
 }
 
-function NavButton({ icon, label, active, onClick }: { icon: ReactNode; label: string; active: boolean; onClick: () => void }) {
+function NavButton({ icon, label, active, onClick, className }: { icon: ReactNode; label: string; active: boolean; onClick: () => void; className?: string }) {
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button variant="ghost" className={`nav-item ${active ? "active" : ""}`} aria-current={active ? "page" : undefined} onClick={onClick}>
+        <Button variant="ghost" className={`nav-item ${active ? "active" : ""} ${className ?? ""}`} aria-current={active ? "page" : undefined} onClick={onClick}>
           <AnimatedIcon icon={icon as ReactElement} active={active} />
           <span>{label}</span>
         </Button>

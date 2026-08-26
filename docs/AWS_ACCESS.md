@@ -22,6 +22,7 @@ Load the sanitized private AWS deployment variables:
 
 ```bash
 source "$HOME/Documents/aisevak-aws-deployment.env"
+export AWS_SHARED_CREDENTIALS_FILE="$HOME/Documents/credentials/credentials"
 aws --profile "$AISEVAK_AWS_PROFILE" \
   --region "$AISEVAK_AWS_REGION" \
   ssm start-session \
