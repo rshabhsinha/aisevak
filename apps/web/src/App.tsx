@@ -1179,7 +1179,7 @@ export function App() {
 
           {view === "runs" ? (
             <>
-              <div className="mobile-threads-view">
+              <div className={`mobile-threads-view ${selectedThreadId || draftThread ? "mobile-hide-threads" : ""}`}>
                 <MobileThreadListView
                   threads={filteredThreads}
                   query={query}

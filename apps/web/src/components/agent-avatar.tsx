@@ -14,10 +14,10 @@ export function AgentAvatar(props: {
   const label = `${props.agentName || "Agent"} profile picture`;
 
   return (
-    <div className="relative inline-flex shrink-0">
+    <div className={cn("relative inline-flex shrink-0 items-center justify-center overflow-hidden", props.className)}>
       <Blobatar
         animate={props.motion ?? "hover"}
-        className={cn("agent-avatar", props.className)}
+        className="agent-avatar w-full h-full object-contain"
         data-agent-avatar={seed}
         name={seed}
         title={label}

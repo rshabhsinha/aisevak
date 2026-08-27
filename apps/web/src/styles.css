@@ -1166,12 +1166,23 @@ select:disabled {
 
 .agent-avatar {
   display: block;
+  width: 100%;
+  height: 100%;
   flex: 0 0 auto;
   overflow: hidden;
   border: none !important;
   border-radius: 50% !important;
   transition: transform 240ms cubic-bezier(0.34, 1.56, 0.64, 1), filter 240ms ease !important;
   will-change: transform;
+}
+
+svg.agent-avatar,
+.agent-avatar svg {
+  width: 100% !important;
+  height: 100% !important;
+  max-width: 100% !important;
+  max-height: 100% !important;
+  display: block !important;
 }
 
 .agent-avatar:hover,
@@ -4877,13 +4888,19 @@ label {
   .agent-chat-mobile-back {
     display: none !important;
   }
+
+  .chat-view-container {
+    display: flex !important;
+  }
 }
 
 @media (max-width: 700px) {
   html, body {
-    overflow-x: hidden;
+    overflow: hidden;
     max-width: 100vw;
     width: 100%;
+    height: 100%;
+    height: 100svh;
   }
 
   .nav-item-threads,
@@ -4892,9 +4909,14 @@ label {
   }
 
   .app-layout {
+    height: 100svh;
     min-height: 100svh;
-    height: auto;
-    padding-bottom: calc(58px + env(safe-area-inset-bottom, 0px));
+    max-height: 100svh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    padding-bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    box-sizing: border-box;
   }
 
   .sidebar {
@@ -4919,13 +4941,13 @@ label {
   }
 
   .agent-thread-sidebar {
-    display: none;
+    display: none !important;
   }
 
   .sidebar-brand,
   .sidebar-footer,
   .nav-label {
-    display: none;
+    display: none !important;
   }
 
   .sidebar-nav {
@@ -4945,7 +4967,7 @@ label {
   }
 
   .sidebar-agent-heading {
-    display: none;
+    display: none !important;
   }
 
   .nav-item.button {
@@ -4960,27 +4982,45 @@ label {
 
   .main-content {
     width: 100%;
-    min-height: calc(100svh - 56px - env(safe-area-inset-bottom, 0px));
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    flex: 1 1 auto;
   }
 
   .main-content.agent-chat-mode {
-    height: calc(100svh - 56px - env(safe-area-inset-bottom, 0px));
-    min-height: calc(100svh - 56px - env(safe-area-inset-bottom, 0px));
-    overflow: hidden;
-  }
-
-  .view-container {
     height: 100%;
     min-height: 0;
+    overflow: hidden;
   }
 
   .top-header {
     height: 52px;
     min-height: 52px;
+    flex: 0 0 52px;
     padding: 0 14px;
     display: flex;
     align-items: center;
     justify-content: space-between;
+    border-bottom: 1px solid var(--border);
+    background: var(--card);
+  }
+
+  .view-container {
+    height: calc(100% - 52px);
+    min-height: 0;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .main-content.agent-chat-mode .view-container {
+    height: 100%;
+    min-height: 0;
+    overflow: hidden;
   }
 
   .header-title {
@@ -5004,22 +5044,45 @@ label {
   }
 
   /* Tasks & Kanban Board */
+  .board-layout {
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
   .board-toolbar {
+    flex: 0 0 auto;
     padding: 10px 12px;
   }
 
   .board-columns {
+    flex: 1 1 auto;
+    min-height: 0;
     padding: 12px;
     gap: 12px;
     overflow-x: auto;
+    overflow-y: hidden;
     scroll-snap-type: x mandatory;
     -webkit-overflow-scrolling: touch;
+    display: flex;
   }
 
   .kanban-col {
     min-width: calc(100vw - 32px);
     max-width: calc(100vw - 32px);
+    height: 100%;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     scroll-snap-align: center;
+    background: var(--card);
+    border-radius: 10px;
+    padding: 10px;
+    border: 1px solid var(--border);
   }
 
   .kanban-card {
@@ -5068,17 +5131,26 @@ label {
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     width: 100%;
+    overflow: hidden;
+  }
+
+  .mobile-threads-view.mobile-hide-threads {
+    display: none !important;
   }
 
   .mobile-thread-list-view {
     display: flex;
     flex-direction: column;
     height: 100%;
+    min-height: 0;
     width: 100%;
+    overflow: hidden;
   }
 
   .mobile-thread-list-header {
+    flex: 0 0 auto;
     padding: 16px 16px 12px;
     border-bottom: 1px solid var(--border);
     display: flex;
@@ -5128,8 +5200,10 @@ label {
   }
 
   .mobile-thread-list-scroll {
-    flex: 1;
+    flex: 1 1 auto;
+    min-height: 0;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
     padding: 10px 14px;
     display: flex;
     flex-direction: column;
@@ -5213,10 +5287,10 @@ label {
   /* Agent Chat View & Timeline */
   .chat-view-container {
     display: flex;
-    flex: 1;
+    flex: 1 1 auto;
     flex-direction: column;
-    height: calc(100svh - 56px - env(safe-area-inset-bottom, 0px));
-    min-height: calc(100svh - 56px - env(safe-area-inset-bottom, 0px));
+    height: 100%;
+    min-height: 0;
     width: 100%;
     overflow: hidden;
   }
@@ -5312,7 +5386,7 @@ label {
 
   .agent-chat-stage {
     display: flex;
-    flex: 1;
+    flex: 1 1 auto;
     min-height: 0;
     height: calc(100% - 52px);
     flex-direction: column;
@@ -5325,6 +5399,7 @@ label {
     min-height: 0;
     overflow-y: auto;
     overflow-x: hidden;
+    -webkit-overflow-scrolling: touch;
   }
 
   .agent-chat-composer-wrap {
@@ -5337,6 +5412,7 @@ label {
   .is-draft .agent-chat-stage {
     padding: 0 10px 4vh;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
   .is-draft .agent-chat-composer-wrap {
@@ -5424,19 +5500,48 @@ label {
     display: flex;
     flex-direction: column;
     width: 100%;
-    overflow-x: hidden;
+    height: 100% !important;
+    min-height: 0 !important;
+    overflow: hidden;
   }
 
   .master-list {
+    display: flex;
+    flex-direction: column;
     width: 100% !important;
     min-width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
     border-right: none !important;
+    overflow: hidden;
+  }
+
+  .master-list .list-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
   }
 
   .detail-view {
+    display: flex;
+    flex-direction: column;
     width: 100% !important;
     min-width: 100% !important;
+    height: 100% !important;
+    min-height: 0 !important;
     padding: 0 !important;
+    overflow: hidden;
+  }
+
+  .detail-view .detail-scroll,
+  .detail-view .form-view,
+  .detail-view .detail-content {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px 28px;
   }
 
   .master-detail.has-selection .master-list {
@@ -5468,14 +5573,6 @@ label {
     color: var(--muted-foreground);
   }
 
-  .detail-scroll,
-  .detail-content,
-  .form-view,
-  .flat-list-view,
-  .resource-feed-view {
-    padding: 16px 14px;
-  }
-
   .form-grid,
   .agent-settings-grid,
   .api-key-form,
@@ -5492,6 +5589,15 @@ label {
   }
 
   /* Activity & Incidents */
+  .resource-feed-view {
+    width: 100%;
+    height: 100% !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px 28px;
+  }
+
   .resource-card {
     padding: 14px;
   }
@@ -5521,7 +5627,12 @@ label {
 
   /* Schedules */
   .schedules-calendar-view {
-    padding: 10px;
+    width: 100%;
+    height: 100% !important;
+    min-height: 0 !important;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding: 10px 10px 28px;
   }
 
   .calendar-toolbar {
@@ -5645,8 +5756,12 @@ label {
 
   /* Settings */
   .settings-container {
-    flex-direction: column;
     width: 100%;
+    height: 100% !important;
+    min-height: 0 !important;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
   }
 
   .settings-tabs-bar {
@@ -5658,6 +5773,7 @@ label {
     border-bottom: 1px solid var(--border);
     scrollbar-width: none;
     -webkit-overflow-scrolling: touch;
+    flex: 0 0 auto;
   }
 
   .settings-tabs-bar::-webkit-scrollbar {
@@ -5673,7 +5789,12 @@ label {
   }
 
   .settings-content-pane {
-    padding: 16px 14px;
+    flex: 1 1 auto;
+    min-height: 0;
+    height: auto;
+    overflow-y: auto !important;
+    -webkit-overflow-scrolling: touch;
+    padding: 16px 14px 28px;
     width: 100%;
   }
 
