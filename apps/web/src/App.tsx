@@ -1180,53 +1180,21 @@ export function App() {
           {view === "runs" ? (
             <>
               <div className="mobile-threads-view">
-                {selectedThreadId || draftThread ? (
-                  <AgentChatsView
-                    thread={selectedThread}
-                    draft={draftThread}
-                    run={selectedThreadRun}
-                    events={agentThreadEvents}
-                    eventsTruncated={agentThreadEventsTruncated}
-                    detailState={threadDetailState}
-                    pendingMessages={pendingThreadMessages}
-                    providers={providerInstances}
-                    selection={composerSelection}
-                    onSelectionChange={selectComposerModel}
-                    onSendMessage={sendAgentThreadMessage}
-                    onBack={() => {
-                      selectAgentThread("");
-                      navigateToView("runs", null);
-                    }}
-                    onRetry={() => {
-                      if (selectedThreadId) void loadAgentThread(selectedThreadId);
-                    }}
-                    onCancel={async () => {
-                      if (!selectedThreadId) return;
-                      try {
-                        await api(`/api/agent-threads/${selectedThreadId}/cancel`, { method: "POST" });
-                        await Promise.all([loadAgentThread(selectedThreadId), reloadAgentThreads()]);
-                      } catch (error) {
-                        setMessage(error instanceof Error ? error.message : "Failed to stop the active turn.");
-                      }
-                    }}
-                  />
-                ) : (
-                  <MobileThreadListView
-                    threads={filteredThreads}
-                    query={query}
-                    hasMore={Boolean(nextThreadCursor)}
-                    loadingMore={loadingOlderThreads}
-                    onQueryChange={setQuery}
-                    onLoadMore={() => void loadOlderAgentThreads()}
-                    onCreateThread={createAgentThread}
-                    onSelectThread={async (threadId) => {
-                      selectAgentThread(threadId);
-                      await loadAgentThread(threadId);
-                    }}
-                  />
-                )}
+                <MobileThreadListView
+                  threads={filteredThreads}
+                  query={query}
+                  hasMore={Boolean(nextThreadCursor)}
+                  loadingMore={loadingOlderThreads}
+                  onQueryChange={setQuery}
+                  onLoadMore={() => void loadOlderAgentThreads()}
+                  onCreateThread={createAgentThread}
+                  onSelectThread={async (threadId) => {
+                    selectAgentThread(threadId);
+                    await loadAgentThread(threadId);
+                  }}
+                />
               </div>
-              <div className="desktop-chat-stage">
+              <div className={`chat-view-container ${!selectedThreadId && !draftThread ? "mobile-hide-chat" : ""}`}>
                 <AgentChatsView
                   thread={selectedThread}
                   draft={draftThread}
@@ -3019,10 +2987,10 @@ function AgentChatsView(props: {
               {projectName ? (
                 <>
                   <span className="agent-chat-crumb-project">{projectName}</span>
-                  <span>/</span>
+                  <span className="agent-chat-crumb-divider">/</span>
                 </>
               ) : null}
-              <span>{agentName}</span>
+              <span className="agent-chat-crumb-agent">{agentName}</span>
             </div>
             <h1>{title}</h1>
           </div>
@@ -3373,6 +3341,9 @@ function AgentsView(props: {
   return (
     <div className={`master-detail ${editing ? "has-selection" : ""}`}>
       <aside className="master-list">
+        <div className="master-header">
+          <h3>Agents</h3>
+        </div>
         <div className="list-scroll">
           {props.agents.map((agent) => (
             <button
@@ -4142,6 +4113,9 @@ function SkillsView(props: {
   return (
     <div className={`master-detail ${editing ? "has-selection" : ""}`}>
       <aside className="master-list">
+        <div className="master-header">
+          <h3>Skills</h3>
+        </div>
         {props.errors.length > 0 ? (
           <div className="skill-catalog-errors" title={props.errors.map((error) => `${error.directory}: ${error.message}`).join("\n")}>
             {props.errors.length} invalid skill {props.errors.length === 1 ? "directory" : "directories"}
