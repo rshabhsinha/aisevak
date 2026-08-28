@@ -918,11 +918,11 @@ export function App() {
         <nav className="sidebar-nav">
           <span className="nav-label">Overview</span>
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => navigateToView("tasks")} />
-          <NavButton className="nav-item-threads" icon={<ChatsIcon />} label="Threads" active={view === "runs"} onClick={() => navigateToView("runs")} />
+          <NavButton className="nav-item-threads" icon={<ChatsIcon />} label="Threads" active={view === "runs"} onClick={() => { selectAgentThread(""); navigateToView("runs"); }} />
           <NavButton icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => navigateToView("activity")} />
           <NavButton icon={<CircleAlert />} label="Incidents" active={view === "incidents"} onClick={() => navigateToView("incidents")} />
-          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => navigateToView("agents")} />
-          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => navigateToView("skills")} />
+          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => { if (window.innerWidth <= 700) setEditingAgent(null); navigateToView("agents"); }} />
+          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => { if (window.innerWidth <= 700) setEditingSkill(null); navigateToView("skills"); }} />
           <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
           <NavButton className="nav-item-settings" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")} />
 
@@ -3335,6 +3335,12 @@ function AgentsView(props: {
 }) {
   const { editing, onSelectAgent: setEditing } = props;
   useEffect(() => {
+    if (typeof window !== "undefined" && window.innerWidth <= 700) {
+      if (editing?.id) {
+        setEditing(props.agents.find((a) => a.id === editing.id) ?? null);
+      }
+      return;
+    }
     setEditing(reconcileSelectedAgent(editing, props.agents));
   }, [props.agents]);
 
@@ -4102,6 +4108,12 @@ function SkillsView(props: {
 }) {
   const { editing, onSelectSkill: setEditing } = props;
   useEffect(() => {
+    if (typeof window !== "undefined" && window.innerWidth <= 700) {
+      if (editing?.id) {
+        setEditing(props.skills.find((s) => s.id === editing.id) ?? null);
+      }
+      return;
+    }
     if (!editing) {
       if (props.skills[0]) setEditing(props.skills[0]);
       return;
