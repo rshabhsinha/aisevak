@@ -49,6 +49,7 @@ import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
+import { cn } from "./lib/utils";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
 import {
@@ -1083,6 +1084,7 @@ export function App() {
                   <TaskComposer
                     projects={projects}
                     agents={agents}
+                    onCancel={() => setTaskComposerOpen(false)}
                     onCreate={async (payload) => {
                       const result = await createTaskAndQueueRun<Task>(api, payload);
                       await Promise.all([reloadTasks(), reloadAgentThreads()]);
@@ -1717,6 +1719,7 @@ function TasksView(props: {
 function TaskComposer(props: {
   projects: Project[];
   agents: Agent[];
+  onCancel?: () => void;
   onCreate: (payload: Record<string, unknown>) => Promise<void>;
 }) {
   const [prompt, setPrompt] = useState("");
@@ -1819,6 +1822,17 @@ function TaskComposer(props: {
           </div>
 
           <div className="task-composer-actions">
+            {props.onCancel ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                onClick={props.onCancel}
+                disabled={submitting}
+              >
+                Cancel
+              </Button>
+            ) : null}
             <span className="composer-hint">↵ to create</span>
             <Button
               type="submit"
@@ -1884,6 +1898,36 @@ function toDateKey(date: Date | string | null | undefined): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
+function ModalBackdrop(props: {
+  onClose: () => void;
+  children: ReactNode;
+  className?: string;
+}) {
+  useEffect(() => {
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        props.onClose();
+      }
+    }
+    window.addEventListener("keydown", handleKeyDown);
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = originalOverflow;
+    };
+  }, [props.onClose]);
+
+  return (
+    <div
+      className={cn("calendar-modal-backdrop", props.className)}
+      onClick={props.onClose}
+    >
+      {props.children}
+    </div>
+  );
+}
+
 function ScheduleComposer(props: {
   agents: Agent[];
   skills: Skill[];
@@ -1943,7 +1987,7 @@ function ScheduleComposer(props: {
 
   return (
     <form
-      className="schedule-composer-form stack"
+      className="schedule-composer-form"
       onSubmit={async (event) => {
         event.preventDefault();
         if (!agentId || !title.trim() || !prompt.trim()) return;
@@ -1991,9 +2035,20 @@ function ScheduleComposer(props: {
             {props.scheduleToEdit ? "Edit schedule" : "Schedule an agent"}
           </span>
         </div>
+        <Button
+          type="button"
+          variant="ghost"
+          size="icon"
+          className="h-7 w-7 text-muted-foreground hover:text-foreground"
+          aria-label="Close dialog"
+          onClick={props.onCancel}
+          disabled={busy}
+        >
+          <X size={15} />
+        </Button>
       </div>
 
-      <div className="p-4 flex flex-col gap-3">
+      <div className="schedule-composer-body">
         <label className="text-[12px] font-medium text-foreground">
           Title
           <Input
@@ -2439,7 +2494,12 @@ function SchedulesView(props: {
       )}
 
       {props.composerOpen ? (
-        <div className="calendar-modal-backdrop" onClick={() => props.onComposerOpenChange(false)}>
+        <ModalBackdrop
+          onClose={() => {
+            props.onComposerOpenChange(false);
+            props.onEditingScheduleChange(null);
+          }}
+        >
           <div className="calendar-modal-content" onClick={(e) => e.stopPropagation()}>
             <ScheduleComposer
               agents={props.agents}
@@ -2458,11 +2518,11 @@ function SchedulesView(props: {
               }}
             />
           </div>
-        </div>
+        </ModalBackdrop>
       ) : null}
 
       {calendarOverflow ? (
-        <div className="calendar-modal-backdrop" onClick={() => setCalendarOverflow(null)}>
+        <ModalBackdrop onClose={() => setCalendarOverflow(null)}>
           <div className="calendar-modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
             <div className="p-6 flex flex-col gap-4">
               <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
@@ -2576,11 +2636,11 @@ function SchedulesView(props: {
               </div>
             </div>
           </div>
-        </div>
+        </ModalBackdrop>
       ) : null}
 
       {selectedEventDetails && selectedEventDetails.schedule ? (
-        <div className="calendar-modal-backdrop" onClick={() => setSelectedEventDetails(null)}>
+        <ModalBackdrop onClose={() => setSelectedEventDetails(null)}>
           <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
             <div className="p-6 flex flex-col gap-4">
               <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
@@ -2673,7 +2733,7 @@ function SchedulesView(props: {
               </div>
             </div>
           </div>
-        </div>
+        </ModalBackdrop>
       ) : null}
     </div>
   );
