@@ -2049,25 +2049,23 @@ function ScheduleComposer(props: {
       </div>
 
       <div className="schedule-composer-body">
-        <label className="text-[12px] font-medium text-foreground">
-          Title
+        <label className="schedule-composer-field">
+          <span>Title</span>
           <Input
             value={title}
             onChange={(e) => setTitle(e.target.value)}
             placeholder="e.g. Daily operational brief, Nightly integration tests"
             required
-            className="mt-1"
           />
         </label>
 
-        <div className="grid grid-cols-2 gap-2.5">
-          <label className="text-[12px] font-medium text-foreground">
-            Agent
+        <div className="schedule-composer-row-2">
+          <label className="schedule-composer-field">
+            <span>Agent</span>
             <NativeSelect
               value={agentId}
               onChange={(e) => setAgentId(e.target.value)}
               required
-              className="mt-1"
             >
               {enabledAgents.map((agent) => (
                 <option value={agent.id} key={agent.id}>
@@ -2077,12 +2075,11 @@ function ScheduleComposer(props: {
             </NativeSelect>
           </label>
 
-          <label className="text-[12px] font-medium text-foreground">
-            Frequency
+          <label className="schedule-composer-field">
+            <span>Frequency</span>
             <NativeSelect
               value={scheduleKind}
               onChange={(e) => setScheduleKind(e.target.value as "once" | "interval")}
-              className="mt-1"
             >
               <option value="once">One time</option>
               <option value="interval">Repeating interval</option>
@@ -2090,22 +2087,22 @@ function ScheduleComposer(props: {
           </label>
         </div>
 
-        <div className="grid grid-cols-1 gap-2.5">
-          <label className="text-[12px] font-medium text-foreground">
-            {scheduleKind === "once" ? "Run at" : "First run"}
+        <div className="schedule-composer-field">
+          <label className="schedule-composer-field">
+            <span>{scheduleKind === "once" ? "Run at" : "First run"}</span>
             <Input
               type="datetime-local"
               value={nextRunAt}
               onChange={(e) => setNextRunAt(e.target.value)}
               required
-              className="mt-1 font-mono text-[12px]"
+              className="font-mono"
             />
           </label>
 
           {scheduleKind === "interval" ? (
-            <label className="text-[12px] font-medium text-foreground">
-              Repeat every
-              <div className="flex gap-2 mt-1">
+            <label className="schedule-composer-field mt-1">
+              <span>Repeat every</span>
+              <div className="schedule-composer-interval-row">
                 <Input
                   type="number"
                   min={1}
@@ -2114,7 +2111,7 @@ function ScheduleComposer(props: {
                   onChange={(e) => setIntervalValue(Math.max(1, Number(e.target.value)))}
                   required
                   style={{ width: "90px" }}
-                  className="font-mono text-[12px]"
+                  className="font-mono"
                 />
                 <NativeSelect
                   value={intervalUnit}
@@ -2130,8 +2127,8 @@ function ScheduleComposer(props: {
           ) : null}
         </div>
 
-        <div className="flex flex-col gap-1 mt-1">
-          <span className="text-[12px] font-medium text-foreground">Task instructions</span>
+        <div className="schedule-composer-field">
+          <span>Task instructions</span>
           <PromptComposer
             value={prompt}
             onChange={setPrompt}
@@ -2524,13 +2521,13 @@ function SchedulesView(props: {
       {calendarOverflow ? (
         <ModalBackdrop onClose={() => setCalendarOverflow(null)}>
           <div className="calendar-modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
-            <div className="p-6 flex flex-col gap-4">
-              <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
-                <div>
-                  <div className="text-[11.5px] font-medium text-muted-foreground">
+            <div className="day-overview-dialog">
+              <div className="day-overview-header">
+                <div className="day-overview-header-copy">
+                  <span className="day-overview-subtitle">
                     Day Overview
-                  </div>
-                  <h3 className="text-[16px] font-semibold text-foreground mt-0.5 tracking-tight">
+                  </span>
+                  <h3 className="day-overview-title">
                     {calendarOverflow.date.toLocaleDateString(undefined, {
                       weekday: "long",
                       month: "long",
@@ -2551,7 +2548,7 @@ function SchedulesView(props: {
                 </Button>
               </div>
 
-              <div className="calendar-modal-overflow-body flex flex-col gap-3 max-h-[380px] overflow-y-auto pr-1">
+              <div className="day-overview-body">
                 {calendarOverflow.schedules.length > 0 ? (
                   <div className="calendar-modal-section">
                     <div className="calendar-modal-section-title">
@@ -2629,7 +2626,7 @@ function SchedulesView(props: {
                 ) : null}
 
                 {calendarOverflow.schedules.length === 0 && calendarOverflow.threads.length === 0 ? (
-                  <div className="text-center py-8 text-muted-foreground text-[13px]">
+                  <div className="day-overview-empty">
                     No events or activity on this day.
                   </div>
                 ) : null}
@@ -2642,17 +2639,17 @@ function SchedulesView(props: {
       {selectedEventDetails && selectedEventDetails.schedule ? (
         <ModalBackdrop onClose={() => setSelectedEventDetails(null)}>
           <div className="calendar-modal-content max-w-md" onClick={(e) => e.stopPropagation()}>
-            <div className="p-6 flex flex-col gap-4">
-              <div className="flex items-start justify-between gap-3 border-b border-border pb-3">
-                <div>
-                  <div className="text-[11.5px] font-medium text-muted-foreground">
+            <div className="event-details-dialog">
+              <div className="event-details-header">
+                <div className="event-details-header-copy">
+                  <span className="event-details-subtitle">
                     Scheduled Agent Run
-                  </div>
-                  <h3 className="text-[16px] font-semibold text-foreground mt-0.5 tracking-tight">
+                  </span>
+                  <h3 className="event-details-title">
                     {selectedEventDetails.schedule.title}
                   </h3>
                 </div>
-                <div className="flex items-center gap-2">
+                <div className="event-details-header-actions">
                   <Badge variant={selectedEventDetails.schedule.enabled ? "success" : "secondary"} className="text-[10.5px] font-medium">
                     {selectedEventDetails.schedule.enabled ? "Scheduled" : "Paused"}
                   </Badge>
@@ -2669,34 +2666,34 @@ function SchedulesView(props: {
                 </div>
               </div>
 
-              <div className="bg-secondary/40 rounded-lg p-3 text-[12px] flex flex-col gap-1.5 text-muted-foreground border border-border">
-                <div className="flex justify-between items-center">
-                  <span>Agent</span>
-                  <span className="text-foreground font-semibold flex items-center gap-1.5">
+              <div className="event-details-info-box">
+                <div className="event-details-info-row">
+                  <span className="event-details-info-label">Agent</span>
+                  <span className="event-details-info-value">
                     <AgentAvatar agentId={selectedEventDetails.schedule.agent_id} agentName={selectedEventDetails.schedule.agent_name} className="w-4 h-4" />
-                    {selectedEventDetails.schedule.agent_name}
+                    <span>{selectedEventDetails.schedule.agent_name}</span>
                   </span>
                 </div>
-                <div className="flex justify-between">
-                  <span>Next run</span>
-                  <span className="text-foreground font-medium">{formatDateTime(selectedEventDetails.schedule.next_run_at)}</span>
+                <div className="event-details-info-row">
+                  <span className="event-details-info-label">Next run</span>
+                  <span className="event-details-info-value font-mono">{formatDateTime(selectedEventDetails.schedule.next_run_at)}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span>Cadence</span>
-                  <span className="text-foreground font-medium">{formatScheduleCadence(selectedEventDetails.schedule)}</span>
+                <div className="event-details-info-row">
+                  <span className="event-details-info-label">Cadence</span>
+                  <span className="event-details-info-value">{formatScheduleCadence(selectedEventDetails.schedule)}</span>
                 </div>
-                <div className="flex justify-between">
-                  <span>Total runs</span>
-                  <span className="text-foreground font-medium">{selectedEventDetails.schedule.run_count}</span>
+                <div className="event-details-info-row">
+                  <span className="event-details-info-label">Total runs</span>
+                  <span className="event-details-info-value font-mono">{selectedEventDetails.schedule.run_count}</span>
                 </div>
               </div>
 
-              <div className="text-[12.5px] text-foreground bg-card border border-border rounded-lg p-3 max-h-36 overflow-y-auto whitespace-pre-wrap leading-relaxed">
+              <div className="event-details-prompt-box">
                 {selectedEventDetails.schedule.prompt}
               </div>
 
-              <div className="flex items-center justify-between pt-2 border-t border-border">
-                <div className="flex items-center gap-2">
+              <div className="event-details-actions">
+                <div className="event-details-actions-left">
                   <Button
                     variant="secondary"
                     size="sm"
