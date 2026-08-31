@@ -249,6 +249,165 @@ describe("persistent Codex app-server", () => {
     expect(second.status).toBe("completed");
     expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
   });
+
+  it("contains delayed event-write rejection before a provider turn completes", async () => {
+    const fixture = await fakeAppServerFixture();
+    const unrelated = await fakeAppServerFixture();
+    const secret = "fixture-persistence-secret";
+    const failedOptions = turnOptions(fixture, "wait-for-steer");
+    failedOptions.secrets = [secret];
+    failedOptions.onLine = async (line) => {
+      if (JSON.parse(line).method !== "turn/started") return;
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      throw new Error(`database unavailable ${secret}`);
+    };
+
+    const [failed, independent] = await Promise.all([
+      runCodexAppServerTurn(failedOptions),
+      runCodexAppServerTurn(turnOptions(unrelated, "independent"))
+    ]);
+    expect(failed.status).toBe("failed");
+    expect(failed.error).toBe("Codex event persistence failed: database unavailable [REDACTED]");
+    expect(failed.promptMayHaveBeenPresented).toBe(true);
+    expect(independent.status).toBe("completed");
+    // The original provider never sent turn/completed. Returning proves the
+    // failure was observed while active; Vitest also rejects unhandled errors.
+    expect(failed.rawStdout).not.toContain('"method":"turn/completed"');
+    const replacement = await runCodexAppServerTurn(turnOptions(fixture, "replacement", failed.threadId));
+    expect(replacement.status).toBe("completed");
+    expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
+  });
+
+  it("does not persist later events or report success after an earlier delayed write fails", async () => {
+    const fixture = await fakeAppServerFixture();
+    const persisted: string[] = [];
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "complete-before-write-failure"),
+      onLine: async (line) => {
+        const method = JSON.parse(line).method;
+        if (method === "turn/started") {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          throw new Error("late DB write failed");
+        }
+        if (method) persisted.push(method);
+      }
+    });
+    expect(result.rawStdout).toContain('"method":"turn/completed"');
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("Codex event persistence failed: late DB write failed");
+    expect(persisted).not.toContain("turn/completed");
+  });
+
+  it.each([200, 5000])("waits for actual quarantined process exit with SIGTERM delay %i ms", async (delay) => {
+    const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "complete-before-delayed-quarantine");
+    options.env.FAKE_DELAY_SIGTERM_MS = String(delay);
+    options.onLine = async (line) => {
+      if (JSON.parse(line).method !== "turn/started") return;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      throw new Error("late write failure");
+    };
+    const result = await runCodexAppServerTurn(options);
+    const firstPid = Number((await readFile(fixture.startsFile, "utf8")).trim());
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("Codex event persistence failed: late write failure");
+    expect(result.rawStdout).toContain('"method":"turn/completed"');
+    expect(() => process.kill(firstPid, 0)).toThrow();
+    // 5000 ms exercises the SIGKILL fallback; 200 ms exits via SIGTERM.
+    const replacement = await runCodexAppServerTurn(turnOptions(fixture, "replacement", result.threadId));
+    expect(replacement.status).toBe("completed");
+    expect((await readFile(fixture.startsFile, "utf8")).trim().split("\n")).toHaveLength(2);
+  }, 10000);
+
+  it("waits for successful delayed event persistence in original sequence", async () => {
+    const fixture = await fakeAppServerFixture();
+    const persisted: number[] = [];
+    let finalPersisted = false;
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "ordered-writes"),
+      onLine: async (line, seq) => {
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        persisted.push(seq);
+        if (JSON.parse(line).method === "turn/completed") finalPersisted = true;
+      }
+    });
+    expect(result.status).toBe("completed");
+    expect(finalPersisted).toBe(true);
+    expect(persisted).toEqual(persisted.map((_, index) => index));
+    expect(persisted.length).toBeGreaterThan(3);
+  });
+
+  it("contains an asynchronously rejected thread-identity event", async () => {
+    const fixture = await fakeAppServerFixture();
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "wait-for-steer"),
+      onThreadId: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        throw new Error("identity persistence failed");
+      }
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("identity persistence failed");
+    expect(result.promptMayHaveBeenPresented).toBe(false);
+  });
+
+  it("contains delayed monitor persistence failure without waiting for completion", async () => {
+    const fixture = await fakeAppServerFixture();
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "wait-for-steer"),
+      nextInput: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        throw new Error("delivery claim failed");
+      }
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("Codex turn monitor failed: delivery claim failed");
+    expect(result.rawStdout).not.toContain('"method":"turn/completed"');
+  });
+
+  it("waits for persistence of a late reply generated by the final in-flight monitor", async () => {
+    const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "complete-after-monitor-start");
+    options.env.FAKE_REJECT_LATE_STEER = "1";
+    let offered = false;
+    options.nextInput = async () => {
+      if (offered) return null;
+      offered = true;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { id: "late-input", message: "arrives after completion" };
+    };
+    options.onLine = async (line) => {
+      if (JSON.parse(line).error?.message !== "turn already completed") return;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      throw new Error("late steer reply persistence failed");
+    };
+    const result = await runCodexAppServerTurn(options);
+    expect(result.rawStdout).toContain('"method":"turn/completed"');
+    expect(result.rawStdout).toContain("turn already completed");
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("Codex event persistence failed: late steer reply persistence failed");
+  });
+
+  it("retains redacted stderr when quarantine closes before monitor persistence finishes", async () => {
+    const fixture = await fakeAppServerFixture();
+    const options = turnOptions(fixture, "complete-after-monitor-start");
+    options.env.FAKE_STDERR_LINE = "fixture diagnostic fixture-only-stderr-secret";
+    options.secrets = ["fixture-only-stderr-secret"];
+    options.nextInput = async () => {
+      await new Promise((resolve) => setTimeout(resolve, 350));
+      return null;
+    };
+    options.onLine = async (line) => {
+      if (JSON.parse(line).method !== "turn/completed") return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      throw new Error("completion write failed");
+    };
+    const result = await runCodexAppServerTurn(options);
+    expect(result.status).toBe("failed");
+    expect(result.error).toBe("Codex event persistence failed: completion write failed");
+    expect(result.rawStderr).toBe("fixture diagnostic [REDACTED]\n");
+    expect(result.rawStderr).not.toContain("fixture-only-stderr-secret");
+  });
 });
 
 interface FakeFixture {
@@ -270,7 +429,11 @@ const readline = require("node:readline");
 fs.appendFileSync(process.env.FAKE_STARTS_FILE, process.pid + "\\n");
 let turn = 0;
 const send = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+if (process.env.FAKE_DELAY_SIGTERM_MS) setInterval(() => {}, 1000);
 process.on("SIGTERM", () => {
+  if (process.env.FAKE_DELAY_SIGTERM_MS) {
+    return setTimeout(() => process.exit(0), Number(process.env.FAKE_DELAY_SIGTERM_MS));
+  }
   if (process.env.FAKE_REQUEST_ON_SIGTERM === "1") {
     send({ id: "late-approval", method: "item/commandExecution/requestApproval", params: {} });
     return setTimeout(() => process.exit(0), 10);
@@ -301,6 +464,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   if (message.method === "turn/start") {
     const turnId = "turn-" + (++turn);
     const prompt = message.params.input[0].text;
+    if (process.env.FAKE_STDERR_LINE) process.stderr.write(process.env.FAKE_STDERR_LINE + "\\n");
     if (prompt === "exit-on-turn-start") return process.exit(0);
     if (prompt === "reject-turn-start") {
       return send({ id: message.id, error: { code: -32602, message: "turn rejected" } });
@@ -311,12 +475,15 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId, delta: process.env.FAKE_OLD_SECRET } });
     }
     if (prompt !== "wait-for-steer") {
-      setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } }), 10);
+      setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } }), prompt === "complete-after-monitor-start" ? 800 : 10);
     }
     if (prompt === "exit-after-turn") setTimeout(() => process.exit(0), 20);
     return;
   }
   if (message.method === "turn/steer") {
+    if (process.env.FAKE_REJECT_LATE_STEER === "1") {
+      return send({ id: message.id, error: { code: -32602, message: "turn already completed" } });
+    }
     send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
     send({ method: "item/agentMessage/delta", params: { threadId: message.params.threadId, turnId: message.params.expectedTurnId, delta: message.params.input[0].text } });
     return setTimeout(() => send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: message.params.expectedTurnId, status: "completed" } } }), 10);

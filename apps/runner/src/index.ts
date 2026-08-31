@@ -51,6 +51,7 @@ import {
   safeChildEnvironment
 } from "./githubCli.js";
 import { skillMarkdown } from "./skillMarkdown.js";
+import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
 
 const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
@@ -1402,7 +1403,7 @@ export async function processOneDispatcherRun(
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
        WHERE id = $1`,
-      [job.id, finalStatus, stdout, stderr, exitCode]
+      [job.id, finalStatus, encodePostgresText(stdout), encodePostgresText(stderr), exitCode]
     );
     if (job.message_delivery_id) {
       await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
@@ -1821,7 +1822,7 @@ export async function finalizeWorkerRunState(
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
        WHERE id = $1`,
-      [input.runId, input.finalStatus, input.stdout, input.stderr, input.exitCode]
+      [input.runId, input.finalStatus, encodePostgresText(input.stdout), encodePostgresText(input.stderr), input.exitCode]
     );
     if (!ownsCurrentThread) return;
     await client.query(
@@ -2017,7 +2018,7 @@ function safeSkillFilePath(skillDir: string, relativePath: string): string {
   return join(skillDir, ...parts);
 }
 
-async function persistCodexLine(pool: DbPool, job: RunJob, line: string, seq: number): Promise<void> {
+export async function persistCodexLine(pool: DbPool, job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id">, line: string, seq: number): Promise<void> {
   const raw = parseCodexJsonLine(line);
   if (!raw) return;
   const normalized = normalizeCodexEvent(raw);
@@ -2035,13 +2036,13 @@ async function persistCodexLine(pool: DbPool, job: RunJob, line: string, seq: nu
     `INSERT INTO run_events (run_id, seq, event_type, text, payload)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (run_id, seq) DO NOTHING`,
-    [job.id, seq, normalized.type, normalized.text ?? null, normalized]
+    [job.id, seq, encodePostgresText(normalized.type), normalized.text === undefined ? null : encodePostgresText(normalized.text), encodePostgresJson(normalized)]
   );
 }
 
-async function persistDispatcherCodexLine(
+export async function persistDispatcherCodexLine(
   pool: DbPool,
-  job: DispatcherJob,
+  job: Pick<DispatcherJob, "id">,
   line: string,
   seq: number
 ): Promise<void> {
@@ -2059,7 +2060,7 @@ async function persistDispatcherCodexLine(
     `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (dispatcher_run_id, seq) DO NOTHING`,
-    [job.id, seq, normalized.type, normalized.text ?? null, normalized]
+    [job.id, seq, encodePostgresText(normalized.type), normalized.text === undefined ? null : encodePostgresText(normalized.text), encodePostgresJson(normalized)]
   );
 }
 
@@ -2135,7 +2136,7 @@ export async function finishMessageDelivery(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
            WHERE id = $1 AND status = 'running'`,
-          [messageDeliveryId, error]
+          [messageDeliveryId, encodePostgresText(error)]
         );
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, error || "Delivery failed");
         return;
@@ -2167,7 +2168,7 @@ export async function finishMessageDelivery(
            WHERE id = $1 AND status = 'running'`,
           [
             messageDeliveryId,
-            `Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`
+            encodePostgresText(`Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`)
           ]
         );
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionReason);
@@ -2202,7 +2203,7 @@ export async function finishMessageDelivery(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
            WHERE id = $1 AND status = 'running'`,
-           [messageDeliveryId, suppressionError]
+          [messageDeliveryId, encodePostgresText(suppressionError)]
         );
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionError);
         return;
@@ -2213,7 +2214,7 @@ export async function finishMessageDelivery(
          SET status = 'retrying', available_at = now() + ($2 * interval '5 seconds'),
              error = NULLIF($3, ''), updated_at = now()
          WHERE id = $1 AND status = 'running'`,
-        [messageDeliveryId, delivery.attempt_count, error]
+        [messageDeliveryId, delivery.attempt_count, encodePostgresText(error)]
       );
     });
   } catch (retryError) {
@@ -2226,7 +2227,7 @@ export async function finishMessageDelivery(
          SET status = 'failed', completed_at = now(),
              error = $2, updated_at = now()
          WHERE id = $1 AND status = 'running'`,
-        [messageDeliveryId, finalError]
+        [messageDeliveryId, encodePostgresText(finalError)]
       );
       await cancelQueuedDeliveryRuns(client, messageDeliveryId, finalError);
     });
@@ -2276,7 +2277,7 @@ async function cancelQueuedDeliveryRuns(
          updated_at = now()
      WHERE message_delivery_id = $1
        AND (status = 'queued' OR status = 'cancel_requested')`,
-    [messageDeliveryId, error]
+    [messageDeliveryId, encodePostgresText(error)]
   );
 }
 
@@ -2403,7 +2404,7 @@ export async function finishAgentTurnInput(
            updated_at = now()
        WHERE id = $1 AND status = 'delivering'
        RETURNING message_delivery_id`,
-      [input.id, error ? "failed" : "delivered", error ?? null]
+      [input.id, error ? "failed" : "delivered", error === undefined ? null : encodePostgresText(error)]
     );
     const deliveryId = result.rows[0]?.message_delivery_id ?? input.messageDeliveryId;
     if (!deliveryId) return;
@@ -2412,7 +2413,7 @@ export async function finishAgentTurnInput(
         `UPDATE message_deliveries
          SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
          WHERE id = $1 AND status = 'running'`,
-        [deliveryId, error]
+        [deliveryId, encodePostgresText(error)]
       );
       await cancelQueuedDeliveryRuns(client, deliveryId, error);
     } else {

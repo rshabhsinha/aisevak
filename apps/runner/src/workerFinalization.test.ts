@@ -1,6 +1,7 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import { finalizeWorkerRunState } from "./index.js";
+import { decodePostgresText, POSTGRES_TEXT_ESCAPE_PREFIX } from "./postgresText.js";
 
 function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?: unknown[] }> } {
   const queries: Array<{ sql: string; params?: unknown[] }> = [];
@@ -18,6 +19,23 @@ function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?:
 }
 
 describe("worker run finalization", () => {
+  it("stores exceptional stdout/stderr losslessly so failure finalization remains writable", async () => {
+    const { pool, queries } = recordingPool();
+    const stdout = "tool bytes\u0000with \"quotes\" and \\slashes";
+    const stderr = "failure\u0000\ud800";
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id", taskId: "task-id", agentThreadId: null,
+      coordinationThreadId: null, finalStatus: "failed", stdout, stderr, exitCode: null
+    });
+    const update = queries.find((query) => query.sql.includes("UPDATE task_runs"))!;
+    for (const value of update.params ?? []) {
+      if (typeof value === "string") expect(value).not.toContain("\u0000");
+    }
+    expect(update.params?.[2]).toContain(POSTGRES_TEXT_ESCAPE_PREFIX);
+    expect(decodePostgresText(update.params?.[2] as string)).toBe(stdout);
+    expect(decodePostgresText(update.params?.[3] as string)).toBe(stderr);
+  });
+
   it("completes the run, task, and coordination thread in one transaction", async () => {
     const { pool, queries } = recordingPool();
 
