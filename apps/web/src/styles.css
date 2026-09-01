@@ -2617,6 +2617,63 @@ select:disabled {
   word-break: break-word;
 }
 
+.task-work-identity,
+.task-orchestration-summary,
+.task-assignment-strip {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.task-work-identity {
+  color: var(--accent-foreground);
+  font-family: var(--font-code);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.task-orchestration-summary {
+  flex-wrap: wrap;
+  gap: 4px 9px;
+}
+
+.task-assignment-strip {
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.task-assignment-pill,
+.task-assignment-more {
+  border-radius: 999px;
+  padding: 2px 6px;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.task-assignment-pill.completed {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.task-assignment-pill.running,
+.task-assignment-pill.queued {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.task-assignment-pill.failed,
+.task-assignment-pill.blocked,
+.task-assignment-pill.cancelled {
+  background: var(--danger-soft);
+  color: var(--destructive);
+}
+
 .card-body-preview {
   font-size: 11px;
   color: var(--muted-foreground);

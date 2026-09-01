@@ -215,8 +215,38 @@ interface Task {
   latest_run_id?: string | null;
   has_runs?: boolean;
   open_pr_on_success: boolean;
+  work_scope?: string | null;
+  work_key?: string | null;
+  parent_task_id?: string | null;
+  parent_task_number?: number | null;
+  active_child_count?: number;
+  assignment_count?: number;
+  active_assignment_count?: number;
+  assignments?: TaskAssignment[];
+  safety_event_count?: number;
+  latest_safety_event?: {
+    operation: string;
+    work_scope?: string | null;
+    work_key?: string | null;
+    would_reject?: boolean;
+    details?: unknown;
+    created_at?: string;
+  } | null;
   updated_at?: string;
   created_at?: string;
+}
+
+interface TaskAssignment {
+  id: string;
+  number: number;
+  key?: string;
+  assignment_key: string;
+  status: string;
+  attempt_count: number;
+  assigned_agent_name?: string | null;
+  created_by_agent_name?: string | null;
+  active_delivery_id?: string | null;
+  updated_at?: string;
 }
 
 interface ActivityReport {
@@ -1677,6 +1707,36 @@ function TasksView(props: {
                           <TaskStatus status={status} />
                         </div>
                         <div className="card-title">{task.title}</div>
+                        {task.work_key ? (
+                          <div className="task-work-identity" title={`${task.work_scope ?? "task"}/${task.work_key}`}>
+                            <KeyRound size={11} />
+                            <span>{task.work_scope ? `${task.work_scope}/` : ""}{task.work_key}</span>
+                          </div>
+                        ) : null}
+                        {((task.assignment_count ?? 0) > 0 || task.parent_task_number || (task.safety_event_count ?? 0) > 0) ? (
+                          <div className="task-orchestration-summary">
+                            {task.parent_task_number ? <span>Parent TASK-{task.parent_task_number}</span> : null}
+                            {(task.assignment_count ?? 0) > 0 ? (
+                              <span>{task.active_assignment_count ?? 0}/{task.assignment_count} assignments active</span>
+                            ) : null}
+                            {(task.safety_event_count ?? 0) > 0 ? (
+                              <span>{task.safety_event_count} reuse/conflict event{task.safety_event_count === 1 ? "" : "s"}</span>
+                            ) : null}
+                            {task.latest_safety_event?.operation ? (
+                              <span title={task.latest_safety_event.work_key ?? undefined}>Latest: {task.latest_safety_event.operation}</span>
+                            ) : null}
+                          </div>
+                        ) : null}
+                        {task.assignments && task.assignments.length > 0 ? (
+                          <div className="task-assignment-strip" aria-label="Task assignments">
+                            {task.assignments.slice(0, 3).map((assignment) => (
+                              <span className={`task-assignment-pill ${runBucket(assignment.status)}`} key={assignment.id}>
+                                {assignment.assignment_key} · {statusLabel(assignment.status)} · {assignment.attempt_count}×
+                              </span>
+                            ))}
+                            {task.assignments.length > 3 ? <span className="task-assignment-more">+{task.assignments.length - 3}</span> : null}
+                          </div>
+                        ) : null}
                         {task.body && task.body !== task.title ? (
                           <div className="card-body-preview">{task.body}</div>
                         ) : null}

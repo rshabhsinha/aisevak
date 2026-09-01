@@ -23,6 +23,7 @@ export interface AppServerTurnInput {
   id: string;
   message: string;
   messageDeliveryId?: string | null;
+  assignmentId?: string | null;
 }
 
 export interface AppServerTurnOptions {

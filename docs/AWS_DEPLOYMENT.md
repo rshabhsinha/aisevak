@@ -158,6 +158,26 @@ The installer builds before activation, preserves the production environment,
 persistent data, and the PostgreSQL volume, creates a backup before restarting
 services, and aborts before activation if a required database migration fails.
 
+### Job-safety rollout
+
+Keep the component-library campaign stopped while rolling out the generic job
+model. For the first 24 hours, set `AISEVAK_JOB_SAFETY_MODE=audit` in the
+production environment file before running the installer. Audit mode records
+would-reject operations in `job_safety_events` while preserving existing
+workflow behavior. Review the events and confirm that no legitimate workflow
+depends on unkeyed task or detached-thread creation, then deploy a second
+release with `AISEVAK_JOB_SAFETY_MODE=enforce` (or omit the variable, since
+enforce is the default). In enforce mode, duplicate immutable identities return
+the existing resource for exact retries and HTTP 409 for conflicting payloads;
+unsafe creation and limit violations fail closed.
+
+Before either activation, set `AISEVAK_REQUIRE_BACKUP=1` so the installer must
+create a compressed PostgreSQL backup. Retain the previous directory under
+`/opt/aisevak/releases` as the rollback release. If the canary is unhealthy,
+stop the new services, point `/opt/aisevak/current` back to the retained release,
+and restart the Compose services and host runner; do not delete the database,
+workspaces, task history, messages, or provider sessions.
+
 ## Update Caddy
 
 Stage the private Caddy file through the SSM tunnel:

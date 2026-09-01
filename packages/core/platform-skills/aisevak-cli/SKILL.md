@@ -24,8 +24,10 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 
 ## Choose the coordination primitive
 
-- Send or create a thread when a known agent should receive a focused request and return the result through a durable conversation.
-- Create a task when work should be tracked as a platform work item. Omit `--agent` to route it to the Orchestrator; specify `--agent` only when the right specialist is clear.
+- A task is the logical job. Every agent-created task needs a stable `--work-key`; retries with the same scope/key reuse the task, while a different immutable payload is a conflict. Human-created tasks receive a generated key when one is not supplied.
+- A task owns exactly one coordination thread. Delegate specialist work with a keyed assignment inside that task. Assignments preserve the same coordination thread and provider session across follow-ups, review, rejection, provider failure, usage-limit recovery, and explicit retry.
+- Create a child task only when the work is independently trackable and you can provide `--parent-task`; respect the task's fan-out and depth limits. Do not create a root task from inside an active task.
+- Send a message on the existing task thread only for coordination that is not a separately tracked assignment.
 - Create a schedule only when the request explicitly needs future or recurring execution. Choose the target agent deliberately, use an idempotency key, and avoid short or unbounded recurring intervals.
 - Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready.
 - Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures.
@@ -46,42 +48,49 @@ List resources with `--query`, `--status`, and a bounded `--limit`. Continue wit
 
 ## Hand work to another agent
 
-Discover the target if needed, then give the new thread a clear title, description, and purpose. Aisevak records the triggering agent, origin thread, callback agent, and completion command in the recipient's prompt.
+Discover the target if needed, then create an assignment on the current task. Aisevak records the assignment, attempt, owner, delivery, and result and sends a live job envelope to the specialist.
 
 ```bash
 aisevak agents list --query reviewer --limit 10
 printf '%s\n' 'Review the parser change for correctness and list concrete issues with file references.' \
-  | aisevak threads create \
-      --title 'Review parser change' \
-      --description 'Independent correctness review before completion' \
+  | aisevak assignments create TASK-34 \
+      --key parser-review-v1 \
       --to Reviewer \
-      --purpose-stdin
+      --instructions-stdin
 ```
 
-Use `--origin-thread` or `--origin-message` only when the current context does not already identify the origin. Use an idempotency key when retrying a create or send after an uncertain network result.
+Use the same assignment key for an idempotent retry. Never create a recovery, review, rejection, or retry thread for work that already belongs to an assignment. Use `assignments send` for follow-up, `assignments retry` for a new attempt, and complete or block the assignment when the specialist's part is terminal.
+
+```bash
+aisevak assignments list TASK-34
+printf '%s\n' 'Please re-check the malformed-input case.' | aisevak assignments send ASSIGNMENT-7 --body-stdin
+printf '%s\n' 'Implemented and verified the parser change.' | aisevak assignments complete ASSIGNMENT-7 --result-stdin
+```
+
+`threads create` is only for an explicitly detached, keyed coordination stream and requires the dedicated detached-thread capability. It is rejected from an active task even when an old skill or stored capability still says `threads:create`.
 
 ## Respond and finish
 
-When another agent triggers you to do work, use the completion instruction in the received prompt. Send intermediate information only when it is useful; complete or block exactly once when the requested work reaches that state. Completion sends one final result to the triggering agent.
+When another agent triggers an assignment, use the live envelope and assignment reference in the prompt. Send intermediate information only when useful; complete or block the assignment exactly once when that specialist work reaches a terminal state. Assignment completion reports to the task owner and does not complete the parent task or coordination thread.
 
 ```bash
 printf '%s\n' 'Implemented the parser fix and verified the focused regression tests.' \
-  | aisevak threads complete THREAD-12 --summary-stdin
+  | aisevak assignments complete ASSIGNMENT-7 --result-stdin
 
 printf '%s\n' 'Blocked because the required signing credential is not available to this agent.' \
-  | aisevak threads block THREAD-12 --reason-stdin
+  | aisevak assignments block ASSIGNMENT-7 --result-stdin
 ```
 
-When an agent you triggered sends a completion or blocked response, treat it as a result notification. Do not complete or block the same thread and do not send an automatic acknowledgement. Continue your own work with the result.
+When an agent you assigned sends a completion or blocked response, treat it as a result notification. Do not complete or block the parent task or coordination thread automatically. Continue the job using the assignment result; retry the same assignment when the policy permits.
 
-If the triggered agent needs to do more work, send an explicit follow-up on the same thread:
+If the assigned agent needs to do more work, send an explicit follow-up on the same assignment:
 
 ```bash
 printf '%s\n' 'Please also check the malformed-input case and report the outcome.' \
-  | aisevak threads send THREAD-12 --body-stdin
+  | aisevak assignments send ASSIGNMENT-7 --body-stdin
 ```
 
-This reactivates the thread and queues the follow-up to the triggered agent. It does not reopen a linked completed task; reopen the task explicitly when the tracked work item itself must resume.
+This queues the follow-up on the existing coordination thread and provider session. It does not create another coordination tree. Reopen the task only when the overall job itself must resume.
 
 ## Handle Markdown safely
 

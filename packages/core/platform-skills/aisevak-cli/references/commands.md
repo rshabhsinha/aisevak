@@ -33,9 +33,9 @@ aisevak threads list [--status STATUS] [--query TEXT] [--limit N] [--cursor CURS
 aisevak threads show THREAD
 aisevak threads messages THREAD [--limit N] [--cursor CURSOR]
 aisevak threads create --title TITLE --description DESCRIPTION --to AGENT --purpose-stdin \
-  [--project-id UUID] [--task TASK] [--origin-thread THREAD] [--origin-message MESSAGE] \
-  [--idempotency-key KEY]
+  --work-key KEY [--work-scope SCOPE] [--project-id UUID] [--idempotency-key KEY]
 aisevak threads send THREAD [--to AGENT] --body-stdin [--reply-to MESSAGE] [--idempotency-key KEY]
+`threads create` is restricted to explicitly detached, keyed streams. Inside an active task use an assignment or keyed child task.
 aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]
 aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
 ```
@@ -47,8 +47,8 @@ Addressing a message queues it for the recipient. Completing or blocking is rese
 ```text
 aisevak tasks list [--status STATUS] [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak tasks show TASK
-aisevak tasks create --title TITLE --description DESCRIPTION --body-stdin \
-  [--status STATUS] [--project-id UUID] [--agent AGENT] [--idempotency-key KEY]
+aisevak tasks create --title TITLE --description DESCRIPTION --body-stdin --work-key KEY \
+  [--work-scope SCOPE] [--parent-task TASK] [--status STATUS] [--project-id UUID] [--agent AGENT] [--idempotency-key KEY]
 aisevak tasks update TASK [--title TITLE] [--description DESCRIPTION] [--body-stdin] [--status STATUS]
 aisevak tasks assign TASK --agent AGENT
 aisevak tasks complete TASK [--summary-stdin]
@@ -59,13 +59,27 @@ aisevak tasks attention TASK --reason-stdin
 
 Creating a task without `--agent` assigns it to the Orchestrator for routing. Each created task gets a linked coordination thread and a callback to the creating agent.
 
+## Assignments
+
+```text
+aisevak assignments list TASK
+aisevak assignments show ASSIGNMENT
+aisevak assignments create TASK --key KEY --to AGENT --instructions-stdin [--idempotency-key KEY]
+aisevak assignments send ASSIGNMENT --body-stdin [--idempotency-key KEY]
+aisevak assignments retry ASSIGNMENT [--body-stdin] [--idempotency-key KEY]
+aisevak assignments complete ASSIGNMENT --result-stdin [--idempotency-key KEY]
+aisevak assignments block ASSIGNMENT --result-stdin [--idempotency-key KEY]
+```
+
+Assignment keys are unique within a task. Reusing a key with the same immutable input returns the existing assignment; a different input is rejected. Retries reuse the assignment, task coordination thread, agent thread, and provider session whenever resumable.
+
 ## Schedules
 
 ```text
 aisevak schedules list [--status scheduled|paused|completed] [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak schedules show SCHEDULE
 aisevak schedules create --title TITLE --agent AGENT --at ISO-8601 --prompt-stdin \
-  [--interval-seconds N] [--idempotency-key KEY]
+  [--task TASK] [--overlap-policy skip|queue|allow] [--interval-seconds N] [--idempotency-key KEY]
 aisevak schedules pause SCHEDULE
 aisevak schedules resume SCHEDULE
 aisevak schedules delete SCHEDULE

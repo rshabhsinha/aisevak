@@ -30,7 +30,7 @@ import {
   type DbPool
 } from "@aisevak/core";
 import { agentToolScript } from "@aisevak/cli";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { chmod, copyFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -91,6 +91,14 @@ interface GithubConnectionJob {
 interface RunJob {
   id: string;
   task_id: string;
+  task_number: number;
+  task_status: string;
+  work_scope: string;
+  work_key: string;
+  parent_task_number: number | null;
+  orchestration_policy: unknown;
+  active_assignments: number;
+  active_children: number;
   task_session_id: string;
   agent_thread_id: string | null;
   agent_thread_generation: number;
@@ -116,6 +124,14 @@ interface DispatcherJob {
   agent_thread_generation: number;
   ownership_generation: number | null;
   task_id: string | null;
+  task_number: number | null;
+  task_status: string | null;
+  work_scope: string | null;
+  work_key: string | null;
+  parent_task_number: number | null;
+  orchestration_policy: unknown;
+  active_assignments: number;
+  active_children: number;
   prompt: string;
   model: string;
   model_options: Array<{ id: string; value: string | number | boolean }>;
@@ -130,9 +146,16 @@ interface DispatcherJob {
   agent_description: string;
   agent_instructions: string;
   coordination_thread_id: string | null;
+  thread_work_scope: string | null;
+  thread_work_key: string | null;
   workspace_key: string;
   workspace_mode: string;
   message_delivery_id: string | null;
+  assignment_id: string | null;
+  assignment_number: number | null;
+  assignment_key: string | null;
+  assignment_status: string | null;
+  assignment_attempt: number | null;
 }
 
 async function main(): Promise<void> {
@@ -268,6 +291,7 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
            WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
           [run.message_delivery_id, error]
         );
+        await markAssignmentDeliveryTerminal(client, run.message_delivery_id, error, "cancelled");
         await cancelQueuedDeliveryRuns(client, run.message_delivery_id, error);
       }
       await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, "cancelled");
@@ -321,6 +345,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
            WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
           [deliveryId, error]
         );
+        await markAssignmentDeliveryTerminal(client, deliveryId, error, finalStatus === "cancelled" ? "cancelled" : "blocked");
         await cancelQueuedDeliveryRuns(client, deliveryId, error);
       }
       await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, finalStatus);
@@ -351,6 +376,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
          WHERE id = $1 AND status = 'running'`,
         [delivery.message_delivery_id, status, error]
       );
+      if (error) await markAssignmentDeliveryTerminal(client, delivery.message_delivery_id, error, "blocked");
       await cancelQueuedDeliveryRuns(client, delivery.message_delivery_id, error ?? "Delivery completed");
     });
   }
@@ -397,6 +423,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
          WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
         [deliveryId, delivered ? "completed" : "failed", inputError]
       );
+      if (inputError) await markAssignmentDeliveryTerminal(client, deliveryId, inputError, "blocked");
       await cancelQueuedDeliveryRuns(client, deliveryId, inputError ?? "Delivery completed");
     });
   }
@@ -449,6 +476,7 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<vo
            WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
           [deliveryId, error]
         );
+        await markAssignmentDeliveryTerminal(client, deliveryId, error, finalStatus === "cancelled" ? "cancelled" : "blocked");
         await cancelQueuedDeliveryRuns(client, deliveryId, error);
       }
       await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, finalStatus);
@@ -541,6 +569,7 @@ export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
            WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
           [dispatcher.message_delivery_id, error]
         );
+        await markAssignmentDeliveryTerminal(client, dispatcher.message_delivery_id, error, "cancelled");
         await cancelQueuedDeliveryRuns(client, dispatcher.message_delivery_id, error);
       }
       await failPendingAgentTurnInputsInTransaction(client, "dispatcher", dispatcher.id, "cancelled");
@@ -560,6 +589,97 @@ interface DueSchedule {
   interval_seconds: number | null;
   model: string;
   model_options: Array<{ id: string; value: string | number | boolean }>;
+  task_id: string | null;
+  overlap_policy: "skip" | "queue" | "allow";
+}
+
+interface LiveTaskEnvelope {
+  number: number;
+  status: string;
+  work_scope: string;
+  work_key: string;
+  parent_task_number: number | null;
+  orchestration_policy: unknown;
+  active_assignments: number;
+  active_children: number;
+}
+
+interface LiveAssignmentEnvelope {
+  number: number;
+  assignment_key: string;
+  status: string;
+  attempt_count: number;
+}
+
+function stripLiveJobEnvelope(prompt: string): string {
+  const lines = prompt.split("\n");
+  const envelopeLine = lines.findIndex((line) => line.startsWith("Live job envelope:"));
+  if (envelopeLine < 0 || !lines[envelopeLine + 1]?.startsWith("Limits:")) return prompt;
+  return [...lines.slice(0, envelopeLine), ...lines.slice(envelopeLine + 3)].join("\n");
+}
+
+function taskEnvelopePrompt(
+  task: LiveTaskEnvelope,
+  coordinationThreadId: string | null,
+  agentThreadId: string | null,
+  providerThreadId: string | null,
+  prompt: string,
+  assignment?: LiveAssignmentEnvelope | null
+): string {
+  // Replace a previously materialized envelope (for example, an incremental
+  // message queued before another assignment was created) so provider turns
+  // always receive live limits, status, and binding IDs.
+  const promptBody = stripLiveJobEnvelope(prompt);
+  const source = task.orchestration_policy && typeof task.orchestration_policy === "object" && !Array.isArray(task.orchestration_policy)
+    ? task.orchestration_policy as Record<string, unknown>
+    : {};
+  const limit = (key: string, fallback: number) => {
+    const value = Number(source[key]);
+    return Number.isInteger(value) && value > 0 ? Math.min(value, 100) : fallback;
+  };
+  const maxActiveAssignments = limit("maxActiveAssignments", 5);
+  const maxActiveChildren = limit("maxActiveChildren", 5);
+  const maxChildDepth = limit("maxChildDepth", 3);
+  const maxAssignmentAttempts = limit("maxAssignmentAttempts", 3);
+  const shutdown = ["completed", "blocked", "cancelled"].includes(task.status) ? "stopped" : "running";
+  const safetyMode = process.env.AISEVAK_JOB_SAFETY_MODE === "audit" ? "audit" : "enforce";
+  const assignmentText = assignment
+    ? `ASSIGNMENT-${assignment.number} (${assignment.assignment_key}) status=${assignment.status} attempt=${assignment.attempt_count}`
+    : "none";
+  return [
+    `Live job envelope: task=TASK-${task.number} ${task.work_scope}/${task.work_key}; parent=${task.parent_task_number ? `TASK-${task.parent_task_number}` : "none"}; assignment=${assignmentText}; coordination-thread=${coordinationThreadId ?? "none"}; agent-thread=${agentThreadId ?? "none"}; provider-session=${providerThreadId ?? "none"}; safety=${safetyMode}; shutdown=${shutdown}`,
+    `Limits: active assignments ${task.active_assignments}/${maxActiveAssignments}; active children ${task.active_children}/${maxActiveChildren}; child depth ${maxChildDepth}; assignment attempts ${assignment?.attempt_count ?? 0}/${maxAssignmentAttempts}.`,
+    assignment
+      ? `Use the existing ASSIGNMENT-${assignment.number}; complete or block it with the assignment command. Keep the same coordination thread, agent thread, and provider session; do not create recovery, review, retry, or detached coordination threads.`
+      : "Use the existing keyed task and coordination thread. Do not create another task, recovery, review, retry, or detached coordination thread.",
+    promptBody.trimStart()
+  ].join("\n");
+}
+
+function detachedEnvelopePrompt(
+  coordinationThreadId: string | null,
+  agentThreadId: string | null,
+  providerThreadId: string | null,
+  prompt: string,
+  workScope: string | null = null,
+  workKey: string | null = null
+): string {
+  return [
+    `Live job envelope: task=none; work=${workScope && workKey ? `${workScope}/${workKey}` : "none"}; parent=none; assignment=none; coordination-thread=${coordinationThreadId ?? "none"}; agent-thread=${agentThreadId ?? "none"}; provider-session=${providerThreadId ?? "none"}; safety=${process.env.AISEVAK_JOB_SAFETY_MODE === "audit" ? "audit" : "enforce"}; shutdown=running`,
+    "Limits: active assignments 0/5; active children 0/5; child depth 3; assignment attempts 0/3.",
+    "Allowed next commands: use the existing detached thread; do not create recovery, review, retry, or nested coordination threads.",
+    stripLiveJobEnvelope(prompt).trimStart()
+  ].join("\n");
+}
+
+function scheduleJobEnvelopePrompt(
+  task: LiveTaskEnvelope,
+  coordinationThreadId: string,
+  agentThreadId: string,
+  providerThreadId: string | null,
+  prompt: string
+): string {
+  return taskEnvelopePrompt(task, coordinationThreadId, agentThreadId, providerThreadId, prompt);
 }
 
 async function enqueueDueSchedule(pool: DbPool): Promise<void> {
@@ -572,6 +692,8 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
               schedules.schedule_kind,
               schedules.next_run_at,
               schedules.interval_seconds,
+              schedules.task_id,
+              schedules.overlap_policy,
               agents.model,
               agents.model_options
        FROM schedules
@@ -587,62 +709,208 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     if (!schedule) return;
 
     const scheduledFor = schedule.next_run_at;
+    const alreadyRecorded = await client.query("SELECT id FROM schedule_runs WHERE schedule_id = $1 AND scheduled_for = $2 LIMIT 1", [schedule.id, scheduledFor]);
+    if (alreadyRecorded.rows[0]) {
+      const next = schedule.schedule_kind === "interval" && schedule.interval_seconds
+        ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
+        : scheduledFor;
+      await client.query("UPDATE schedules SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END, next_run_at = $2, updated_at = now() WHERE id = $1", [schedule.id, next]);
+      return;
+    }
+    const nextRunAt = schedule.schedule_kind === "interval" && schedule.interval_seconds
+      ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
+      : scheduledFor;
+
+    const target = schedule.task_id
+      ? await client.query<{
+          id: string; number: number; title: string; agent_id: string; project_id: string | null;
+          coordination_thread_id: string | null; local_path: string | null; workspace_mode: string | null; source: string | null;
+        }>(
+          `SELECT tasks.id, tasks.number, tasks.title, tasks.agent_id, tasks.project_id,
+                  tasks.coordination_thread_id, projects.local_path, projects.workspace_mode, projects.source
+           FROM tasks LEFT JOIN projects ON projects.id = tasks.project_id
+           WHERE tasks.id = $1 FOR UPDATE`, [schedule.task_id]
+        )
+      : null;
+    if (schedule.task_id && !target?.rows[0]) {
+      await client.query("UPDATE schedules SET task_id = NULL, updated_at = now() WHERE id = $1", [schedule.id]);
+      return;
+    }
+
+    if (target?.rows[0] && schedule.overlap_policy === "skip") {
+      const active = await client.query(
+        `SELECT 1 FROM dispatcher_runs
+         WHERE task_id = $1 AND scope = 'coordination' AND status IN ('queued', 'running', 'cancel_requested') LIMIT 1`, [target.rows[0].id]
+      );
+      if (active.rows[0]) {
+        await client.query(
+          `INSERT INTO schedule_runs (schedule_id, scheduled_for) VALUES ($1, $2) ON CONFLICT (schedule_id, scheduled_for) DO NOTHING`,
+          [schedule.id, scheduledFor]
+        );
+        await client.query(
+          `UPDATE schedules SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END,
+             next_run_at = $2, last_run_at = now(), updated_at = now() WHERE id = $1`, [schedule.id, nextRunAt]
+        );
+        return;
+      }
+    }
+
+    let taskId = target?.rows[0]?.id ?? null;
+    let taskNumber = target?.rows[0]?.number ?? null;
+    let taskTitle = target?.rows[0]?.title ?? schedule.title;
+    let projectId = target?.rows[0]?.project_id ?? null;
+    let coordinationThreadId = target?.rows[0]?.coordination_thread_id ?? null;
+    let cwd = target?.rows[0]?.local_path ?? env.managedRoot;
+    let workspaceMode = target?.rows[0]?.workspace_mode ?? "unknown";
+    let workspaceSource = target?.rows[0]?.source ?? "unknown";
+
+    if (!taskId) {
+      const workScope = `schedule:${schedule.id}`;
+      const workKey = `occurrence:${scheduledFor.toISOString()}`;
+      const fingerprint = createHash("sha256").update(JSON.stringify({ scheduleId: schedule.id, scheduledFor: scheduledFor.toISOString(), prompt: schedule.prompt, agentId: schedule.agent_id })).digest("hex");
+      const taskResult = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+        `INSERT INTO tasks (title, description, body, project_id, agent_id, work_scope, work_key, work_fingerprint)
+         VALUES ($1, $2, $3, NULL, $4, $5, $6, $7)
+         ON CONFLICT (work_scope, work_key) DO NOTHING
+         RETURNING id, number, work_fingerprint`,
+        [schedule.title, schedule.title, schedule.prompt, schedule.agent_id, workScope, workKey, fingerprint]
+      );
+      let scheduledTask = taskResult.rows[0];
+      if (!scheduledTask) {
+        const existing = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE",
+          [workScope, workKey]
+        );
+        const row = mustRow(existing.rows[0]);
+        if (row.work_fingerprint !== fingerprint) {
+          throw Object.assign(new Error(`Schedule occurrence ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`), { statusCode: 409 });
+        }
+        scheduledTask = row;
+      }
+      taskId = scheduledTask.id;
+      taskNumber = scheduledTask.number;
+      taskTitle = schedule.title;
+      const existingThread = await client.query<{ id: string }>("SELECT id FROM coordination_threads WHERE task_id = $1", [taskId]);
+      if (existingThread.rows[0]) coordinationThreadId = existingThread.rows[0].id;
+      else {
+        const thread = await client.query<{ id: string }>(
+          `INSERT INTO coordination_threads (title, description, purpose, project_id, task_id, primary_agent_id)
+           VALUES ($1, $2, $3, NULL, $4, $5) RETURNING id`, [schedule.title, schedule.title, schedule.prompt, taskId, schedule.agent_id]
+        );
+        coordinationThreadId = thread.rows[0]!.id;
+        await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [taskId, coordinationThreadId]);
+      }
+    }
+    if (!coordinationThreadId) return;
+
+    const skillsSnapshot = await resolveAgentSkills(client, schedule.agent_id, extractPromptSkillNames(schedule.prompt));
+    // A task has one owner/navigation agent thread, while specialists may
+    // have private sessions keyed by the shared coordination thread. Reuse an
+    // existing session for this schedule and avoid violating the historical
+    // one-task-thread index when the scheduled agent is not the task owner.
+    const taskOwnerAgentId = target?.rows[0]?.agent_id ?? schedule.agent_id;
+    const sessionTaskId = taskOwnerAgentId === schedule.agent_id ? taskId : null;
     const runtimeHome = managedCodexHome(
       env.managedRoot,
-      `schedule-${schedule.id}-${randomUUID()}`
+      sessionTaskId ?? `schedule-thread-${coordinationThreadId}-${schedule.agent_id}`
     );
-    const skillNames = extractPromptSkillNames(schedule.prompt);
-    const skillsSnapshot = await resolveAgentSkills(client, schedule.agent_id, skillNames);
-    const threadResult = await client.query<{ id: string }>(
-      `INSERT INTO agent_threads
-         (title, agent_id, provider_instance_id, model, model_options, cwd, runtime_home)
-       VALUES ($1, $2, 'codex-local', $3, $4, $5, $6)
-       RETURNING id`,
-      [
-        schedule.title,
-        schedule.agent_id,
-        schedule.model,
-        JSON.stringify(schedule.model_options ?? []),
-        env.managedRoot,
-        runtimeHome
-      ]
+    const existingSession = await client.query<{
+      id: string; task_id: string | null; project_id: string | null; coordination_thread_id: string | null;
+      model: string; cwd: string; runtime_home: string; provider_thread_id: string | null; ownership_generation: number;
+    }>(
+      `SELECT id, task_id, project_id, coordination_thread_id, model, cwd, runtime_home, provider_thread_id, ownership_generation
+       FROM agent_threads
+       WHERE agent_id = $3 AND (task_id = $1 OR coordination_thread_id = $2)
+       ORDER BY (coordination_thread_id = $2) DESC, (task_id = $1) DESC
+       LIMIT 1 FOR UPDATE`,
+      [sessionTaskId, coordinationThreadId, schedule.agent_id]
     );
-    const threadId = mustRow(threadResult.rows[0]).id;
+    let agentThread: { id: string; ownership_generation: number; provider_thread_id: string | null };
+    if (existingSession.rows[0]) {
+      const current = existingSession.rows[0];
+      if (sessionTaskId) {
+        await client.query(
+          "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
+          [sessionTaskId, current.id]
+        );
+      }
+      const sameProviderBinding = current.task_id === sessionTaskId
+        && current.project_id === projectId
+        && current.coordination_thread_id === coordinationThreadId
+        && current.model === schedule.model
+        && current.cwd === cwd
+        && current.runtime_home === runtimeHome;
+      const updated = await client.query<{ id: string; ownership_generation: number; provider_thread_id: string | null }>(
+        `UPDATE agent_threads
+         SET title = $2, task_id = $3, project_id = $4, model = $5, model_options = $6,
+             cwd = $7, runtime_home = $8, coordination_thread_id = $9,
+             provider_thread_id = CASE WHEN $10::boolean THEN provider_thread_id ELSE NULL END,
+             ownership_generation = ownership_generation + CASE WHEN $10::boolean THEN 0 ELSE 1 END,
+             last_activity_at = now(), updated_at = now()
+         WHERE id = $1
+         RETURNING id, ownership_generation, provider_thread_id`,
+        [current.id, taskTitle, sessionTaskId, projectId, schedule.model, JSON.stringify(schedule.model_options ?? []), cwd, runtimeHome, coordinationThreadId, sameProviderBinding]
+      );
+      agentThread = mustRow(updated.rows[0]);
+    } else {
+      const session = await client.query<{ id: string; ownership_generation: number; provider_thread_id: string | null }>(
+        `INSERT INTO agent_threads
+           (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
+         VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
+         ON CONFLICT (coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL
+         DO UPDATE SET updated_at = now()
+         RETURNING id, ownership_generation, provider_thread_id`,
+        [taskTitle, schedule.agent_id, sessionTaskId, projectId, schedule.model, JSON.stringify(schedule.model_options ?? []), cwd, runtimeHome, coordinationThreadId]
+      );
+      agentThread = mustRow(session.rows[0]);
+    }
+    const taskEnvelope = await client.query<{
+      number: number; status: string; work_scope: string; work_key: string;
+      parent_task_number: number | null; orchestration_policy: unknown;
+      active_assignments: number; active_children: number;
+    }>(
+      `SELECT tasks.number, tasks.status, tasks.work_scope, tasks.work_key,
+              parent.number AS parent_task_number, tasks.orchestration_policy,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignments,
+              (SELECT count(*)::int FROM tasks child
+                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children
+       FROM tasks LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
+       WHERE tasks.id = $1`, [taskId]
+    );
+    const taskEnvelopeRow = taskEnvelope.rows[0];
+    const scheduledPrompt = taskEnvelopeRow
+      ? scheduleJobEnvelopePrompt(taskEnvelopeRow, coordinationThreadId, agentThread.id, agentThread.provider_thread_id, schedule.prompt)
+      : schedule.prompt;
+    const message = await client.query<{ id: string; number: number }>(
+      `INSERT INTO thread_messages (thread_id, recipient_agent_id, message_type, body)
+       VALUES ($1, $2, 'schedule', $3) RETURNING id, number`, [coordinationThreadId, schedule.agent_id, schedule.prompt]
+    );
+    const delivery = await client.query<{ id: string }>(
+      `INSERT INTO message_deliveries (message_id, recipient_agent_id)
+       VALUES ($1, $2) ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET updated_at = now() RETURNING id`, [message.rows[0]!.id, schedule.agent_id]
+    );
     const runResult = await client.query<{ id: string }>(
       `INSERT INTO dispatcher_runs
-         (agent_thread_id, trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, model, model_options, prompt, skills_snapshot)
-       VALUES ($1, 'schedule', 'schedule', '', 'unknown', 'unknown', 'queued', $2, $3, $4, $5, $6, $7)
+         (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source,
+          message_delivery_id, status, cwd, codex_home, codex_thread_id, model, model_options, prompt, skills_snapshot)
+       VALUES ($1, 'schedule', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13, $14)
        RETURNING id`,
-      [
-        threadId,
-        env.managedRoot,
-        runtimeHome,
-        schedule.model,
-        JSON.stringify(schedule.model_options ?? []),
-        schedule.prompt,
-        serializeCodexSkillSnapshots(skillsSnapshot)
-      ]
+      [taskId, agentThread.id, agentThread.ownership_generation, projectId ?? "", workspaceMode, workspaceSource,
+        delivery.rows[0]!.id, cwd, runtimeHome, agentThread.provider_thread_id, schedule.model,
+        JSON.stringify(schedule.model_options ?? []), scheduledPrompt, serializeCodexSkillSnapshots(skillsSnapshot)]
     );
     const dispatcherRunId = mustRow(runResult.rows[0]).id;
     await client.query(
       `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
        VALUES ($1, -1, 'thread.message-sent', $2, $3)`,
-      [
-        dispatcherRunId,
-        schedule.prompt,
-        { type: "thread.message-sent", role: "user", text: schedule.prompt, scheduled: true }
-      ]
+      [dispatcherRunId, scheduledPrompt, { type: "thread.message-sent", role: "user", text: schedule.prompt, scheduled: true, task: taskNumber ? `TASK-${taskNumber}` : null }]
     );
     await client.query(
       `INSERT INTO schedule_runs (schedule_id, agent_thread_id, dispatcher_run_id, scheduled_for)
-       VALUES ($1, $2, $3, $4)`,
-      [schedule.id, threadId, dispatcherRunId, scheduledFor]
+       VALUES ($1, $2, $3, $4) ON CONFLICT (schedule_id, scheduled_for) DO NOTHING`,
+      [schedule.id, agentThread.id, dispatcherRunId, scheduledFor]
     );
-
-    const nextRunAt =
-      schedule.schedule_kind === "interval" && schedule.interval_seconds
-        ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
-        : scheduledFor;
     await client.query(
       `UPDATE schedules
        SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END,
@@ -651,7 +919,7 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
            last_agent_thread_id = $3,
            updated_at = now()
        WHERE id = $1`,
-      [schedule.id, nextRunAt, threadId]
+      [schedule.id, nextRunAt, agentThread.id]
     );
   });
 }
@@ -920,6 +1188,12 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
     projectsJson: JSON.stringify(context.projects, null, 2),
     skills: skillsSnapshot.map((skill) => ({ name: skill.name, description: skill.description }))
   });
+  const heartbeatPrompt = [
+    "Live job envelope: task=none; work=none; parent=none; assignment=none; coordination-thread=none; agent-thread=none; provider-session=none; safety=" + (process.env.AISEVAK_JOB_SAFETY_MODE === "audit" ? "audit" : "enforce") + "; shutdown=running",
+    "Limits: active assignments 0/5; active children 0/5; child depth 3; assignment attempts 0/3.",
+    "Allowed next commands: create keyed root/child tasks and keyed assignments; do not create detached, recovery, review, or retry threads.",
+    prompt
+  ].join("\n");
   await pool.query(
     `INSERT INTO dispatcher_runs
        (trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
@@ -929,7 +1203,7 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
       codexHome,
       dispatcher.threadId ?? null,
       dispatcher.model,
-      prompt,
+      heartbeatPrompt,
       serializeCodexSkillSnapshots(skillsSnapshot)
     ]
   );
@@ -1203,6 +1477,7 @@ export async function processOneDispatcherRun(
             dispatcher_runs.workspace_key,
             dispatcher_runs.workspace_mode,
             dispatcher_runs.message_delivery_id,
+            dispatcher_runs.assignment_id,
             dispatcher_runs.task_id,
             dispatcher_runs.prompt,
             dispatcher_runs.model,
@@ -1219,10 +1494,30 @@ export async function processOneDispatcherRun(
             agents.name AS agent_name,
             agents.description AS agent_description,
             agents.instructions AS agent_instructions,
+            tasks.number AS task_number,
+            tasks.status AS task_status,
+            tasks.work_scope,
+            tasks.work_key,
+            parent.number AS parent_task_number,
+            tasks.orchestration_policy,
+            (SELECT count(*)::int FROM task_assignments assignment
+               WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignments,
+            (SELECT count(*)::int FROM tasks child
+               WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children,
+            task_assignments.number AS assignment_number,
+            task_assignments.assignment_key,
+            task_assignments.status AS assignment_status,
+            task_assignments.attempt_count AS assignment_attempt,
+            coordination_threads.work_scope AS thread_work_scope,
+            coordination_threads.work_key AS thread_work_key,
             agent_threads.ownership_generation,
             agent_threads.coordination_thread_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+     LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
+     LEFT JOIN task_assignments ON task_assignments.id = dispatcher_runs.assignment_id
+     LEFT JOIN coordination_threads ON coordination_threads.id = agent_threads.coordination_thread_id
      LEFT JOIN agents ON agents.id = agent_threads.agent_id
      WHERE dispatcher_runs.id = $1`,
     [picked.id]
@@ -1240,6 +1535,9 @@ export async function processOneDispatcherRun(
        WHERE id = $1`,
       [job.message_delivery_id]
     );
+    if (job.assignment_id) {
+      await pool.query("UPDATE task_assignments SET status = 'running', active_delivery_id = $2, updated_at = now() WHERE id = $1 AND status IN ('queued', 'blocked')", [job.assignment_id, job.message_delivery_id]);
+    }
   }
 
   let stdout = "";
@@ -1267,7 +1565,8 @@ export async function processOneDispatcherRun(
       taskId: job.task_id,
       agentId: job.agent_id,
       agentThreadId: job.agent_thread_id,
-      coordinationThreadId: job.coordination_thread_id
+      coordinationThreadId: job.coordination_thread_id,
+      assignmentId: job.assignment_id
     });
     const agentTool = await writeAgentTool(job.codex_home, toolToken);
     if (!(await dispatcherRunStillOwned(pool, job))) {
@@ -1276,21 +1575,56 @@ export async function processOneDispatcherRun(
       stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
       return true;
     }
+    const dispatcherPrompt = job.scope === "schedule"
+      ? (() => {
+          const scheduledPrompt = buildScheduledAgentPrompt({
+            agentName: job.agent_name,
+            agentDescription: job.agent_description,
+            agentInstructions: job.agent_instructions,
+            prompt: job.prompt
+          });
+          return job.task_id && job.task_number && job.work_scope && job.work_key
+            ? taskEnvelopePrompt({
+                number: job.task_number,
+                status: job.task_status ?? "running",
+                work_scope: job.work_scope,
+                work_key: job.work_key,
+                parent_task_number: job.parent_task_number,
+                orchestration_policy: job.orchestration_policy,
+                active_assignments: job.active_assignments,
+                active_children: job.active_children
+              }, job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, scheduledPrompt)
+            : detachedEnvelopePrompt(job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, scheduledPrompt, job.thread_work_scope, job.thread_work_key);
+        })()
+      : job.task_id && job.task_number && job.work_scope && job.work_key
+        ? taskEnvelopePrompt({
+            number: job.task_number,
+            status: job.task_status ?? "running",
+            work_scope: job.work_scope,
+            work_key: job.work_key,
+            parent_task_number: job.parent_task_number,
+            orchestration_policy: job.orchestration_policy,
+            active_assignments: job.active_assignments,
+            active_children: job.active_children
+          }, job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, job.prompt,
+          job.assignment_id && job.assignment_number
+            ? {
+                number: job.assignment_number,
+                assignment_key: job.assignment_key ?? "",
+                status: job.assignment_status ?? "queued",
+                attempt_count: job.assignment_attempt ?? 1
+              }
+            : null)
+        : job.scope === "heartbeat"
+          ? job.prompt
+          : detachedEnvelopePrompt(job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, job.prompt, job.thread_work_scope, job.thread_work_key);
     const turn = await runTurn({
       codexBinary: env.codexBinary,
       cwd: job.cwd,
       codexHome: job.codex_home,
       model: job.model,
       modelOptions: job.model_options,
-      prompt:
-        job.scope === "schedule"
-          ? buildScheduledAgentPrompt({
-              agentName: job.agent_name,
-              agentDescription: job.agent_description,
-              agentInstructions: job.agent_instructions,
-              prompt: job.prompt
-            })
-          : job.prompt,
+      prompt: dispatcherPrompt,
       threadId: job.codex_thread_id,
       env: {
         ...codexProcessEnv(),
@@ -1327,7 +1661,8 @@ export async function processOneDispatcherRun(
           taskId: job.task_id,
           agentThreadId: job.agent_thread_id,
           agentThreadGeneration: job.agent_thread_generation,
-          agentId: job.agent_id
+          agentId: job.agent_id,
+          assignmentId: job.assignment_id
         });
         if (!fence) ownershipLost = true;
         return fence;
@@ -1421,16 +1756,21 @@ export async function processOneDispatcherRun(
 
 export async function dispatcherRunStillOwned(
   pool: DbPool,
-  job: Pick<DispatcherJob, "id" | "agent_thread_id" | "agent_thread_generation" | "task_id" | "agent_id">
+  job: Pick<DispatcherJob, "id" | "agent_thread_id" | "agent_thread_generation" | "task_id" | "agent_id"> & { assignment_id?: string | null }
 ): Promise<boolean> {
   const result = await pool.query(
     `SELECT dispatcher_runs.id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
      LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
+     LEFT JOIN task_assignments ON task_assignments.id = dispatcher_runs.assignment_id
      WHERE dispatcher_runs.id = $1
        AND dispatcher_runs.status = 'running'
-       AND (dispatcher_runs.task_id IS NULL OR tasks.agent_id = $2)
+       AND (
+         dispatcher_runs.task_id IS NULL
+         OR tasks.agent_id = $2
+         OR (dispatcher_runs.assignment_id IS NOT NULL AND task_assignments.assigned_agent_id = $2)
+       )
        AND (
          dispatcher_runs.agent_thread_id IS NULL
          OR (
@@ -1468,12 +1808,23 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             task_runs.workspace_source,
             task_runs.skills_snapshot,
             COALESCE(agent_threads.agent_id, tasks.agent_id) AS agent_id,
+            tasks.number AS task_number,
+            tasks.status AS task_status,
+            tasks.work_scope,
+            tasks.work_key,
+            parent.number AS parent_task_number,
+            tasks.orchestration_policy,
+            (SELECT count(*)::int FROM task_assignments assignment
+               WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignments,
+            (SELECT count(*)::int FROM tasks child
+               WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children,
             agent_threads.ownership_generation,
             agent_threads.coordination_thread_id
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
      JOIN tasks ON tasks.id = task_runs.task_id
+     LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      WHERE task_runs.id = $1`,
     [picked.id]
   );
@@ -1521,13 +1872,23 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
       return true;
     }
+    const workerPrompt = taskEnvelopePrompt({
+      number: job.task_number,
+      status: job.task_status,
+      work_scope: job.work_scope,
+      work_key: job.work_key,
+      parent_task_number: job.parent_task_number,
+      orchestration_policy: job.orchestration_policy,
+      active_assignments: job.active_assignments,
+      active_children: job.active_children
+    }, job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, job.prompt);
     const turn = await runCodexAppServerTurn({
       codexBinary: env.codexBinary,
       cwd,
       codexHome: job.codex_home,
       model: job.model,
       modelOptions: job.model_options,
-      prompt: job.prompt,
+      prompt: workerPrompt,
       threadId: job.codex_thread_id,
       env: {
         ...codexProcessEnv(),
@@ -1671,6 +2032,7 @@ interface RunLaunchFenceInput {
   agentThreadId: string | null;
   agentThreadGeneration: number;
   agentId: string;
+  assignmentId?: string | null;
 }
 
 export async function acquireRunLaunchFence(
@@ -1704,6 +2066,19 @@ export async function acquireRunLaunchFence(
       }
     }
 
+    let assignmentAgentId: string | null = null;
+    if (input.assignmentId) {
+      const assignment = await client.query<{ assigned_agent_id: string; task_id: string }>(
+        "SELECT assigned_agent_id, task_id FROM task_assignments WHERE id = $1 FOR UPDATE",
+        [input.assignmentId]
+      );
+      if (!assignment.rows[0] || assignment.rows[0].task_id !== input.taskId) {
+        await rollbackAndRelease();
+        return null;
+      }
+      assignmentAgentId = assignment.rows[0].assigned_agent_id;
+    }
+
     let threadAgentId: string | null = null;
     let threadGeneration: number | null = null;
     if (input.agentThreadId) {
@@ -1726,8 +2101,10 @@ export async function acquireRunLaunchFence(
       task_id: string | null;
       agent_thread_id: string | null;
       agent_thread_generation: number;
+      assignment_id: string | null;
     }>(
-      `SELECT id, status, task_id, agent_thread_id, agent_thread_generation
+      `SELECT id, status, task_id, agent_thread_id, agent_thread_generation,
+              ${input.kind === "dispatcher" ? "assignment_id" : "NULL::uuid AS assignment_id"}
        FROM ${runTable}
        WHERE id = $1
        FOR UPDATE`,
@@ -1739,7 +2116,8 @@ export async function acquireRunLaunchFence(
         row.status === "running" &&
         row.task_id === input.taskId &&
         row.agent_thread_id === input.agentThreadId &&
-        (!input.taskId || taskAgentId === input.agentId) &&
+        (row.assignment_id ?? null) === (input.assignmentId ?? null) &&
+        (!input.taskId || taskAgentId === input.agentId || assignmentAgentId === input.agentId) &&
         (!input.agentThreadId ||
           (threadAgentId === input.agentId &&
             threadGeneration === input.agentThreadGeneration &&
@@ -2064,9 +2442,32 @@ export async function persistDispatcherCodexLine(
   );
 }
 
+async function markAssignmentDeliveryTerminal(
+  queryable: Pick<DbPool, "query">,
+  messageDeliveryId: string,
+  error: string,
+  status: "blocked" | "cancelled"
+): Promise<void> {
+  const assignment = await queryable.query<{ assignment_id: string | null }>(
+    "SELECT assignment_id FROM message_deliveries WHERE id = $1",
+    [messageDeliveryId]
+  );
+  const assignmentId = assignment.rows[0]?.assignment_id;
+  if (!assignmentId) return;
+  await queryable.query(
+    `UPDATE task_assignments
+     SET status = $2,
+         result = CASE WHEN result IS NULL OR result = '' THEN $3 ELSE result END,
+         active_delivery_id = NULL,
+         updated_at = now()
+     WHERE id = $1 AND status IN ('queued', 'running')`,
+    [assignmentId, status, error]
+  );
+}
+
 export async function finishMessageDelivery(
   pool: DbPool,
-  job: Pick<DispatcherJob, "id" | "message_delivery_id">,
+  job: Pick<DispatcherJob, "id" | "message_delivery_id"> & { assignment_id?: string | null },
   status: "succeeded" | "failed" | "cancelled",
   error: string,
   promptMayHaveBeenPresented = false
@@ -2079,6 +2480,10 @@ export async function finishMessageDelivery(
         `UPDATE message_deliveries
          SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
          WHERE id = $1 AND status = 'running'`,
+        [messageDeliveryId]
+      );
+      await client.query(
+        "UPDATE task_assignments SET active_delivery_id = NULL, updated_at = now() WHERE active_delivery_id = $1",
         [messageDeliveryId]
       );
       await cancelQueuedDeliveryRuns(client, messageDeliveryId, "Delivery completed");
@@ -2138,6 +2543,7 @@ export async function finishMessageDelivery(
            WHERE id = $1 AND status = 'running'`,
           [messageDeliveryId, encodePostgresText(error)]
         );
+        await markAssignmentDeliveryTerminal(client, messageDeliveryId, error, status === "cancelled" ? "cancelled" : "blocked");
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, error || "Delivery failed");
         return;
       }
@@ -2154,6 +2560,7 @@ export async function finishMessageDelivery(
            WHERE id = $1 AND status = 'running'`,
           [messageDeliveryId, ownershipError]
         );
+        await markAssignmentDeliveryTerminal(client, messageDeliveryId, ownershipError, "blocked");
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, ownershipError);
         return;
       }
@@ -2171,15 +2578,16 @@ export async function finishMessageDelivery(
             encodePostgresText(`Automatic delivery retry suppressed: ${suppressionReason}.${error ? ` Original error: ${error}` : ""}`)
           ]
         );
+        await markAssignmentDeliveryTerminal(client, messageDeliveryId, suppressionReason, "blocked");
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionReason);
         return;
       }
 
       const retry = await client.query<{ id: string }>(
         `INSERT INTO dispatcher_runs
-           (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+           (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
             codex_thread_id, model, model_options, prompt, skills_snapshot)
-         SELECT source_run.task_id, 'retry', source_run.scope, source_run.agent_thread_id,
+         SELECT source_run.task_id, source_run.assignment_id, 'retry', source_run.scope, source_run.agent_thread_id,
                 source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
                 source_run.codex_thread_id, source_run.model, source_run.model_options,
                 source_run.prompt, source_run.skills_snapshot
@@ -2205,6 +2613,7 @@ export async function finishMessageDelivery(
            WHERE id = $1 AND status = 'running'`,
           [messageDeliveryId, encodePostgresText(suppressionError)]
         );
+        await markAssignmentDeliveryTerminal(client, messageDeliveryId, suppressionError, "blocked");
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, suppressionError);
         return;
       }
@@ -2229,6 +2638,7 @@ export async function finishMessageDelivery(
          WHERE id = $1 AND status = 'running'`,
         [messageDeliveryId, encodePostgresText(finalError)]
       );
+      await markAssignmentDeliveryTerminal(client, messageDeliveryId, finalError, "blocked");
       await cancelQueuedDeliveryRuns(client, messageDeliveryId, finalError);
     });
   }
@@ -2258,6 +2668,7 @@ async function cancelMismatchedDispatcherRun(
          WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
         [job.message_delivery_id, error]
       );
+      await markAssignmentDeliveryTerminal(client, job.message_delivery_id, error, "cancelled");
       await cancelQueuedDeliveryRuns(client, job.message_delivery_id, error);
     }
   });
@@ -2291,14 +2702,15 @@ async function createAgentToolToken(
     agentId?: string | null;
     agentThreadId?: string | null;
     coordinationThreadId?: string | null;
+    assignmentId?: string | null;
   }
 ): Promise<string> {
   const token = newSessionToken();
   await pool.query(
     `INSERT INTO agent_tool_tokens
      (token_hash, task_run_id, dispatcher_run_id, task_id, agent_id, agent_thread_id,
-      coordination_thread_id, role, expires_at)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + interval '24 hours')`,
+      coordination_thread_id, assignment_id, role, expires_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + interval '24 hours')`,
     [
       hashToken(token),
       options.taskRunId ?? null,
@@ -2307,6 +2719,7 @@ async function createAgentToolToken(
       options.agentId ?? null,
       options.agentThreadId ?? null,
       options.coordinationThreadId ?? null,
+      options.assignmentId ?? null,
       options.role
     ]
   );
@@ -2335,7 +2748,7 @@ export async function claimAgentTurnInput(
 ): Promise<AppServerTurnInput | null> {
   const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
   return withTransaction(pool, async (client) => {
-    const result = await client.query<AppServerTurnInput & { message_delivery_id: string | null }>(
+    const result = await client.query<AppServerTurnInput & { message_delivery_id: string | null; assignment_id: string | null }>(
       `UPDATE agent_turn_inputs
        SET status = 'delivering', updated_at = now()
        WHERE id = (
@@ -2351,11 +2764,19 @@ export async function claimAgentTurnInput(
                  AND message_deliveries.status IN ('queued', 'retrying')
              )
            )
+           AND (
+             assignment_id IS NULL
+             OR EXISTS (
+               SELECT 1 FROM task_assignments
+               WHERE task_assignments.id = agent_turn_inputs.assignment_id
+                 AND task_assignments.status IN ('queued', 'running')
+             )
+           )
          ORDER BY created_at ASC
          LIMIT 1
          FOR UPDATE SKIP LOCKED
        )
-       RETURNING id, message, message_delivery_id`,
+       RETURNING id, message, message_delivery_id, assignment_id`,
       [runId]
     );
     const input = result.rows[0];
@@ -2381,11 +2802,56 @@ export async function claimAgentTurnInput(
         );
         return null;
       }
+      if (input.assignment_id) {
+        await client.query(
+          "UPDATE task_assignments SET status = 'running', active_delivery_id = $2, updated_at = now() WHERE id = $1 AND status IN ('queued', 'blocked')",
+          [input.assignment_id, input.message_delivery_id]
+        );
+      }
+    }
+    const runTable = kind === "worker" ? "task_runs" : "dispatcher_runs";
+    const assignmentColumn = kind === "worker" ? "NULL::uuid" : "dispatcher_runs.assignment_id";
+    const task = await client.query<LiveTaskEnvelope & {
+      task_id: string;
+      agent_thread_id: string | null;
+      coordination_thread_id: string | null;
+      provider_thread_id: string | null;
+      run_assignment_id: string | null;
+    }>(
+      `SELECT tasks.number, tasks.status, tasks.work_scope, tasks.work_key,
+              parent.number AS parent_task_number, tasks.orchestration_policy,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignments,
+              (SELECT count(*)::int FROM tasks child
+                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children,
+              ${runTable}.task_id, ${runTable}.agent_thread_id,
+              tasks.coordination_thread_id,
+              agent_threads.provider_thread_id,
+              ${assignmentColumn} AS run_assignment_id
+       FROM ${runTable}
+       JOIN tasks ON tasks.id = ${runTable}.task_id
+       LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
+       LEFT JOIN agent_threads ON agent_threads.id = ${runTable}.agent_thread_id
+       WHERE ${runTable}.id = $1`,
+      [runId]
+    );
+    const taskRow = task.rows[0];
+    let message = input.message;
+    if (taskRow) {
+      const assignmentId = input.assignment_id ?? taskRow.run_assignment_id;
+      const assignment = assignmentId
+        ? await client.query<LiveAssignmentEnvelope>(
+            "SELECT number, assignment_key, status, attempt_count FROM task_assignments WHERE id = $1",
+            [assignmentId]
+          )
+        : { rows: [] as LiveAssignmentEnvelope[] };
+      message = taskEnvelopePrompt(taskRow, taskRow.coordination_thread_id ?? null, taskRow.agent_thread_id, taskRow.provider_thread_id, input.message, assignment.rows[0] ?? null);
     }
     return {
       id: input.id,
-      message: input.message,
-      messageDeliveryId: input.message_delivery_id
+      message,
+      messageDeliveryId: input.message_delivery_id,
+      assignmentId: input.assignment_id
     };
   });
 }
@@ -2415,12 +2881,17 @@ export async function finishAgentTurnInput(
          WHERE id = $1 AND status = 'running'`,
         [deliveryId, encodePostgresText(error)]
       );
+      await markAssignmentDeliveryTerminal(client, deliveryId, error, "blocked");
       await cancelQueuedDeliveryRuns(client, deliveryId, error);
     } else {
       await client.query(
         `UPDATE message_deliveries
          SET status = 'completed', completed_at = now(), error = NULL, updated_at = now()
          WHERE id = $1 AND status = 'running'`,
+        [deliveryId]
+      );
+      await client.query(
+        "UPDATE task_assignments SET active_delivery_id = NULL, updated_at = now() WHERE active_delivery_id = $1",
         [deliveryId]
       );
       await cancelQueuedDeliveryRuns(client, deliveryId, "Delivery completed");
@@ -2464,6 +2935,7 @@ async function failPendingAgentTurnInputsInTransaction(
       [deliveryIds, deliveryError]
     );
   for (const deliveryId of deliveryIds) {
+    await markAssignmentDeliveryTerminal(client, deliveryId, deliveryError, finalStatus === "cancelled" ? "cancelled" : "blocked");
     await cancelQueuedDeliveryRuns(client, deliveryId, deliveryError);
   }
 }
@@ -2586,6 +3058,25 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             tasks.body,
             tasks.status,
             tasks.project_id,
+            tasks.work_scope,
+            tasks.work_key,
+            tasks.parent_task_id,
+            parent.number AS parent_task_number,
+            tasks.orchestration_policy,
+            (SELECT count(*)::int FROM task_assignments assignment
+               WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignment_count,
+            (SELECT count(*)::int FROM tasks child
+               WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
+            COALESCE((SELECT json_agg(json_build_object(
+              'number', assignment.number,
+              'key', assignment.assignment_key,
+              'status', assignment.status,
+              'attempt_count', assignment.attempt_count,
+              'assigned_agent_name', assigned.name
+            ) ORDER BY assignment.number)
+              FROM task_assignments assignment
+              JOIN agents assigned ON assigned.id = assignment.assigned_agent_id
+              WHERE assignment.task_id = tasks.id), '[]'::json) AS assignments,
             projects.name AS project_name,
             CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
             agents.kind AS agent_kind,
@@ -2593,6 +3084,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             latest.id AS latest_worker_run_id
      FROM tasks
      LEFT JOIN projects ON projects.id = tasks.project_id
+     LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
      LEFT JOIN LATERAL (
        SELECT id, status
