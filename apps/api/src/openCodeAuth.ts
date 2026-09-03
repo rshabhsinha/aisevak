@@ -89,7 +89,11 @@ export class OpenCodeAuthManager {
             : "OpenCode has no stored provider credentials."
       };
     } catch {
-      const probe = await runHarnessCommand(this.openCodeBinary, ["--version"], { timeoutMs: 8_000 });
+      // The API container has no writable HOME; give the probe a scratch one.
+      const probe = await runHarnessCommand(this.openCodeBinary, ["--version"], {
+        env: scratchHomeEnv(),
+        timeoutMs: 8_000
+      });
       return {
         connected: false,
         installed: probe.exitCode === 0,
@@ -194,8 +198,7 @@ export class OpenCodeAuthManager {
     }
   }
 
-  private async readSecret(name: string): Promise<string | undefined> {
-    const result = await this.pool.query<{ encrypted_value: string }>(
+  private async readSecret(name: string): Promise<string | undefined> {    const result = await this.pool.query<{ encrypted_value: string }>(
       "SELECT encrypted_value FROM secrets WHERE name = $1",
       [name]
     );
@@ -213,4 +216,14 @@ export class OpenCodeAuthManager {
       [OPENCODE_AUTH_SECRET_NAME, "Internal OpenCode authentication used by the runner", encrypted]
     );
   }
+}
+
+export function scratchHomeEnv(base: string = "/tmp/aisevak-harness-probe"): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    HOME: base,
+    XDG_DATA_HOME: join(base, ".local", "share"),
+    XDG_CONFIG_HOME: join(base, ".config"),
+    XDG_CACHE_HOME: join(base, ".cache")
+  };
 }
