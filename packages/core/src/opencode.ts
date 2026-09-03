@@ -72,6 +72,10 @@ export function parseOpenCodeModelList(output: string): CodexHarnessModel[] {
   for (const line of output.split(/\r?\n/)) {
     const trimmed = stripAnsi(line).trim();
     if (!trimmed) continue;
+    // Never treat CLI/process errors as models (e.g. "spawn opencode ENOENT").
+    // Bare ids contain no spaces, so only filter spaced lines plus ENOENT.
+    if (/enoent/i.test(trimmed)) continue;
+    if (/\s/.test(trimmed) && /not found|command not found|authentication required|not authenticated|login required|^error\b/i.test(trimmed)) continue;
     const idMatch = trimmed.match(/^([a-z0-9._-]+\/[a-z0-9._-]+)/i) ?? trimmed.match(/^([a-z0-9._-]+)/i);
     const id = idMatch?.[1];
     if (!id || seen.has(id) || /^(provider|model|id)$/i.test(id)) continue;
