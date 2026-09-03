@@ -3411,7 +3411,12 @@ function AgentChatComposer(props: {
                             }}
                           >
                             <div className="model-row-copy">
-                              <span className="model-row-label">{modelEntry.label}</span>
+                              <span className="model-row-label">
+                                {modelEntry.label}
+                                {modelEntry.badge && modelEntry.badge !== "Default" ? (
+                                  <span className="model-row-badge">{modelEntry.badge}</span>
+                                ) : null}
+                              </span>
                               {modelEntry.description ? (
                                 <span className="model-row-desc">{modelEntry.description}</span>
                               ) : null}
