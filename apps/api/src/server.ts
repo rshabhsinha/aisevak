@@ -22,6 +22,7 @@ import {
   OPENCODE_HARNESS_MODELS,
   defaultCodexModelOptions,
   discoverCodexModels,
+  fetchZenModelCatalog,
   parseCursorModelList,
   parseOpenCodeModelList,
   resolveCodexBinary,
@@ -37,6 +38,7 @@ import {
   verifyPassword,
   writeInstalledSkill,
   withTransaction,
+  type CodexHarnessModel,
   type CodexSkillSnapshot,
   type DbPool,
   type UserRole
@@ -2517,28 +2519,41 @@ async function getOpenCodeModelSnapshot(): Promise<{
   source: "live" | "fallback";
 }> {
   if (openCodeModelCache && openCodeModelCache.expiresAt > Date.now()) return openCodeModelCache;
+  const liveModels: CodexHarnessModel[] = [];
+  const seen = new Set<string>();
+  const collect = (models: CodexHarnessModel[]): void => {
+    for (const model of models) {
+      if (seen.has(model.id)) continue;
+      seen.add(model.id);
+      liveModels.push(model);
+    }
+  };
   try {
     const listed = await runHarnessCommand(env.openCodeBinary, ["models"], { timeoutMs: 12_000 });
     if (listed.exitCode !== 0) {
-      console.warn("OpenCode model discovery exited nonzero; using fallback catalog", {
+      console.warn("OpenCode CLI model discovery exited nonzero", {
         exitCode: listed.exitCode,
         stderrTail: listed.stderr.slice(-500)
       });
     } else {
-      const liveModels = parseOpenCodeModelList(`${listed.stdout}\n${listed.stderr}`);
-      if (liveModels.length > 0) {
-        const configured = applyOpenCodeModelDefaults(liveModels);
-        openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
-        return openCodeModelCache;
-      }
-      console.warn("OpenCode model discovery returned no models; using fallback catalog", {
-        exitCode: listed.exitCode,
-        stderrTail: listed.stderr.slice(-500)
-      });
+      collect(parseOpenCodeModelList(`${listed.stdout}\n${listed.stderr}`));
     }
   } catch (error) {
-    console.warn("OpenCode model discovery failed; using fallback catalog", error);
+    console.warn("OpenCode CLI model discovery failed", error);
   }
+  try {
+    // Zen metadata needs no auth and covers the full pay-as-you-go lineup;
+    // the CLI covers Go subscriptions and locally configured providers.
+    collect(await fetchZenModelCatalog());
+  } catch (error) {
+    console.warn("OpenCode Zen model catalog fetch failed", error);
+  }
+  if (liveModels.length > 0) {
+    const configured = applyOpenCodeModelDefaults(liveModels);
+    openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+    return openCodeModelCache;
+  }
+  console.warn("OpenCode model discovery returned no models; using fallback catalog");
   const configured = applyOpenCodeModelDefaults(OPENCODE_HARNESS_MODELS);
   openCodeModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
   return openCodeModelCache;

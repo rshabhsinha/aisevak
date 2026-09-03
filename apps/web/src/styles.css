@@ -1898,6 +1898,21 @@ select:disabled {
   text-overflow: ellipsis;
 }
 
+.model-row-badge {
+  display: inline-block;
+  vertical-align: 1px;
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--secondary);
+  color: var(--muted-foreground);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
 .agent-composer-actions > span {
   color: var(--muted-foreground);
   font-size: 11px;
