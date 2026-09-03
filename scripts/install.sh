@@ -103,6 +103,38 @@ if ! command_exists pnpm; then
   fail "pnpm is still unavailable after attempting to enable corepack."
 fi
 
+# Agent harness CLIs run as RUNNER_USER. Both vendor installers are
+# HOME-bound, so install as the runner user and symlink into /usr/local/bin
+# where every process (host runner, containers' PATH lookups) can resolve them.
+install_harness_clis() {
+  local runner_home
+  runner_home="$(getent passwd "${RUNNER_USER}" | cut -d: -f6)"
+  if [[ -z "${runner_home}" ]]; then
+    fail "Runner user ${RUNNER_USER} has no home directory."
+  fi
+  if command_exists curl; then
+    if [[ ! -x "${runner_home}/.opencode/bin/opencode" ]]; then
+      log "Installing OpenCode CLI for ${RUNNER_USER}"
+      sudo -u "${RUNNER_USER}" curl -fsSL https://opencode.ai/install | sudo -u "${RUNNER_USER}" bash -s -- --no-modify-path || log "OpenCode install failed; continuing without it"
+    fi
+    if [[ ! -x "${runner_home}/.local/bin/cursor-agent" ]]; then
+      log "Installing Cursor agent CLI for ${RUNNER_USER}"
+      sudo -u "${RUNNER_USER}" curl -fsSL https://cursor.com/install | sudo -u "${RUNNER_USER}" bash || log "Cursor agent install failed; continuing without it"
+    fi
+  else
+    log "curl is unavailable; skipping OpenCode/Cursor CLI provisioning"
+  fi
+  [[ -x "${runner_home}/.opencode/bin/opencode" ]] && ln -sf "${runner_home}/.opencode/bin/opencode" /usr/local/bin/opencode
+  [[ -x "${runner_home}/.local/bin/agent" ]] && ln -sf "${runner_home}/.local/bin/agent" /usr/local/bin/agent
+  [[ -x "${runner_home}/.local/bin/cursor-agent" ]] && ln -sf "${runner_home}/.local/bin/cursor-agent" /usr/local/bin/cursor-agent
+  if command_exists npm; then
+    log "Updating Codex CLI"
+    npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
+  fi
+}
+
+install_harness_clis
+
 compose_current() {
   docker compose -p "${COMPOSE_PROJECT_NAME}" --env-file "${ENV_FILE}" -f "${CURRENT_DIR}/docker-compose.yml" "$@"
 }
