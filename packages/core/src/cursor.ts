@@ -121,7 +121,11 @@ export function parseCursorModelList(output: string): CodexHarnessModel[] {
   for (const line of output.split(/\r?\n/)) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith("Available") || trimmed.startsWith("Model")) continue;
-    if (/error|authentication required|not authenticated|login required/i.test(trimmed)) continue;
+    // Never treat CLI/process errors as models (e.g. "spawn cursor-agent
+    // ENOENT"). Bare ids contain no spaces, so only filter spaced lines plus
+    // ENOENT anywhere.
+    if (/enoent/i.test(trimmed)) continue;
+    if (/\s/.test(trimmed) && /not found|command not found|authentication required|not authenticated|login required|^error\b/i.test(trimmed)) continue;
     const id = trimmed.split(/\s{2,}|\s-\s/)[0]?.trim();
     if (!id || seen.has(id) || id.startsWith("-")) continue;
     // Model ids never contain path separators; skip table headers and prompts.

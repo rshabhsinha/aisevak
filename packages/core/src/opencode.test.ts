@@ -20,6 +20,11 @@ describe("OpenCode helpers", () => {
     ]);
   });
 
+  it("ignores CLI error output instead of inventing models", () => {
+    expect(parseOpenCodeModelList("spawn opencode ENOENT")).toEqual([]);
+    expect(parseOpenCodeModelList("opencode: command not found")).toEqual([]);
+    expect(parseOpenCodeModelList("Error: Authentication required")).toEqual([]);
+  });
   it("extracts a login URL", () => {
     expect(parseOpenCodeLoginUrl("Visit https://opencode.ai/auth?code=1")).toBe(
       "https://opencode.ai/auth?code=1"

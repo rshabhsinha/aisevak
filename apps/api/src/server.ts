@@ -2486,16 +2486,23 @@ async function getCursorModelSnapshot(pool: DbPool): Promise<{
       env: { ...process.env, ...(apiKey ? { CURSOR_API_KEY: apiKey } : {}), NO_OPEN_BROWSER: "1" },
       timeoutMs: 12_000
     });
-    const liveModels = parseCursorModelList(`${listed.stdout}\n${listed.stderr}`);
-    if (liveModels.length > 0) {
-      const configured = applyCursorModelDefaults(liveModels);
-      cursorModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
-      return cursorModelCache;
+    if (listed.exitCode !== 0) {
+      console.warn("Cursor model discovery exited nonzero; using fallback catalog", {
+        exitCode: listed.exitCode,
+        stderrTail: listed.stderr.slice(-500)
+      });
+    } else {
+      const liveModels = parseCursorModelList(`${listed.stdout}\n${listed.stderr}`);
+      if (liveModels.length > 0) {
+        const configured = applyCursorModelDefaults(liveModels);
+        cursorModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+        return cursorModelCache;
+      }
+      console.warn("Cursor model discovery returned no models; using fallback catalog", {
+        exitCode: listed.exitCode,
+        stderrTail: listed.stderr.slice(-500)
+      });
     }
-    console.warn("Cursor model discovery returned no models; using fallback catalog", {
-      exitCode: listed.exitCode,
-      stderrTail: listed.stderr.slice(-500)
-    });
   } catch (error) {
     console.warn("Cursor model discovery failed; using fallback catalog", error);
   }
@@ -2512,16 +2519,23 @@ async function getOpenCodeModelSnapshot(): Promise<{
   if (openCodeModelCache && openCodeModelCache.expiresAt > Date.now()) return openCodeModelCache;
   try {
     const listed = await runHarnessCommand(env.openCodeBinary, ["models"], { timeoutMs: 12_000 });
-    const liveModels = parseOpenCodeModelList(`${listed.stdout}\n${listed.stderr}`);
-    if (liveModels.length > 0) {
-      const configured = applyOpenCodeModelDefaults(liveModels);
-      openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
-      return openCodeModelCache;
+    if (listed.exitCode !== 0) {
+      console.warn("OpenCode model discovery exited nonzero; using fallback catalog", {
+        exitCode: listed.exitCode,
+        stderrTail: listed.stderr.slice(-500)
+      });
+    } else {
+      const liveModels = parseOpenCodeModelList(`${listed.stdout}\n${listed.stderr}`);
+      if (liveModels.length > 0) {
+        const configured = applyOpenCodeModelDefaults(liveModels);
+        openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+        return openCodeModelCache;
+      }
+      console.warn("OpenCode model discovery returned no models; using fallback catalog", {
+        exitCode: listed.exitCode,
+        stderrTail: listed.stderr.slice(-500)
+      });
     }
-    console.warn("OpenCode model discovery returned no models; using fallback catalog", {
-      exitCode: listed.exitCode,
-      stderrTail: listed.stderr.slice(-500)
-    });
   } catch (error) {
     console.warn("OpenCode model discovery failed; using fallback catalog", error);
   }

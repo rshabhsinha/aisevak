@@ -35,6 +35,11 @@ describe("Cursor helpers", () => {
     ).toEqual({ authenticated: false, email: null, message: "Not logged in" });
   });
 
+  it("ignores missing-binary errors instead of inventing models", () => {
+    expect(parseCursorModelList("spawn cursor-agent ENOENT")).toEqual([]);
+    expect(parseCursorModelList("cursor-agent: command not found")).toEqual([]);
+  });
+
   it("recognizes host keychain auth bundles", () => {
     expect(isCursorHostAuthBundle(cursorHostAuthBundle())).toBe(true);
     expect(isCursorHostAuthBundle(JSON.stringify({ homeFiles: {} }))).toBe(false);

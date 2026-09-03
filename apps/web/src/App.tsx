@@ -3343,7 +3343,6 @@ function AgentChatComposer(props: {
               }}
             >
               <SelectTrigger className="agent-harness-trigger" aria-label="Choose a harness" title={props.harnessLocked ? "Harness is locked for this thread" : "Choose a harness"}>
-                {provider ? <HarnessMark driver={provider.driver} size={14} /> : null}
                 <SelectValue placeholder="Harness" />
                 {props.harnessLocked ? <LockKeyhole size={11} /> : null}
               </SelectTrigger>
@@ -3411,10 +3410,10 @@ function AgentChatComposer(props: {
                               setModelQuery("");
                             }}
                           >
-                            <div className="model-row-copy flex-1 min-w-0">
-                              <span className="font-medium text-[13px] text-foreground truncate block">{modelEntry.label}</span>
+                            <div className="model-row-copy">
+                              <span className="model-row-label">{modelEntry.label}</span>
                               {modelEntry.description ? (
-                                <span className="text-[11.5px] text-muted-foreground line-clamp-1 block mt-0.5">{modelEntry.description}</span>
+                                <span className="model-row-desc">{modelEntry.description}</span>
                               ) : null}
                             </div>
                             {isSelected ? <Check size={14} className="text-primary shrink-0 ml-2" /> : null}
