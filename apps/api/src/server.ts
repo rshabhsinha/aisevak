@@ -57,7 +57,7 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 import { CursorAuthManager } from "./cursorAuth.js";
-import { OpenCodeAuthManager } from "./openCodeAuth.js";
+import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
 import { runHarnessCommand } from "./harnessCommand.js";
 import {
   cancelStaleQueuedAgentThreadRuns,
@@ -2529,7 +2529,10 @@ async function getOpenCodeModelSnapshot(): Promise<{
     }
   };
   try {
-    const listed = await runHarnessCommand(env.openCodeBinary, ["models"], { timeoutMs: 12_000 });
+    const listed = await runHarnessCommand(env.openCodeBinary, ["models"], {
+      env: scratchHomeEnv(),
+      timeoutMs: 12_000
+    });
     if (listed.exitCode !== 0) {
       console.warn("OpenCode CLI model discovery exited nonzero", {
         exitCode: listed.exitCode,
