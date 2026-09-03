@@ -11,6 +11,8 @@ export type AppView =
   | "api"
   | "credentials"
   | "codex"
+  | "cursor"
+  | "opencode"
   | "settings";
 
 export interface AppRoute {
@@ -31,6 +33,8 @@ const VIEW_PATHS: Record<Exclude<AppView, "runs">, string> = {
   api: "/settings/api",
   credentials: "/settings/credentials",
   codex: "/settings/chatgpt",
+  cursor: "/settings/cursor",
+  opencode: "/settings/opencode",
   settings: "/settings"
 };
 

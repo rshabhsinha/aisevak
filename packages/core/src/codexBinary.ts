@@ -12,12 +12,12 @@ export function resolveCodexBinary(
   const automatic = AUTO_VALUES.has(requested.toLowerCase());
 
   if (!automatic) {
-    const resolved = resolveExecutable(requested, environment);
+    const resolved = resolvePathExecutable(requested, environment);
     if (resolved) return resolved;
     if (requested !== "codex") return requested;
   }
 
-  const fromPath = resolveExecutable("codex", environment);
+  const fromPath = resolvePathExecutable("codex", environment);
   if (fromPath) return fromPath;
 
   if (process.platform === "darwin") {
@@ -35,7 +35,7 @@ export function resolveCodexBinary(
   return "codex";
 }
 
-function resolveExecutable(command: string, environment: NodeJS.ProcessEnv): string | null {
+export function resolvePathExecutable(command: string, environment: NodeJS.ProcessEnv = process.env): string | null {
   if (isAbsolute(command) || command.includes("/") || command.includes("\\")) {
     return isExecutable(command) ? command : null;
   }

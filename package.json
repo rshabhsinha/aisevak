@@ -14,6 +14,8 @@
     "dev:api": "pnpm --filter @aisevak/api dev",
     "dev:runner": "pnpm --filter @aisevak/runner dev",
     "dev:web": "pnpm --filter @aisevak/web dev",
+    "dev:site": "pnpm --filter @aisevak/site dev",
+    "build:site": "pnpm --filter @aisevak/site build",
     "test": "vitest run",
     "typecheck": "pnpm -r typecheck",
     "db:migrate": "pnpm --filter @aisevak/core migrate"

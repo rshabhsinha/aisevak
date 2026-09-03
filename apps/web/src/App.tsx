@@ -47,6 +47,7 @@ import { AgentAvatar } from "./components/agent-avatar";
 import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
+import { CursorLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { cn } from "./lib/utils";
@@ -114,6 +115,7 @@ interface Agent {
   kind: "worker" | "dispatcher";
   name: string;
   description: string;
+  provider_instance_id: string;
   model: string;
   model_options: ModelOptionSelection[];
   instructions: string;
@@ -164,7 +166,7 @@ interface ModelSelection {
 
 interface ProviderInstance {
   id: string;
-  driver: "codex";
+  driver: "codex" | "cursor" | "opencode";
   display_name: string;
   enabled: boolean;
   status: "ready" | "warning" | "error";
@@ -186,7 +188,7 @@ interface AgentThread {
   project_id: string | null;
   project_name: string | null;
   provider_instance_id: string;
-  provider_driver: "codex";
+  provider_driver: "codex" | "cursor" | "opencode";
   provider_name: string;
   model: string;
   model_options: ModelOptionSelection[];
@@ -635,10 +637,7 @@ export function App() {
       return;
     }
     if (!draftThread || composerSelection) return;
-    const provider = providerInstances[0];
-    if (!provider) return;
-    const sticky = readStickyModelSelection(provider);
-    setComposerSelection(sticky);
+    setComposerSelection(readStickyModelSelection(providerInstances));
   }, [selectedThread?.id, selectedThread?.model, selectedThread?.model_options, draftThread, providerInstances]);
 
   async function boot() {
@@ -838,7 +837,6 @@ export function App() {
   }
 
   function createAgentThread() {
-    const provider = providerInstances[0];
     threadLoadGuardRef.current.select(null);
     setSelectedThreadId(null);
     setDraftThread(true);
@@ -847,7 +845,7 @@ export function App() {
     setAgentThreadEventsTruncated(false);
     setThreadDetailState(threadDetailIdle());
     setPendingThreadMessages([]);
-    setComposerSelection(provider ? readStickyModelSelection(provider) : null);
+    setComposerSelection(readStickyModelSelection(providerInstances));
     navigateToView("runs");
     setMessage(null);
   }
@@ -1133,7 +1131,7 @@ export function App() {
               <Button
                 size="sm"
                 className="gap-1.5 font-medium"
-                onClick={() => setEditingAgent(emptyAgent(defaultModel, models))}
+                onClick={() => setEditingAgent(emptyAgent(providerInstances))}
               >
                 <Plus size={14} />
                 <span>New agent</span>
@@ -1238,6 +1236,7 @@ export function App() {
                   providers={providerInstances}
                   selection={composerSelection}
                   onSelectionChange={selectComposerModel}
+                  harnessLocked={Boolean(selectedThread && !draftThread)}
                   onSendMessage={sendAgentThreadMessage}
                   onBack={() => {
                     selectAgentThread("");
@@ -1265,8 +1264,7 @@ export function App() {
               agents={agents}
               skills={skills}
               tasks={tasks}
-              models={models}
-              defaultModel={defaultModel}
+              providers={providerInstances}
               editing={editingAgent}
               onSelectAgent={setEditingAgent}
               onSaved={reloadAgents}
@@ -1316,6 +1314,10 @@ export function App() {
                   ? "projects"
                   : view === "connectors"
                   ? "connectors"
+                  : view === "cursor"
+                  ? "cursor"
+                  : view === "opencode"
+                  ? "opencode"
                   : "codex"
               }
               onTabChange={(tab) => navigateToView(tab)}
@@ -3029,6 +3031,7 @@ function AgentChatsView(props: {
   pendingMessages: AgentRunChatMessage[];
   providers: ProviderInstance[];
   selection: ModelSelection | null;
+  harnessLocked?: boolean;
   onSelectionChange: (selection: ModelSelection) => Promise<void>;
   onSendMessage: (message: string, selection: ModelSelection) => Promise<void>;
   onBack?: () => void;
@@ -3246,6 +3249,7 @@ function AgentChatsView(props: {
             active={active}
             providers={props.providers}
             selection={props.selection}
+            harnessLocked={props.harnessLocked}
             message={draftMessage}
             onMessageChange={setDraftMessage}
             onSelectionChange={props.onSelectionChange}
@@ -3262,6 +3266,7 @@ function AgentChatComposer(props: {
   active: boolean;
   providers: ProviderInstance[];
   selection: ModelSelection | null;
+  harnessLocked?: boolean;
   message?: string;
   onMessageChange?: (msg: string) => void;
   onSelectionChange: (selection: ModelSelection) => Promise<void>;
@@ -3313,7 +3318,7 @@ function AgentChatComposer(props: {
           value={message}
           disabled={sending}
           rows={2}
-          placeholder={props.active ? "Send guidance to the active turn…" : "Ask Codex to build, inspect, or change something"}
+          placeholder={props.active ? "Send guidance to the active turn…" : "Ask the agent to build, inspect, or change something"}
           onChange={(event) => setMessage(event.target.value)}
           onKeyDown={(event) => {
             if (event.key !== "Enter" || event.shiftKey) return;
@@ -3323,6 +3328,40 @@ function AgentChatComposer(props: {
         />
         <div className="agent-composer-footer">
           <div className="agent-composer-controls">
+            <Select
+              value={provider?.id}
+              disabled={!provider || props.harnessLocked}
+              onValueChange={(providerId) => {
+                const nextProvider = props.providers.find((entry) => entry.id === providerId);
+                if (!nextProvider) return;
+                const nextModel =
+                  nextProvider.models.find((entry) => entry.id === selection?.model) ??
+                  nextProvider.models.find((entry) => entry.id === nextProvider.defaultModel) ??
+                  nextProvider.models[0];
+                if (!nextModel) return;
+                void props.onSelectionChange(selectionForModel(nextProvider, nextModel, selection));
+              }}
+            >
+              <SelectTrigger className="agent-harness-trigger" aria-label="Choose a harness" title={props.harnessLocked ? "Harness is locked for this thread" : "Choose a harness"}>
+                {provider ? <HarnessMark driver={provider.driver} size={14} /> : null}
+                <SelectValue placeholder="Harness" />
+                {props.harnessLocked ? <LockKeyhole size={11} /> : null}
+              </SelectTrigger>
+              <SelectContent side="top" align="start">
+                <SelectGroup>
+                  <SelectLabel>Harness</SelectLabel>
+                  {props.providers.map((entry) => (
+                    <SelectItem key={entry.id} value={entry.id}>
+                      <span className="agent-harness-option">
+                        <HarnessMark driver={entry.driver} size={13} />
+                        {entry.display_name}
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
+              </SelectContent>
+            </Select>
+
             <Popover
               open={pickerOpen}
               onOpenChange={(open) => {
@@ -3338,7 +3377,6 @@ function AgentChatComposer(props: {
                   type="button"
                   disabled={!provider}
                 >
-                  <OpenAILogo size={14} />
                   <span>{model?.label ?? selection?.model ?? "Choose model"}</span>
                   <ChevronDown size={11} />
                 </Button>
@@ -3352,32 +3390,31 @@ function AgentChatComposer(props: {
               >
                 <Command>
                   <CommandInput
-                    autoFocus
                     value={modelQuery}
                     placeholder="Search models…"
                     onValueChange={setModelQuery}
                   />
                   <CommandList>
                     <CommandEmpty>No matching models.</CommandEmpty>
-                    <CommandGroup>
-                      {(provider?.models ?? []).map((entry) => {
-                        const isSelected = entry.id === selection?.model;
+                    <CommandGroup heading={provider?.display_name ?? "Models"}>
+                      {(provider?.models ?? []).map((modelEntry) => {
+                        const isSelected = modelEntry.id === selection?.model;
                         return (
                           <CommandItem
-                            value={`${entry.label} ${entry.id} ${entry.description}`}
+                            value={`${modelEntry.label} ${modelEntry.id} ${modelEntry.description}`}
                             className={isSelected ? "is-selected" : ""}
-                            key={entry.id}
+                            key={modelEntry.id}
                             onSelect={() => {
                               if (!provider) return;
-                              void props.onSelectionChange(selectionForModel(provider, entry, selection));
+                              void props.onSelectionChange(selectionForModel(provider, modelEntry, selection));
                               setPickerOpen(false);
                               setModelQuery("");
                             }}
                           >
                             <div className="model-row-copy flex-1 min-w-0">
-                              <span className="font-medium text-[13px] text-foreground truncate block">{entry.label}</span>
-                              {entry.description ? (
-                                <span className="text-[11.5px] text-muted-foreground line-clamp-1 block mt-0.5">{entry.description}</span>
+                              <span className="font-medium text-[13px] text-foreground truncate block">{modelEntry.label}</span>
+                              {modelEntry.description ? (
+                                <span className="text-[11.5px] text-muted-foreground line-clamp-1 block mt-0.5">{modelEntry.description}</span>
                               ) : null}
                             </div>
                             {isSelected ? <Check size={14} className="text-primary shrink-0 ml-2" /> : null}
@@ -3444,8 +3481,7 @@ function AgentsView(props: {
   agents: Agent[];
   skills: Skill[];
   tasks: Task[];
-  models: CodexModel[];
-  defaultModel: string;
+  providers: ProviderInstance[];
   editing: Agent | null;
   onSelectAgent: (agent: Agent | null) => void;
   onSaved: () => Promise<void>;
@@ -3481,7 +3517,7 @@ function AgentsView(props: {
               />
               <div className="list-item-main">
                 <span className="list-item-title">{agent.name}</span>
-                <span className="list-item-desc">{agentSummary(agent, props.models)}</span>
+                <span className="list-item-desc">{agentSummary(agent, props.providers)}</span>
               </div>
               <ChevronRight size={14} className="mobile-chevron-indicator" />
             </button>
@@ -3508,8 +3544,7 @@ function AgentsView(props: {
               agents={props.agents}
               skills={props.skills}
               tasks={props.tasks}
-              models={props.models}
-              defaultModel={props.defaultModel}
+              providers={props.providers}
               onSaved={async (agent) => {
                 setEditing(agent);
                 await props.onSaved();
@@ -3533,8 +3568,7 @@ function AgentEditor(props: {
   agents: Agent[];
   skills: Skill[];
   tasks: Task[];
-  models: CodexModel[];
-  defaultModel: string;
+  providers: ProviderInstance[];
   onSaved: (agent: Agent) => Promise<void>;
   onDeleted: () => Promise<void>;
 }) {
@@ -3547,7 +3581,9 @@ function AgentEditor(props: {
     setDeleteArmed(false);
     setError(null);
   }, [props.agent]);
-  const selectedModel = props.models.find((model) => model.id === (draft.model || props.defaultModel));
+  const provider =
+    props.providers.find((entry) => entry.id === draft.provider_instance_id) ?? props.providers[0];
+  const selectedModel = provider?.models.find((model) => model.id === draft.model) ?? provider?.models.find((model) => model.id === provider.defaultModel);
   const resolvedModelOptions = selectedModel
     ? optionsForModel(selectedModel, normalizeComposerOptions(draft.model_options))
     : normalizeComposerOptions(draft.model_options);
@@ -3565,7 +3601,15 @@ function AgentEditor(props: {
         try {
           const result = await api<{ agent: Agent }>(path, {
             method: draft.id ? "PATCH" : "POST",
-            body: JSON.stringify({ ...draft, modelOptions: resolvedModelOptions })
+            body: JSON.stringify({
+              name: draft.name,
+              description: draft.description,
+              instructions: draft.instructions,
+              enabled: draft.enabled,
+              providerInstanceId: draft.provider_instance_id || provider?.id,
+              model: selectedModel?.id ?? draft.model,
+              modelOptions: resolvedModelOptions
+            })
           });
           await props.onSaved(result.agent);
         } catch (saveError) {
@@ -3593,11 +3637,36 @@ function AgentEditor(props: {
           <Input value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} />
         </label>
         <label>
+          Harness
+          <NativeSelect
+            value={provider?.id ?? ""}
+            onChange={(event) => {
+              const nextProvider = props.providers.find((entry) => entry.id === event.target.value);
+              const nextModel =
+                nextProvider?.models.find((entry) => entry.id === draft.model) ??
+                nextProvider?.models.find((entry) => entry.id === nextProvider.defaultModel) ??
+                nextProvider?.models[0];
+              setDraft({
+                ...draft,
+                provider_instance_id: event.target.value,
+                model: nextModel?.id ?? draft.model,
+                model_options: nextModel ? optionsForModel(nextModel) : []
+              });
+            }}
+          >
+            {props.providers.map((entry) => (
+              <option value={entry.id} key={entry.id}>
+                {entry.display_name}
+              </option>
+            ))}
+          </NativeSelect>
+        </label>
+        <label>
           Model
           <NativeSelect
-            value={draft.model || props.defaultModel}
+            value={selectedModel?.id ?? draft.model}
             onChange={(event) => {
-              const model = props.models.find((entry) => entry.id === event.target.value);
+              const model = provider?.models.find((entry) => entry.id === event.target.value);
               setDraft({
                 ...draft,
                 model: event.target.value,
@@ -3608,7 +3677,7 @@ function AgentEditor(props: {
             {draft.model && !selectedModel ? (
               <option value={draft.model}>{draft.model} - unavailable</option>
             ) : null}
-            {props.models.map((model) => (
+            {(provider?.models ?? []).map((model) => (
               <option value={model.id} key={model.id}>
                 {model.label}{model.badge ? ` - ${model.badge}` : ""}
               </option>
@@ -3665,7 +3734,7 @@ function AgentEditor(props: {
         />
       </label>
       <div className="model-list">
-        {props.models.map((model) => (
+        {(provider?.models ?? []).map((model) => (
           <span className="model-pill" key={model.id}>
             {model.id}
           </span>
@@ -3907,6 +3976,412 @@ function CodexConnectionView() {
         {status.apiKeyConfigured && !status.chatgptConnected ? (
           <div className="notice codex-inline-notice">An API key is currently configured as the fallback authentication method.</div>
         ) : null}
+        {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
+      </section>
+    </div>
+  );
+}
+
+function CursorConnectionView() {
+  const [status, setStatus] = useState({
+    connected: false,
+    activeMethod: null as "subscription" | "api_key" | null,
+    installed: true,
+    version: null as string | null,
+    email: null as string | null,
+    subscription: null as string | null,
+    needsLogin: true,
+    lastError: null as string | null
+  });
+  const [login, setLogin] = useState<{ loginId: string; verificationUrl: string | null; userCode: string | null; intervalSeconds: number; expiresAt: number } | null>(null);
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!login) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (login.expiresAt <= Date.now()) {
+        setError("The Cursor login request expired. Start a new login.");
+        setLogin(null);
+        return;
+      }
+      try {
+        const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
+          `/api/cursor-auth/login/${encodeURIComponent(login.loginId)}`
+        );
+        if (stopped) return;
+        setStatus(result.auth);
+        if (result.status === "connected") {
+          setLogin(null);
+          setError(null);
+          return;
+        }
+        timer = window.setTimeout(poll, Math.max(2000, login.intervalSeconds * 1000));
+      } catch (pollError) {
+        if (stopped) return;
+        setError(friendlyError(pollError instanceof Error ? pollError.message : "Cursor authorization failed."));
+        setLogin(null);
+      }
+    };
+    timer = window.setTimeout(poll, 2000);
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [login?.loginId]);
+
+  async function loadStatus() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/cursor-auth"));
+    } catch (statusError) {
+      setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Cursor status."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importHost() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/cursor-auth/import-host", { method: "POST" }));
+    } catch (importError) {
+      setError(
+        friendlyError(
+          importError instanceof Error
+            ? importError.message
+            : "Could not import portable Cursor CLI credentials from this host."
+        )
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startLogin() {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api<{ loginId: string; verificationUrl: string | null; userCode: string | null; intervalSeconds: number; expiresAt: number }>(
+        "/api/cursor-auth/login",
+        { method: "POST" }
+      );
+      setLogin(started);
+      if (started.verificationUrl) window.open(started.verificationUrl, "_blank", "noopener,noreferrer");
+    } catch (loginError) {
+      setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start Cursor login."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveApiKey() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/cursor-auth/api-key", { method: "POST", body: JSON.stringify({ apiKey }) }));
+      setApiKey("");
+    } catch (saveError) {
+      setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save Cursor API key."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/cursor-auth", { method: "DELETE" }));
+      setLogin(null);
+    } catch (disconnectError) {
+      setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Cursor."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flat-list-view api-view codex-connection-view">
+      <div className="flat-header">
+        <h3>Cursor</h3>
+      </div>
+      <section className="codex-connection-hero">
+        <div className="codex-connection-heading">
+          <div className="codex-connection-mark"><CursorLogo size={25} /></div>
+          <div>
+            <h4>Connect Cursor to Aisevak</h4>
+            <p>Save a Cursor API key for VM worker homes, or sign in on this Aisevak host so portable CLI files can be copied into encrypted secrets.</p>
+          </div>
+        </div>
+        <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Login required"}</Badge>
+      </section>
+      <section className="codex-connection-grid">
+        <div>
+          <span>Active method</span>
+          <strong>{status.activeMethod === "subscription" ? "Cursor subscription" : status.activeMethod === "api_key" ? "Cursor API key" : "None"}</strong>
+        </div>
+        <div>
+          <span>Account</span>
+          <strong>{status.email ?? "Not connected"}</strong>
+        </div>
+        <div>
+          <span>CLI</span>
+          <strong>{status.version ?? (status.installed ? "Installed" : "Missing")}</strong>
+        </div>
+      </section>
+      {login ? (
+        <section className="codex-login-panel">
+          <div>
+            <h4>Finish Cursor sign-in</h4>
+            <p>Complete the browser login. Aisevak copies any portable CLI files from this host into encrypted secrets for isolated worker homes.</p>
+          </div>
+          {login.verificationUrl ? (
+            <a href={login.verificationUrl} target="_blank" rel="noopener noreferrer" className="codex-auth-link">
+              Open Cursor authorization <ArrowUp size={14} />
+            </a>
+          ) : (
+            <span><Loader2 className="spin" size={13} /> Waiting for a login URL…</span>
+          )}
+        </section>
+      ) : null}
+      <section className="api-section codex-connection-actions">
+        <div className="section-title-row">
+          <div>
+            <h4>{status.connected ? "Connection is ready" : "Connect Cursor"}</h4>
+            <p>CURSOR_API_KEY is the portable VM path. Host sign-in only connects workers if Cursor writes files Aisevak can materialize into each task home.</p>
+          </div>
+          <div className="row-actions">
+            {status.connected ? (
+              <>
+                <Button variant="outline" disabled={busy} onClick={() => void loadStatus()}>
+                  <RefreshCw className={busy ? "spin" : ""} size={14} /> Refresh
+                </Button>
+                <Button variant="destructive" disabled={busy} onClick={() => void disconnect()}>
+                  Disconnect
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" disabled={busy || Boolean(login)} onClick={() => void importHost()}>
+                  Import host credentials
+                </Button>
+                <Button disabled={busy || Boolean(login)} onClick={() => void startLogin()}>
+                  {busy ? <Loader2 className="spin" size={14} /> : <CursorLogo size={14} />}
+                  Sign in with Cursor
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+        {!status.connected ? (
+          <form
+            className="row-actions"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveApiKey();
+            }}
+          >
+            <Input
+              type="password"
+              value={apiKey}
+              placeholder="CURSOR_API_KEY"
+              onChange={(event) => setApiKey(event.target.value)}
+            />
+            <Button type="submit" variant="outline" disabled={busy || !apiKey.trim()}>
+              Save API key
+            </Button>
+          </form>
+        ) : null}
+        {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
+      </section>
+    </div>
+  );
+}
+
+function OpenCodeConnectionView() {
+  const [status, setStatus] = useState({
+    connected: false,
+    installed: true,
+    providerIds: [] as string[],
+    needsLogin: true,
+    lastError: null as string | null
+  });
+  const [login, setLogin] = useState<{ loginId: string; verificationUrl: string | null; intervalSeconds: number; expiresAt: number } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!login) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (login.expiresAt <= Date.now()) {
+        setError("The OpenCode login request expired. Start a new login.");
+        setLogin(null);
+        return;
+      }
+      try {
+        const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
+          `/api/opencode-auth/login/${encodeURIComponent(login.loginId)}`
+        );
+        if (stopped) return;
+        setStatus(result.auth);
+        if (result.status === "connected") {
+          setLogin(null);
+          setError(null);
+          return;
+        }
+        timer = window.setTimeout(poll, Math.max(2000, login.intervalSeconds * 1000));
+      } catch (pollError) {
+        if (stopped) return;
+        setError(friendlyError(pollError instanceof Error ? pollError.message : "OpenCode authorization failed."));
+        setLogin(null);
+      }
+    };
+    timer = window.setTimeout(poll, 2000);
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [login?.loginId]);
+
+  async function loadStatus() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/opencode-auth"));
+    } catch (statusError) {
+      setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read OpenCode status."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importHost() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/opencode-auth/import-host", { method: "POST" }));
+    } catch (importError) {
+      setError(friendlyError(importError instanceof Error ? importError.message : "Could not import host OpenCode credentials."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startLogin() {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api<{ loginId: string; verificationUrl: string | null; intervalSeconds: number; expiresAt: number }>(
+        "/api/opencode-auth/login",
+        { method: "POST" }
+      );
+      setLogin(started);
+      if (started.verificationUrl) window.open(started.verificationUrl, "_blank", "noopener,noreferrer");
+    } catch (loginError) {
+      setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start OpenCode login."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/opencode-auth", { method: "DELETE" }));
+      setLogin(null);
+    } catch (disconnectError) {
+      setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect OpenCode."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flat-list-view api-view codex-connection-view">
+      <div className="flat-header">
+        <h3>OpenCode</h3>
+      </div>
+      <section className="codex-connection-hero">
+        <div className="codex-connection-heading">
+          <div className="codex-connection-mark"><OpenCodeLogo size={25} /></div>
+          <div>
+            <h4>Connect OpenCode to Aisevak</h4>
+            <p>Import this machine’s OpenCode credentials or sign in so worker threads can run the OpenCode harness.</p>
+          </div>
+        </div>
+        <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Login required"}</Badge>
+      </section>
+      <section className="codex-connection-grid">
+        <div>
+          <span>Providers</span>
+          <strong>{status.providerIds.length > 0 ? status.providerIds.join(", ") : "None"}</strong>
+        </div>
+        <div>
+          <span>CLI</span>
+          <strong>{status.installed ? "Installed" : "Missing"}</strong>
+        </div>
+      </section>
+      {login ? (
+        <section className="codex-login-panel">
+          <div>
+            <h4>Finish OpenCode sign-in</h4>
+            <p>Complete the provider login. Aisevak stores the resulting auth.json for later runs.</p>
+          </div>
+          {login.verificationUrl ? (
+            <a href={login.verificationUrl} target="_blank" rel="noopener noreferrer" className="codex-auth-link">
+              Open OpenCode authorization <ArrowUp size={14} />
+            </a>
+          ) : (
+            <span><Loader2 className="spin" size={13} /> Waiting for a login URL…</span>
+          )}
+        </section>
+      ) : null}
+      <section className="api-section codex-connection-actions">
+        <div className="section-title-row">
+          <div>
+            <h4>{status.connected ? "Connection is ready" : "Connect OpenCode"}</h4>
+            <p>Host import copies ~/.local/share/opencode/auth.json into Aisevak’s encrypted secrets.</p>
+          </div>
+          <div className="row-actions">
+            {status.connected ? (
+              <>
+                <Button variant="outline" disabled={busy} onClick={() => void loadStatus()}>
+                  <RefreshCw className={busy ? "spin" : ""} size={14} /> Refresh
+                </Button>
+                <Button variant="destructive" disabled={busy} onClick={() => void disconnect()}>
+                  Disconnect
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" disabled={busy} onClick={() => void importHost()}>
+                  Import host credentials
+                </Button>
+                <Button disabled={busy || Boolean(login)} onClick={() => void startLogin()}>
+                  {busy ? <Loader2 className="spin" size={14} /> : <OpenCodeLogo size={14} />}
+                  Sign in with OpenCode
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
         {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
       </section>
     </div>
@@ -4641,7 +5116,7 @@ function githubConnectionStatus(status: GithubConnection["status"]): string {
   }
 }
 
-type SettingsTab = "codex" | "api" | "credentials" | "projects" | "connectors";
+type SettingsTab = "codex" | "cursor" | "opencode" | "api" | "credentials" | "projects" | "connectors";
 
 function SettingsView(props: {
   activeTab: SettingsTab;
@@ -4663,6 +5138,8 @@ function SettingsView(props: {
 }) {
   const tabs: Array<{ id: SettingsTab; label: string; icon: ReactElement; restricted?: boolean }> = [
     { id: "codex", label: "ChatGPT", icon: <OpenAILogo size={14} />, restricted: true },
+    { id: "cursor", label: "Cursor", icon: <CursorLogo size={14} />, restricted: true },
+    { id: "opencode", label: "OpenCode", icon: <OpenCodeLogo size={14} />, restricted: true },
     { id: "api", label: "API Keys", icon: <KeyRound size={14} /> },
     { id: "credentials", label: "Credentials", icon: <LockKeyhole size={14} />, restricted: true },
     { id: "projects", label: "Projects", icon: <FolderGit2 size={14} /> },
@@ -4690,6 +5167,12 @@ function SettingsView(props: {
       <div className="settings-content-pane">
         {props.activeTab === "codex" && props.userRole !== "member" ? (
           <CodexConnectionView />
+        ) : null}
+        {props.activeTab === "cursor" && props.userRole !== "member" ? (
+          <CursorConnectionView />
+        ) : null}
+        {props.activeTab === "opencode" && props.userRole !== "member" ? (
+          <OpenCodeConnectionView />
         ) : null}
         {props.activeTab === "api" ? (
           <ApiView apiKeys={props.apiKeys} onSaved={props.onSavedApiKeys} />
@@ -5133,14 +5616,18 @@ function NavButton({ icon, label, active, onClick, className }: { icon: ReactNod
   );
 }
 
-function emptyAgent(defaultModel: string, models: CodexModel[]): Agent {
-  const model = models.find((entry) => entry.id === defaultModel) ?? models[0];
+function emptyAgent(providers: ProviderInstance[]): Agent {
+  const provider = providers[0];
+  const model = provider
+    ? (provider.models.find((entry) => entry.id === provider.defaultModel) ?? provider.models[0])
+    : undefined;
   return {
     id: "",
     kind: "worker",
     name: "New Agent",
     description: "",
-    model: model?.id ?? defaultModel,
+    provider_instance_id: provider?.id ?? "codex-local",
+    model: model?.id ?? "",
     model_options: model ? optionsForModel(model) : [],
     instructions: "You are a focused coding agent. Complete the task, verify it, and summarize the result.",
     enabled: true
@@ -5253,7 +5740,7 @@ function apiKeyStatus(key: ExternalApiKey): string {
 }
 
 function isSettingsView(view: View): boolean {
-  return ["settings", "codex", "api", "credentials", "projects", "connectors"].includes(view);
+  return ["settings", "codex", "cursor", "opencode", "api", "credentials", "projects", "connectors"].includes(view);
 }
 
 function viewTitle(view: View): string {
@@ -5268,6 +5755,8 @@ function viewTitle(view: View): string {
     schedules: "Schedule",
     settings: "Settings",
     codex: "Settings",
+    cursor: "Settings",
+    opencode: "Settings",
     api: "Settings",
     credentials: "Settings",
     projects: "Settings",
@@ -5314,12 +5803,13 @@ function optionsForModel(
   });
 }
 
-function agentSummary(agent: Agent, models: CodexModel[]): string {
-  const model = models.find((entry) => entry.id === agent.model);
+function agentSummary(agent: Agent, providers: ProviderInstance[]): string {
+  const provider = providers.find((entry) => entry.id === agent.provider_instance_id);
+  const model = provider?.models.find((entry) => entry.id === agent.model);
   const reasoningOption = model?.options?.find((option) => option.id === "reasoningEffort");
   const reasoning = normalizeComposerOptions(agent.model_options)
     .find((option) => option.id === "reasoningEffort")?.value ?? reasoningOption?.defaultValue;
-  return [agent.kind, agent.model, reasoning ? String(reasoning) : null].filter(Boolean).join(" / ");
+  return [provider?.display_name ?? agent.kind, agent.model, reasoning ? String(reasoning) : null].filter(Boolean).join(" / ");
 }
 
 function normalizeComposerOptions(value: unknown): ModelOptionSelection[] {
@@ -5333,12 +5823,13 @@ function normalizeComposerOptions(value: unknown): ModelOptionSelection[] {
   });
 }
 
-function readStickyModelSelection(provider: ProviderInstance): ModelSelection {
+function readStickyModelSelection(providers: ProviderInstance[]): ModelSelection | null {
+  if (providers.length === 0) return null;
   try {
     const raw = window.localStorage.getItem("aisevak.agent-model-selection.v2");
     if (raw) {
       const parsed = JSON.parse(raw) as ModelSelection;
-      const selectedProvider = parsed.providerInstanceId === provider.id ? provider : null;
+      const selectedProvider = providers.find((entry) => entry.id === parsed.providerInstanceId);
       if (selectedProvider?.models.some((model) => model.id === parsed.model)) {
         return { ...parsed, options: normalizeComposerOptions(parsed.options) };
       }
@@ -5346,6 +5837,7 @@ function readStickyModelSelection(provider: ProviderInstance): ModelSelection {
   } catch {
     // Ignore corrupt local preferences and use the live provider default.
   }
+  const provider = providers[0]!;
   const model = provider.models.find((entry) => entry.id === provider.defaultModel) ?? provider.models[0];
   return model
     ? selectionForModel(provider, model)

@@ -15,7 +15,7 @@ export type AgentKind = "worker" | "dispatcher";
 export type RunKind = "worker" | "dispatcher";
 export type RunTrigger = "manual" | "heartbeat" | "auto_route" | "agent_tool";
 
-export type ProviderDriver = "codex";
+export type ProviderDriver = "codex" | "cursor" | "opencode";
 
 export interface ModelOptionSelection {
   id: string;
