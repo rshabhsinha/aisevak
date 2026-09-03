@@ -37,6 +37,8 @@ services:
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY must be set}
       MANAGED_ROOT: /srv/aisevak
       CODEX_BINARY: ${CODEX_BINARY:-auto}
+      CURSOR_BINARY: ${CURSOR_BINARY:-auto}
+      OPENCODE_BINARY: ${OPENCODE_BINARY:-auto}
       CODEX_DEFAULT_MODEL: ${CODEX_DEFAULT_MODEL:-gpt-5.6-luna}
       CODEX_OAUTH_CLIENT_ID: ${CODEX_OAUTH_CLIENT_ID:-}
       GITHUB_HOST: ${GITHUB_HOST:-github.com}
@@ -48,6 +50,9 @@ services:
       # remain host-runner-only.
       - /srv/aisevak/skills:/srv/aisevak/skills
       - /srv/aisevak/probe-schema:/srv/aisevak/probe-schema
+      # Host-published harness CLIs (read-only) so status probes and model
+      # discovery inside the container see the same binaries as the runner.
+      - /opt/aisevak/harness-bin:/opt/aisevak/harness-bin:ro
 
   web:
     build:

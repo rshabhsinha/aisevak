@@ -104,14 +104,18 @@ if ! command_exists pnpm; then
 fi
 
 # Agent harness CLIs run as RUNNER_USER. Both vendor installers are
-# HOME-bound, so install as the runner user and symlink into /usr/local/bin
-# where every process (host runner, containers' PATH lookups) can resolve them.
+# HOME-bound, so install as the runner user, publish real binaries into
+# HARNESS_BIN_DIR (bind-mounted read-only into the API container so its
+# status probes and model discovery see the same CLIs), and symlink into
+# /usr/local/bin for the host runner and operator shells.
+HARNESS_BIN_DIR="${APP_DIR}/harness-bin"
 install_harness_clis() {
   local runner_home
   runner_home="$(getent passwd "${RUNNER_USER}" | cut -d: -f6)"
   if [[ -z "${runner_home}" ]]; then
     fail "Runner user ${RUNNER_USER} has no home directory."
   fi
+  install -d -o root -g "${RUNNER_USER}" -m 0755 "${HARNESS_BIN_DIR}"
   if command_exists curl; then
     if [[ ! -x "${runner_home}/.opencode/bin/opencode" ]]; then
       log "Installing OpenCode CLI for ${RUNNER_USER}"
@@ -127,6 +131,20 @@ install_harness_clis() {
   [[ -x "${runner_home}/.opencode/bin/opencode" ]] && ln -sf "${runner_home}/.opencode/bin/opencode" /usr/local/bin/opencode
   [[ -x "${runner_home}/.local/bin/agent" ]] && ln -sf "${runner_home}/.local/bin/agent" /usr/local/bin/agent
   [[ -x "${runner_home}/.local/bin/cursor-agent" ]] && ln -sf "${runner_home}/.local/bin/cursor-agent" /usr/local/bin/cursor-agent
+  # Publish dereferenced copies for the read-only container mount.
+  # opencode is a single static binary; cursor-agent is a launcher that
+  # needs its sibling node runtime, so publish its whole version directory.
+  if [[ -x /usr/local/bin/opencode ]]; then
+    cp -f /usr/local/bin/opencode "${HARNESS_BIN_DIR}/opencode"
+  fi
+  if [[ -x /usr/local/bin/cursor-agent ]]; then
+    cursor_version_dir="$(dirname "$(readlink -f /usr/local/bin/cursor-agent)")"
+    rm -rf "${HARNESS_BIN_DIR}/cursor-dist"
+    cp -r "${cursor_version_dir}" "${HARNESS_BIN_DIR}/cursor-dist"
+    ln -sf cursor-dist/cursor-agent "${HARNESS_BIN_DIR}/cursor-agent"
+    ln -sf cursor-dist/cursor-agent "${HARNESS_BIN_DIR}/agent"
+  fi
+  chmod -R a+rX "${HARNESS_BIN_DIR}" 2>/dev/null || true
   if command_exists npm; then
     log "Updating Codex CLI"
     npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
