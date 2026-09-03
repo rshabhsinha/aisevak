@@ -74,6 +74,7 @@ interface TurnState {
   finalError: string | null;
   cancelRequested: boolean;
   eventChain: Promise<void>;
+  eventError: Error | null;
   resolveCompleted: () => void;
   completedPromise: Promise<void>;
 }
@@ -118,6 +119,7 @@ class PersistentAppServer {
   private nextId = 1;
   private activeTurn: TurnState | null = null;
   private initializePromise: Promise<void> | null = null;
+  private closingPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   private closed = false;
 
@@ -197,6 +199,7 @@ class PersistentAppServer {
       finalError: null,
       cancelRequested: false,
       eventChain: Promise.resolve(),
+      eventError: null,
       resolveCompleted,
       completedPromise
     };
@@ -321,6 +324,11 @@ class PersistentAppServer {
           .finally(() => {
             monitorBusy = false;
           });
+        // Monitor callbacks also persist delivery state. Observe their failure
+        // while a provider turn is active, not only in runTurn's final cleanup.
+        void monitorTask.catch((error: unknown) => {
+          this.failCallback(state, error, "turn monitor");
+        });
       }, 750);
 
       const closeOrTurn = await Promise.race([
@@ -330,7 +338,12 @@ class PersistentAppServer {
       if (closeOrTurn.kind === "close" && !state.completed) {
         throw closeOrTurn.error ?? new Error(`app-server exited before turn completed with code ${closeOrTurn.code ?? "null"}`);
       }
-      await state.eventChain;
+      if (monitor) clearInterval(monitor);
+      monitor = null;
+      // An already-running monitor may receive a late turn/steer response and
+      // append its persistence callback. Drain it BEFORE the final event chain.
+      await monitorTask;
+      await this.drainEvents(state);
 
       return {
         status: state.finalStatus ?? "failed",
@@ -343,7 +356,15 @@ class PersistentAppServer {
         promptMayHaveBeenPresented: state.promptMayHaveBeenPresented
       };
     } catch (error) {
-      await state.eventChain.catch(() => undefined);
+      if (monitor) clearInterval(monitor);
+      monitor = null;
+      await monitorTask.catch(() => undefined);
+      await this.drainEvents(state).catch(() => undefined);
+      // A completed turn can race a delayed persistence failure. Quarantine
+      // starts closing synchronously, but the old provider may still execute
+      // tools until its actual close event. Do not release this run earlier.
+      if (this.closed) await this.closePromise;
+      const failure = state.eventError ?? error;
       return {
         status: state.cancelRequested ? "interrupted" : "failed",
         threadId: state.threadId ?? "",
@@ -351,7 +372,7 @@ class PersistentAppServer {
         rawStdout: state.rawStdout,
         rawStderr: this.rawStderr.slice(state.stderrStart),
         exitCode: null,
-        error: error instanceof Error ? error.message : String(error),
+        error: redactText(failure instanceof Error ? failure.message : String(failure), [...this.redactionSecrets]),
         promptMayHaveBeenPresented: state.promptMayHaveBeenPresented
       };
     } finally {
@@ -362,22 +383,33 @@ class PersistentAppServer {
         this.turnStates.delete(state.turnId);
       }
       if (this.activeTurn === state) this.activeTurn = null;
+      if (this.closed) {
+        this.rawStderr = "";
+        this.redactionSecrets.clear();
+      }
       this.scheduleIdleCheck(idleSessionMs);
     }
   }
 
-  async close(): Promise<void> {
-    if (this.closed) return;
+  close(): Promise<void> {
+    if (this.closingPromise) return this.closingPromise;
     this.closed = true;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = null;
     this.rejectPending(new Error("app-server session closed"));
-    await stopChild(this.child, this.closePromise.then(({ code }) => code));
-    this.turnStates.clear();
-    this.loadedThreads.clear();
-    this.redactionSecrets.clear();
-    this.stdoutBuffer = "";
-    this.rawStderr = "";
+    this.closingPromise = (async () => {
+      await stopChild(this.child, this.closePromise.then(({ code }) => code));
+      this.turnStates.clear();
+      this.loadedThreads.clear();
+      this.stdoutBuffer = "";
+      // An in-flight monitor may outlast process shutdown. Keep the active
+      // turn's redacted diagnostics/redaction set until its result is captured.
+      if (!this.activeTurn) {
+        this.redactionSecrets.clear();
+        this.rawStderr = "";
+      }
+    })();
+    return this.closingPromise;
   }
 
   private async initialize(): Promise<void> {
@@ -443,7 +475,7 @@ class PersistentAppServer {
     if (state && maybeThreadId && maybeThreadId !== state.threadId) {
       state.threadId = maybeThreadId;
       this.loadedThreads.add(maybeThreadId);
-      state.eventChain = state.eventChain.then(() => state.options.onThreadId(maybeThreadId));
+      this.queueEvent(state, () => state.options.onThreadId(maybeThreadId));
     }
 
     if (message.method && message.id !== undefined) {
@@ -480,7 +512,36 @@ class PersistentAppServer {
     const redacted = redactText(line, [...this.redactionSecrets]);
     state.rawStdout += `${redacted}\n`;
     const seq = state.seq++;
-    state.eventChain = state.eventChain.then(() => state.options.onLine(redacted, seq));
+    this.queueEvent(state, () => state.options.onLine(redacted, seq));
+  }
+
+  private queueEvent(state: TurnState, persist: () => Promise<void>): void {
+    const next = state.eventChain.then(persist);
+    state.eventChain = next;
+    // Observe rejection immediately, not only after turn/completed arrives.
+    // A failed DB write must fail this turn, never become a process-wide
+    // unhandled rejection while unrelated provider turns are still running.
+    void next.catch((error: unknown) => {
+      // Preserve the rejected chain for ordered completion/failure reporting;
+      // do not continue later writes or silently turn failure into success.
+      this.failCallback(state, error, "event persistence");
+    });
+  }
+
+  private async drainEvents(state: TurnState): Promise<void> {
+    let observed: Promise<void>;
+    do {
+      observed = state.eventChain;
+      await observed;
+    } while (observed !== state.eventChain);
+  }
+
+  private failCallback(state: TurnState, error: unknown, context: string): void {
+    if (!state.eventError) {
+      const detail = error instanceof Error ? error.message : String(error);
+      state.eventError = new Error(`Codex ${context} failed: ${redactText(detail, [...this.redactionSecrets])}`);
+    }
+    this.quarantine(state.eventError);
   }
 
   private bindTurnId(state: TurnState, turnId: string | undefined): void {
@@ -700,11 +761,17 @@ async function stopChild(
   child: ChildProcessWithoutNullStreams,
   closePromise: Promise<number | null>
 ): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.exitCode !== null || child.signalCode !== null) {
+    await closePromise;
+    return;
+  }
   child.stdin.end();
   child.kill("SIGTERM");
   await Promise.race([closePromise.catch(() => null), sleep(2000)]);
   if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  // Sending SIGKILL is not proof of exit; every closing caller waits for the
+  // actual process/stdio close before a replacement may reuse this runtime.
+  await closePromise;
 }
 
 function sleep(ms: number): Promise<void> {
