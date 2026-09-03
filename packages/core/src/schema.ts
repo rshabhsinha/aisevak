@@ -129,6 +129,7 @@ export const agents = pgTable("agents", {
   name: text("name").notNull(),
   description: text("description").notNull().default(""),
   model: text("model").notNull().default("gpt-5.6-luna"),
+  providerInstanceId: text("provider_instance_id").notNull().default("codex-local"),
   modelOptions: jsonb("model_options").notNull().default([{ id: "reasoningEffort", value: "max" }]),
   capabilities: jsonb("capabilities").notNull().default([]),
   instructions: text("instructions").notNull(),

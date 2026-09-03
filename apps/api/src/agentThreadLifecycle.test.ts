@@ -73,6 +73,7 @@ describe("coordinated task agent threads", () => {
       agent_description: "Builds",
       agent_model: "gpt-5.6-luna",
       agent_model_options: [],
+      agent_provider_instance_id: "codex-local",
       agent_instructions: "Build it"
     };
     const query = async (sql: string, params?: unknown[]) => {
@@ -248,6 +249,7 @@ describe("coordinated task agent threads", () => {
       agent_description: "Builds",
       agent_model: "gpt-test",
       agent_model_options: [],
+      agent_provider_instance_id: "codex-local",
       agent_instructions: "Build it"
     };
     const query = async (sql: string) => {
@@ -305,6 +307,7 @@ describe("coordinated task agent threads", () => {
       agent_description: "Builds",
       agent_model: "gpt-test",
       agent_model_options: [],
+      agent_provider_instance_id: "codex-local",
       agent_instructions: "Build it"
     };
     const query = async (sql: string) => {

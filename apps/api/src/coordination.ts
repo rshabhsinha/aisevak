@@ -2188,12 +2188,12 @@ async function queueDelivery(
     const created = await client.query<AgentThreadSession>(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
-       VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (coordination_thread_id, agent_id)
          WHERE coordination_thread_id IS NOT NULL
        DO NOTHING
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), desiredCwd, runtimeHome, threadId]
+      [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.provider_instance_id || "codex-local", recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), desiredCwd, runtimeHome, threadId]
     );
     session = created.rows[0];
     if (!session) {

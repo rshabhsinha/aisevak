@@ -1035,7 +1035,10 @@ WHERE coordination_threads.primary_agent_id IS NOT NULL
 ON CONFLICT (thread_id, agent_id) DO NOTHING;
 
 INSERT INTO provider_instances (id, driver, display_name, enabled)
-VALUES ('codex-local', 'codex', 'Codex', true)
+VALUES
+  ('codex-local', 'codex', 'Codex', true),
+  ('cursor-local', 'cursor', 'Cursor', true),
+  ('opencode-local', 'opencode', 'OpenCode', true)
 ON CONFLICT (id) DO UPDATE
 SET driver = EXCLUDED.driver,
     display_name = EXCLUDED.display_name,
@@ -1272,6 +1275,8 @@ DO $$ BEGIN
     CHECK (overlap_policy IN ('skip', 'queue', 'allow'));
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS schedules_task_idx ON schedules(task_id) WHERE task_id IS NOT NULL;
+
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL DEFAULT 'codex-local' REFERENCES provider_instances(id) ON DELETE RESTRICT;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

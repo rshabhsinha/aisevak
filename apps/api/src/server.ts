@@ -6,7 +6,6 @@ import {
   buildDispatcherPrompt,
   createPool,
   decryptSecret,
-  discoverCodexModels,
   encryptSecret,
   hashPassword,
   hashToken,
@@ -14,13 +13,23 @@ import {
   managedCodexHome,
   managedGithubRepoPath,
   newSessionToken,
+  applyCodexModelDefaults,
+  applyCursorModelDefaults,
+  applyOpenCodeModelDefaults,
+  CODEX_HARNESS_MODELS,
+  CURSOR_API_KEY_SECRET_NAME,
+  CURSOR_HARNESS_MODELS,
+  OPENCODE_HARNESS_MODELS,
+  defaultCodexModelOptions,
+  discoverCodexModels,
+  parseCursorModelList,
+  parseOpenCodeModelList,
   resolveCodexBinary,
+  resolveCursorBinary,
+  resolveOpenCodeBinary,
+  resolveCodexDefaultModel,
   removeInstalledSkill,
   normalizeCodexSkillSnapshots,
-  applyCodexModelDefaults,
-  CODEX_HARNESS_MODELS,
-  defaultCodexModelOptions,
-  resolveCodexDefaultModel,
   runMigrations,
   serializeCodexSkillSnapshots,
   synchronizeInstalledSkills,
@@ -45,6 +54,9 @@ import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
+import { CursorAuthManager } from "./cursorAuth.js";
+import { OpenCodeAuthManager } from "./openCodeAuth.js";
+import { runHarnessCommand } from "./harnessCommand.js";
 import {
   cancelStaleQueuedAgentThreadRuns,
   registerCoordinationRoutes,
@@ -84,6 +96,8 @@ const env = {
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
+  cursorBinary: resolveCursorBinary(process.env.CURSOR_BINARY),
+  openCodeBinary: resolveOpenCodeBinary(process.env.OPENCODE_BINARY),
   codexDefaultModel: resolveCodexDefaultModel(),
   githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
@@ -93,10 +107,28 @@ const MAX_AGENT_THREAD_EVENTS = 2_000;
 let codexModelCache:
   | { expiresAt: number; models: typeof CODEX_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
   | undefined;
+let cursorModelCache:
+  | { expiresAt: number; models: typeof CURSOR_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
+  | undefined;
+let openCodeModelCache:
+  | { expiresAt: number; models: typeof OPENCODE_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
+  | undefined;
 
 export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
   const codexAuth = new CodexAuthManager(pool, env.secretKey);
+  const cursorAuth = new CursorAuthManager(
+    pool,
+    env.secretKey,
+    env.cursorBinary,
+    resolve(env.managedRoot, "cursor-auth")
+  );
+  const openCodeAuth = new OpenCodeAuthManager(
+    pool,
+    env.secretKey,
+    env.openCodeBinary,
+    resolve(env.managedRoot, "opencode-auth")
+  );
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
   await app.register(cors, {
@@ -258,6 +290,68 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return codexAuth.disconnect();
   });
 
+  app.get("/api/cursor-auth", async (request) => {
+    requireAdmin(request);
+    return cursorAuth.getStatus();
+  });
+
+  app.post("/api/cursor-auth/api-key", async (request) => {
+    requireAdmin(request);
+    const body = z.object({ apiKey: z.string().trim().min(1) }).parse(request.body);
+    return cursorAuth.saveApiKey(body.apiKey);
+  });
+
+  app.post("/api/cursor-auth/import-host", async (request) => {
+    requireAdmin(request);
+    try {
+      return await cursorAuth.importHostAuth();
+    } catch (error) {
+      throw app.httpErrors.badRequest(error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  app.post("/api/cursor-auth/login", async (request) => {
+    const user = requireAdmin(request);
+    return cursorAuth.startLogin(user.id);
+  });
+
+  app.get("/api/cursor-auth/login/:id", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    return cursorAuth.pollLogin(id, user.id);
+  });
+
+  app.delete("/api/cursor-auth", async (request) => {
+    requireAdmin(request);
+    return cursorAuth.disconnect();
+  });
+
+  app.get("/api/opencode-auth", async (request) => {
+    requireAdmin(request);
+    return openCodeAuth.getStatus();
+  });
+
+  app.post("/api/opencode-auth/import-host", async (request) => {
+    requireAdmin(request);
+    return openCodeAuth.importHostAuth();
+  });
+
+  app.post("/api/opencode-auth/login", async (request) => {
+    const user = requireAdmin(request);
+    return openCodeAuth.startLogin(user.id);
+  });
+
+  app.get("/api/opencode-auth/login/:id", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    return openCodeAuth.pollLogin(id, user.id);
+  });
+
+  app.delete("/api/opencode-auth", async (request) => {
+    requireAdmin(request);
+    return openCodeAuth.disconnect();
+  });
+
   app.get("/api/codex/models", async (request) => {
     requireUser(request);
     return getCodexModelSnapshot();
@@ -265,7 +359,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/provider-instances", async (request) => {
     requireUser(request);
-    const [instances, catalog] = await Promise.all([
+    const [instances, codexCatalog, cursorCatalog, openCodeCatalog] = await Promise.all([
       pool.query<{
         id: string;
         driver: string;
@@ -277,17 +371,29 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          WHERE enabled = true
          ORDER BY created_at ASC`
       ),
-      getCodexModelSnapshot()
+      getCodexModelSnapshot(),
+      getCursorModelSnapshot(pool),
+      getOpenCodeModelSnapshot()
     ]);
     return {
-      instances: instances.rows.map((instance) => ({
-        ...instance,
-        status: "ready",
-        capabilities: { sessionModelSwitch: "in-session" },
-        models: instance.driver === "codex" ? catalog.models : [],
-        defaultModel: instance.driver === "codex" ? catalog.defaultModel : null,
-        modelSource: instance.driver === "codex" ? catalog.source : null
-      }))
+      instances: instances.rows.map((instance) => {
+        const catalog =
+          instance.driver === "cursor"
+            ? cursorCatalog
+            : instance.driver === "opencode"
+              ? openCodeCatalog
+              : instance.driver === "codex"
+                ? codexCatalog
+                : { models: [], defaultModel: null, source: null };
+        return {
+          ...instance,
+          status: "ready",
+          capabilities: { sessionModelSwitch: "in-session" },
+          models: catalog.models,
+          defaultModel: catalog.defaultModel,
+          modelSource: catalog.source
+        };
+      })
     };
   });
 
@@ -529,13 +635,15 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireAdmin(request);
     const body = agentSchema.parse(request.body);
     const model = body.model ?? env.codexDefaultModel;
+    const providerInstanceId = await resolveAgentProviderInstanceId(pool, body.providerInstanceId);
     const result = await pool.query(
-      `INSERT INTO agents (name, description, model, model_options, capabilities, instructions, enabled)
-       VALUES ($1, $2, $3, $4, $5, $6, true)
+      `INSERT INTO agents (name, description, provider_instance_id, model, model_options, capabilities, instructions, enabled)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, true)
        RETURNING *`,
       [
         body.name,
         body.description ?? "",
+        providerInstanceId,
         model,
         JSON.stringify(modelOptionsFor(model, body.modelOptions)),
         JSON.stringify(body.capabilities ?? []),
@@ -552,15 +660,19 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireAdmin(request);
     const { id } = idParams.parse(request.params);
     const body = agentPatchSchema.parse(request.body);
+    const providerInstanceId = body.providerInstanceId
+      ? await resolveAgentProviderInstanceId(pool, body.providerInstanceId)
+      : null;
     const result = await pool.query(
       `UPDATE agents
        SET name = COALESCE($2, name),
            description = COALESCE($3, description),
-           model = COALESCE($4, model),
-           model_options = COALESCE($5, model_options),
-           capabilities = COALESCE($6, capabilities),
-           instructions = COALESCE($7, instructions),
-           enabled = COALESCE($8, enabled),
+           provider_instance_id = COALESCE($4, provider_instance_id),
+           model = COALESCE($5, model),
+           model_options = COALESCE($6, model_options),
+           capabilities = COALESCE($7, capabilities),
+           instructions = COALESCE($8, instructions),
+           enabled = COALESCE($9, enabled),
            updated_at = now()
        WHERE id = $1
        RETURNING *`,
@@ -568,6 +680,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         id,
         body.name ?? null,
         body.description ?? null,
+        providerInstanceId,
         body.model ?? null,
         body.modelOptions ? JSON.stringify(body.modelOptions) : null,
         body.capabilities ? JSON.stringify(body.capabilities) : null,
@@ -1855,6 +1968,7 @@ const modelOptionSelectionSchema = z.object({
 const agentSchema = z.object({
   name: z.string().min(1),
   description: z.string().min(1),
+  providerInstanceId: z.string().trim().min(1).max(120).optional(),
   model: z.string().optional(),
   modelOptions: z.array(modelOptionSelectionSchema).max(20).optional(),
   capabilities: z.array(z.string().trim().min(1).max(100)).max(50).optional(),
@@ -1981,6 +2095,7 @@ interface TaskJoin {
   agent_description: string;
   agent_model: string;
   agent_model_options: unknown;
+  agent_provider_instance_id: string;
   agent_instructions: string;
   work_scope?: string;
   work_key?: string;
@@ -2259,8 +2374,8 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
       continue;
     }
     const result = await pool.query(
-      `INSERT INTO agents (kind, name, description, model, model_options, instructions, enabled)
-       VALUES ($1, $2, $3, $4, $5, $6, true)
+      `INSERT INTO agents (kind, name, description, provider_instance_id, model, model_options, instructions, enabled)
+       VALUES ($1, $2, $3, 'codex-local', $4, $5, $6, true)
        RETURNING *`,
       [
         agent.kind,
@@ -2317,6 +2432,7 @@ async function getTaskJoin(pool: Pick<DbPool, "query">, taskId: string): Promise
             agents.kind AS agent_kind,
             agents.name AS agent_name, agents.description AS agent_description,
             agents.model AS agent_model, agents.model_options AS agent_model_options,
+            agents.provider_instance_id AS agent_provider_instance_id,
             agents.instructions AS agent_instructions
      FROM tasks
      LEFT JOIN projects ON projects.id = tasks.project_id
@@ -2356,6 +2472,54 @@ async function getCodexModelSnapshot(): Promise<{
     expiresAt: Date.now() + 30_000
   };
   return codexModelCache;
+}
+
+async function getCursorModelSnapshot(pool: DbPool): Promise<{
+  defaultModel: string;
+  models: typeof CURSOR_HARNESS_MODELS;
+  source: "live" | "fallback";
+}> {
+  if (cursorModelCache && cursorModelCache.expiresAt > Date.now()) return cursorModelCache;
+  try {
+    const apiKey = await readSecret(pool, CURSOR_API_KEY_SECRET_NAME);
+    const listed = await runHarnessCommand(env.cursorBinary, ["--list-models"], {
+      env: { ...process.env, ...(apiKey ? { CURSOR_API_KEY: apiKey } : {}), NO_OPEN_BROWSER: "1" },
+      timeoutMs: 12_000
+    });
+    const liveModels = parseCursorModelList(`${listed.stdout}\n${listed.stderr}`);
+    if (liveModels.length > 0) {
+      const configured = applyCursorModelDefaults(liveModels);
+      cursorModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+      return cursorModelCache;
+    }
+  } catch (error) {
+    console.warn("Cursor model discovery failed; using fallback catalog", error);
+  }
+  const configured = applyCursorModelDefaults(CURSOR_HARNESS_MODELS);
+  cursorModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
+  return cursorModelCache;
+}
+
+async function getOpenCodeModelSnapshot(): Promise<{
+  defaultModel: string;
+  models: typeof OPENCODE_HARNESS_MODELS;
+  source: "live" | "fallback";
+}> {
+  if (openCodeModelCache && openCodeModelCache.expiresAt > Date.now()) return openCodeModelCache;
+  try {
+    const listed = await runHarnessCommand(env.openCodeBinary, ["models"], { timeoutMs: 12_000 });
+    const liveModels = parseOpenCodeModelList(`${listed.stdout}\n${listed.stderr}`);
+    if (liveModels.length > 0) {
+      const configured = applyOpenCodeModelDefaults(liveModels);
+      openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+      return openCodeModelCache;
+    }
+  } catch (error) {
+    console.warn("OpenCode model discovery failed; using fallback catalog", error);
+  }
+  const configured = applyOpenCodeModelDefaults(OPENCODE_HARNESS_MODELS);
+  openCodeModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
+  return openCodeModelCache;
 }
 
 async function listAgentThreads(
@@ -2416,10 +2580,7 @@ async function createAgentChatThread(
   input: z.infer<typeof createAgentThreadSchema>
 ): Promise<{ thread: AgentThreadRow; turn: Record<string, unknown> }> {
   const dispatcher = await getDispatcherAgent(pool);
-  const selection = await resolveModelSelection(pool, input.modelSelection, dispatcher.model, {
-    provider_instance_id: "codex-local",
-    model_options: dispatcher.model_options
-  });
+  const selection = await resolveModelSelection(pool, input.modelSelection, dispatcher.model);
   const runtimeHome = managedCodexHome(env.managedRoot, `dispatcher-${randomUUID()}`);
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const title = input.title ?? threadTitleFromMessage(input.message);
@@ -2573,15 +2734,13 @@ async function updateAgentThread(
   await pool.query(
     `UPDATE agent_threads
      SET title = COALESCE($2, title),
-         provider_instance_id = COALESCE($3, provider_instance_id),
-         model = COALESCE($4, model),
-         model_options = COALESCE($5, model_options),
+         model = COALESCE($3, model),
+         model_options = COALESCE($4, model_options),
          updated_at = now()
      WHERE id = $1`,
     [
       id,
       input.title ?? null,
-      selection?.providerInstanceId ?? null,
       selection?.model ?? null,
       selection ? JSON.stringify(selection.options) : null
     ]
@@ -2906,20 +3065,40 @@ async function selectThreadTurn(
   return result.rows[0] ?? null;
 }
 
+async function resolveAgentProviderInstanceId(
+  pool: Pick<DbPool, "query">,
+  providerInstanceId?: string
+): Promise<string> {
+  const id = providerInstanceId?.trim() || "codex-local";
+  const provider = await pool.query<{ enabled: boolean }>(
+    "SELECT enabled FROM provider_instances WHERE id = $1",
+    [id]
+  );
+  const instance = provider.rows[0];
+  if (!instance) throwBadRequest("The selected harness was not found");
+  if (!instance.enabled) throwBadRequest("The selected harness is disabled");
+  return id;
+}
+
 async function resolveModelSelection(
   pool: Pick<DbPool, "query">,
   input: ModelSelectionInput | undefined,
   fallbackModel: string,
   thread?: Pick<AgentThreadRow, "provider_instance_id" | "model_options">
 ): Promise<ModelSelectionInput> {
-  const providerInstanceId = input?.providerInstanceId ?? thread?.provider_instance_id ?? "codex-local";
+  if (thread && input?.providerInstanceId && input.providerInstanceId !== thread.provider_instance_id) {
+    throwBadRequest("The harness for this thread cannot be changed");
+  }
+  const providerInstanceId = thread?.provider_instance_id ?? input?.providerInstanceId ?? "codex-local";
   const provider = await pool.query<{ driver: string; enabled: boolean }>(
     "SELECT driver, enabled FROM provider_instances WHERE id = $1",
     [providerInstanceId]
   );
   const instance = mustRow(provider.rows[0]);
   if (!instance.enabled) throwBadRequest("The selected harness is disabled");
-  if (instance.driver !== "codex") throwBadRequest("Only the Codex harness is currently supported");
+  if (!["codex", "cursor", "opencode"].includes(instance.driver)) {
+    throwBadRequest("The selected harness is not supported");
+  }
   const model = input?.model ?? fallbackModel;
   return {
     providerInstanceId,
@@ -2988,7 +3167,7 @@ async function ensureTaskAgentThreadInTransaction(
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
           cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
-       VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
        ON CONFLICT (coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL DO UPDATE
          SET title = EXCLUDED.title,
              task_id = EXCLUDED.task_id,
@@ -3022,6 +3201,7 @@ async function ensureTaskAgentThreadInTransaction(
         input.task.agent_id,
         input.task.id,
         input.task.project_id,
+        input.task.agent_provider_instance_id || "codex-local",
         input.model,
         JSON.stringify(modelOptions),
         input.cwd,
@@ -3046,7 +3226,7 @@ async function ensureTaskAgentThreadInTransaction(
     `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id)
-     VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
      ON CONFLICT (task_id) WHERE task_id IS NOT NULL DO UPDATE
        SET agent_id = EXCLUDED.agent_id,
            project_id = EXCLUDED.project_id,
@@ -3087,6 +3267,7 @@ async function ensureTaskAgentThreadInTransaction(
       input.task.agent_id,
       input.task.id,
       input.task.project_id,
+      input.task.agent_provider_instance_id || "codex-local",
       input.model,
       JSON.stringify(modelOptions),
       input.cwd,
@@ -3179,7 +3360,7 @@ async function ensureTaskNavigationThreadInTransaction(
      `INSERT INTO agent_threads
        (title, agent_id, task_id, project_id, provider_instance_id, model, model_options,
         cwd, branch, runtime_home, provider_thread_id, coordination_thread_id)
-     VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9, $10, $11)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
      ON CONFLICT (task_id) WHERE task_id IS NOT NULL DO NOTHING
      RETURNING id`,
     [
@@ -3187,6 +3368,7 @@ async function ensureTaskNavigationThreadInTransaction(
       task.agent_id,
       task.id,
       task.project_id,
+      task.agent_provider_instance_id || "codex-local",
       task.agent_model,
       JSON.stringify(modelOptionsFor(task.agent_model, task.agent_model_options)),
       task.local_path ?? env.managedRoot,
@@ -4588,7 +4770,10 @@ async function main(): Promise<void> {
   const pool = createPool();
   await runMigrations(pool);
   const app = await buildServer(pool);
-  app.log.info({ codexBinary: env.codexBinary }, "Codex harness configured");
+  app.log.info(
+    { codexBinary: env.codexBinary, cursorBinary: env.cursorBinary, openCodeBinary: env.openCodeBinary },
+    "Harness binaries configured"
+  );
   await app.listen({ host: env.apiHost, port: env.apiPort });
 }
 

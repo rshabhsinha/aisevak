@@ -126,7 +126,7 @@ export function PromptComposer(props: PromptComposerProps) {
         disabled={props.disabled}
         aria-label={props.ariaLabel ?? "Prompt"}
         placeholder={props.placeholder}
-        style={{ minHeight: props.minHeight ?? 180, fontFamily: "var(--font-mono)", fontSize: 13 }}
+        style={{ minHeight: props.minHeight ?? 180, fontFamily: "var(--font-mono)" }}
         onFocus={(event) => {
           setFocused(true);
           setCursor(event.currentTarget.selectionStart);

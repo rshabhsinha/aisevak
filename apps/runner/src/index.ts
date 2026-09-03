@@ -16,18 +16,19 @@ import {
   newSessionToken,
   nextScheduleRunAt,
   normalizeCodexSkillSnapshots,
-  normalizeCodexEvent,
   parseCodexChatGptAuthFile,
-  parseCodexJsonLine,
   redactSecrets,
   resolveCodexBinary,
+  resolveCursorBinary,
+  resolveOpenCodeBinary,
   serializeCodexChatGptAuthFile,
   runMigrations,
   serializeCodexSkillSnapshots,
   withTransaction,
   type CodexSkillSnapshot,
   type CodexChatGptAuthFile,
-  type DbPool
+  type DbPool,
+  type ProviderDriver
 } from "@aisevak/core";
 import { agentToolScript } from "@aisevak/cli";
 import { createHash, randomUUID } from "node:crypto";
@@ -39,8 +40,11 @@ import { fileURLToPath } from "node:url";
 import {
   closeAllCodexAppServers,
   runCodexAppServerTurn,
-  type AppServerTurnInput
+  type AppServerTurnInput,
+  type AppServerTurnOptions
 } from "./appServerClient.js";
+import { closeAllAcpSessions } from "./acpClient.js";
+import { materializeHarnessAuth, normalizeHarnessLine, runHarnessTurn } from "./harnessRuntime.js";
 import {
   agentGithubEnvironment,
   authenticateGithubCli,
@@ -56,6 +60,8 @@ import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
 const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
+  cursorBinary: resolveCursorBinary(process.env.CURSOR_BINARY),
+  openCodeBinary: resolveOpenCodeBinary(process.env.OPENCODE_BINARY),
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
@@ -116,6 +122,7 @@ interface RunJob {
   skills_snapshot: CodexSkillSnapshot[];
   agent_id: string;
   coordination_thread_id: string | null;
+  provider_driver: ProviderDriver;
 }
 
 interface DispatcherJob {
@@ -156,6 +163,7 @@ interface DispatcherJob {
   assignment_key: string | null;
   assignment_status: string | null;
   assignment_attempt: number | null;
+  provider_driver: ProviderDriver;
 }
 
 async function main(): Promise<void> {
@@ -174,7 +182,9 @@ async function main(): Promise<void> {
   process.on("SIGINT", beginShutdown);
   process.on("SIGTERM", beginShutdown);
 
-  console.log(`Aisevak runner started (Codex: ${env.codexBinary})`);
+  console.log(
+    `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary})`
+  );
   while (!shuttingDown) {
     startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     try {
@@ -190,6 +200,7 @@ async function main(): Promise<void> {
   }
   await waitForRunJobs(activeRunJobs);
   await closeAllCodexAppServers();
+  await closeAllAcpSessions();
   await pool.end();
 }
 
@@ -1511,9 +1522,11 @@ export async function processOneDispatcherRun(
             coordination_threads.work_scope AS thread_work_scope,
             coordination_threads.work_key AS thread_work_key,
             agent_threads.ownership_generation,
-            agent_threads.coordination_thread_id
+            agent_threads.coordination_thread_id,
+            COALESCE(provider_instances.driver, 'codex') AS provider_driver
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+     LEFT JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
      LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      LEFT JOIN task_assignments ON task_assignments.id = dispatcher_runs.assignment_id
@@ -1549,9 +1562,22 @@ export async function processOneDispatcherRun(
 
   try {
     await mkdir(job.codex_home, { recursive: true });
-    await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    const driver = harnessDriver(job.provider_driver);
+    if (driver === "codex") {
+      await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    }
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
-    const codexAuth = await materializeCodexAuth(pool, job.codex_home);
+    const codexAuth =
+      driver === "codex"
+        ? await materializeCodexAuth(pool, job.codex_home)
+        : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
+    const harnessAuth =
+      driver === "codex"
+        ? null
+        : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
+            ...codexProcessEnv(),
+            HOME: job.codex_home
+          });
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await dispatcherRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -1618,7 +1644,7 @@ export async function processOneDispatcherRun(
         : job.scope === "heartbeat"
           ? job.prompt
           : detachedEnvelopePrompt(job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, job.prompt, job.thread_work_scope, job.thread_work_key);
-    const turn = await runTurn({
+    const turnOptions: AppServerTurnOptions = {
       codexBinary: env.codexBinary,
       cwd: job.cwd,
       codexHome: job.codex_home,
@@ -1638,7 +1664,7 @@ export async function processOneDispatcherRun(
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
       },
-      secrets: [...codexAuth.redactionSecrets, toolToken, ...credentialSecrets],
+      secrets: [...codexAuth.redactionSecrets, ...(harnessAuth?.secrets ?? []), toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         await pool.query(
@@ -1701,7 +1727,23 @@ export async function processOneDispatcherRun(
       },
       nextInput: () => claimAgentTurnInput(pool, "dispatcher", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
-    });
+    };
+    const turn =
+      driver === "codex"
+        ? await runTurn(turnOptions)
+        : await runHarnessTurn({
+            driver,
+            cursorBinary: env.cursorBinary,
+            openCodeBinary: env.openCodeBinary,
+            options: turnOptions,
+            acpEnv: {
+              ...(harnessAuth?.env ?? turnOptions.env),
+              PATH: turnOptions.env.PATH,
+              AISEVAK_API_URL: env.apiUrl,
+              AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+              AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home)
+            }
+          });
     promptMayHaveBeenPresented = turn.promptMayHaveBeenPresented;
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
@@ -1819,10 +1861,12 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             (SELECT count(*)::int FROM tasks child
                WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children,
             agent_threads.ownership_generation,
-            agent_threads.coordination_thread_id
+            agent_threads.coordination_thread_id,
+            COALESCE(provider_instances.driver, 'codex') AS provider_driver
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
+     LEFT JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
      JOIN tasks ON tasks.id = task_runs.task_id
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      WHERE task_runs.id = $1`,
@@ -1847,9 +1891,22 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       cwd
     ]);
     await mkdir(job.codex_home, { recursive: true });
-    await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    const driver = harnessDriver(job.provider_driver);
+    if (driver === "codex") {
+      await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
+    }
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
-    const codexAuth = await materializeCodexAuth(pool, job.codex_home);
+    const codexAuth =
+      driver === "codex"
+        ? await materializeCodexAuth(pool, job.codex_home)
+        : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
+    const harnessAuth =
+      driver === "codex"
+        ? null
+        : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
+            ...codexProcessEnv(),
+            HOME: job.codex_home
+          });
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await workerRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -1882,7 +1939,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       active_assignments: job.active_assignments,
       active_children: job.active_children
     }, job.coordination_thread_id, job.agent_thread_id, job.codex_thread_id, job.prompt);
-    const turn = await runCodexAppServerTurn({
+    const turnOptions: AppServerTurnOptions = {
       codexBinary: env.codexBinary,
       cwd,
       codexHome: job.codex_home,
@@ -1902,7 +1959,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
           ? { CODEX_API_KEY: codexAuth.apiKey, OPENAI_API_KEY: codexAuth.apiKey }
           : {})
       },
-      secrets: [...codexAuth.redactionSecrets, toolToken, ...credentialSecrets],
+      secrets: [...codexAuth.redactionSecrets, ...(harnessAuth?.secrets ?? []), toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
       onThreadId: async (threadId) => {
         if (!job.agent_thread_id) {
@@ -1958,7 +2015,23 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       },
       nextInput: () => claimAgentTurnInput(pool, "worker", job.id),
       onInputHandled: (input, error) => finishAgentTurnInput(pool, input, error)
-    });
+    };
+    const turn =
+      driver === "codex"
+        ? await runCodexAppServerTurn(turnOptions)
+        : await runHarnessTurn({
+            driver,
+            cursorBinary: env.cursorBinary,
+            openCodeBinary: env.openCodeBinary,
+            options: turnOptions,
+            acpEnv: {
+              ...(harnessAuth?.env ?? turnOptions.env),
+              PATH: turnOptions.env.PATH,
+              AISEVAK_API_URL: env.apiUrl,
+              AISEVAK_AGENT_TOKEN_FILE: agentTool.tokenFile,
+              AISEVAK_SKILLS_DIR: materializedSkillsRoot(job.codex_home)
+            }
+          });
     stdout = turn.rawStdout;
     stderr = turn.rawStderr;
     if (codexAuth.chatGptAuth && codexAuth.chatGptAuthRevision) {
@@ -2396,10 +2469,9 @@ function safeSkillFilePath(skillDir: string, relativePath: string): string {
   return join(skillDir, ...parts);
 }
 
-export async function persistCodexLine(pool: DbPool, job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id">, line: string, seq: number): Promise<void> {
-  const raw = parseCodexJsonLine(line);
-  if (!raw) return;
-  const normalized = normalizeCodexEvent(raw);
+export async function persistCodexLine(pool: DbPool, job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id"> & Partial<Pick<RunJob, "provider_driver" | "codex_thread_id">>, line: string, seq: number): Promise<void> {
+  const normalized = normalizeHarnessLine(harnessDriver(job.provider_driver), line, job.codex_thread_id);
+  if (!normalized) return;
   const threadId = extractThreadId(normalized);
   if (threadId) {
     if (!job.agent_thread_id) {
@@ -2420,13 +2492,12 @@ export async function persistCodexLine(pool: DbPool, job: Pick<RunJob, "id" | "t
 
 export async function persistDispatcherCodexLine(
   pool: DbPool,
-  job: Pick<DispatcherJob, "id">,
+  job: Pick<DispatcherJob, "id"> & Partial<Pick<DispatcherJob, "provider_driver" | "codex_thread_id">>,
   line: string,
   seq: number
 ): Promise<void> {
-  const raw = parseCodexJsonLine(line);
-  if (!raw) return;
-  const normalized = normalizeCodexEvent(raw);
+  const normalized = normalizeHarnessLine(harnessDriver(job.provider_driver), line, job.codex_thread_id);
+  if (!normalized) return;
   const threadId = extractThreadId(normalized);
   if (threadId) {
     await pool.query(
@@ -3165,6 +3236,10 @@ async function defaultBranch(cwd: string): Promise<string> {
 function mustRow<T>(row: T | undefined): T {
   if (!row) throw new Error("Expected database row was not found");
   return row;
+}
+
+function harnessDriver(value: string | null | undefined): ProviderDriver {
+  return value === "cursor" || value === "opencode" ? value : "codex";
 }
 
 function sleep(ms: number): Promise<void> {

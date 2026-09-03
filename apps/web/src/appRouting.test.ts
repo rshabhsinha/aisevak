@@ -7,6 +7,8 @@ describe("app routing", () => {
     ["/activity", "activity"],
     ["/incidents/", "incidents"],
     ["/settings/chatgpt", "codex"],
+    ["/settings/cursor", "cursor"],
+    ["/settings/opencode", "opencode"],
     ["/settings/api", "api"]
   ])("restores %s as the %s view", (path, view) => {
     expect(parseAppRoute(path)).toMatchObject({ view, threadId: null });

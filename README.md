@@ -1,54 +1,59 @@
-# Aisevak
+<div align="center">
+  <img src="apps/site/public/favicon.svg" width="64" height="64" alt="AiSevak Logo" />
+  <h1>AiSevak</h1>
+  <p><strong>The host-native autonomous operating system and multi-agent coordination layer for software engineers.</strong></p>
 
-A self-hosted coordination, context, and messaging layer for isolated agents running in a VM.
+  <p>
+    <a href="https://aisevak.com"><img src="https://img.shields.io/badge/Website-aisevak.com-7c72ff?style=flat-square" alt="Website" /></a>
+    <a href="https://aisevak.embedr.dev"><img src="https://img.shields.io/badge/Live%20Demo-aisevak.embedr.dev-34d399?style=flat-square" alt="Live Demo" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT License" /></a>
+    <a href="https://github.com/rshabhsinha/aisevak/stargazers"><img src="https://img.shields.io/github/stars/rshabhsinha/aisevak?style=flat-square&color=fbbf24" alt="GitHub Stars" /></a>
+  </p>
+</div>
 
-Agents coordinate entirely through the `aisevak` CLI. Durable threads hold shared history and outlive individual model turns; each participating agent keeps its own provider session for that thread, so queued follow-ups resume the same private model context. Unassigned tasks route to the Orchestrator, while authorized agents can address another agent directly when their workflow calls for it.
+---
 
-Every agent-visible resource has a stable key, title, description, status, and bounded content preview. Lists and Markdown content are cursor-paginated so agents can inspect context lazily:
+## ⚡ The Multi-Agent Problem & AiSevak Solution
 
+Running isolated coding agents (OpenAI Codex, Claude Code, Cursor, OpenCode) in single chat tabs causes severe context degradation, uncoordinated branch collisions, and exponential token waste.
+
+**AiSevak** transforms isolated LLMs into a coordinated autonomous engineering squad with deterministic host guarantees:
+
+1. **Durable Multi-Agent Threads**: Conversations outlive individual model turns; each agent retains its own private provider session for serialized follow-ups with zero context drift.
+2. **Isolated Git Worktrees**: Every task executes in its own dedicated, sandboxed branch worktree (`/srv/aisevak/worktrees/task-xxx`), allowing parallel work without Git locks.
+3. **Host-Native Linux Execution**: Runs real bash commands, Playwright headless browsers, compilers, Docker services, and AST-grep directly on host hardware.
+4. **$0 Token Markup (BYO AI)**: Connect your existing OpenAI Codex (device-code auth), Anthropic Claude Code, Cursor, or local Ollama subscriptions directly. No middleman fee.
+5. **Unified CLI Socket (`aisevak`)**: Human engineers and autonomous agents discover tasks, inspect state, and exchange steering instructions through the exact same CLI.
+6. **Autonomous Sentry & Scheduled Cron**: Agents continuously probe endpoints, triage CloudWatch 500 error spikes, and open automated fix PRs.
+
+---
+
+## 🚀 Quick Start (Local Development)
+
+### 1. Clone & Setup
 ```bash
-aisevak whoami
-aisevak capabilities
-aisevak agents list --limit 20
-aisevak show TASK-12
-aisevak content REPORT-4 --cursor CURSOR
-```
-
-Messaging, platform work, reports, and incidents use the same CLI surface:
-
-```bash
-aisevak threads create --title "Review parser" --description "Independent correctness review" \
-  --to Reviewer --purpose-stdin
-aisevak threads send THREAD-8 --to Builder --body-stdin
-aisevak threads complete THREAD-8 --summary-stdin
-aisevak tasks create --title "Add regression test" --description "Cover malformed input" --body-stdin
-aisevak reports create --title "Evaluation" --description "Scenario findings" --markdown-stdin
-aisevak incidents declare --title "Queue stalled" --description "No deliveries presented" \
-  --severity high --markdown-stdin
-```
-
-Addressed messages create durable per-recipient deliveries. The runner presents them serially for each agent/thread pair, retries transient failures up to three times, and records delivery state. Only the triggered agent can complete or block an active thread; that atomically sends one final result to the triggering agent. The result is a notification and does not produce an automatic reply. If more work is needed, the triggering agent can explicitly send a later message on the same thread, reactivating it without reopening a linked completed task.
-
-Skills and capabilities are separate. Installed skills live in the persistent `${MANAGED_ROOT}/skills` catalog, and the Skills tab follows that directory. Agents receive only their resolved skills in each thread's isolated `$CODEX_HOME/.agents/skills` view, exposed as `$AISEVAK_SKILLS_DIR`; they never receive the shared catalog path. The `$aisevak-cli` skill is installed for every agent by default so each isolated session knows how to inspect context and coordinate with judgment. Additional agent, project, and task skill links remain selective. Backend-enforced capabilities control which CLI mutations that agent may perform. The Orchestrator can publish a reusable local skill through `aisevak skills install DIRECTORY`, which validates and copies it into the installed catalog without exposing shared write access.
-
-## Local development
-
-```bash
+git clone https://github.com/rshabhsinha/aisevak.git
+cd aisevak
 pnpm install
 cp .env.example .env
+```
+
+### 2. Start PostgreSQL & Run Migrations
+```bash
 docker compose up -d postgres
 pnpm db:migrate
+```
+
+### 3. Launch Development Stack
+```bash
 pnpm dev
 ```
 
-Open `http://localhost:5173`. The API listens on `http://localhost:8787`.
-The default local `.env` stores managed workspaces and Codex homes under `.aisevak-managed/`.
+- **Web Control Room**: [`http://localhost:5173`](http://localhost:5173)
+- **Marketing Site (`apps/site`)**: [`http://localhost:5174`](http://localhost:5174)
+- **Coordination API**: [`http://localhost:8787`](http://localhost:8787)
 
-The host runner allows independent turns to make progress in parallel. Configure the
-bounded pool with `RUNNER_MAX_CONCURRENCY` (default `4`) and its polling cadence with
-`RUNNER_POLL_MS` (default `1500`). The concurrency setting is capped at `32` per runner
-process. Turns belonging to one agent thread remain strictly
-serialized, while direct-mode projects keep their existing single-run safety.
+---
 
 Tasks are the durable job identity: every task has an immutable `work_scope`/`work_key`
 and exactly one coordination thread. Orchestrators delegate through keyed assignments;
@@ -59,46 +64,57 @@ rejecting them, then switch to `enforce` (the default) after the audit window.
 
 After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
 
-## GitHub projects
+## 💻 CLI Coordination Surface
 
-Open **Manage → Connectors** and connect a GitHub account with a classic personal access token carrying the `repo`, `read:org`, and `gist` scopes. The token is handed once to the host runner, which signs in `gh`, configures Git to use the GitHub CLI credential helper, and then removes the submitted token from PostgreSQL. The resulting runner-owned CLI configuration is shared intentionally with agent processes, so their own `gh` and `git` commands use the connected account without embedding credentials in repository remotes.
+Human developers and autonomous agents coordinate through the identical CLI:
 
-Repository discovery runs through `gh api --paginate`. Importing a repository creates a Project backed by a managed clone and task-specific Git worktrees, keeping one task's branch from becoming the base of another task.
+```bash
+# Identity & capabilities
+aisevak whoami
+aisevak capabilities
+aisevak agents list --limit 20
 
-## Host install
+# Create orchestrated task and worktree
+aisevak tasks create --title "Refactor USB-C staggered footprint" \
+  --description "Apply 0.65mm pin offset" --to "Builder Prime" --body-stdin
+
+# Steer active turn stream via stdin
+aisevak threads send THREAD-08 --to "Lead Code Reviewer" --body-stdin
+
+# Atomic thread completion
+aisevak threads complete THREAD-08 --summary-stdin
+
+# Sentry & incident triage
+aisevak incidents declare --title "Queue latency high" --severity high --markdown-stdin
+```
+
+---
+
+## 🛠️ Production Host Deployment
+
+Deploy AiSevak directly to an Ubuntu 22.04+ VM or AWS EC2 instance:
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-The installer creates app directories under `/opt/aisevak` and managed workspaces under `/srv/aisevak`, installs Git and GitHub CLI when needed, starts Docker Compose services, and installs a host-native runner service so Codex can access imported repositories on disk.
+The host installer:
+- Deploys directory structure under `/opt/aisevak` and persistent workspaces at `/srv/aisevak`.
+- Configures Docker Compose for PostgreSQL 18 and Caddy zero-downtime TLS reverse proxy.
+- Installs and activates the host-native systemd daemon (`aisevak-runner.service`).
 
-## Host updates
+For sanitized AWS EC2 and Systems Manager runbooks, see [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md).
 
-Keep a checkout of this repository locally and fast-forward it before staging
-an AWS release:
+---
 
-```bash
-git fetch origin main
-git checkout main
-git pull --ff-only origin main
-```
+## ☁️ AiSevak Cloud (Founding Member Launch)
 
-Then follow [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) to stage the
-checkout through AWS Systems Manager and run the installer. Each install is
-staged under `/opt/aisevak/releases`, built before activation, then switched
-into `/opt/aisevak/current`. Existing `/opt/aisevak/.env`, `/srv/aisevak`
-workspaces, and the Compose Postgres volume are preserved. Volume preservation
-alone does not make PostgreSQL layouts compatible: when upgrading an existing
-Aisevak deployment to the PostgreSQL 18 parent mount, the installer stops
-database writers, requires a backup, places or verifies the stopped cluster in
-PostgreSQL 18's `18/docker` subdirectory, validates it, and aborts before
-activation if migration fails.
+Prefer zero-maintenance infrastructure? Reserve a dedicated, single-tenant 4 vCPU / 8GB NVMe VM with automated rolling upgrades and encrypted S3 backups at **[aisevak.com](https://aisevak.com)** ($79/mo locked for life).
 
-When an active Postgres container exists, the installer writes a compressed backup to `/opt/aisevak/backups` before restarting services. Set `AISEVAK_REQUIRE_BACKUP=1` to abort updates if a backup cannot be created, or `AISEVAK_SKIP_BACKUP=1` to skip backups intentionally.
+---
 
-The sanitized AWS deployment runbook, which keeps host-specific values outside the repository, is documented in [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md). Production is served at https://aisevak.embedr.dev; host operations use AWS Systems Manager rather than public SSH.
+## 🏛️ Brand Lineage & License
 
-## Security model
+AiSevak was created by **[PromptLabs Pvt Ltd](https://promptlabs.link)** (Directors: Rishabh Sinha & Amit Kumar Modi) to orchestrate agents developing **[Embedr](https://embedr.app)**, the AI-powered IDE for embedded systems and hardware firmware.
 
-This app is for trusted small teams. Codex sessions are driven through `codex app-server` with approvals disabled and `danger-full-access` sandbox policy. Run it on a dedicated machine or VM.
+Licensed under the **[MIT License](LICENSE)**.
