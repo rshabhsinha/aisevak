@@ -90,6 +90,16 @@ aisevak incidents declare --title "Queue latency high" --severity high --markdow
 
 ---
 
+## 🔧 Operator Notes
+
+- **Runner pool**: independent turns run in parallel. Tune with `RUNNER_MAX_CONCURRENCY` (default `4`, max `32`) and `RUNNER_POLL_MS` (default `1500`). Turns on one agent thread stay serialized.
+- **Harnesses**: worker turns require a connected provider. Codex uses device-code auth (API key fallback); Cursor turns require a `CURSOR_API_KEY` (keychain subscriptions never reach worker homes); OpenCode reads stored or host `auth.json`.
+- **Skills vs capabilities**: installed skills live in `${MANAGED_ROOT}/skills` and are mounted per-thread as `$AISEVAK_SKILLS_DIR`; backend-enforced capabilities gate which CLI mutations each agent may perform.
+- **GitHub**: connect via **Manage → Connectors** with a classic PAT (`repo`, `read:org`, `gist`). The runner signs in `gh`, shares the CLI credential helper with agents, and discards the token.
+- **Security model**: for trusted small teams. Harnesses run with approvals disabled and full host access — use a dedicated machine or VM.
+
+---
+
 ## 🛠️ Production Host Deployment
 
 Deploy AiSevak directly to an Ubuntu 22.04+ VM or AWS EC2 instance:

@@ -6,25 +6,27 @@ import { applyCodexModelDefaults } from "./models.js";
 
 export const OPENCODE_AUTH_SECRET_NAME = "opencode_auth";
 export const OPENCODE_SERVER_PASSWORD_SECRET_NAME = "opencode_server_password";
-export const DEFAULT_OPENCODE_MODEL = "opencode/gpt-5.4-nano";
+export const DEFAULT_OPENCODE_MODEL = "opencode-go/gpt-5.6-luna";
 export const MINIMUM_OPENCODE_VERSION = "1.14.19";
 
+// Fallback catalog used only when `opencode models` discovery fails. These IDs
+// were observed from real `opencode models` output.
 export const OPENCODE_HARNESS_MODELS: CodexHarnessModel[] = [
   {
-    id: "opencode/gpt-5.4-nano",
-    label: "GPT-5.4 Nano",
-    description: "OpenCode Go subscription model.",
+    id: "opencode-go/gpt-5.6-luna",
+    label: "GPT-5.6 Luna",
+    description: "OpenAI GPT-5.6 through OpenCode.",
     badge: "Default"
   },
   {
-    id: "opencode/claude-sonnet-4-6",
-    label: "Claude Sonnet 4.6",
-    description: "Anthropic Sonnet through OpenCode."
+    id: "opencode/muse-spark-1.3-contributor-free",
+    label: "Muse Spark 1.3",
+    description: "Muse Spark through OpenCode."
   },
   {
-    id: "opencode/gpt-5.4",
-    label: "GPT-5.4",
-    description: "OpenAI GPT-5.4 through OpenCode."
+    id: "opencode-go/glm-5.3",
+    label: "GLM 5.3",
+    description: "Zhipu GLM through OpenCode."
   }
 ];
 

@@ -24,7 +24,9 @@ export async function runHarnessCommand(
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
     const timeout = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGTERM");
     }, options.timeoutMs ?? 15_000);
     child.stdout.on("data", (chunk) => {
@@ -39,6 +41,9 @@ export async function runHarnessCommand(
     });
     child.on("close", (exitCode) => {
       clearTimeout(timeout);
+      if (timedOut) {
+        console.warn("Harness command timed out", { command, args, timeoutMs: options.timeoutMs ?? 15_000 });
+      }
       resolve({ exitCode, stdout, stderr });
     });
     if (options.stdin) child.stdin.write(options.stdin);

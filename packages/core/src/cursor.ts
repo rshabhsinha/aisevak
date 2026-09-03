@@ -8,6 +8,9 @@ export const CURSOR_AUTH_SECRET_NAME = "cursor_cli_auth";
 export const CURSOR_HOST_AUTH_KIND = "host_keychain";
 export const DEFAULT_CURSOR_MODEL = "auto";
 
+// Fallback catalog used only when `cursor-agent --list-models` discovery fails
+// (it requires an API key). IDs below are real model IDs evidenced from
+// `--list-models` outputs and Cursor docs; `auto` is always safe.
 export const CURSOR_HARNESS_MODELS: CodexHarnessModel[] = [
   {
     id: "auto",
@@ -21,12 +24,12 @@ export const CURSOR_HARNESS_MODELS: CodexHarnessModel[] = [
     description: "Cursor's agentic coding model."
   },
   {
-    id: "gpt-5.4",
-    label: "GPT-5.4",
-    description: "OpenAI GPT-5.4 through Cursor."
+    id: "gpt-5.5",
+    label: "GPT-5.5",
+    description: "OpenAI GPT-5.5 through Cursor."
   },
   {
-    id: "claude-opus-4.6",
+    id: "claude-opus-4-6",
     label: "Claude Opus 4.6",
     description: "Anthropic Opus through Cursor."
   }
@@ -120,7 +123,9 @@ export function parseCursorModelList(output: string): CodexHarnessModel[] {
     if (!trimmed || trimmed.startsWith("Available") || trimmed.startsWith("Model")) continue;
     if (/error|authentication required|not authenticated|login required/i.test(trimmed)) continue;
     const id = trimmed.split(/\s{2,}|\s-\s/)[0]?.trim();
-    if (!id || seen.has(id) || id.startsWith("-") || /[:/\\]/.test(id) && !/^[a-z0-9._-]+$/i.test(id)) continue;
+    if (!id || seen.has(id) || id.startsWith("-")) continue;
+    // Model ids never contain path separators; skip table headers and prompts.
+    if (/[/\\:]/.test(id)) continue;
     if (!/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,80}$/.test(id)) continue;
     seen.add(id);
     models.push({

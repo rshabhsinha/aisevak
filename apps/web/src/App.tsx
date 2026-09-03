@@ -4120,7 +4120,7 @@ function CursorConnectionView() {
           <div className="codex-connection-mark"><CursorLogo size={25} /></div>
           <div>
             <h4>Connect Cursor to Aisevak</h4>
-            <p>Save a Cursor API key for VM worker homes, or sign in on this Aisevak host so portable CLI files can be copied into encrypted secrets.</p>
+            <p>Worker turns require a Cursor API key. Host subscription sign-in alone is not enough on a VM: macOS/keychain tokens cannot be copied into isolated worker homes.</p>
           </div>
         </div>
         <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Login required"}</Badge>
@@ -4158,7 +4158,7 @@ function CursorConnectionView() {
         <div className="section-title-row">
           <div>
             <h4>{status.connected ? "Connection is ready" : "Connect Cursor"}</h4>
-            <p>CURSOR_API_KEY is the portable VM path. Host sign-in only connects workers if Cursor writes files Aisevak can materialize into each task home.</p>
+            <p>Save a CURSOR_API_KEY to enable worker turns. Host sign-in or credential import only helps if Cursor wrote portable CLI files; keychain-bound subscriptions never reach worker homes.</p>
           </div>
           <div className="row-actions">
             {status.connected ? (
