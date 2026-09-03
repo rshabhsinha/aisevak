@@ -26,6 +26,8 @@ export function buildOpenCodeAcpArgs(): string[] {
 }
 
 export function acpPermissionDecision(params: Record<string, unknown>): { outcome: { outcome: "selected"; optionId: string } } {
+  // Security: auto-approves tool calls, matching the Codex harness
+  // `danger-full-access` policy. Only run on trusted hosts (see README).
   const options = Array.isArray(params.options) ? params.options : [];
   const optionIds = options.flatMap((option) => {
     if (!option || typeof option !== "object") return [];

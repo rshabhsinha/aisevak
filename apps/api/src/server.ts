@@ -2492,6 +2492,10 @@ async function getCursorModelSnapshot(pool: DbPool): Promise<{
       cursorModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
       return cursorModelCache;
     }
+    console.warn("Cursor model discovery returned no models; using fallback catalog", {
+      exitCode: listed.exitCode,
+      stderrTail: listed.stderr.slice(-500)
+    });
   } catch (error) {
     console.warn("Cursor model discovery failed; using fallback catalog", error);
   }
@@ -2514,6 +2518,10 @@ async function getOpenCodeModelSnapshot(): Promise<{
       openCodeModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
       return openCodeModelCache;
     }
+    console.warn("OpenCode model discovery returned no models; using fallback catalog", {
+      exitCode: listed.exitCode,
+      stderrTail: listed.stderr.slice(-500)
+    });
   } catch (error) {
     console.warn("OpenCode model discovery failed; using fallback catalog", error);
   }

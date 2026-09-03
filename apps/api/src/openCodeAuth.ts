@@ -8,7 +8,7 @@ import {
   parseOpenCodeLoginUrl,
   type DbPool
 } from "@aisevak/core";
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdir, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
@@ -21,6 +21,7 @@ interface LoginState {
   verificationUrl: string | null;
   home: string;
   expiresAt: number;
+  child: ChildProcessWithoutNullStreams;
 }
 
 export interface OpenCodeAuthStatus {
@@ -75,15 +76,17 @@ export class OpenCodeAuthManager {
     try {
       const host = await readFile(this.hostAuthPath, "utf8");
       const providerIds = openCodeAuthProviderIds(parseOpenCodeAuthFile(host));
-      if (providerIds.length > 0) {
-        await this.upsertSecret(host);
-      }
+      // Read-only: never persist host credentials from a status check.
+      // Use importHostAuth() to store them explicitly.
       return {
         connected: providerIds.length > 0,
         installed: true,
         providerIds,
         needsLogin: providerIds.length === 0,
-        lastError: providerIds.length > 0 ? null : "OpenCode has no stored provider credentials."
+        lastError:
+          providerIds.length > 0
+            ? "Using host OpenCode credentials. Import them to persist in the database."
+            : "OpenCode has no stored provider credentials."
       };
     } catch {
       const probe = await runHarnessCommand(this.openCodeBinary, ["--version"], { timeoutMs: 8_000 });
@@ -106,6 +109,10 @@ export class OpenCodeAuthManager {
 
   async startLogin(requestedBy: string): Promise<OpenCodeDeviceLogin> {
     this.pruneExpiredLogins();
+    for (const [id, login] of this.logins) {
+      login.child.kill("SIGTERM");
+      this.logins.delete(id);
+    }
     const loginId = randomUUID();
     const home = join(this.authHomeRoot, loginId);
     await mkdir(join(home, ".local", "share", "opencode"), { recursive: true });
@@ -123,7 +130,8 @@ export class OpenCodeAuthManager {
       requestedBy,
       verificationUrl: null,
       home,
-      expiresAt: Date.now() + LOGIN_TTL_MS
+      expiresAt: Date.now() + LOGIN_TTL_MS,
+      child
     };
     collectCliOutput(child, (text) => {
       state.verificationUrl = parseOpenCodeLoginUrl(text) ?? state.verificationUrl;
@@ -147,6 +155,7 @@ export class OpenCodeAuthManager {
       throw new Error("That OpenCode login request is no longer available");
     }
     if (login.expiresAt <= Date.now()) {
+      login.child.kill("SIGTERM");
       this.logins.delete(loginId);
       throw new Error("The OpenCode login request expired");
     }
@@ -158,9 +167,13 @@ export class OpenCodeAuthManager {
         return { status: "pending", auth: await this.getStatus() };
       }
       await this.upsertSecret(value);
+      login.child.kill("SIGTERM");
       this.logins.delete(loginId);
       return { status: "connected", auth: await this.getStatus() };
-    } catch {
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+        console.warn("OpenCode login poll failed unexpectedly", error);
+      }
       return { status: "pending", auth: await this.getStatus() };
     }
   }
@@ -174,7 +187,10 @@ export class OpenCodeAuthManager {
   private pruneExpiredLogins(): void {
     const now = Date.now();
     for (const [id, login] of this.logins) {
-      if (login.expiresAt <= now) this.logins.delete(id);
+      if (login.expiresAt <= now) {
+        login.child.kill("SIGTERM");
+        this.logins.delete(id);
+      }
     }
   }
 

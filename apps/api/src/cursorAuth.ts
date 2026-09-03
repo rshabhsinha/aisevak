@@ -187,15 +187,17 @@ export class CursorAuthManager {
   private async probeHome(home: string): Promise<CursorAuthStatus> {
     try {
       const env = cursorLoginEnv(home);
-      const statusResult = await runHarnessCommand(this.cursorBinary, ["status", "--format", "json"], {
-        env,
-        timeoutMs: 12_000
-      });
+      const [statusResult, aboutResult] = await Promise.all([
+        runHarnessCommand(this.cursorBinary, ["status", "--format", "json"], {
+          env,
+          timeoutMs: 12_000
+        }),
+        runHarnessCommand(this.cursorBinary, ["about", "--format", "json"], {
+          env,
+          timeoutMs: 12_000
+        })
+      ]);
       const parsedStatus = parseCursorStatusOutput(statusResult.stdout || statusResult.stderr);
-      const aboutResult = await runHarnessCommand(this.cursorBinary, ["about", "--format", "json"], {
-        env,
-        timeoutMs: 12_000
-      });
       const parsedAbout = parseCursorAboutOutput(aboutResult.stdout, aboutResult.stderr, aboutResult.exitCode);
       const authenticated = parsedStatus.authenticated || parsedAbout.authenticated;
       return {

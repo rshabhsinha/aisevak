@@ -43,11 +43,15 @@ function reasoning(defaultValue: string, maximum: "xhigh" | "max" | "ultra"): Co
   ];
 }
 
+// Fallback catalog used only when live `model/list` discovery fails.
+// IDs, reasoning ranges, and defaults below were verified against a live
+// `codex` app-server on 2026-09-03. The luna/max default is repo policy
+// (see migrations); the live server reports sol as its own default.
 export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
   {
     id: "gpt-5.6-sol",
     label: "GPT-5.6-Sol",
-    description: "Latest frontier agentic coding model.",
+    description: "Reliable agentic workhorse for everyday tasks.",
     options: reasoning("low", "ultra")
   },
   {

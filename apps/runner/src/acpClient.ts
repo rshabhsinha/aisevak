@@ -17,9 +17,11 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
 }
 
 const sessions = new Map<string, PersistentAcpSession>();
+const ACP_SESSION_IDLE_MS = 30 * 60_000;
 
 export async function runAcpTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
   const key = options.runtimeHome;
+  await closeIdleAcpSessions(key);
   let session = sessions.get(key);
   if (session && !session.matches(options)) {
     sessions.delete(key);
@@ -41,6 +43,18 @@ export async function closeAllAcpSessions(): Promise<void> {
   await Promise.all(active.map((session) => session.close()));
 }
 
+export async function closeIdleAcpSessions(exceptKey?: string, idleMs = ACP_SESSION_IDLE_MS): Promise<void> {
+  const now = Date.now();
+  const stale: Array<Promise<void>> = [];
+  for (const [key, session] of sessions) {
+    if (key !== exceptKey && now - session.lastUsedAt > idleMs) {
+      sessions.delete(key);
+      stale.push(session.close());
+    }
+  }
+  await Promise.all(stale);
+}
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
@@ -57,6 +71,7 @@ class PersistentAcpSession {
   private closed = false;
   private initializePromise: Promise<void> | null = null;
   private sessionId: string | null = null;
+  lastUsedAt = Date.now();
   private readonly closePromise: Promise<{ code: number | null; error?: Error }>;
   private onNotification: ((line: string) => Promise<void>) | null = null;
 
@@ -108,6 +123,7 @@ class PersistentAcpSession {
     };
 
     this.onNotification = emit;
+    this.lastUsedAt = Date.now();
     try {
       await this.initialize(options.authMethodId);
       if (options.threadId) {
@@ -118,7 +134,11 @@ class PersistentAcpSession {
             mcpServers: []
           });
           this.sessionId = options.threadId;
-        } catch {
+        } catch (error) {
+          console.warn("ACP session/load failed; starting a fresh session and orphaning prior context", {
+            threadId: options.threadId,
+            error: error instanceof Error ? error.message : String(error)
+          });
           this.sessionId = null;
         }
       }
