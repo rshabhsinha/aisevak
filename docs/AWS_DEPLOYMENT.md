@@ -17,6 +17,15 @@ The private file is:
 $HOME/Documents/aisevak-aws-deployment.env
 ~~~
 
+The AWS CLI credentials for `AISEVAK_AWS_PROFILE` are stored separately at:
+
+~~~text
+$HOME/Documents/credentials/credentials
+~~~
+
+Keep that file local and private. The deployment commands reference it through
+`AWS_SHARED_CREDENTIALS_FILE`; no credential values belong in this repository.
+
 It defines the deployment URL and host values, including:
 
 | Variable | Purpose |
@@ -44,10 +53,11 @@ Load it before running commands:
 
 ~~~bash
 source "$HOME/Documents/aisevak-aws-deployment.env"
+export AWS_SHARED_CREDENTIALS_FILE="$HOME/Documents/credentials/credentials"
 ~~~
 
-Never copy this file, the Caddy configuration, the SSH private key, or the
-production environment file into the repository.
+Never copy this file, the AWS credentials file, the Caddy configuration, the
+SSH private key, or the production environment file into the repository.
 
 ## Confirm access and instance health
 

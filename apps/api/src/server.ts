@@ -709,6 +709,39 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/reports", async (request) => {
     requireUser(request);
+    const query = reportsQuerySchema.parse(request.query);
+    const values: unknown[] = [];
+    const conditions: string[] = [];
+
+    if (query.cursor) {
+      const { updatedAt, id } = decodeResourceCursor(query.cursor);
+      values.push(updatedAt, id);
+      conditions.push(`(reports.updated_at, reports.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
+    }
+
+    if (query.query) {
+      values.push(`%${query.query}%`);
+      conditions.push(`(
+        reports.title ILIKE $${values.length}
+        OR COALESCE(reports.description, '') ILIKE $${values.length}
+        OR COALESCE(agents.name, '') ILIKE $${values.length}
+        OR COALESCE(projects.name, '') ILIKE $${values.length}
+        OR report_versions.markdown ILIKE $${values.length}
+      )`);
+    }
+
+    if (query.projectId) {
+      values.push(query.projectId);
+      conditions.push(`reports.project_id = $${values.length}`);
+    }
+
+    if (query.status) {
+      values.push(query.status);
+      conditions.push(`reports.status = $${values.length}`);
+    }
+
+    values.push(query.limit + 1);
+
     const result = await pool.query(
       `SELECT reports.id, reports.number, reports.title, reports.description, reports.status,
               reports.project_id, projects.name AS project_name,
@@ -732,14 +765,59 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          ORDER BY agent_threads.last_activity_at DESC, agent_threads.id DESC
          LIMIT 1
        ) author_thread ON true
+       ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY reports.updated_at DESC, reports.number DESC, reports.id DESC
-       LIMIT 200`
+       LIMIT $${values.length}`,
+      values
     );
-    return { reports: result.rows };
+
+    const hasMore = result.rows.length > query.limit;
+    const reports = result.rows.slice(0, query.limit);
+    const last = reports.at(-1) as { updated_at?: string; id?: string } | undefined;
+    const nextCursor = hasMore && last?.updated_at && last?.id ? encodeResourceCursor(last.updated_at, last.id) : null;
+    return { reports, nextCursor, hasMore };
   });
 
   app.get("/api/incidents", async (request) => {
     requireUser(request);
+    const query = incidentsQuerySchema.parse(request.query);
+    const values: unknown[] = [];
+    const conditions: string[] = [];
+
+    if (query.cursor) {
+      const { updatedAt, id } = decodeResourceCursor(query.cursor);
+      values.push(updatedAt, id);
+      conditions.push(`(incidents.updated_at, incidents.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
+    }
+
+    if (query.query) {
+      values.push(`%${query.query}%`);
+      conditions.push(`(
+        incidents.title ILIKE $${values.length}
+        OR COALESCE(incidents.description, '') ILIKE $${values.length}
+        OR COALESCE(commander.name, '') ILIKE $${values.length}
+        OR COALESCE(creator.name, '') ILIKE $${values.length}
+        OR COALESCE(projects.name, '') ILIKE $${values.length}
+      )`);
+    }
+
+    if (query.projectId) {
+      values.push(query.projectId);
+      conditions.push(`incidents.project_id = $${values.length}`);
+    }
+
+    if (query.status) {
+      values.push(query.status);
+      conditions.push(`incidents.status = $${values.length}`);
+    }
+
+    if (query.severity) {
+      values.push(query.severity);
+      conditions.push(`incidents.severity = $${values.length}`);
+    }
+
+    values.push(query.limit + 1);
+
     const result = await pool.query(
       `SELECT incidents.id, incidents.number, incidents.title, incidents.description,
               incidents.status, incidents.severity,
@@ -771,10 +849,17 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          ORDER BY incident_updates.created_at DESC, incident_updates.id DESC
          LIMIT 1
        ) latest ON true
+       ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY incidents.updated_at DESC, incidents.number DESC, incidents.id DESC
-       LIMIT 200`
+       LIMIT $${values.length}`,
+      values
     );
-    return { incidents: result.rows };
+
+    const hasMore = result.rows.length > query.limit;
+    const incidents = result.rows.slice(0, query.limit);
+    const last = incidents.at(-1) as { updated_at?: string; id?: string } | undefined;
+    const nextCursor = hasMore && last?.updated_at && last?.id ? encodeResourceCursor(last.updated_at, last.id) : null;
+    return { incidents, nextCursor, hasMore };
   });
 
   app.get("/api/tasks", async (request) => {
@@ -1631,6 +1716,21 @@ const agentThreadsQuerySchema = z.object({
   limit: z.coerce.number().int().min(1).max(50).default(10),
   cursor: z.string().trim().min(1).optional(),
   query: z.string().trim().max(200).optional()
+});
+const reportsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(15),
+  cursor: z.string().trim().min(1).optional(),
+  query: z.string().trim().max(200).optional(),
+  projectId: z.string().uuid().optional(),
+  status: z.string().trim().optional()
+});
+const incidentsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(100).default(15),
+  cursor: z.string().trim().min(1).optional(),
+  query: z.string().trim().max(200).optional(),
+  projectId: z.string().uuid().optional(),
+  status: z.string().trim().optional(),
+  severity: z.string().trim().optional()
 });
 const agentToolCreateTaskSchema = z.object({
   title: z.string().min(1),
@@ -3068,6 +3168,25 @@ function decodeThreadCursor(value: string): { lastActivityAt: string; id: string
     return { lastActivityAt, id };
   } catch {
     throwBadRequest("Invalid thread cursor");
+  }
+}
+
+function encodeResourceCursor(value: string | Date, id: string): string {
+  return Buffer.from(`${dateString(value)}|${id}`, "utf8").toString("base64url");
+}
+
+function decodeResourceCursor(value: string): { updatedAt: string; id: string } {
+  try {
+    const decoded = Buffer.from(value, "base64url").toString("utf8");
+    const separator = decoded.lastIndexOf("|");
+    const updatedAt = decoded.slice(0, separator);
+    const id = decoded.slice(separator + 1);
+    if (separator <= 0 || !z.string().datetime().safeParse(updatedAt).success || !z.string().uuid().safeParse(id).success) {
+      throw new Error("invalid cursor");
+    }
+    return { updatedAt, id };
+  } catch {
+    throwBadRequest("Invalid page cursor");
   }
 }
 

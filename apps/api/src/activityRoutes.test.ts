@@ -48,7 +48,11 @@ describe("web activity routes", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ reports: [{ number: 7, title: "Daily review", markdown: "## Healthy" }] });
+    expect(response.json()).toEqual({
+      reports: [{ number: 7, title: "Daily review", markdown: "## Healthy" }],
+      nextCursor: null,
+      hasMore: false
+    });
     expect(queries.some((sql) => sql.includes("report_versions.revision = reports.current_revision"))).toBe(true);
   });
 
@@ -61,7 +65,11 @@ describe("web activity routes", () => {
     });
 
     expect(response.statusCode).toBe(200);
-    expect(response.json()).toEqual({ incidents: [{ number: 3, title: "Queue stalled", markdown: "## Investigating" }] });
+    expect(response.json()).toEqual({
+      incidents: [{ number: 3, title: "Queue stalled", markdown: "## Investigating" }],
+      nextCursor: null,
+      hasMore: false
+    });
     expect(queries.some((sql) => sql.includes("ORDER BY incident_updates.created_at DESC"))).toBe(true);
   });
 

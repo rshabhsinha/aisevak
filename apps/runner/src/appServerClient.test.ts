@@ -60,6 +60,18 @@ describe("persistent Codex app-server", () => {
     expect(result.status).toBe("interrupted");
   });
 
+  it("closes a provider session when cancellation never completes", async () => {
+    const fixture = await fakeAppServerFixture();
+    const result = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "wait-for-steer"),
+      env: { ...turnOptions(fixture, "wait-for-steer").env, FAKE_IGNORE_INTERRUPT: "1" },
+      shouldCancel: async () => true,
+      cancelGraceMs: 50
+    });
+
+    expect(result.status).toBe("interrupted");
+  });
+
   it("redacts secrets from earlier turns throughout the persistent session", async () => {
     const fixture = await fakeAppServerFixture();
     const oldSecret = "old-secret-value";
@@ -311,6 +323,7 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   }
   if (message.method === "turn/interrupt") {
     send({ id: message.id, result: {} });
+    if (process.env.FAKE_IGNORE_INTERRUPT === "1") return;
     return send({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: message.params.turnId, status: "interrupted" } } });
   }
   if (message.method === "thread/backgroundTerminals/list") return send({ id: message.id, result: { data: [], nextCursor: null } });

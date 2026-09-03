@@ -141,6 +141,7 @@ async function main(): Promise<void> {
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   await recoverInterruptedCoordinationRuns(pool);
+  await recoverInterruptedDispatcherRuns(pool);
   await recoverStaleAgentThreadRuns(pool);
 
   const beginShutdown = () => {
@@ -396,6 +397,68 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
         [deliveryId, delivered ? "completed" : "failed", inputError]
       );
       await cancelQueuedDeliveryRuns(client, deliveryId, inputError ?? "Delivery completed");
+    });
+  }
+}
+
+export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<void> {
+  const interrupted = await pool.query<{
+    id: string;
+    status: "running" | "cancel_requested";
+    message_delivery_id: string | null;
+    agent_thread_id: string | null;
+  }>(
+    `SELECT id, status::text, message_delivery_id, agent_thread_id
+     FROM dispatcher_runs
+     WHERE scope <> 'coordination'
+       AND status IN ('running', 'cancel_requested')
+     ORDER BY started_at ASC NULLS FIRST, id ASC`
+  );
+
+  for (const run of interrupted.rows) {
+    const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
+    const error =
+      run.status === "cancel_requested"
+        ? "The dispatcher turn was cancelled when the runner stopped"
+        : "The dispatcher turn was interrupted when the runner stopped";
+    await withTransaction(pool, async (client) => {
+      const locked = await client.query<{ message_delivery_id: string | null; status: string }>(
+        `SELECT message_delivery_id, status::text
+         FROM dispatcher_runs
+         WHERE id = $1
+         FOR UPDATE`,
+        [run.id]
+      );
+      const current = locked.rows[0];
+      if (!current || !["running", "cancel_requested"].includes(current.status)) return;
+      await client.query(
+        `UPDATE dispatcher_runs
+         SET status = $2::run_status,
+             error = $3,
+             finished_at = now(),
+             updated_at = now()
+         WHERE id = $1`,
+        [run.id, finalStatus, error]
+      );
+      const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
+      if (deliveryId) {
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+          [deliveryId, error]
+        );
+        await cancelQueuedDeliveryRuns(client, deliveryId, error);
+      }
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, finalStatus);
+      if (run.agent_thread_id) {
+        await client.query(
+          `UPDATE agent_threads
+           SET last_activity_at = now(), updated_at = now()
+           WHERE id = $1`,
+          [run.agent_thread_id]
+        );
+      }
     });
   }
 }
