@@ -52,6 +52,8 @@ describe("embedded aisevak CLI", () => {
       env: { ...process.env, AISEVAK_AGENT_TOKEN: "test-token" }
     });
     expect(result.stdout).toContain("threads");
+    expect(result.stdout).toContain("assignments");
+    expect(result.stdout).toContain("--work-key");
     expect(result.stdout).toContain("reports");
     expect(result.stdout).toContain("incidents");
     expect(result.stdout).toContain("schedules");
@@ -202,5 +204,44 @@ describe("embedded aisevak CLI", () => {
       idempotencyKey: "daily-brief-v1"
     });
     expect(JSON.parse(result.stdout)).toMatchObject({ schedule: { key: "SCHEDULE-1" } });
+  });
+
+  it("creates keyed assignments through the durable assignment endpoint", async () => {
+    let requestPath = "";
+    let requestBody: Record<string, unknown> = {};
+    const server = createServer((request, response) => {
+      requestPath = request.url ?? "";
+      let body = "";
+      request.on("data", (chunk) => { body += String(chunk); });
+      request.on("end", () => {
+        requestBody = JSON.parse(body) as Record<string, unknown>;
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ assignment: { key: "ASSIGNMENT-7", status: "queued" } }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const result = await execFileAsync(
+      process.execPath,
+      [cliPath, "assignments", "create", "TASK-34", "--key", "parser-review", "--to", "Reviewer", "--instructions", "Validate the parser and report concrete failures."],
+      {
+        env: {
+          ...process.env,
+          AISEVAK_API_URL: `http://127.0.0.1:${address.port}`,
+          AISEVAK_AGENT_TOKEN: "test-token"
+        }
+      }
+    );
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    expect(requestPath).toBe("/api/agent-tools/v1/tasks/TASK-34/assignments");
+    expect(requestBody).toMatchObject({ key: "parser-review", to: "Reviewer" });
+    expect(JSON.parse(result.stdout)).toMatchObject({ assignment: { key: "ASSIGNMENT-7" } });
   });
 });

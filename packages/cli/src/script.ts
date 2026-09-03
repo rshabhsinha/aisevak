@@ -1,9 +1,10 @@
 export function agentToolScript(): string {
   return `#!/usr/bin/env node
 const apiUrl = process.env.AISEVAK_API_URL || "http://localhost:8787";
+const builtin = (name) => process.getBuiltinModule ? process.getBuiltinModule(name) : require(name);
 const tokenFile = process.env.AISEVAK_AGENT_TOKEN_FILE;
 const token = process.env.AISEVAK_AGENT_TOKEN || (tokenFile
-  ? process.getBuiltinModule("node:fs").readFileSync(tokenFile, "utf8").trim()
+  ? builtin("node:fs").readFileSync(tokenFile, "utf8").trim()
   : undefined);
 const args = process.argv.slice(2);
 if (!token) fail("AISEVAK_AGENT_TOKEN is missing", "AUTH_MISSING");
@@ -24,6 +25,7 @@ async function main() {
   if (["skill", "skills"].includes(root)) return skills();
   if (["thread", "threads"].includes(root)) return threads();
   if (["task", "tasks"].includes(root)) return tasks();
+  if (["assignment", "assignments"].includes(root)) return assignments();
   if (["schedule", "schedules"].includes(root)) return schedules();
   if (["report", "reports"].includes(root)) return reports();
   if (["incident", "incidents"].includes(root)) return incidents();
@@ -49,8 +51,8 @@ async function skills() {
 }
 
 function readSkillDirectory(directory) {
-  const fs = process.getBuiltinModule("node:fs");
-  const pathModule = process.getBuiltinModule("node:path");
+  const fs = builtin("node:fs");
+  const pathModule = builtin("node:path");
   const root = pathModule.resolve(directory);
   const rootInfo = fs.lstatSync(root);
   if (!rootInfo.isDirectory() || rootInfo.isSymbolicLink()) {
@@ -110,6 +112,7 @@ async function threads() {
       purpose: await markdown("--purpose"), to: option("--to", true),
       projectId: option("--project-id"), task: option("--task"),
       originThread: option("--origin-thread"), originMessage: option("--origin-message"),
+      workKey: option("--work-key"), workScope: option("--work-scope"),
       idempotencyKey: option("--idempotency-key")
     }) }));
   }
@@ -134,6 +137,7 @@ async function tasks() {
   if (command === "create") return print(await request("/api/agent-tools/v1/tasks", { method: "POST", body: compact({
     title: option("--title", true), description: option("--description", true), body: await markdown("--body"),
     status: option("--status"), projectId: option("--project-id"), agent: option("--agent"),
+    workKey: option("--work-key"), workScope: option("--work-scope"), parentTask: option("--parent-task"),
     idempotencyKey: option("--idempotency-key")
   }) }));
   const ref = required(args[2], "Task reference");
@@ -152,12 +156,39 @@ async function tasks() {
   fail("Usage: aisevak tasks list|show|create|update|assign|complete|reopen", "USAGE");
 }
 
+async function assignments() {
+  const command = args[1] || "list";
+  if (command === "list") {
+    const task = required(args[2], "Task reference");
+    return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(task) + "/assignments"));
+  }
+  const ref = required(args[2], "Assignment reference");
+  if (command === "show") return print(await request("/api/agent-tools/v1/assignments/" + encodeURIComponent(ref)));
+  if (command === "create") {
+    return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref) + "/assignments", { method: "POST", body: compact({
+      key: option("--key", true), to: option("--to", true), instructions: await markdown("--instructions"),
+      idempotencyKey: option("--idempotency-key")
+    }) }));
+  }
+  if (command === "send") return print(await request("/api/agent-tools/v1/assignments/" + encodeURIComponent(ref) + "/send", { method: "POST", body: compact({
+    body: await markdown("--body"), idempotencyKey: option("--idempotency-key")
+  }) }));
+  if (command === "retry") return print(await request("/api/agent-tools/v1/assignments/" + encodeURIComponent(ref) + "/retry", { method: "POST", body: compact({
+    body: await optionalMarkdown("--body"), idempotencyKey: option("--idempotency-key")
+  }) }));
+  if (command === "complete" || command === "block") return print(await request("/api/agent-tools/v1/assignments/" + encodeURIComponent(ref) + "/" + command, { method: "POST", body: compact({
+    result: await markdown("--result"), idempotencyKey: option("--idempotency-key")
+  }) }));
+  fail("Usage: aisevak assignments list TASK|show ASSIGNMENT|create TASK|send ASSIGNMENT|retry ASSIGNMENT|complete ASSIGNMENT|block ASSIGNMENT", "USAGE");
+}
+
 async function schedules() {
   const command = args[1] || "list";
   if (command === "list") return print(await request("/api/agent-tools/v1/schedules" + listQuery()));
   if (command === "create") return print(await request("/api/agent-tools/v1/schedules", { method: "POST", body: compact({
     title: option("--title", true), prompt: await markdown("--prompt"), agent: option("--agent", true),
     at: option("--at", true), intervalSeconds: option("--interval-seconds"),
+    task: option("--task"), overlapPolicy: option("--overlap-policy"),
     idempotencyKey: option("--idempotency-key")
   }) }));
   const ref = required(args[2], "Schedule reference");
@@ -238,7 +269,8 @@ function help() { console.log([
   "aisevak agents list | agents show AGENT",
   "aisevak skills path | skills install DIRECTORY",
   "aisevak threads list | show | messages | create | send | complete | block",
-  "aisevak tasks list | show | create | update | assign | complete | reopen",
+  "aisevak tasks list | show | create --work-key KEY | update | assign | complete | reopen",
+  "aisevak assignments list TASK | show ASSIGNMENT | create TASK --key KEY --to AGENT --instructions-stdin | send | retry | complete | block",
   "aisevak schedules list | show | create | pause | resume | delete",
   "aisevak reports list | show | create | revise | publish",
   "aisevak incidents list | show | declare | update | resolve",

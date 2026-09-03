@@ -18,18 +18,34 @@ import {
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import pg, { type PoolClient } from "pg";
 import { z } from "zod";
+import {
+  assignmentFingerprint,
+  childDepth,
+  detachedWorkScope,
+  jobSafetyMode,
+  normalizeWorkKey,
+  normalizeWorkScope,
+  orchestrationPolicy,
+  safetyConflict,
+  safetyForbidden,
+  stableFingerprint,
+  taskFingerprint,
+  taskWorkScope,
+  type OrchestrationPolicy
+} from "./jobSafety.js";
 
 const DEFAULT_WORKER_CAPABILITIES = [
   "agents:read",
   "credentials:read",
   "projects:read",
   "threads:read",
-  "threads:create",
   "threads:send",
-  "threads:complete",
   "tasks:read",
-  "tasks:create",
-  "tasks:update",
+  "tasks:complete",
+  "assignments:read",
+  "assignments:send",
+  "assignments:complete",
+  "assignments:block",
   "schedules:read",
   "reports:read",
   "reports:write",
@@ -39,9 +55,16 @@ const DEFAULT_WORKER_CAPABILITIES = [
 
 const ORCHESTRATOR_CAPABILITIES = [
   ...DEFAULT_WORKER_CAPABILITIES,
+  "threads:complete",
   "credentials:write",
   "skills:write",
+  "tasks:create-root",
+  "tasks:create-child",
+  "tasks:update",
   "tasks:assign",
+  "assignments:create",
+  "assignments:manage",
+  "assignments:retry",
   "schedules:write",
   "orchestration:route"
 ] as const;
@@ -56,6 +79,11 @@ export interface AgentContext {
   name: string;
   description: string;
   capabilities: string[];
+  assignmentId: string | null;
+  assignmentKey: string | null;
+  assignmentStatus: string | null;
+  assignmentAttempt: number | null;
+  providerThreadId: string | null;
 }
 
 export type Queryable = DbPool | PoolClient;
@@ -86,6 +114,8 @@ const threadCreateSchema = z.object({
   task: z.string().optional(),
   originThread: z.string().optional(),
   originMessage: z.string().optional(),
+  workKey: z.string().trim().min(1).max(200).optional(),
+  workScope: z.string().trim().min(1).max(200).optional(),
   idempotencyKey: z.string().max(200).optional()
 });
 const messageSchema = z.object({
@@ -102,6 +132,9 @@ const taskCreateSchema = z.object({
   status: z.string().default("open"),
   projectId: z.string().uuid().optional(),
   agent: z.string().optional(),
+  workKey: z.string().trim().min(1).max(200).optional(),
+  workScope: z.string().trim().min(1).max(200).optional(),
+  parentTask: z.string().optional(),
   idempotencyKey: z.string().max(200).optional()
 });
 const taskPatchSchema = z.object({
@@ -111,6 +144,20 @@ const taskPatchSchema = z.object({
   status: z.string().optional()
 });
 const assignSchema = z.object({ agent: z.string().min(1) });
+const assignmentCreateSchema = z.object({
+  key: z.string().trim().min(1).max(200),
+  to: z.string().min(1),
+  instructions: z.string().min(1).max(50_000),
+  idempotencyKey: z.string().trim().min(1).max(200).optional()
+});
+const assignmentMessageSchema = z.object({
+  body: z.string().min(1).max(50_000),
+  idempotencyKey: z.string().trim().min(1).max(200).optional()
+});
+const assignmentResultSchema = z.object({
+  result: z.string().min(1).max(100_000),
+  idempotencyKey: z.string().trim().min(1).max(200).optional()
+});
 const optionalBodySchema = z.object({ body: z.string().optional() });
 const reportCreateSchema = z.object({
   title: z.string().trim().min(1),
@@ -135,6 +182,8 @@ const scheduleCreateSchema = z.object({
   agent: z.string().min(1),
   at: z.string().datetime(),
   intervalSeconds: z.coerce.number().int().min(60).max(31_536_000).optional(),
+  task: z.string().optional(),
+  overlapPolicy: z.enum(["skip", "queue", "allow"]).default("skip"),
   idempotencyKey: z.string().trim().min(1).max(200).optional()
 });
 const skillInstallSchema = z.object({
@@ -187,7 +236,12 @@ export async function registerCoordinationRoutes(
 ): Promise<void> {
   app.get("/api/agent-tools/v1/whoami", async (request) => {
     const context = await requireAgent(pool, request);
-    return { agent: agentIdentity(context), current: currentContext(context) };
+    const envelope = await loadJobEnvelope(pool, context.taskId, context.assignmentId, {
+      coordinationThreadId: context.coordinationThreadId,
+      agentThreadId: context.agentThreadId,
+      providerThreadId: context.providerThreadId
+    });
+    return { agent: agentIdentity(context), current: currentContext(context, envelope) };
   });
 
   app.get("/api/agent-tools/v1/capabilities", async (request) => {
@@ -291,9 +345,21 @@ export async function registerCoordinationRoutes(
 
   app.post("/api/agent-tools/v1/threads", async (request) => {
     const context = await requireAgent(pool, request);
-    requireCapability(context, "threads:create");
+    if (context.taskId) {
+      await withTransaction(pool, async (client) => {
+        await recordSafetyEvent(client, {
+          operation: "thread.create.inside-task",
+          context,
+          taskId: context.taskId,
+          message: "This agent is inside an active task. Use a keyed assignment or child task; detached coordination threads are not allowed here."
+        });
+      });
+    }
+    requireCapability(context, "threads:create-detached");
     const body = threadCreateSchema.parse(request.body);
+    if (!body.workKey) badRequest("Detached thread creation requires a stable workKey; use an assignment or keyed child task inside an active task");
     const recipient = await getAgent(pool, body.to);
+    if (!recipient.enabled) badRequest(`Agent ${recipient.name} is disabled`);
     let originThread = body.originThread
       ? await resolveResourceId(pool, "coordination_threads", "THREAD", body.originThread)
       : context.coordinationThreadId;
@@ -315,16 +381,43 @@ export async function registerCoordinationRoutes(
       if (!belongs.rows[0]) badRequest("Origin message does not belong to the origin thread");
     }
     const taskId = body.task ? await resolveResourceId(pool, "tasks", "TASK", body.task) : null;
+    if (taskId) badRequest("threads create cannot attach to a task; use tasks create --work-key or assignments create");
     const projectId = body.projectId ?? context.taskProjectId;
+    const workKey = normalizeWorkKey(body.workKey);
+    const workScope = normalizeWorkScope(body.workScope, detachedWorkScope(context.agentId));
+    const workFingerprint = stableFingerprint({ title: body.title, description: body.description, purpose: body.purpose, to: recipient.id, projectId });
     const result = await withTransaction(pool, async (client) => {
+      const existing = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+        `SELECT id, number, work_fingerprint FROM coordination_threads
+         WHERE task_id IS NULL AND work_scope = $1 AND work_key = $2 FOR UPDATE`, [workScope, workKey]
+      );
+      if (existing.rows[0]) {
+        if (existing.rows[0].work_fingerprint !== workFingerprint) {
+          await recordSafetyEvent(client, {
+            operation: "thread.create.identity-conflict",
+            context,
+            workScope,
+            workKey,
+            details: { existingFingerprint: existing.rows[0].work_fingerprint, requestedFingerprint: workFingerprint },
+            message: `Detached work key ${workScope}/${workKey} already belongs to THREAD-${existing.rows[0].number} with different immutable input`
+          });
+        }
+        const prior = await client.query<{ id: string }>(
+          "SELECT id FROM thread_messages WHERE thread_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1", [existing.rows[0].id]
+        );
+        return { threadId: existing.rows[0].id, messageId: prior.rows[0]?.id ?? "", duplicate: true };
+      }
       const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
       if (duplicate) return { threadId: duplicate.thread_id, messageId: duplicate.id, duplicate: true };
       const inserted = await client.query<{ id: string; number: number }>(
         `INSERT INTO coordination_threads
            (title, description, purpose, project_id, task_id, created_by_agent_id, primary_agent_id,
-            callback_agent_id, origin_thread_id, origin_message_id, completion_instructions)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, $9,
-                 'When complete, send the result back to ' || $10 || ' with: aisevak threads complete THREAD-<number> --summary-stdin')
+            callback_agent_id, origin_thread_id, origin_message_id, work_scope, work_key, work_fingerprint, completion_instructions)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8, $9, $10, $11, $12,
+                 'When complete, send the result back to ' || $13 || ' with: aisevak threads complete THREAD-<number> --summary-stdin')
+         ON CONFLICT (work_scope, work_key)
+           WHERE task_id IS NULL AND work_scope IS NOT NULL AND work_key IS NOT NULL
+         DO NOTHING
          RETURNING id, number`,
         [
           body.title,
@@ -336,9 +429,33 @@ export async function registerCoordinationRoutes(
           recipient.id,
           originThread,
           originMessage,
+          workScope,
+          workKey,
+          workFingerprint,
           context.name
         ]
       );
+      if (!inserted.rows[0]) {
+        const concurrent = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          `SELECT id, number, work_fingerprint FROM coordination_threads
+           WHERE task_id IS NULL AND work_scope = $1 AND work_key = $2 FOR UPDATE`, [workScope, workKey]
+        );
+        const row = concurrent.rows[0] ?? notFound("Thread created by concurrent request");
+        if (row.work_fingerprint !== workFingerprint) {
+          await recordSafetyEvent(client, {
+            operation: "thread.create.identity-conflict",
+            context,
+            workScope,
+            workKey,
+            details: { existingFingerprint: row.work_fingerprint, requestedFingerprint: workFingerprint, concurrent: true },
+            message: `Detached work key ${workScope}/${workKey} already belongs to THREAD-${row.number} with different immutable input`
+          });
+        }
+        const prior = await client.query<{ id: string }>(
+          "SELECT id FROM thread_messages WHERE thread_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1", [row.id]
+        );
+        return { threadId: row.id, messageId: prior.rows[0]?.id ?? "", duplicate: true };
+      }
       const thread = inserted.rows[0]!;
       await client.query(
         `UPDATE coordination_threads
@@ -490,59 +607,37 @@ export async function registerCoordinationRoutes(
 
   app.post("/api/agent-tools/v1/tasks", async (request) => {
     const context = await requireAgent(pool, request);
-    requireCapability(context, "tasks:create");
+    // Check capability before validating the body so stale/unauthorized
+    // callers cannot turn a forbidden mutation into a schema error (or learn
+    // more about the route than their capability permits).
+    const rawBody = request.body && typeof request.body === "object"
+      ? request.body as { parentTask?: unknown }
+      : {};
+    const hasParentTask = typeof rawBody.parentTask === "string" && rawBody.parentTask.trim().length > 0;
+    requireCapability(context, hasParentTask ? "tasks:create-child" : "tasks:create-root");
     const body = taskCreateSchema.parse(request.body);
+    if (!body.workKey) badRequest("Agent-created tasks require a stable workKey; use assignments for specialist work");
     const recipient = body.agent ? await getAgent(pool, body.agent) : await getOrchestrator(pool);
     const projectId = body.projectId ?? context.taskProjectId;
+    const parentTaskId = body.parentTask ? await resolveResourceId(pool, "tasks", "TASK", body.parentTask) : null;
     const ids = await withTransaction(pool, async (client) => {
-      const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
-      if (duplicate) {
-        const existing = await client.query<{ task_id: string }>(
-          "SELECT task_id FROM coordination_threads WHERE id = $1 AND task_id IS NOT NULL",
-          [duplicate.thread_id]
-        );
-        if (existing.rows[0]) {
-          return { taskId: existing.rows[0].task_id, threadId: duplicate.thread_id, duplicate: true };
-        }
-      }
-      const task = await client.query<{ id: string; number: number }>(
-        `INSERT INTO tasks (title, description, body, status, project_id, agent_id)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING id, number`,
-        [body.title, body.description, body.body, body.status, projectId, recipient.id]
-      );
-      const row = task.rows[0]!;
-      const thread = await client.query<{ id: string; number: number }>(
-        `INSERT INTO coordination_threads
-           (title, description, purpose, project_id, task_id, created_by_agent_id, primary_agent_id,
-            callback_agent_id, origin_thread_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8) RETURNING id, number`,
-        [body.title, body.description, body.body || body.description, projectId, row.id, context.agentId, recipient.id, context.coordinationThreadId]
-      );
-      const threadRow = thread.rows[0]!;
-      await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [
-        row.id,
-        threadRow.id
-      ]);
-      await client.query(
-        `UPDATE coordination_threads
-         SET completion_instructions = 'When complete, report back to ' || $2 || ' with: aisevak threads complete THREAD-' || $3 || ' --summary-stdin'
-         WHERE id = $1`,
-        [threadRow.id, context.name, threadRow.number]
-      );
-      await addParticipants(client, threadRow.id, [[context.agentId, "initiator"], [recipient.id, "assignee"]]);
-      const message = await insertMessage(client, {
-        threadId: threadRow.id,
-        senderAgentId: context.agentId,
-        recipientAgentId: recipient.id,
-        body: `Task TASK-${row.number}: ${body.title}\n\n${body.description}\n\n${body.body}`.trim(),
-        type: "task.created",
-        idempotencyKey: body.idempotencyKey
+      await assertTaskCreationAllowed(client, context, parentTaskId);
+      return createOrReuseTaskInTransaction(client, {
+        context,
+        title: body.title,
+        description: body.description,
+        body: body.body,
+        status: body.status,
+        projectId,
+        recipient,
+        parentTaskId,
+        workKey: body.workKey!,
+        workScope: body.workScope,
+        idempotencyKey: body.idempotencyKey,
+        managedRoot: options.managedRoot
       });
-      if (recipient.id !== context.agentId) {
-        await queueDelivery(client, options.managedRoot, threadRow.id, message.id, recipient.id);
-      }
-      return { taskId: row.id, threadId: threadRow.id, duplicate: false };
     });
+    if (ids.conflict) return { task: await showTask(pool, ids.taskId), thread: ids.threadId ? await showThread(pool, ids.threadId) : null, duplicate: true, conflict: true };
     return {
       task: await showTask(pool, ids.taskId),
       thread: await showThread(pool, ids.threadId),
@@ -562,6 +657,22 @@ export async function registerCoordinationRoutes(
     requireCapability(context, "tasks:update");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = taskPatchSchema.parse(request.body);
+    const currentTask = await pool.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [id]);
+    requireTaskOwner(context, currentTask.rows[0] ?? notFound("Task"), "update this task");
+    if (["completed", "blocked", "cancelled"].includes(body.status ?? "")) {
+      const active = await pool.query<{ count: string }>(
+        "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [id]
+      );
+      if (Number(active.rows[0]?.count ?? 0) > 0) {
+        await recordSafetyEvent(pool, {
+          operation: "task.complete.active-assignments",
+          context,
+          taskId: id,
+          details: { requestedStatus: body.status, activeAssignments: Number(active.rows[0]?.count ?? 0) },
+          message: `Task cannot be marked ${body.status} while assignments are active; complete or block each assignment first`
+        });
+      }
+    }
     const result = await pool.query(
       `UPDATE tasks SET title = COALESCE($2, title), description = COALESCE($3, description),
               body = COALESCE($4, body), status = COALESCE($5, status), updated_at = now()
@@ -592,6 +703,8 @@ export async function registerCoordinationRoutes(
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = assignSchema.parse(request.body);
     const recipient = await getAgent(pool, body.agent);
+    const owner = await pool.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [id]);
+    requireTaskOwner(context, owner.rows[0] ?? notFound("Task"), "reassign this task");
     const output = await withTransaction(pool, async (client) => {
       await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [id]);
       const task = await client.query<{ number: number; title: string; coordination_thread_id: string }>(
@@ -629,11 +742,282 @@ export async function registerCoordinationRoutes(
     return { task: await showTask(pool, id), thread: await showThread(pool, output.threadId) };
   });
 
+  app.get("/api/agent-tools/v1/tasks/:ref/assignments", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "assignments:read");
+    const taskId = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
+    const result = await pool.query(
+      `SELECT task_assignments.*, tasks.number AS task_number, tasks.title AS task_title,
+              tasks.coordination_thread_id, agents.name AS assigned_agent_name,
+              creator.name AS created_by_agent_name, message_deliveries.status AS delivery_status
+       FROM task_assignments
+       JOIN tasks ON tasks.id = task_assignments.task_id
+       JOIN agents ON agents.id = task_assignments.assigned_agent_id
+       LEFT JOIN agents creator ON creator.id = task_assignments.created_by_agent_id
+       LEFT JOIN message_deliveries ON message_deliveries.id = task_assignments.active_delivery_id
+       WHERE task_assignments.task_id = $1
+       ORDER BY task_assignments.number ASC`, [taskId]
+    );
+    return { assignments: result.rows.map((row) => assignmentResource(row)) };
+  });
+
+  app.get("/api/agent-tools/v1/assignments/:ref", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "assignments:read");
+    const id = await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", refParams.parse(request.params).ref);
+    return { assignment: await showAssignment(pool, id, true) };
+  });
+
+  app.post("/api/agent-tools/v1/tasks/:ref/assignments", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireAnyCapability(context, ["assignments:create", "assignments:manage"]);
+    const taskId = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
+    const body = assignmentCreateSchema.parse(request.body);
+    const recipient = await getAgent(pool, body.to);
+    if (!recipient.enabled) badRequest(`Agent ${recipient.name} is disabled`);
+    if (recipient.kind === "dispatcher") badRequest("Assignments must target an enabled worker agent");
+    const result = await withTransaction(pool, async (client) => {
+      const taskResult = await client.query<{
+        id: string; number: number; title: string; status: string; agent_id: string; coordination_thread_id: string | null; orchestration_policy: unknown;
+      }>("SELECT id, number, title, status, agent_id, coordination_thread_id, orchestration_policy FROM tasks WHERE id = $1 FOR UPDATE", [taskId]);
+      const task = taskResult.rows[0] ?? notFound("Task");
+      requireTaskOwner(context, task, "create assignments for this task");
+      if (["completed", "blocked", "cancelled"].includes(task.status)) throw safetyConflict(`Cannot add an assignment to a ${task.status} task`);
+      if (!task.coordination_thread_id) badRequest("This task has no coordination thread; migrate the task before adding an assignment");
+      const key = normalizeWorkKey(body.key);
+      const fingerprint = assignmentFingerprint({ taskId, assignmentKey: key, assignedAgentId: recipient.id, instructions: body.instructions });
+      const existing = await client.query<{ id: string; fingerprint: string }>(
+        "SELECT id, fingerprint FROM task_assignments WHERE task_id = $1 AND assignment_key = $2 FOR UPDATE", [taskId, key]
+      );
+      if (existing.rows[0]) {
+        if (existing.rows[0].fingerprint !== fingerprint) {
+          await recordSafetyEvent(client, {
+            operation: "assignment.create.identity-conflict",
+            context,
+            taskId,
+            assignmentId: existing.rows[0].id,
+            workKey: key,
+            details: { existingFingerprint: existing.rows[0].fingerprint, requestedFingerprint: fingerprint },
+            message: `Assignment key ${key} already exists on TASK-${task.number} with different immutable input`
+          });
+        }
+        return { assignmentId: existing.rows[0].id, duplicate: true };
+      }
+      const policy = orchestrationPolicy(task.orchestration_policy);
+      const active = await client.query<{ count: string }>(
+        "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [taskId]
+      );
+      if (Number(active.rows[0]?.count ?? 0) >= policy.maxActiveAssignments) {
+        await recordSafetyEvent(client, {
+          operation: "assignment.create.active-limit",
+          context,
+          taskId,
+          workKey: key,
+          details: { limit: policy.maxActiveAssignments },
+          message: `Task has reached its active assignment limit (${policy.maxActiveAssignments})`
+        });
+      }
+      const inserted = await client.query<{ id: string; number: number }>(
+         `INSERT INTO task_assignments
+           (task_id, assignment_key, assigned_agent_id, created_by_agent_id, instructions, fingerprint)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (task_id, assignment_key) DO NOTHING
+         RETURNING id, number`,
+        [taskId, key, recipient.id, context.agentId, body.instructions, fingerprint]
+      );
+      if (!inserted.rows[0]) {
+        // A concurrent request may have passed the initial SELECT before the
+        // other transaction committed. The unique key is the final arbiter;
+        // reuse that assignment instead of creating a second delivery/session.
+        const concurrent = await client.query<{ id: string; fingerprint: string }>(
+          "SELECT id, fingerprint FROM task_assignments WHERE task_id = $1 AND assignment_key = $2 FOR UPDATE",
+          [taskId, key]
+        );
+        const row = concurrent.rows[0] ?? notFound("Assignment created by concurrent request");
+        if (row.fingerprint !== fingerprint) {
+          await recordSafetyEvent(client, {
+            operation: "assignment.create.identity-conflict",
+            context,
+            taskId,
+            assignmentId: row.id,
+            workKey: key,
+            details: { existingFingerprint: row.fingerprint, requestedFingerprint: fingerprint, concurrent: true },
+            message: `Assignment key ${key} already exists on TASK-${task.number} with different immutable input`
+          });
+        }
+        return { assignmentId: row.id, duplicate: true };
+      }
+      const assignment = inserted.rows[0];
+      const message = await insertMessage(client, {
+        threadId: task.coordination_thread_id,
+        senderAgentId: context.agentId,
+        recipientAgentId: recipient.id,
+        body: `ASSIGNMENT-${assignment.number} (${key}) for TASK-${task.number}:\n\n${body.instructions}\n\nUse the same assignment to report completion; do not create a recovery or review thread.`,
+        type: "assignment.created",
+        idempotencyKey: body.idempotencyKey
+      });
+      await client.query("UPDATE task_assignments SET last_message_id = $2 WHERE id = $1", [assignment.id, message.id]);
+      const deliveryId = recipient.id === context.agentId
+        ? null
+        : await queueDelivery(client, options.managedRoot, task.coordination_thread_id, message.id, recipient.id, assignment.id);
+      if (deliveryId) {
+        await client.query("UPDATE task_assignments SET active_delivery_id = $2 WHERE id = $1", [assignment.id, deliveryId]);
+      }
+      return { assignmentId: assignment.id, duplicate: false };
+    });
+    return { assignment: await showAssignment(pool, result.assignmentId, true), duplicate: result.duplicate };
+  });
+
+  app.post("/api/agent-tools/v1/assignments/:ref/send", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireAnyCapability(context, ["assignments:send", "assignments:manage"]);
+    const id = await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", refParams.parse(request.params).ref);
+    const body = assignmentMessageSchema.parse(request.body);
+    await withTransaction(pool, async (client) => {
+      const row = await client.query<{ task_id: string; assigned_agent_id: string; status: string; coordination_thread_id: string; task_agent_id: string; task_status: string }>(
+        `SELECT task_assignments.task_id, task_assignments.assigned_agent_id, task_assignments.status,
+                tasks.coordination_thread_id, tasks.agent_id AS task_agent_id, tasks.status AS task_status
+         FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id
+         WHERE task_assignments.id = $1 FOR UPDATE`, [id]
+      );
+      const assignment = row.rows[0] ?? notFound("Assignment");
+      if (context.agentId !== assignment.assigned_agent_id && context.agentId !== assignment.task_agent_id && context.kind !== "dispatcher") {
+        forbidden("Only the assigned agent, task owner, or orchestrator may send assignment instructions");
+      }
+      const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
+      if (duplicate) return;
+      if (["completed", "cancelled"].includes(assignment.task_status)) throw safetyConflict(`Cannot send instructions on a ${assignment.task_status} task`);
+      if (["completed", "cancelled"].includes(assignment.status)) throw safetyConflict("A terminal assignment cannot receive more instructions");
+      const message = await insertMessage(client, {
+        threadId: assignment.coordination_thread_id,
+        senderAgentId: context.agentId,
+        recipientAgentId: assignment.assigned_agent_id,
+        body: body.body,
+        type: "assignment.message",
+        idempotencyKey: body.idempotencyKey
+      });
+      const deliveryId = context.agentId === assignment.assigned_agent_id
+        ? null
+        : await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, assignment.assigned_agent_id, id);
+      await client.query("UPDATE task_assignments SET last_message_id = $2, active_delivery_id = $3, status = CASE WHEN status = 'blocked' THEN 'queued' ELSE status END, updated_at = now() WHERE id = $1", [id, message.id, deliveryId]);
+    });
+    return { assignment: await showAssignment(pool, id, true) };
+  });
+
+  app.post("/api/agent-tools/v1/assignments/:ref/retry", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireAnyCapability(context, ["assignments:retry", "assignments:manage"]);
+    const id = await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", refParams.parse(request.params).ref);
+    const body = assignmentMessageSchema.partial().parse(request.body ?? {});
+    await withTransaction(pool, async (client) => {
+      const row = await client.query<{
+        task_id: string; task_number: number; assignment_number: number; assigned_agent_id: string; status: string; attempt_count: number;
+        max_attempts: unknown; coordination_thread_id: string; task_agent_id: string; task_status: string; assignment_key: string; instructions: string; active_delivery_id: string | null;
+      }>(
+        `SELECT task_assignments.task_id, tasks.number AS task_number, task_assignments.number AS assignment_number, task_assignments.assigned_agent_id,
+                task_assignments.status, task_assignments.attempt_count, tasks.orchestration_policy AS max_attempts,
+                tasks.coordination_thread_id, tasks.agent_id AS task_agent_id, tasks.status AS task_status, task_assignments.assignment_key, task_assignments.instructions,
+                task_assignments.active_delivery_id
+         FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id
+         WHERE task_assignments.id = $1 FOR UPDATE`, [id]
+      );
+      const assignment = row.rows[0] ?? notFound("Assignment");
+      requireTaskOwner(context, { agent_id: assignment.task_agent_id }, "retry this assignment");
+      if (["completed", "cancelled"].includes(assignment.task_status)) throw safetyConflict(`Cannot retry an assignment on a ${assignment.task_status} task`);
+      if (["completed", "cancelled"].includes(assignment.status)) throw safetyConflict("A terminal assignment cannot be retried");
+      if (assignment.status === "running") throw safetyConflict("The assignment is already running; wait for it to finish or fail");
+      const policy = orchestrationPolicy(assignment.max_attempts);
+      if (assignment.attempt_count >= policy.maxAssignmentAttempts) {
+        await recordSafetyEvent(client, {
+          operation: "assignment.retry.attempt-limit",
+          context,
+          taskId: assignment.task_id,
+          assignmentId: id,
+          details: { limit: policy.maxAssignmentAttempts },
+          message: `Assignment has reached its retry limit (${policy.maxAssignmentAttempts})`
+        });
+      }
+      const nextAttempt = assignment.attempt_count + 1;
+      const retryIdempotencyKey = body.idempotencyKey || `assignment:${id}:attempt:${nextAttempt}`;
+      const duplicate = await existingIdempotentMessage(client, context.agentId, retryIdempotencyKey);
+      if (duplicate) return;
+      if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Retrying ASSIGNMENT-${assignment.assignment_number}`);
+      await client.query("UPDATE task_assignments SET attempt_count = $2, status = 'queued', result = NULL, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, nextAttempt]);
+      const message = await insertMessage(client, {
+        threadId: assignment.coordination_thread_id,
+        senderAgentId: context.agentId,
+        recipientAgentId: assignment.assigned_agent_id,
+        body: body.body || `Retry ASSIGNMENT-${assignment.assignment_number} (${assignment.assignment_key}) attempt ${nextAttempt}. Continue the same assignment and provider session when resumable.`,
+        type: "assignment.retry",
+        idempotencyKey: retryIdempotencyKey
+      });
+      await client.query("UPDATE task_assignments SET last_message_id = $2 WHERE id = $1", [id, message.id]);
+      const deliveryId = context.agentId === assignment.assigned_agent_id
+        ? null
+        : await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, assignment.assigned_agent_id, id);
+      if (deliveryId) await client.query("UPDATE task_assignments SET active_delivery_id = $2 WHERE id = $1", [id, deliveryId]);
+    });
+    return { assignment: await showAssignment(pool, id, true) };
+  });
+
+  for (const action of ["complete", "block"] as const) {
+    app.post(`/api/agent-tools/v1/assignments/:ref/${action}`, async (request) => {
+      const context = await requireAgent(pool, request);
+      requireCapability(context, action === "complete" ? "assignments:complete" : "assignments:block");
+      const id = await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", refParams.parse(request.params).ref);
+      const body = assignmentResultSchema.parse(request.body);
+      await withTransaction(pool, async (client) => {
+        const row = await client.query<{
+          task_id: string; assignment_number: number; assigned_agent_id: string; status: string; coordination_thread_id: string; task_agent_id: string; task_number: number; active_delivery_id: string | null;
+        }>(
+          `SELECT task_assignments.task_id, task_assignments.number AS assignment_number, task_assignments.assigned_agent_id, task_assignments.status,
+                  task_assignments.active_delivery_id,
+                  tasks.coordination_thread_id, tasks.agent_id AS task_agent_id, tasks.number AS task_number
+           FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id
+           WHERE task_assignments.id = $1 FOR UPDATE`, [id]
+        );
+        const assignment = row.rows[0] ?? notFound("Assignment");
+        if (assignment.assigned_agent_id !== context.agentId) forbidden("Only the assigned specialist may complete or block this assignment");
+        if (["completed", "blocked", "cancelled"].includes(assignment.status)) return;
+        const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
+        if (duplicate) return;
+        await client.query("UPDATE task_assignments SET status = $2, result = $3, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, action === "complete" ? "completed" : "blocked", body.result]);
+        if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`);
+        if (assignment.task_agent_id !== context.agentId) {
+          const message = await insertMessage(client, {
+            threadId: assignment.coordination_thread_id,
+            senderAgentId: context.agentId,
+            recipientAgentId: assignment.task_agent_id,
+          body: `ASSIGNMENT-${assignment.assignment_number} ${action === "complete" ? "completed" : "blocked"}:\n\n${body.result}`,
+            type: action === "complete" ? "assignment.completed" : "assignment.blocked",
+            idempotencyKey: body.idempotencyKey
+          });
+          await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, assignment.task_agent_id);
+        }
+      });
+      return { assignment: await showAssignment(pool, id, true) };
+    });
+  }
+
   app.post("/api/agent-tools/v1/tasks/:ref/complete", async (request) => {
     const context = await requireAgent(pool, request);
-    requireCapability(context, "tasks:update");
+    requireCapability(context, "tasks:complete");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = optionalBodySchema.parse(request.body ?? {});
+    const owner = await pool.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [id]);
+    requireTaskOwner(context, owner.rows[0] ?? notFound("Task"), "complete this task");
+    const active = await pool.query<{ count: string }>(
+      "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [id]
+    );
+    if (Number(active.rows[0]?.count ?? 0) > 0) {
+      await recordSafetyEvent(pool, {
+        operation: "task.complete.active-assignments",
+        context,
+        taskId: id,
+        details: { requestedStatus: "completed", activeAssignments: Number(active.rows[0]?.count ?? 0) },
+        message: "Task cannot be completed while assignments are queued or running; complete or block each assignment first"
+      });
+    }
     const task = await showTask(pool, id);
     if (task.coordination_thread_id) {
       await finalizeThread(pool, options.managedRoot, context, task.coordination_thread_id, "completed", body.body || "Task completed.");
@@ -738,11 +1122,12 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
     if (!agent.enabled) badRequest(`Agent ${agent.name} is disabled`);
     const runAt = new Date(body.at);
     if (runAt.getTime() <= Date.now()) badRequest("Schedule time must be in the future");
+    const taskId = body.task ? await resolveResourceId(pool, "tasks", "TASK", body.task) : null;
     const result = await pool.query<{ id: string }>(
       `INSERT INTO schedules
          (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds,
-          created_by_agent_id, idempotency_key)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+          created_by_agent_id, idempotency_key, task_id, overlap_policy)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        ON CONFLICT (created_by_agent_id, idempotency_key)
        WHERE created_by_agent_id IS NOT NULL AND idempotency_key IS NOT NULL
        DO UPDATE SET updated_at = schedules.updated_at
@@ -755,7 +1140,9 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
         runAt,
         body.intervalSeconds ?? null,
         context.agentId,
-        body.idempotencyKey ?? null
+        body.idempotencyKey ?? null,
+        taskId,
+        body.overlapPolicy
       ]
     );
     return { schedule: await showSchedule(pool, result.rows[0]!.id) };
@@ -992,15 +1379,25 @@ export async function requireAgent(pool: DbPool, request: FastifyRequest): Promi
     agent_id: string | null; agent_thread_id: string | null; coordination_thread_id: string | null;
     task_id: string | null; task_project_id: string | null; role: "worker" | "dispatcher";
     kind: "worker" | "dispatcher" | null; name: string | null; description: string | null; capabilities: unknown;
+    assignment_id: string | null; assignment_key: string | null; assignment_status: string | null; assignment_attempt: number | null;
+    provider_thread_id: string | null;
   }>(
     `SELECT agent_tool_tokens.agent_id, agent_tool_tokens.agent_thread_id,
             COALESCE(agent_tool_tokens.coordination_thread_id, agent_threads.coordination_thread_id) AS coordination_thread_id,
             agent_tool_tokens.task_id, tasks.project_id AS task_project_id, agent_tool_tokens.role,
-            agents.kind, agents.name, agents.description, agents.capabilities
+            agents.kind, agents.name, agents.description, agents.capabilities,
+            COALESCE(agent_tool_tokens.assignment_id, dispatcher_runs.assignment_id, message_deliveries.assignment_id) AS assignment_id,
+            task_assignments.assignment_key, task_assignments.status AS assignment_status,
+            task_assignments.attempt_count AS assignment_attempt,
+            agent_threads.provider_thread_id
      FROM agent_tool_tokens
      LEFT JOIN agents ON agents.id = agent_tool_tokens.agent_id
      LEFT JOIN tasks ON tasks.id = agent_tool_tokens.task_id
      LEFT JOIN agent_threads ON agent_threads.id = agent_tool_tokens.agent_thread_id
+     LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_tool_tokens.dispatcher_run_id
+     LEFT JOIN message_deliveries ON message_deliveries.id = dispatcher_runs.message_delivery_id
+     LEFT JOIN task_assignments ON task_assignments.id = COALESCE(agent_tool_tokens.assignment_id, dispatcher_runs.assignment_id, message_deliveries.assignment_id)
+       AND (agent_tool_tokens.task_id IS NULL OR task_assignments.task_id = agent_tool_tokens.task_id)
      WHERE agent_tool_tokens.token_hash = $1 AND agent_tool_tokens.expires_at > now() LIMIT 1`,
     [hashToken(token!)]
   );
@@ -1019,22 +1416,353 @@ export async function requireAgent(pool: DbPool, request: FastifyRequest): Promi
     agentId: agentId!, agentThreadId: row.agent_thread_id, coordinationThreadId: row.coordination_thread_id,
     taskId: row.task_id, taskProjectId: row.task_project_id, kind,
     name: name ?? (kind === "dispatcher" ? "Orchestrator" : "Agent"), description: description ?? "",
-    capabilities: effectiveCapabilities(kind, capabilities)
+    capabilities: effectiveCapabilities(kind, capabilities),
+    assignmentId: row.assignment_key ? row.assignment_id : null,
+    assignmentKey: row.assignment_key,
+    assignmentStatus: row.assignment_status,
+    assignmentAttempt: row.assignment_attempt,
+    providerThreadId: row.provider_thread_id
   };
 }
 
 function agentIdentity(context: AgentContext) {
   return { id: context.agentId, name: context.name, description: context.description, kind: context.kind };
 }
-function currentContext(context: AgentContext) {
-  return { taskId: context.taskId, threadId: context.coordinationThreadId, providerSessionId: context.agentThreadId };
+function currentContext(context: AgentContext, envelope?: JobEnvelope | null) {
+  return {
+    taskId: context.taskId,
+    threadId: context.coordinationThreadId,
+    providerSessionId: context.agentThreadId,
+    assignmentId: context.assignmentId,
+    assignmentKey: context.assignmentKey,
+    assignmentStatus: context.assignmentStatus,
+    assignmentAttempt: context.assignmentAttempt,
+    job: envelope,
+    safetyMode: jobSafetyMode(),
+    allowedNextCommands: context.assignmentId
+      ? ["aisevak assignments show ASSIGNMENT-n", "aisevak assignments send ASSIGNMENT-n --instructions-stdin", "aisevak assignments complete ASSIGNMENT-n --result-stdin", "aisevak assignments block ASSIGNMENT-n --result-stdin"]
+      : context.kind === "dispatcher"
+        ? ["aisevak tasks create --work-key ...", "aisevak assignments create TASK-n --key ... --to ... --instructions-stdin"]
+        : ["aisevak assignments list TASK-n", "aisevak assignments show ASSIGNMENT-n"]
+  };
 }
 function effectiveCapabilities(kind: string, value: unknown): string[] {
-  if (Array.isArray(value) && value.every((item) => typeof item === "string") && value.length > 0) return [...new Set(value)];
-  return [...(kind === "dispatcher" ? ORCHESTRATOR_CAPABILITIES : DEFAULT_WORKER_CAPABILITIES)];
+  const baseline = kind === "dispatcher" ? ORCHESTRATOR_CAPABILITIES : DEFAULT_WORKER_CAPABILITIES;
+  const explicit = Array.isArray(value) && value.every((item) => typeof item === "string") && value.length > 0
+    ? value.filter((item): item is string => typeof item === "string")
+    : baseline;
+  const caps = new Set(explicit);
+  // Stored legacy capabilities are data, not authority. The new route guards
+  // deliberately remove bare thread/task creation even when old skills remain.
+  caps.delete("threads:create");
+  caps.delete("tasks:create");
+  if (kind !== "dispatcher") {
+    caps.delete("threads:complete");
+    caps.delete("tasks:update");
+    for (const capability of ["tasks:complete", "assignments:read", "assignments:send", "assignments:complete", "assignments:block"]) caps.add(capability);
+  } else {
+    for (const capability of ["tasks:create-root", "tasks:create-child", "tasks:update", "assignments:create", "assignments:manage", "assignments:retry"]) caps.add(capability);
+  }
+  return [...caps];
 }
 export function requireCapability(context: AgentContext, capability: string): void {
   if (!context.capabilities.includes(capability)) forbidden(`Agent ${context.name} does not have ${capability}`);
+}
+function requireAnyCapability(context: AgentContext, capabilities: string[]): void {
+  if (!capabilities.some((capability) => context.capabilities.includes(capability))) {
+    forbidden(`Agent ${context.name} does not have any of: ${capabilities.join(", ")}`);
+  }
+}
+
+async function recordSafetyEvent(
+  client: Queryable,
+  input: {
+    operation: string;
+    context?: Pick<AgentContext, "agentId">;
+    taskId?: string | null;
+    assignmentId?: string | null;
+    workScope?: string | null;
+    workKey?: string | null;
+    details?: Record<string, unknown>;
+    message: string;
+  }
+): Promise<void> {
+  await client.query(
+    `INSERT INTO job_safety_events
+       (operation, actor_agent_id, task_id, assignment_id, work_scope, work_key, would_reject, details)
+     VALUES ($1, $2, $3, $4, $5, $6, true, $7)`,
+    [input.operation, input.context?.agentId ?? null, input.taskId ?? null, input.assignmentId ?? null,
+      input.workScope ?? null, input.workKey ?? null, JSON.stringify(input.details ?? {})]
+  );
+  if (jobSafetyMode() === "enforce") throw safetyConflict(input.message);
+}
+
+async function cancelPendingAssignmentDelivery(
+  client: PoolClient,
+  deliveryId: string,
+  reason: string
+): Promise<void> {
+  // Completing/blocking an assignment must make an already-queued delivery
+  // inert. A running provider turn is allowed to finish its current turn;
+  // its terminalizer observes the failed delivery and will not enqueue a
+  // duplicate retry.
+  await client.query(
+    `UPDATE message_deliveries
+     SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+     WHERE id = $1 AND status IN ('queued', 'retrying')`,
+    [deliveryId, reason]
+  );
+  await client.query(
+    `UPDATE dispatcher_runs
+     SET status = 'cancelled', finished_at = COALESCE(finished_at, now()),
+         error = COALESCE(error, $2), updated_at = now()
+     WHERE message_delivery_id = $1 AND status IN ('queued', 'cancel_requested')`,
+    [deliveryId, reason]
+  );
+  await client.query(
+    `UPDATE dispatcher_runs
+     SET status = 'cancel_requested', error = COALESCE(error, $2), updated_at = now()
+     WHERE message_delivery_id = $1 AND status = 'running'`,
+    [deliveryId, reason]
+  );
+  await client.query(
+    `UPDATE agent_turn_inputs
+     SET status = 'failed', error = $2, updated_at = now()
+     WHERE message_delivery_id = $1 AND status IN ('queued', 'delivering')`,
+    [deliveryId, reason]
+  );
+}
+
+export function requireTaskOwner(context: AgentContext, task: { agent_id: string }, operation: string): void {
+  if (context.kind !== "dispatcher" && context.agentId !== task.agent_id) {
+    throw safetyForbidden(`Only the task owner or orchestrator may ${operation}`);
+  }
+}
+
+async function assertTaskCreationAllowed(
+  client: PoolClient,
+  context: AgentContext,
+  parentTaskId: string | null
+): Promise<void> {
+  if (parentTaskId) {
+    requireCapability(context, "tasks:create-child");
+    if (context.taskId && context.taskId !== parentTaskId && context.kind !== "dispatcher") {
+      await recordSafetyEvent(client, {
+        operation: "task.create.child.context-mismatch",
+        context,
+        taskId: parentTaskId,
+        message: "A child task must be created from its active parent task context"
+      });
+    }
+    return;
+  }
+  if (context.taskId) {
+    await recordSafetyEvent(client, {
+      operation: "task.create.root.inside-task",
+      context,
+      taskId: context.taskId,
+      message: "You are inside an active task. Use a keyed child task or a task assignment instead of creating another root task."
+    });
+  }
+  requireCapability(context, "tasks:create-root");
+}
+
+async function createOrReuseTaskInTransaction(
+  client: PoolClient,
+  options: {
+    context: AgentContext;
+    title: string;
+    description: string;
+    body: string;
+    status: string;
+    projectId: string | null;
+    recipient: any;
+    parentTaskId: string | null;
+    workKey: string;
+    workScope?: string;
+    idempotencyKey?: string;
+    managedRoot: string;
+  }
+): Promise<{ taskId: string; threadId: string; duplicate: boolean; conflict?: boolean }> {
+  const workKey = normalizeWorkKey(options.workKey);
+  const workScope = normalizeWorkScope(options.workScope, taskWorkScope({
+    parentTaskId: options.parentTaskId,
+    projectId: options.projectId,
+    actorId: options.context.agentId
+  }));
+  const fingerprint = taskFingerprint({
+    title: options.title,
+    description: options.description,
+    body: options.body,
+    projectId: options.projectId,
+    agentId: options.recipient.id,
+    parentTaskId: options.parentTaskId,
+    workScope,
+    workKey
+  });
+
+  // Resolve identity before applying parent limits. An exact retry must reuse
+  // the existing job even if the parent has since reached its active fan-out
+  // limit. The unique identity index is the final concurrency guard below.
+  const existing = await client.query<{ id: string; number: number; coordination_thread_id: string | null; work_fingerprint: string }>(
+    `SELECT id, number, coordination_thread_id, work_fingerprint
+     FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE`, [workScope, workKey]
+  );
+  if (existing.rows[0]) {
+    const row = existing.rows[0];
+    if (row.work_fingerprint !== fingerprint) {
+      await recordSafetyEvent(client, {
+        operation: "task.create.identity-conflict",
+        context: options.context,
+        taskId: row.id,
+        workScope,
+        workKey,
+        details: { existingFingerprint: row.work_fingerprint, requestedFingerprint: fingerprint },
+        message: `Work key ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`
+      });
+      return { taskId: row.id, threadId: row.coordination_thread_id ?? "", duplicate: true, conflict: true };
+    }
+    if (!row.coordination_thread_id) {
+      const thread = await client.query<{ id: string }>(
+        `INSERT INTO coordination_threads
+           (title, description, purpose, project_id, task_id, created_by_agent_id, primary_agent_id, callback_agent_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $6) RETURNING id`,
+        [options.title, options.description, options.body || options.description, options.projectId, row.id, options.context.agentId, options.recipient.id]
+      );
+      await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [row.id, thread.rows[0]!.id]);
+      return { taskId: row.id, threadId: thread.rows[0]!.id, duplicate: true };
+    }
+    return { taskId: row.id, threadId: row.coordination_thread_id, duplicate: true };
+  }
+
+  if (options.parentTaskId) {
+    const parent = await client.query<{ id: string; parent_task_id: string | null; orchestration_policy: unknown; status: string }>(
+      "SELECT id, parent_task_id, orchestration_policy, status FROM tasks WHERE id = $1 FOR UPDATE", [options.parentTaskId]
+    );
+    const parentRow = parent.rows[0];
+    if (!parentRow) notFound("Parent task");
+    if (["completed", "blocked", "cancelled"].includes(parentRow.status)) {
+      await recordSafetyEvent(client, {
+        operation: "task.create.child.parent-stopped",
+        context: options.context,
+        taskId: options.parentTaskId,
+        workScope,
+        workKey,
+        details: { parentStatus: parentRow.status },
+        message: `Cannot create a child task under a ${parentRow.status} parent task`
+      });
+    }
+    const concurrentExisting = await client.query<{ id: string; number: number; coordination_thread_id: string | null; work_fingerprint: string }>(
+      `SELECT id, number, coordination_thread_id, work_fingerprint
+       FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE`, [workScope, workKey]
+    );
+    if (concurrentExisting.rows[0]) {
+      const row = concurrentExisting.rows[0];
+      if (row.work_fingerprint !== fingerprint) {
+        await recordSafetyEvent(client, {
+          operation: "task.create.identity-conflict",
+          context: options.context,
+          taskId: row.id,
+          workScope,
+          workKey,
+          details: { existingFingerprint: row.work_fingerprint, requestedFingerprint: fingerprint, concurrent: true },
+          message: `Work key ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`
+        });
+        return { taskId: row.id, threadId: row.coordination_thread_id ?? "", duplicate: true, conflict: true };
+      }
+      return { taskId: row.id, threadId: row.coordination_thread_id ?? "", duplicate: true };
+    }
+    const policy = orchestrationPolicy(parentRow.orchestration_policy);
+    const children = await client.query<{ count: string }>(
+      "SELECT count(*)::int AS count FROM tasks WHERE parent_task_id = $1 AND status NOT IN ('completed', 'blocked', 'cancelled')",
+      [options.parentTaskId]
+    );
+    if (Number(children.rows[0]?.count ?? 0) >= policy.maxActiveChildren) {
+      await recordSafetyEvent(client, {
+        operation: "task.create.child.fanout-limit",
+        context: options.context,
+        taskId: options.parentTaskId,
+        workScope,
+        workKey,
+        details: { limit: policy.maxActiveChildren },
+        message: `Parent task has reached its active child limit (${policy.maxActiveChildren})`
+      });
+    }
+    const depthResult = await client.query<{ depth: number }>(
+      `WITH RECURSIVE chain AS (
+         SELECT id, parent_task_id, 0::int AS depth FROM tasks WHERE id = $1
+         UNION ALL
+         SELECT parent.id, parent.parent_task_id, chain.depth + 1
+         FROM tasks parent JOIN chain ON parent.id = chain.parent_task_id
+       ) SELECT COALESCE(max(depth), 0)::int AS depth FROM chain`, [options.parentTaskId]
+    );
+    const depth = childDepth(depthResult.rows[0]?.depth) + 1;
+    if (depth > policy.maxChildDepth) {
+      await recordSafetyEvent(client, {
+        operation: "task.create.child.depth-limit",
+        context: options.context,
+        taskId: options.parentTaskId,
+        workScope,
+        workKey,
+        details: { depth, limit: policy.maxChildDepth },
+        message: `Child task depth ${depth} exceeds the limit (${policy.maxChildDepth})`
+      });
+    }
+  }
+
+  const inserted = await client.query<{ id: string; number: number }>(
+    `INSERT INTO tasks
+       (title, description, body, status, project_id, agent_id, parent_task_id, work_scope, work_key, work_fingerprint)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+     ON CONFLICT (work_scope, work_key) DO NOTHING
+     RETURNING id, number`,
+    [options.title, options.description, options.body, options.status, options.projectId, options.recipient.id,
+      options.parentTaskId, workScope, workKey, fingerprint]
+  );
+  if (!inserted.rows[0]) {
+    const concurrent = await client.query<{ id: string; number: number; coordination_thread_id: string | null; work_fingerprint: string }>(
+      `SELECT id, number, coordination_thread_id, work_fingerprint
+       FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE`, [workScope, workKey]
+    );
+    const row = concurrent.rows[0] ?? notFound("Task created by concurrent request");
+    if (row.work_fingerprint !== fingerprint) {
+      await recordSafetyEvent(client, {
+        operation: "task.create.identity-conflict",
+        context: options.context,
+        taskId: row.id,
+        workScope,
+        workKey,
+        details: { existingFingerprint: row.work_fingerprint, requestedFingerprint: fingerprint, concurrent: true },
+        message: `Work key ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`
+      });
+      return { taskId: row.id, threadId: row.coordination_thread_id ?? "", duplicate: true, conflict: true };
+    }
+    return { taskId: row.id, threadId: row.coordination_thread_id ?? "", duplicate: true };
+  }
+  const task = inserted.rows[0]!;
+  const thread = await client.query<{ id: string; number: number }>(
+    `INSERT INTO coordination_threads
+       (title, description, purpose, project_id, task_id, created_by_agent_id, primary_agent_id,
+        callback_agent_id, origin_thread_id, completion_instructions)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $6, $8,
+             'Report results to ' || $9 || ' through the task assignment or coordination thread.')
+     RETURNING id, number`,
+    [options.title, options.description, options.body || options.description, options.projectId, task.id,
+      options.context.agentId, options.recipient.id, options.context.coordinationThreadId, options.context.name]
+  );
+  const threadRow = thread.rows[0]!;
+  await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [task.id, threadRow.id]);
+  await addParticipants(client, threadRow.id, [[options.context.agentId, "initiator"], [options.recipient.id, "assignee"]]);
+  const message = await insertMessage(client, {
+    threadId: threadRow.id,
+    senderAgentId: options.context.agentId,
+    recipientAgentId: options.recipient.id,
+    body: `Task TASK-${task.number}: ${options.title}\n\n${options.description}\n\n${options.body}`.trim(),
+    type: "task.created",
+    idempotencyKey: options.idempotencyKey
+  });
+  if (options.recipient.id !== options.context.agentId) await queueDelivery(client, options.managedRoot, threadRow.id, message.id, options.recipient.id);
+  return { taskId: task.id, threadId: threadRow.id, duplicate: false };
 }
 
 async function getAgent(queryable: Queryable, ref: string): Promise<any> {
@@ -1075,7 +1803,7 @@ async function agentForTask(queryable: Queryable, taskId: string | null): Promis
 }
 
 async function resolveResourceId(queryable: Queryable, table: string, prefix: string, ref: string): Promise<string> {
-  const allowed = new Set(["coordination_threads", "tasks", "thread_messages", "reports", "incidents", "schedules"]);
+  const allowed = new Set(["coordination_threads", "tasks", "thread_messages", "reports", "incidents", "schedules", "task_assignments"]);
   if (!allowed.has(table)) throw new Error("Unsupported resource table");
   const number = ref.match(new RegExp(`^(?:${prefix}-)?(\\d+)$`, "i"));
   const result = number
@@ -1112,10 +1840,46 @@ async function showMessage(queryable: Queryable, id: string, includeContent = fa
 async function showTask(queryable: Queryable, id: string, includeContent = false): Promise<any> {
   const result = await queryable.query(
     `SELECT tasks.*, agents.name AS agent_name, projects.name AS project_name,
+            parent.number AS parent_task_number,
+            (SELECT count(*)::int FROM task_assignments WHERE task_assignments.task_id = tasks.id) AS assignment_count,
+            (SELECT count(*)::int FROM task_assignments WHERE task_assignments.task_id = tasks.id AND task_assignments.status IN ('queued', 'running')) AS active_assignment_count,
+            (SELECT count(*)::int FROM tasks child WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
             left(tasks.body, 1000) AS content_preview, octet_length(tasks.body) AS content_total_bytes
      FROM tasks JOIN agents ON agents.id = tasks.agent_id LEFT JOIN projects ON projects.id = tasks.project_id
+       LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      WHERE tasks.id = $1`, [id]);
-  return taskResource(result.rows[0] ?? notFound("Task"), includeContent);
+  const row = result.rows[0] ?? notFound("Task");
+  let assignmentRows: { rows: any[] } = { rows: [] };
+  try {
+    assignmentRows = await queryable.query(
+      `SELECT task_assignments.*, agents.name AS assigned_agent_name,
+              creator.name AS created_by_agent_name,
+              message_deliveries.status AS delivery_status
+       FROM task_assignments
+       JOIN agents ON agents.id = task_assignments.assigned_agent_id
+       LEFT JOIN agents creator ON creator.id = task_assignments.created_by_agent_id
+       LEFT JOIN message_deliveries ON message_deliveries.id = task_assignments.active_delivery_id
+       WHERE task_assignments.task_id = $1
+       ORDER BY task_assignments.number ASC`, [id]);
+  } catch (error) {
+    if (!String(error instanceof Error ? error.message : error).includes("task_assignments")) throw error;
+  }
+  return taskResource({ ...row, assignments: assignmentRows.rows.map((assignment) => assignmentResource(assignment)) }, includeContent);
+}
+async function showAssignment(queryable: Queryable, id: string, includeContent = false): Promise<any> {
+  const result = await queryable.query(
+    `SELECT task_assignments.*, tasks.number AS task_number, tasks.title AS task_title,
+            tasks.coordination_thread_id, agents.name AS assigned_agent_name,
+            creator.name AS created_by_agent_name,
+            message_deliveries.status AS delivery_status
+     FROM task_assignments
+     JOIN tasks ON tasks.id = task_assignments.task_id
+     JOIN agents ON agents.id = task_assignments.assigned_agent_id
+     LEFT JOIN agents creator ON creator.id = task_assignments.created_by_agent_id
+     LEFT JOIN message_deliveries ON message_deliveries.id = task_assignments.active_delivery_id
+     WHERE task_assignments.id = $1`, [id]);
+  const row = result.rows[0] ?? notFound("Assignment");
+  return assignmentResource(row, includeContent);
 }
 async function showReport(queryable: Queryable, id: string, includeContent = false): Promise<any> {
   const result = await queryable.query(
@@ -1299,13 +2063,20 @@ async function failStaleQueuedRunInputs(
   }
 }
 
-async function queueDelivery(client: PoolClient, managedRoot: string, threadId: string, messageId: string, recipientAgentId: string): Promise<void> {
+async function queueDelivery(
+  client: PoolClient,
+  managedRoot: string,
+  threadId: string,
+  messageId: string,
+  recipientAgentId: string,
+  assignmentId?: string | null
+): Promise<string | null> {
   const delivery = await client.query<{ id: string; status: string }>(
-    `INSERT INTO message_deliveries (message_id, recipient_agent_id) VALUES ($1, $2)
-     ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET updated_at = now()
-     RETURNING id, status`, [messageId, recipientAgentId]);
+    `INSERT INTO message_deliveries (message_id, recipient_agent_id, assignment_id) VALUES ($1, $2, $3)
+     ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET assignment_id = COALESCE(message_deliveries.assignment_id, EXCLUDED.assignment_id), updated_at = now()
+     RETURNING id, status`, [messageId, recipientAgentId, assignmentId ?? null]);
   const deliveryRow = delivery.rows[0];
-  if (!deliveryRow || deliveryRow.status === "completed" || deliveryRow.status === "failed") return;
+  if (!deliveryRow || deliveryRow.status === "completed" || deliveryRow.status === "failed") return deliveryRow?.id ?? null;
   const thread = await showThread(client, threadId, true);
   const recipient = await getAgent(client, recipientAgentId);
   const linkedTask = thread.task_id
@@ -1317,7 +2088,7 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : null;
   const existing = await client.query<AgentThreadSession>(
     `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd FROM agent_threads
-     WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1`, [threadId, recipientAgentId]);
+     WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1 FOR UPDATE`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
   let ownershipTransferUnsafe = false;
   const desiredRuntimeHome = linkedTaskId
@@ -1418,15 +2189,39 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
       `INSERT INTO agent_threads
          (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
        VALUES ($1, $2, $3, $4, 'codex-local', $5, $6, $7, $8, $9)
+       ON CONFLICT (coordination_thread_id, agent_id)
+         WHERE coordination_thread_id IS NOT NULL
+       DO NOTHING
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
       [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), desiredCwd, runtimeHome, threadId]
     );
-    session = created.rows[0]!;
+    session = created.rows[0];
+    if (!session) {
+      const concurrent = await client.query<AgentThreadSession>(
+        `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd
+         FROM agent_threads
+         WHERE coordination_thread_id = $1 AND agent_id = $2
+         LIMIT 1 FOR UPDATE`, [threadId, recipientAgentId]
+      );
+      session = concurrent.rows[0];
+    }
+    if (!session) throw new Error("Agent session was created concurrently but could not be read");
   }
 
   const message = await showMessage(client, messageId, true);
-  if (!ownershipTransferUnsafe && await queueIncrementalCoordinationInput(client, session.id, delivery.rows[0]!.id, message.body)) {
-    return;
+  const envelope = await loadJobEnvelope(client, thread.task_id, assignmentId ?? null, {
+    coordinationThreadId: threadId,
+    agentThreadId: session.id,
+    providerThreadId: session.provider_thread_id
+  });
+  if (!ownershipTransferUnsafe && await queueIncrementalCoordinationInput(
+    client,
+    session.id,
+    delivery.rows[0]!.id,
+    coordinationIncrementalPrompt(message, envelope),
+    assignmentId
+  )) {
+    return delivery.rows[0]!.id;
   }
 
   const history = await client.query(
@@ -1437,8 +2232,8 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
      WHERE thread_messages.thread_id = $1 ORDER BY thread_messages.created_at DESC, thread_messages.id DESC LIMIT 12`, [threadId]);
   const skills = await resolveAgentSkills(client, recipientAgentId, thread.project_id, thread.task_id);
   const prompt = session.provider_thread_id
-    ? coordinationIncrementalPrompt(message)
-    : coordinationPrompt(thread, recipient, message, history.rows.reverse());
+    ? coordinationIncrementalPrompt(message, envelope)
+    : coordinationPrompt(thread, recipient, message, history.rows.reverse(), envelope);
   const workspaceMode = thread.project_id
     ? project?.rows[0]?.workspace_mode ?? "unknown"
     : "projectless";
@@ -1447,17 +2242,18 @@ async function queueDelivery(client: PoolClient, managedRoot: string, threadId: 
     : "projectless";
   const createdRun = await client.query<{ id: string }>(
     `INSERT INTO dispatcher_runs
-       (task_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+       (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
         codex_thread_id, model, model_options, prompt, skills_snapshot)
-     VALUES ($1, 'message', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13, $14)
+     VALUES ($1, $2, 'message', 'coordination', $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, $12, $13, $14, $15)
      RETURNING id`,
-    [thread.task_id, session!.id, session!.ownership_generation, thread.project_id ?? "",
+    [thread.task_id, assignmentId ?? null, session!.id, session!.ownership_generation, thread.project_id ?? "",
       workspaceMode,
       workspaceSource,
       delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
       recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), prompt, serializeCodexSkillSnapshots(skills)]
   );
   await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
+  return delivery.rows[0]!.id;
 }
 
 async function migrateStaleCoordinationRuns(
@@ -1493,14 +2289,15 @@ async function migrateStaleCoordinationRuns(
       );
       message = source.rows[0]?.body ?? message;
     }
-    await client.query(
-      `INSERT INTO agent_turn_inputs
-         (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
-       VALUES ($1, $2, $3, $4)
-       ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
-         SET agent_thread_id = EXCLUDED.agent_thread_id,
-             dispatcher_run_id = EXCLUDED.dispatcher_run_id
-         WHERE agent_turn_inputs.status = 'queued'`,
+        await client.query(
+          `INSERT INTO agent_turn_inputs
+             (agent_thread_id, dispatcher_run_id, message_delivery_id, assignment_id, message)
+           VALUES ($1, $2, $3, (SELECT assignment_id FROM message_deliveries WHERE id = $3), $4)
+           ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
+             SET agent_thread_id = EXCLUDED.agent_thread_id,
+                 dispatcher_run_id = EXCLUDED.dispatcher_run_id,
+                 assignment_id = COALESCE(EXCLUDED.assignment_id, agent_turn_inputs.assignment_id)
+             WHERE agent_turn_inputs.status = 'queued'`,
       [agentThreadId, replacementRunId, stale.message_delivery_id, message]
     );
     await client.query(
@@ -1520,7 +2317,8 @@ async function queueIncrementalCoordinationInput(
   client: PoolClient,
   agentThreadId: string,
   messageDeliveryId: string,
-  message: string
+  message: string,
+  assignmentId?: string | null
 ): Promise<boolean> {
   await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [agentThreadId]);
   const active = await client.query<{
@@ -1571,11 +2369,12 @@ async function queueIncrementalCoordinationInput(
       if (staleMessage?.trim()) {
         await client.query(
           `INSERT INTO agent_turn_inputs
-             (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
-           VALUES ($1, $2, $3, $4)
+             (agent_thread_id, dispatcher_run_id, message_delivery_id, assignment_id, message)
+           VALUES ($1, $2, $3, (SELECT assignment_id FROM message_deliveries WHERE id = $3), $4)
            ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO UPDATE
              SET agent_thread_id = EXCLUDED.agent_thread_id,
-                 dispatcher_run_id = EXCLUDED.dispatcher_run_id
+                 dispatcher_run_id = EXCLUDED.dispatcher_run_id,
+                 assignment_id = COALESCE(EXCLUDED.assignment_id, agent_turn_inputs.assignment_id)
              WHERE agent_turn_inputs.status = 'queued'`,
           [agentThreadId, run.id, stale.message_delivery_id, staleMessage]
         );
@@ -1595,10 +2394,10 @@ async function queueIncrementalCoordinationInput(
 
   await client.query(
     `INSERT INTO agent_turn_inputs
-       (agent_thread_id, dispatcher_run_id, message_delivery_id, message)
-     VALUES ($1, $2, $3, $4)
+       (agent_thread_id, dispatcher_run_id, message_delivery_id, assignment_id, message)
+     VALUES ($1, $2, $3, $5, $4)
      ON CONFLICT (message_delivery_id) WHERE message_delivery_id IS NOT NULL DO NOTHING`,
-    [agentThreadId, run.id, messageDeliveryId, message]
+    [agentThreadId, run.id, messageDeliveryId, message, assignmentId ?? null]
   );
   return true;
 }
@@ -1657,7 +2456,29 @@ export async function transferTaskAgentThread(
   return result.rows[0];
 }
 
-export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[]): string {
+export interface JobEnvelope {
+  taskId: string | null;
+  taskRef: string | null;
+  workScope: string | null;
+  workKey: string | null;
+  parentTaskId: string | null;
+  parentTaskRef: string | null;
+  assignmentId: string | null;
+  assignmentRef: string | null;
+  assignmentKey: string | null;
+  assignmentStatus: string | null;
+  attempt: number | null;
+  limits: OrchestrationPolicy;
+  activeAssignments: number;
+  activeChildren: number;
+  safetyMode: string;
+  shutdownState: "running" | "stopped";
+  coordinationThreadId: string | null;
+  agentThreadId: string | null;
+  providerThreadId: string | null;
+}
+
+export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[], envelope?: JobEnvelope | null): string {
   const lines = history.map((item) => `- ${item.sender_agent_name ?? "System"} -> ${item.recipient_agent_name ?? "thread"} [${item.message_type}]: ${String(item.body).slice(0, 1200)}`);
   const context = [
     `You are ${recipient.name}: ${recipient.description}`,
@@ -1673,6 +2494,7 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
     thread.origin_thread_id ? `Origin thread: THREAD-${thread.origin_thread_number ?? thread.origin_thread_id}` : "Origin thread: none",
     `Triggered agent: ${thread.primary_agent_name ?? "none"}`,
     `Result recipient: ${thread.callback_agent_name ?? "none"}`,
+    ...formatJobEnvelope(envelope),
     "",
     "Recent thread history:",
     ...(lines.length ? lines : ["- No earlier messages."]),
@@ -1686,6 +2508,23 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
       `If the triggered agent needs to do more work, explicitly send a new message on the same thread with: aisevak threads send THREAD-${thread.number} --body-stdin. That reactivates the thread and delivers the follow-up to the triggered agent.`
     ].join("\n");
   }
+  if (envelope?.assignmentId && envelope.assignmentRef) {
+    return [
+      ...context,
+      `Assignment ${envelope.assignmentRef} (${envelope.assignmentKey}) is the unit of work for this delivery.`,
+      `Complete it with: aisevak assignments complete ${envelope.assignmentRef} --result-stdin`,
+      `If blocked, use: aisevak assignments block ${envelope.assignmentRef} --result-stdin`,
+      "Keep the existing assignment, coordination thread, agent thread, and provider session. Do not create recovery, review, retry, or detached coordination threads."
+    ].join("\n");
+  }
+  if (thread.task_id) {
+    return [
+      ...context,
+      "This is a task-scoped coordination message. Work through the existing task and assignments; do not create another coordination thread.",
+      "Only the task owner or orchestrator may complete the overall task after all assignments are terminal.",
+      "Use aisevak assignments create TASK-n --key ... --to ... --instructions-stdin for specialist work."
+    ].join("\n");
+  }
   return [
     ...context,
     `Completion instruction: ${thread.completion_instructions}`,
@@ -1693,8 +2532,105 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
   ].join("\n");
 }
 
-export function coordinationIncrementalPrompt(message: { body: string }): string {
-  return message.body;
+export function coordinationIncrementalPrompt(message: { body: string }, envelope?: JobEnvelope | null): string {
+  return [...formatJobEnvelope(envelope), message.body].filter(Boolean).join("\n");
+}
+
+function formatJobEnvelope(envelope?: JobEnvelope | null): string[] {
+  if (!envelope) {
+    return [
+      `Live job envelope: task=none; work=none; parent=none; assignment=none; coordination-thread=none; agent-thread=none; provider-session=none; safety=${jobSafetyMode()}; shutdown=running`,
+      "Limits: active assignments 0/5; active children 0/5; child depth 3; assignment attempts 0/3.",
+      "Allowed next commands: use an existing thread; create only an explicitly keyed detached stream when authorized. Do not create recovery, review, retry, or nested coordination threads."
+    ];
+  }
+  const workIdentity = envelope.workScope && envelope.workKey ? `${envelope.workScope}/${envelope.workKey}` : "none";
+  const assignment = envelope.assignmentRef
+    ? `${envelope.assignmentRef} (${envelope.assignmentKey}) status=${envelope.assignmentStatus} attempt=${envelope.attempt}`
+    : "none";
+  return [
+    `Live job envelope: task=${envelope.taskRef ?? "none"}; work=${workIdentity}; parent=${envelope.parentTaskRef ?? "none"}; assignment=${assignment}; coordination-thread=${envelope.coordinationThreadId ?? "none"}; agent-thread=${envelope.agentThreadId ?? "none"}; provider-session=${envelope.providerThreadId ?? "none"}; safety=${envelope.safetyMode}; shutdown=${envelope.shutdownState}`,
+    `Limits: active assignments ${envelope.activeAssignments}/${envelope.limits.maxActiveAssignments}; active children ${envelope.activeChildren}/${envelope.limits.maxActiveChildren}; child depth ${envelope.limits.maxChildDepth}; assignment attempts ${envelope.attempt ?? 0}/${envelope.limits.maxAssignmentAttempts}.`,
+    envelope.assignmentId
+      ? "Allowed next commands: assignments show/send/complete/block for this assignment. Keep this assignment, coordination thread, and provider session; do not create recovery, review, or retry threads."
+      : "Allowed next commands: orchestrators may create keyed root/child tasks and assignments; workers may read/send/complete/block assignments. Use a keyed child task or assignment instead of a new coordination thread."
+  ];
+}
+
+async function loadJobEnvelope(
+  queryable: Queryable,
+  taskId: string | null,
+  assignmentId: string | null,
+  bindings: { coordinationThreadId?: string | null; agentThreadId?: string | null; providerThreadId?: string | null } = {}
+): Promise<JobEnvelope | null> {
+  if (!taskId) {
+    const detached = bindings.coordinationThreadId
+      ? await queryable.query<{ work_scope: string | null; work_key: string | null }>(
+          "SELECT work_scope, work_key FROM coordination_threads WHERE id = $1",
+          [bindings.coordinationThreadId]
+        )
+      : { rows: [] as Array<{ work_scope: string | null; work_key: string | null }> };
+    return {
+      taskId: null,
+      taskRef: null,
+      workScope: detached.rows[0]?.work_scope ?? null,
+      workKey: detached.rows[0]?.work_key ?? null,
+      parentTaskId: null,
+      parentTaskRef: null,
+      assignmentId: null,
+      assignmentRef: null,
+      assignmentKey: null,
+      assignmentStatus: null,
+      attempt: null,
+      limits: orchestrationPolicy(null),
+      activeAssignments: 0,
+      activeChildren: 0,
+      safetyMode: jobSafetyMode(),
+      shutdownState: "running",
+      coordinationThreadId: bindings.coordinationThreadId ?? null,
+      agentThreadId: bindings.agentThreadId ?? null,
+      providerThreadId: bindings.providerThreadId ?? null
+    };
+  }
+  const task = await queryable.query<{
+    id: string; number: number; status: string; work_scope: string; work_key: string; parent_task_id: string | null;
+    parent_task_number: number | null; orchestration_policy: unknown; active_assignments: number; active_children: number;
+  }>(
+    `SELECT tasks.id, tasks.number, tasks.status, tasks.work_scope, tasks.work_key, tasks.parent_task_id,
+            parent.number AS parent_task_number, tasks.orchestration_policy,
+            (SELECT count(*)::int FROM task_assignments WHERE task_id = tasks.id AND status IN ('queued', 'running')) AS active_assignments,
+            (SELECT count(*)::int FROM tasks child WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children
+     FROM tasks LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id WHERE tasks.id = $1`, [taskId]
+  );
+  const row = task.rows[0];
+  if (!row) return null;
+  const assignment = assignmentId
+    ? await queryable.query<{ number: number; assignment_key: string; status: string; attempt_count: number }>(
+        "SELECT number, assignment_key, status, attempt_count FROM task_assignments WHERE id = $1 AND task_id = $2", [assignmentId, taskId]
+      )
+    : { rows: [] as Array<{ number: number; assignment_key: string; status: string; attempt_count: number }> };
+  const assigned = assignment.rows[0];
+  return {
+    taskId: row.id,
+    taskRef: `TASK-${row.number}`,
+    workScope: row.work_scope,
+    workKey: row.work_key,
+    parentTaskId: row.parent_task_id,
+    parentTaskRef: row.parent_task_number ? `TASK-${row.parent_task_number}` : null,
+    assignmentId: assigned ? assignmentId : null,
+    assignmentRef: assigned ? `ASSIGNMENT-${assigned.number}` : null,
+    assignmentKey: assigned?.assignment_key ?? null,
+    assignmentStatus: assigned?.status ?? null,
+    attempt: assigned?.attempt_count ?? null,
+    limits: orchestrationPolicy(row.orchestration_policy),
+    activeAssignments: Number(row.active_assignments ?? 0),
+    activeChildren: Number(row.active_children ?? 0),
+    safetyMode: jobSafetyMode(),
+    shutdownState: ["completed", "blocked", "cancelled"].includes(row.status) ? "stopped" : "running",
+    coordinationThreadId: bindings.coordinationThreadId ?? null,
+    agentThreadId: bindings.agentThreadId ?? null,
+    providerThreadId: bindings.providerThreadId ?? null
+  };
 }
 
 async function resolveAgentSkills(queryable: Queryable, agentId: string, projectId: string | null, taskId: string | null): Promise<CodexSkillSnapshot[]> {
@@ -1746,11 +2682,26 @@ async function finalizeThread(
     );
     if (taskLink.rows[0]?.task_id) {
       await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [taskLink.rows[0].task_id]);
+      const activeAssignments = await client.query<{ count: string }>(
+        "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')",
+        [taskLink.rows[0].task_id]
+      );
+      if (["completed", "blocked"].includes(status) && Number(activeAssignments.rows[0]?.count ?? 0) > 0) {
+        throw safetyConflict("The coordination task cannot be completed while assignments are active; finish each assignment first");
+      }
     }
     const thread = await lockThread(client, threadId);
     const duplicate = await existingIdempotentMessage(client, context.agentId, idempotencyKey);
     if (duplicate) return duplicate.id;
-    assertThreadCanFinalize(thread, context.agentId);
+    // A task owner/orchestrator may close the overall task thread. Specialist
+    // agents still use assignment complete/block and cannot finalize the job.
+    if (thread.task_id && context.kind === "dispatcher") {
+      if (thread.status !== "active") {
+        throw httpError(409, `THREAD-${thread.number} is already ${thread.status}. Send a new message to reactivate it before requesting more work.`);
+      }
+    } else {
+      assertThreadCanFinalize(thread, context.agentId);
+    }
     const recipientId = thread.callback_agent_id && thread.callback_agent_id !== context.agentId
       ? thread.callback_agent_id
       : null;
@@ -1780,6 +2731,7 @@ export function assertThreadCanFinalize(
 async function showResource(pool: DbPool, context: AgentContext, ref: string): Promise<any> {
   if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); return showThread(pool, await resolveResourceId(pool, "coordination_threads", "THREAD", ref)); }
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); return showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref)); }
+  if (/^ASSIGNMENT-/i.test(ref)) { requireCapability(context, "assignments:read"); return showAssignment(pool, await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", ref)); }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); return showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref)); }
   if (/^INC-/i.test(ref)) { requireCapability(context, "incidents:read"); return showIncident(pool, await resolveResourceId(pool, "incidents", "INC", ref)); }
   if (/^SCHEDULE-/i.test(ref)) { requireCapability(context, "schedules:read"); return showSchedule(pool, await resolveResourceId(pool, "schedules", "SCHEDULE", ref)); }
@@ -1789,14 +2741,25 @@ async function showResource(pool: DbPool, context: AgentContext, ref: string): P
 async function contentResource(pool: DbPool, context: AgentContext, ref: string): Promise<{ ref: string; title: string; content: string; revision: string }> {
   if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); const row = await showThread(pool, await resolveResourceId(pool, "coordination_threads", "THREAD", ref), true); return { ref: row.key, title: row.title, content: row.purpose, revision: iso(row.updated_at) }; }
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); const row = await showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref), true); return { ref: row.key, title: row.title, content: row.body, revision: iso(row.updated_at) }; }
+  if (/^ASSIGNMENT-/i.test(ref)) { requireCapability(context, "assignments:read"); const row = await showAssignment(pool, await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", ref), true); return { ref: row.key, title: `${row.task_title}: ${row.assignment_key}`, content: row.instructions, revision: iso(row.updated_at) }; }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); const row = await showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref), true); return { ref: row.key, title: row.title, content: row.markdown, revision: String(row.current_revision) }; }
   if (/^INC-/i.test(ref)) { requireCapability(context, "incidents:read"); const row = await showIncident(pool, await resolveResourceId(pool, "incidents", "INC", ref), true); return { ref: row.key, title: row.title, content: row.markdown ?? row.description, revision: iso(row.updated_at) }; }
   if (/^SCHEDULE-/i.test(ref)) { requireCapability(context, "schedules:read"); const row = await showSchedule(pool, await resolveResourceId(pool, "schedules", "SCHEDULE", ref), true); return { ref: row.key, title: row.title, content: row.prompt, revision: iso(row.updated_at) }; }
-  badRequest("Content is available for TASK, THREAD, SCHEDULE, REPORT, and INC references");
+  badRequest("Content is available for TASK, ASSIGNMENT, THREAD, SCHEDULE, REPORT, and INC references");
 }
 
 function threadResource(row: any, includeContent = false) { const { purpose, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { purpose } : {}), key: `THREAD-${row.number}` }); }
 function taskResource(row: any, includeContent = false) { const { body, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { body } : {}), key: `TASK-${row.number}` }); }
+function assignmentResource(row: any, includeContent = false) {
+  const { instructions, result, ...rest } = row;
+  return resourcePreview({
+    ...rest,
+    ...(includeContent ? { instructions, result } : {}),
+    resultPreview: previewText(result ?? ""),
+    resultTotalBytes: Buffer.byteLength(result ?? ""),
+    key: `ASSIGNMENT-${row.number}`
+  });
+}
 function reportResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `REPORT-${row.number}` }); }
 function incidentResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `INC-${row.number}` }); }
 function scheduleResource(row: any, includeContent = false) { const { prompt, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { prompt } : {}), key: `SCHEDULE-${row.number}` }); }

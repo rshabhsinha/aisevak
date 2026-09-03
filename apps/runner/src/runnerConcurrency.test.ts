@@ -132,6 +132,7 @@ describe("bounded runner execution", () => {
 
     expect(queries[0]?.sql).toContain("dispatcher_runs.status = 'running'");
     expect(queries[0]?.sql).toContain("agent_threads.ownership_generation = $4");
+    expect(queries[0]?.sql).toContain("task_assignments.assigned_agent_id = $2");
     expect(queries[1]?.sql).toContain("task_runs.status = 'running'");
     expect(queries[1]?.sql).toContain("tasks.agent_id = $2");
     expect(queries[1]?.sql).toContain("agent_threads.ownership_generation = $4");

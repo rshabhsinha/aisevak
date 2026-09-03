@@ -46,9 +46,43 @@ describe("coordination delivery prompts", () => {
   });
 
   it("uses only the new message body after a provider session is established", () => {
-    expect(coordinationIncrementalPrompt({ body: "Follow up with the requested checks." })).toBe(
-      "Follow up with the requested checks."
-    );
+    const prompt = coordinationIncrementalPrompt({ body: "Follow up with the requested checks." });
+    expect(prompt).toContain("Live job envelope: task=none");
+    expect(prompt).toContain("Follow up with the requested checks.");
+  });
+
+  it("keeps a live assignment envelope on fresh and incremental prompts", () => {
+    const envelope = {
+      taskId: "task-id",
+      taskRef: "TASK-34",
+      workScope: "project:parser",
+      workKey: "parser-v1",
+      parentTaskId: null,
+      parentTaskRef: null,
+      assignmentId: "assignment-id",
+      assignmentRef: "ASSIGNMENT-7",
+      assignmentKey: "parser-review",
+      assignmentStatus: "running",
+      attempt: 2,
+      limits: { maxActiveAssignments: 5, maxActiveChildren: 5, maxChildDepth: 3, maxAssignmentAttempts: 3 },
+      activeAssignments: 1,
+      activeChildren: 0,
+      safetyMode: "enforce",
+      shutdownState: "running" as const,
+      coordinationThreadId: "coordination-thread",
+      agentThreadId: "agent-thread",
+      providerThreadId: "provider-thread"
+    };
+    const fresh = coordinationPrompt(thread, recipient, {
+      message_type: "handoff",
+      sender_agent_name: "Builder",
+      body: "Review this parser."
+    }, [], envelope);
+    expect(fresh).toContain("project:parser/parser-v1");
+    expect(fresh).toContain("ASSIGNMENT-7");
+    expect(fresh).toContain("coordination-thread=coordination-thread");
+    expect(fresh).toContain("assignments complete ASSIGNMENT-7");
+    expect(coordinationIncrementalPrompt({ body: "Follow up" }, envelope)).toContain("provider-session=provider-thread");
   });
 });
 

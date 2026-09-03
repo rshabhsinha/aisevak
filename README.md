@@ -50,6 +50,13 @@ bounded pool with `RUNNER_MAX_CONCURRENCY` (default `4`) and its polling cadence
 process. Turns belonging to one agent thread remain strictly
 serialized, while direct-mode projects keep their existing single-run safety.
 
+Tasks are the durable job identity: every task has an immutable `work_scope`/`work_key`
+and exactly one coordination thread. Orchestrators delegate through keyed assignments;
+assignment retries reuse the same assignment, agent thread, and provider session whenever
+possible. The API records would-reject operations in `job_safety_events`. Set
+`AISEVAK_JOB_SAFETY_MODE=audit` during a rollout canary to observe violations without
+rejecting them, then switch to `enforce` (the default) after the audit window.
+
 After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
 
 ## GitHub projects

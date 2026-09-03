@@ -50,9 +50,18 @@ import {
   registerCoordinationRoutes,
   requireAgent,
   requireCapability,
+  requireTaskOwner,
   type AgentContext
 } from "./coordination.js";
 import { agentDeletionBlockReason } from "./agents.js";
+import {
+  normalizeWorkKey,
+  normalizeWorkScope,
+  orchestrationPolicy,
+  taskFingerprint,
+  taskWorkScope,
+  safetyConflict
+} from "./jobSafety.js";
 
 interface AuthUser {
   id: string;
@@ -625,8 +634,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     await requireEnabledAgent(pool, body.agentId);
     const result = await pool.query<{ id: string }>(
       `INSERT INTO schedules
-         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
+         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by, task_id, overlap_policy)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        RETURNING id`,
       [
         body.title,
@@ -635,7 +644,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.scheduleKind,
         nextRunAt,
         body.scheduleKind === "interval" ? body.intervalSeconds : null,
-        user.id
+        user.id,
+        body.taskId ?? null,
+        body.overlapPolicy ?? "skip"
       ]
     );
     return { schedule: await getSchedule(pool, mustRow(result.rows[0]).id) };
@@ -647,7 +658,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const body = schedulePatchSchema.parse(request.body);
     await withTransaction(pool, async (client) => {
       const currentResult = await client.query<ScheduleTimingRow>(
-        `SELECT id, schedule_kind, next_run_at, interval_seconds, enabled
+        `SELECT id, schedule_kind, next_run_at, interval_seconds, enabled, task_id, overlap_policy
          FROM schedules WHERE id = $1 FOR UPDATE`,
         [id]
       );
@@ -682,6 +693,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
              next_run_at = $6,
              interval_seconds = $7,
              enabled = $8,
+             task_id = CASE WHEN $9::boolean THEN $10 ELSE task_id END,
+             overlap_policy = COALESCE($11, overlap_policy),
              updated_at = now()
          WHERE id = $1`,
         [
@@ -692,7 +705,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
           scheduleKind,
           nextRunAt,
           intervalSeconds,
-          enabled
+          enabled,
+          Object.prototype.hasOwnProperty.call(body, "taskId"),
+          body.taskId ?? null,
+          body.overlapPolicy ?? null
         ]
       );
     });
@@ -869,6 +885,41 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
               projects.name AS project_name,
               CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
               agents.kind AS agent_kind,
+              parent.number AS parent_task_number,
+              (SELECT count(*)::int FROM tasks child
+                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id) AS assignment_count,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignment_count,
+              COALESCE((SELECT json_agg(json_build_object(
+                'id', assignment.id,
+                'number', assignment.number,
+                'key', 'ASSIGNMENT-' || assignment.number,
+                'assignment_key', assignment.assignment_key,
+                'status', assignment.status,
+                'attempt_count', assignment.attempt_count,
+                'assigned_agent_name', assigned.name,
+                'created_by_agent_name', creator.name,
+                'active_delivery_id', assignment.active_delivery_id,
+                'updated_at', assignment.updated_at
+              ) ORDER BY assignment.number)
+                FROM task_assignments assignment
+                JOIN agents assigned ON assigned.id = assignment.assigned_agent_id
+                LEFT JOIN agents creator ON creator.id = assignment.created_by_agent_id
+                WHERE assignment.task_id = tasks.id), '[]'::json) AS assignments,
+              (SELECT count(*)::int FROM job_safety_events safety_event
+                 WHERE safety_event.task_id = tasks.id) AS safety_event_count,
+              (SELECT json_build_object(
+                'operation', safety_event.operation,
+                'work_scope', safety_event.work_scope,
+                'work_key', safety_event.work_key,
+                'would_reject', safety_event.would_reject,
+                'details', safety_event.details,
+                'created_at', safety_event.created_at
+              ) FROM job_safety_events safety_event
+                 WHERE safety_event.task_id = tasks.id
+                 ORDER BY safety_event.created_at DESC, safety_event.id DESC LIMIT 1) AS latest_safety_event,
               latest.status AS latest_run_status,
               latest.id AS latest_run_id,
               EXISTS (
@@ -878,6 +929,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
               ) AS has_runs
        FROM tasks
        LEFT JOIN projects ON projects.id = tasks.project_id
+       LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
        JOIN agents ON agents.id = tasks.agent_id
        LEFT JOIN LATERAL (
          SELECT id, status
@@ -895,14 +947,71 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireUser(request);
     const body = taskSchema.parse(request.body);
     const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
+    const parentTaskId = body.parentTask ?? null;
+    const workKey = normalizeWorkKey(body.workKey ?? `user:${user.id}:${randomUUID()}`);
+    const workScope = normalizeWorkScope(body.workScope, taskWorkScope({ parentTaskId, projectId: body.projectId ?? null, actorId: user.id }));
     const task = await withTransaction(pool, async (client) => {
       const description = body.description ?? summarizeTaskDescription(body.title, body.body);
-      const result = await client.query(
-        `INSERT INTO tasks (title, description, body, project_id, agent_id, created_by, open_pr_on_success)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)
-         RETURNING *`,
-        [body.title, description, body.body ?? "", body.projectId ?? null, agentId, user.id, body.openPrOnSuccess ?? false]
+      const fingerprint = taskFingerprint({
+        title: body.title,
+        description,
+        body: body.body ?? "",
+        projectId: body.projectId ?? null,
+        agentId,
+        parentTaskId,
+        workScope,
+        workKey
+      });
+      const existing = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+        "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]
       );
+      if (existing.rows[0]) {
+        if (existing.rows[0].work_fingerprint !== fingerprint) {
+          throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${existing.rows[0].number} with different immutable input`);
+        }
+        return { ...(await getTaskJoin(client, existing.rows[0].id)), duplicate: true };
+      }
+      if (parentTaskId) {
+        const parent = await client.query<{ orchestration_policy: unknown; status: string }>("SELECT orchestration_policy, status FROM tasks WHERE id = $1 FOR UPDATE", [parentTaskId]);
+        if (!parent.rows[0]) throw app.httpErrors.notFound("Parent task not found");
+        if (["completed", "blocked", "cancelled"].includes(parent.rows[0].status)) {
+          throw app.httpErrors.conflict(`Cannot create a child task under a ${parent.rows[0].status} parent task`);
+        }
+        const policy = orchestrationPolicy(parent.rows[0].orchestration_policy);
+        const concurrentExisting = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]
+        );
+        if (concurrentExisting.rows[0]) {
+          if (concurrentExisting.rows[0].work_fingerprint !== fingerprint) throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${concurrentExisting.rows[0].number} with different immutable input`);
+          return { ...(await getTaskJoin(client, concurrentExisting.rows[0].id)), duplicate: true };
+        }
+        const activeChildren = await client.query<{ count: string }>("SELECT count(*)::int AS count FROM tasks WHERE parent_task_id = $1 AND status NOT IN ('completed', 'blocked', 'cancelled')", [parentTaskId]);
+        if (Number(activeChildren.rows[0]?.count ?? 0) >= policy.maxActiveChildren) throw app.httpErrors.conflict(`Parent task has reached its active child limit (${policy.maxActiveChildren})`);
+        const depthResult = await client.query<{ depth: number }>(
+          `WITH RECURSIVE chain AS (
+             SELECT id, parent_task_id, 0::int AS depth FROM tasks WHERE id = $1
+             UNION ALL
+             SELECT parent.id, parent.parent_task_id, chain.depth + 1
+             FROM tasks parent JOIN chain ON parent.id = chain.parent_task_id
+           ) SELECT COALESCE(max(depth), 0)::int AS depth FROM chain`, [parentTaskId]
+        );
+        if (Number(depthResult.rows[0]?.depth ?? 0) + 1 > policy.maxChildDepth) throw app.httpErrors.conflict(`Child task depth exceeds the limit (${policy.maxChildDepth})`);
+      }
+      const result = await client.query(
+        `INSERT INTO tasks (title, description, body, project_id, agent_id, created_by, open_pr_on_success, parent_task_id, work_scope, work_key, work_fingerprint)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+         ON CONFLICT (work_scope, work_key) DO NOTHING
+         RETURNING *`,
+        [body.title, description, body.body ?? "", body.projectId ?? null, agentId, user.id, body.openPrOnSuccess ?? false, parentTaskId, workScope, workKey, fingerprint]
+      );
+      if (!result.rows[0]) {
+        const concurrent = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]
+        );
+        const row = concurrent.rows[0] ?? app.httpErrors.notFound("Task created by concurrent request");
+        if (row.work_fingerprint !== fingerprint) throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`);
+        return { ...(await getTaskJoin(client, row.id)), duplicate: true };
+      }
       const created = mustRow(result.rows[0] as Record<string, unknown> | undefined);
       const thread = await client.query<{ id: string }>(
         `INSERT INTO coordination_threads
@@ -912,9 +1021,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       );
       await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [created.id, thread.rows[0]!.id]);
       await client.query("INSERT INTO thread_participants (thread_id, agent_id, role) VALUES ($1, $2, 'assignee') ON CONFLICT DO NOTHING", [thread.rows[0]!.id, agentId]);
-      return { ...created, coordination_thread_id: thread.rows[0]!.id };
+      return { ...created, coordination_thread_id: thread.rows[0]!.id, duplicate: false };
     });
-    return { task };
+    return { task, duplicate: Boolean((task as { duplicate?: boolean }).duplicate) };
   });
 
   app.patch("/api/tasks/:id", async (request) => {
@@ -924,6 +1033,14 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const hasProjectId = Object.prototype.hasOwnProperty.call(body, "projectId");
     return withTransaction(pool, async (client) => {
       await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [id]);
+      if (["completed", "blocked", "cancelled"].includes(body.status ?? "")) {
+        const activeAssignments = await client.query<{ count: string }>(
+          "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [id]
+        );
+        if (Number(activeAssignments.rows[0]?.count ?? 0) > 0) {
+          throw app.httpErrors.conflict("Task cannot be completed while assignments are queued or running; complete or block each assignment first");
+        }
+      }
       const result = await client.query(
         `UPDATE tasks
          SET title = COALESCE($2, title),
@@ -971,6 +1088,17 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       await ensureTaskNavigationThreadInTransaction(client, authoritativeTask);
       return { task };
     });
+  });
+
+  app.patch("/api/tasks/:id/orchestration-policy", async (request) => {
+    requireAdmin(request);
+    const { id } = idParams.parse(request.params);
+    const body = orchestrationPolicySchema.parse(request.body);
+    const current = await pool.query<{ orchestration_policy: unknown }>("SELECT orchestration_policy FROM tasks WHERE id = $1", [id]);
+    if (!current.rows[0]) throw app.httpErrors.notFound("Task not found");
+    const policy = { ...orchestrationPolicy(current.rows[0].orchestration_policy), ...body };
+    await pool.query("UPDATE tasks SET orchestration_policy = $2, updated_at = now() WHERE id = $1", [id, JSON.stringify(policy)]);
+    return { task: await getTaskJoin(pool, id), orchestrationPolicy: policy };
   });
 
   app.post("/api/tasks/:id/runs", async (request) => {
@@ -1309,17 +1437,70 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.post("/api/agent-tools/tasks", async (request) => {
-    const context = await requireLegacyAgentCapabilities(pool, request, "tasks:create");
+    const context = await requireLegacyAgentCapabilities(pool, request);
+    const rawBody = request.body && typeof request.body === "object"
+      ? request.body as { parentTask?: unknown }
+      : {};
+    const hasParentTask = typeof rawBody.parentTask === "string" && rawBody.parentTask.trim().length > 0;
+    requireCapability(context, hasParentTask ? "tasks:create-child" : "tasks:create-root");
     const body = agentToolCreateTaskSchema.parse(request.body);
+    const parentTaskId = body.parentTask ?? null;
+    if (!parentTaskId && context.taskId) {
+      throw safetyConflict("Use a keyed child task or assignment inside an active task; root task creation is not allowed from task context");
+    }
     const projectId = body.projectId ?? context.taskProjectId ?? null;
     const agentId = body.agentId ?? (await getDispatcherAgent(pool)).id;
+    const workKey = normalizeWorkKey(body.workKey);
+    const workScope = normalizeWorkScope(body.workScope, taskWorkScope({ parentTaskId, projectId, actorId: context.agentId }));
     const task = await withTransaction(pool, async (client) => {
       const description = summarizeTaskDescription(body.title, body.body);
+      const fingerprint = taskFingerprint({ title: body.title, description, body: body.body ?? "", projectId, agentId, parentTaskId, workScope, workKey });
+      const existing = await client.query<{ id: string; number: number; work_fingerprint: string }>("SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]);
+      if (existing.rows[0]) {
+        if (existing.rows[0].work_fingerprint !== fingerprint) throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${existing.rows[0].number} with different immutable input`);
+        return { ...(await getTaskJoin(client, existing.rows[0].id)), duplicate: true };
+      }
+      if (parentTaskId) {
+        const parent = await client.query<{ orchestration_policy: unknown; status: string }>("SELECT orchestration_policy, status FROM tasks WHERE id = $1 FOR UPDATE", [parentTaskId]);
+        if (!parent.rows[0]) throw app.httpErrors.notFound("Parent task not found");
+        if (["completed", "blocked", "cancelled"].includes(parent.rows[0].status)) {
+          throw app.httpErrors.conflict(`Cannot create a child task under a ${parent.rows[0].status} parent task`);
+        }
+        const policy = orchestrationPolicy(parent.rows[0].orchestration_policy);
+        const concurrentExisting = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]
+        );
+        if (concurrentExisting.rows[0]) {
+          if (concurrentExisting.rows[0].work_fingerprint !== fingerprint) throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${concurrentExisting.rows[0].number} with different immutable input`);
+          return { ...(await getTaskJoin(client, concurrentExisting.rows[0].id)), duplicate: true };
+        }
+        const activeChildren = await client.query<{ count: string }>("SELECT count(*)::int AS count FROM tasks WHERE parent_task_id = $1 AND status NOT IN ('completed', 'blocked', 'cancelled')", [parentTaskId]);
+        if (Number(activeChildren.rows[0]?.count ?? 0) >= policy.maxActiveChildren) throw app.httpErrors.conflict(`Parent task has reached its active child limit (${policy.maxActiveChildren})`);
+        const depthResult = await client.query<{ depth: number }>(
+          `WITH RECURSIVE chain AS (
+             SELECT id, parent_task_id, 0::int AS depth FROM tasks WHERE id = $1
+             UNION ALL
+             SELECT parent.id, parent.parent_task_id, chain.depth + 1
+             FROM tasks parent JOIN chain ON parent.id = chain.parent_task_id
+           ) SELECT COALESCE(max(depth), 0)::int AS depth FROM chain`, [parentTaskId]
+        );
+        if (Number(depthResult.rows[0]?.depth ?? 0) + 1 > policy.maxChildDepth) throw app.httpErrors.conflict(`Child task depth exceeds the limit (${policy.maxChildDepth})`);
+      }
       const result = await client.query(
-        `INSERT INTO tasks (title, description, body, status, project_id, agent_id)
-         VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-        [body.title, description, body.body ?? "", body.status ?? "open", projectId, agentId]
+        `INSERT INTO tasks (title, description, body, status, project_id, agent_id, parent_task_id, work_scope, work_key, work_fingerprint)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         ON CONFLICT (work_scope, work_key) DO NOTHING
+         RETURNING *`,
+        [body.title, description, body.body ?? "", body.status ?? "open", projectId, agentId, parentTaskId, workScope, workKey, fingerprint]
       );
+      if (!result.rows[0]) {
+        const concurrent = await client.query<{ id: string; number: number; work_fingerprint: string }>(
+          "SELECT id, number, work_fingerprint FROM tasks WHERE work_scope = $1 AND work_key = $2 FOR UPDATE", [workScope, workKey]
+        );
+        const row = concurrent.rows[0] ?? app.httpErrors.notFound("Task created by concurrent request");
+        if (row.work_fingerprint !== fingerprint) throw safetyConflict(`Work key ${workScope}/${workKey} already belongs to TASK-${row.number} with different immutable input`);
+        return { ...(await getTaskJoin(client, row.id)), duplicate: true };
+      }
       const created = mustRow(result.rows[0] as Record<string, unknown> | undefined);
       const thread = await client.query<{ id: string }>(
         `INSERT INTO coordination_threads (title, description, purpose, project_id, task_id, primary_agent_id)
@@ -1327,19 +1508,28 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         [body.title, description, body.body ?? "", projectId, created.id, agentId]
       );
       await client.query("UPDATE tasks SET coordination_thread_id = $2 WHERE id = $1", [created.id, thread.rows[0]!.id]);
-      return { ...created, coordination_thread_id: thread.rows[0]!.id };
+      return { ...created, coordination_thread_id: thread.rows[0]!.id, duplicate: false };
     });
-    return { task };
+    return { task, duplicate: Boolean((task as { duplicate?: boolean }).duplicate) };
   });
 
   app.patch("/api/agent-tools/tasks/:key", async (request) => {
-    await requireLegacyAgentCapabilities(pool, request, "tasks:update");
+    const context = await requireLegacyAgentCapabilities(pool, request, "tasks:update");
     const { key } = taskKeyParams.parse(request.params);
     const task = await getTaskByKey(pool, key);
     const body = agentToolPatchTaskSchema.parse(request.body);
     const hasProjectId = Object.prototype.hasOwnProperty.call(body, "projectId");
     const updatedTask = await withTransaction(pool, async (client) => {
       await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [task.id]);
+      if (["completed", "blocked", "cancelled"].includes(body.status ?? "")) {
+        requireTaskOwner(context, task, "complete or block this task");
+        const activeAssignments = await client.query<{ count: string }>(
+          "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [task.id]
+        );
+        if (Number(activeAssignments.rows[0]?.count ?? 0) > 0) {
+          throw app.httpErrors.conflict("Task cannot be completed while assignments are queued or running; complete or block each assignment first");
+        }
+      }
       const result = await client.query(
         `UPDATE tasks
          SET title = COALESCE($2, title),
@@ -1678,7 +1868,9 @@ const scheduleFieldsSchema = z.object({
   agentId: z.string().uuid(),
   scheduleKind: z.enum(["once", "interval"]),
   nextRunAt: z.string().datetime(),
-  intervalSeconds: z.number().int().min(60).max(31_536_000).nullable().optional()
+  intervalSeconds: z.number().int().min(60).max(31_536_000).nullable().optional(),
+  taskId: z.string().uuid().nullable().optional(),
+  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional()
 });
 const scheduleSchema = scheduleFieldsSchema;
 const schedulePatchSchema = scheduleFieldsSchema.partial().extend({ enabled: z.boolean().optional() });
@@ -1688,11 +1880,20 @@ const taskSchema = z.object({
   body: z.string().optional(),
   projectId: z.string().uuid().nullable().optional(),
   agentId: z.string().uuid().optional(),
-  openPrOnSuccess: z.boolean().optional()
+  openPrOnSuccess: z.boolean().optional(),
+  workKey: z.string().trim().min(1).max(200).optional(),
+  workScope: z.string().trim().min(1).max(200).optional(),
+  parentTask: z.string().uuid().optional()
 });
-const taskPatchSchema = taskSchema.partial().extend({
+const taskPatchSchema = taskSchema.omit({ workKey: true, workScope: true, parentTask: true }).partial().extend({
   status: z.string().optional()
 });
+const orchestrationPolicySchema = z.object({
+  maxActiveAssignments: z.number().int().positive().max(100).optional(),
+  maxActiveChildren: z.number().int().positive().max(100).optional(),
+  maxChildDepth: z.number().int().positive().max(100).optional(),
+  maxAssignmentAttempts: z.number().int().positive().max(100).optional()
+}).refine((value) => Object.keys(value).length > 0, "At least one orchestration limit is required");
 const sessionMessageSchema = z.object({
   message: z.string().trim().min(1)
 });
@@ -1737,7 +1938,10 @@ const agentToolCreateTaskSchema = z.object({
   body: z.string().optional(),
   status: z.string().optional(),
   projectId: z.string().uuid().nullable().optional(),
-  agentId: z.string().uuid().optional()
+  agentId: z.string().uuid().optional(),
+  workKey: z.string().trim().min(1).max(200),
+  workScope: z.string().trim().min(1).max(200).optional(),
+  parentTask: z.string().uuid().optional()
 });
 const agentToolPatchTaskSchema = z.object({
   title: z.string().min(1).optional(),
@@ -1778,6 +1982,11 @@ interface TaskJoin {
   agent_model: string;
   agent_model_options: unknown;
   agent_instructions: string;
+  work_scope?: string;
+  work_key?: string;
+  work_fingerprint?: string;
+  parent_task_id?: string | null;
+  orchestration_policy?: unknown;
 }
 
 interface TimelineRunRow {
@@ -1855,6 +2064,8 @@ interface ScheduleTimingRow {
   next_run_at: string | Date;
   interval_seconds: number | null;
   enabled: boolean;
+  task_id?: string | null;
+  overlap_policy?: "skip" | "queue" | "allow";
 }
 
 interface ScheduleRow extends ScheduleTimingRow {
@@ -4189,6 +4400,25 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             tasks.body,
             tasks.status,
             tasks.project_id,
+            tasks.work_scope,
+            tasks.work_key,
+            tasks.parent_task_id,
+            parent.number AS parent_task_number,
+            tasks.orchestration_policy,
+            (SELECT count(*)::int FROM task_assignments assignment
+               WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignment_count,
+            (SELECT count(*)::int FROM tasks child
+               WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
+            COALESCE((SELECT json_agg(json_build_object(
+              'number', assignment.number,
+              'key', assignment.assignment_key,
+              'status', assignment.status,
+              'attempt_count', assignment.attempt_count,
+              'assigned_agent_name', assigned.name
+            ) ORDER BY assignment.number)
+              FROM task_assignments assignment
+              JOIN agents assigned ON assigned.id = assignment.assigned_agent_id
+              WHERE assignment.task_id = tasks.id), '[]'::json) AS assignments,
             projects.name AS project_name,
             projects.workspace_mode,
             CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
@@ -4197,6 +4427,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
             latest.id AS latest_worker_run_id
      FROM tasks
      LEFT JOIN projects ON projects.id = tasks.project_id
+     LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
      LEFT JOIN LATERAL (
        SELECT id, status
@@ -4238,13 +4469,13 @@ async function requireLegacyAgentCapabilities(
   return context;
 }
 
-async function getTaskByKey(pool: DbPool, key: string): Promise<{ id: string; number: number }> {
+async function getTaskByKey(pool: DbPool, key: string): Promise<{ id: string; number: number; agent_id: string }> {
   const numberMatch = key.match(/^(?:TASK-)?(\d+)$/i);
   const result = numberMatch
-    ? await pool.query<{ id: string; number: number }>("SELECT id, number FROM tasks WHERE number = $1", [
+    ? await pool.query<{ id: string; number: number; agent_id: string }>("SELECT id, number, agent_id FROM tasks WHERE number = $1", [
         Number(numberMatch[1])
       ])
-    : await pool.query<{ id: string; number: number }>("SELECT id, number FROM tasks WHERE id = $1", [
+    : await pool.query<{ id: string; number: number; agent_id: string }>("SELECT id, number, agent_id FROM tasks WHERE id = $1", [
         key
       ]);
   return mustRow(result.rows[0]);

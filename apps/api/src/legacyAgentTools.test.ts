@@ -95,4 +95,40 @@ describe("legacy agent-tool capability checks", () => {
 
     expect(response.statusCode).toBe(403);
   });
+
+  it("does not let a stored legacy threads:create capability create detached threads", async () => {
+    const { app } = await serverForCapabilities(["threads:create"]);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agent-tools/v1/threads",
+      headers: { authorization: "Bearer restricted-token" },
+      payload: {
+        title: "Detached",
+        description: "Should be rejected",
+        purpose: "No unkeyed coordination",
+        to: "11111111-1111-4111-8111-111111111111",
+        workKey: "detached-v1"
+      }
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().message).toContain("threads:create-detached");
+  });
+
+  it("requires a new keyed task capability even when old tasks:create is stored", async () => {
+    const { app } = await serverForCapabilities(["tasks:create"]);
+    const response = await app.inject({
+      method: "POST",
+      url: "/api/agent-tools/v1/tasks",
+      headers: { authorization: "Bearer restricted-token" },
+      payload: {
+        title: "Unsafe root",
+        body: "Should be rejected",
+        workKey: "unsafe-root-v1"
+      }
+    });
+
+    expect(response.statusCode).toBe(403);
+    expect(response.json().message).toContain("tasks:create-root");
+  });
 });

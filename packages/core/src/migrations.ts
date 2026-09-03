@@ -514,6 +514,7 @@ ON dispatcher_run_events(dispatcher_run_id, seq, created_at);
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_id uuid REFERENCES agents(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE CASCADE;
 ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS coordination_thread_id uuid;
+ALTER TABLE agent_tool_tokens ADD COLUMN IF NOT EXISTS assignment_id uuid;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS description text NOT NULL DEFAULT '';
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS agent_accessible boolean NOT NULL DEFAULT false;
 ALTER TABLE secrets ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES users(id) ON DELETE SET NULL;
@@ -1148,6 +1149,129 @@ WHERE agent_threads.coordination_thread_id = coordination_threads.id
     WHERE existing_task_thread.task_id = tasks.id
       AND existing_task_thread.id <> agent_threads.id
   );
+
+-- Generic job identity and orchestration safety. These changes are additive: no
+-- historical task, thread, run, message, or provider session is removed.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS work_scope text;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS work_key text;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS work_fingerprint text;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS parent_task_id uuid;
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS orchestration_policy jsonb NOT NULL
+  DEFAULT '{"maxActiveAssignments":5,"maxActiveChildren":5,"maxChildDepth":3,"maxAssignmentAttempts":3}'::jsonb;
+
+UPDATE tasks
+SET work_scope = COALESCE(NULLIF(work_scope, ''), 'legacy'),
+    work_key = COALESCE(NULLIF(work_key, ''), 'legacy:' || id::text),
+    work_fingerprint = COALESCE(
+      NULLIF(work_fingerprint, ''),
+      md5(concat_ws('|', title, description, body, COALESCE(project_id::text, ''), agent_id::text))
+    )
+WHERE work_scope IS NULL OR work_key IS NULL OR work_fingerprint IS NULL
+   OR work_scope = '' OR work_key = '' OR work_fingerprint = '';
+
+ALTER TABLE tasks ALTER COLUMN work_scope SET NOT NULL;
+ALTER TABLE tasks ALTER COLUMN work_key SET NOT NULL;
+ALTER TABLE tasks ALTER COLUMN work_fingerprint SET NOT NULL;
+
+DO $$ BEGIN
+  ALTER TABLE tasks ADD CONSTRAINT tasks_parent_task_id_fkey
+    FOREIGN KEY (parent_task_id) REFERENCES tasks(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS tasks_work_identity_unique
+ON tasks(work_scope, work_key);
+CREATE INDEX IF NOT EXISTS tasks_parent_status_idx
+ON tasks(parent_task_id, status, created_at DESC) WHERE parent_task_id IS NOT NULL;
+
+ALTER TABLE coordination_threads ADD COLUMN IF NOT EXISTS work_scope text;
+ALTER TABLE coordination_threads ADD COLUMN IF NOT EXISTS work_key text;
+ALTER TABLE coordination_threads ADD COLUMN IF NOT EXISTS work_fingerprint text;
+CREATE UNIQUE INDEX IF NOT EXISTS coordination_threads_detached_work_identity_unique
+ON coordination_threads(work_scope, work_key)
+WHERE task_id IS NULL AND work_scope IS NOT NULL AND work_key IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS task_assignments (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  number integer GENERATED ALWAYS AS IDENTITY UNIQUE,
+  task_id uuid NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  assignment_key text NOT NULL,
+  assigned_agent_id uuid NOT NULL REFERENCES agents(id) ON DELETE RESTRICT,
+  created_by_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  status text NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued', 'running', 'completed', 'blocked', 'cancelled')),
+  attempt_count integer NOT NULL DEFAULT 1 CHECK (attempt_count > 0),
+  instructions text NOT NULL,
+  result text,
+  fingerprint text NOT NULL,
+  active_delivery_id uuid,
+  last_message_id uuid,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  UNIQUE (task_id, assignment_key)
+);
+CREATE INDEX IF NOT EXISTS task_assignments_task_status_idx
+ON task_assignments(task_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS task_assignments_agent_status_idx
+ON task_assignments(assigned_agent_id, status, updated_at DESC);
+
+DO $$ BEGIN
+  ALTER TABLE agent_tool_tokens ADD CONSTRAINT agent_tool_tokens_assignment_id_fkey
+    FOREIGN KEY (assignment_id) REFERENCES task_assignments(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS assignment_id uuid;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS assignment_id uuid;
+ALTER TABLE agent_turn_inputs ADD COLUMN IF NOT EXISTS assignment_id uuid;
+DO $$ BEGIN
+  ALTER TABLE task_assignments ADD CONSTRAINT task_assignments_active_delivery_fkey
+    FOREIGN KEY (active_delivery_id) REFERENCES message_deliveries(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE task_assignments ADD CONSTRAINT task_assignments_last_message_fkey
+    FOREIGN KEY (last_message_id) REFERENCES thread_messages(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE message_deliveries ADD CONSTRAINT message_deliveries_assignment_id_fkey
+    FOREIGN KEY (assignment_id) REFERENCES task_assignments(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE dispatcher_runs ADD CONSTRAINT dispatcher_runs_assignment_id_fkey
+    FOREIGN KEY (assignment_id) REFERENCES task_assignments(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE agent_turn_inputs ADD CONSTRAINT agent_turn_inputs_assignment_id_fkey
+    FOREIGN KEY (assignment_id) REFERENCES task_assignments(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS message_deliveries_assignment_idx
+ON message_deliveries(assignment_id) WHERE assignment_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS dispatcher_runs_assignment_idx
+ON dispatcher_runs(assignment_id) WHERE assignment_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS job_safety_events (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  operation text NOT NULL,
+  actor_agent_id uuid REFERENCES agents(id) ON DELETE SET NULL,
+  task_id uuid REFERENCES tasks(id) ON DELETE SET NULL,
+  assignment_id uuid REFERENCES task_assignments(id) ON DELETE SET NULL,
+  work_scope text,
+  work_key text,
+  would_reject boolean NOT NULL DEFAULT true,
+  details jsonb NOT NULL DEFAULT '{}'::jsonb,
+  created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS job_safety_events_created_idx
+ON job_safety_events(created_at DESC, operation);
+
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS task_id uuid;
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS overlap_policy text NOT NULL DEFAULT 'skip';
+DO $$ BEGIN
+  ALTER TABLE schedules ADD CONSTRAINT schedules_task_id_fkey
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE schedules ADD CONSTRAINT schedules_overlap_policy_check
+    CHECK (overlap_policy IN ('skip', 'queue', 'allow'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE INDEX IF NOT EXISTS schedules_task_idx ON schedules(task_id) WHERE task_id IS NOT NULL;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
