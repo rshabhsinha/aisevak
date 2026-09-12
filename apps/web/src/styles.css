@@ -6654,3 +6654,19 @@ label {
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Streaming assistant caret (unified chat timeline) */
+.streaming-caret {
+  display: inline-block;
+  width: 8px;
+  height: 1.05em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  background: var(--primary);
+  border-radius: 1px;
+  animation: caret-blink 1s steps(2, start) infinite;
+}
+
+@keyframes caret-blink {
+  to { visibility: hidden; }
+}
