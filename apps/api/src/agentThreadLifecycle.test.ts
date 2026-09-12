@@ -35,11 +35,13 @@ describe("coordinated task agent threads", () => {
       recipientAgentId: "builder-id",
       model: "gpt-test",
       modelOptions: [{ id: "reasoningEffort", value: "high" }],
-      runtimeHome: "/runtime/task"
+      runtimeHome: "/runtime/task",
+      providerInstanceId: "devin-local"
     });
 
     expect(queries[0]?.sql).toContain("agent_id = $3");
     expect(queries[0]?.sql).toContain("WHEN agent_id = $3 AND runtime_home = $6");
+    expect(queries[0]?.sql).toContain("provider_instance_id = COALESCE($7, provider_instance_id)");
     expect(queries[0]?.sql).toContain("runtime_home = $6");
     expect(queries[0]?.sql).toContain("ownership_generation = ownership_generation + CASE");
     expect(queries[0]?.sql).toContain("WHERE task_id = $2");
@@ -49,7 +51,8 @@ describe("coordinated task agent threads", () => {
       "builder-id",
       "gpt-test",
       JSON.stringify([{ id: "reasoningEffort", value: "high" }]),
-      "/runtime/task"
+      "/runtime/task",
+      "devin-local"
     ]);
     expect(thread).toMatchObject({ id: "thread-id", provider_thread_id: null, ownership_generation: 4 });
   });

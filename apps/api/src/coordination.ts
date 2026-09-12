@@ -724,6 +724,7 @@ export async function registerCoordinationRoutes(
         model: recipient.model,
         modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
         runtimeHome: managedCodexHome(options.managedRoot, id),
+        providerInstanceId: recipient.provider_instance_id ?? null,
         preserveCoordination: recipient.id !== context.agentId
       });
       await addParticipants(client, row.coordination_thread_id, [[recipient.id, "assignee"]]);
@@ -1768,7 +1769,7 @@ async function createOrReuseTaskInTransaction(
 async function getAgent(queryable: Queryable, ref: string): Promise<any> {
   const normalized = ref.replace(/^AGENT-/i, "");
   const result = await queryable.query(
-    `SELECT id, kind, name, description, model, model_options, capabilities, instructions, enabled, created_at, updated_at
+    `SELECT id, kind, name, description, model, model_options, capabilities, instructions, enabled, created_at, updated_at, provider_instance_id
      FROM agents WHERE id::text = $1 OR lower(name) = lower($1) LIMIT 1`,
     [normalized]
   );
@@ -2114,11 +2115,13 @@ async function queueDelivery(
            project_id = $3,
            runtime_home = $4,
            cwd = $5,
+           provider_instance_id = COALESCE($6, provider_instance_id),
            provider_thread_id = CASE
              WHEN task_id IS NOT DISTINCT FROM $2
                AND runtime_home = $4
                AND project_id IS NOT DISTINCT FROM $3
                AND cwd IS NOT DISTINCT FROM $5
+               AND provider_instance_id IS NOT DISTINCT FROM COALESCE($6, provider_instance_id)
                THEN provider_thread_id
              ELSE NULL
            END,
@@ -2127,13 +2130,14 @@ async function queueDelivery(
                OR runtime_home IS DISTINCT FROM $4
                OR project_id IS DISTINCT FROM $3
                OR cwd IS DISTINCT FROM $5
+               OR provider_instance_id IS DISTINCT FROM COALESCE($6, provider_instance_id)
                THEN 1
              ELSE 0
             END,
            updated_at = now()
        WHERE id = $1
        RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
-      [session.id, desiredTaskId, thread.project_id, desiredRuntimeHome, desiredCwd]
+      [session.id, desiredTaskId, thread.project_id, desiredRuntimeHome, desiredCwd, recipient.provider_instance_id ?? null]
     );
     session = updated.rows[0];
     if (session) {
@@ -2149,6 +2153,7 @@ async function queueDelivery(
       model: recipient.model,
       modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
       runtimeHome: managedCodexHome(managedRoot, linkedTaskId),
+      providerInstanceId: recipient.provider_instance_id ?? null,
       preserveCoordination: true
     });
     if (session) {
@@ -2411,6 +2416,7 @@ export async function transferTaskAgentThread(
     model: string;
     modelOptions: unknown;
     runtimeHome: string;
+    providerInstanceId?: string | null;
     preserveCoordination?: boolean;
   }
 ): Promise<AgentThreadSession | undefined> {
@@ -2424,12 +2430,16 @@ export async function transferTaskAgentThread(
          model = $4,
          model_options = $5,
          runtime_home = $6,
+         provider_instance_id = COALESCE($7, provider_instance_id),
          provider_thread_id = CASE
-           WHEN agent_id = $3 AND runtime_home = $6 THEN provider_thread_id
+           WHEN agent_id = $3 AND runtime_home = $6
+             AND provider_instance_id IS NOT DISTINCT FROM COALESCE($7, provider_instance_id)
+             THEN provider_thread_id
            ELSE NULL
          END,
          ownership_generation = ownership_generation + CASE
-           WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $6 THEN 1
+           WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $6
+             OR provider_instance_id IS DISTINCT FROM COALESCE($7, provider_instance_id) THEN 1
            ELSE 0
          END,
          last_activity_at = now(),
@@ -2442,7 +2452,8 @@ export async function transferTaskAgentThread(
       input.recipientAgentId,
       input.model,
       JSON.stringify(input.modelOptions),
-      input.runtimeHome
+      input.runtimeHome,
+      input.providerInstanceId ?? null
     ]
   );
   if (result.rows[0]) {
