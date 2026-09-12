@@ -281,6 +281,7 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
       [error]
     );
     for (const run of workers.rows) {
+      await appendRunCancelEvent(client, "worker", run.id, error);
       await failPendingAgentTurnInputsInTransaction(client, "worker", run.id, "cancelled");
     }
 
@@ -297,6 +298,7 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
       [error]
     );
     for (const run of dispatchers.rows) {
+      await appendRunCancelEvent(client, "dispatcher", run.id, error);
       if (run.message_delivery_id) {
         await client.query(
           `UPDATE message_deliveries
@@ -350,6 +352,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
          WHERE id = $1`,
         [run.id, finalStatus, error]
       );
+      await appendRunCancelEvent(client, "dispatcher", run.id, error);
       const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
       if (deliveryId) {
         await client.query(
@@ -481,6 +484,7 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<vo
          WHERE id = $1`,
         [run.id, finalStatus, error]
       );
+      await appendRunCancelEvent(client, "dispatcher", run.id, error);
       const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
       if (deliveryId) {
         await client.query(
@@ -540,6 +544,7 @@ export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
            WHERE id = $1`,
           [runId, error]
         );
+        await appendRunCancelEvent(client, "worker", runId, error);
         await failPendingAgentTurnInputsInTransaction(client, "worker", runId, "cancelled");
         return true;
       }
@@ -575,6 +580,7 @@ export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
          WHERE id = $1`,
         [dispatcher.id, error]
       );
+      await appendRunCancelEvent(client, "dispatcher", dispatcher.id, error);
       if (dispatcher.message_delivery_id) {
         await client.query(
           `UPDATE message_deliveries
@@ -1585,6 +1591,7 @@ export async function processOneDispatcherRun(
       ownershipLost = true;
       finalStatus = "cancelled";
       stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      await appendRunCancelEvent(pool, "dispatcher", job.id, stderr);
       return true;
     }
     const toolToken = await createAgentToolToken(pool, {
@@ -1601,6 +1608,7 @@ export async function processOneDispatcherRun(
       ownershipLost = true;
       finalStatus = "cancelled";
       stderr = "The dispatcher turn was cancelled because thread ownership changed before provider launch";
+      await appendRunCancelEvent(pool, "dispatcher", job.id, stderr);
       return true;
     }
     const dispatcherPrompt = job.scope === "schedule"
@@ -1916,6 +1924,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       ownershipLost = true;
       finalStatus = "cancelled";
       stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      await appendRunCancelEvent(pool, "worker", job.id, stderr);
       return true;
     }
     const toolToken = await createAgentToolToken(pool, {
@@ -1931,6 +1940,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       ownershipLost = true;
       finalStatus = "cancelled";
       stderr = "The worker turn was cancelled because thread ownership changed before provider launch";
+      await appendRunCancelEvent(pool, "worker", job.id, stderr);
       return true;
     }
     const workerPrompt = taskEnvelopePrompt({
@@ -2228,6 +2238,25 @@ export async function acquireRunLaunchFence(
   }
 }
 
+/** Record a terminal event so cancelled runs render a reason instead of an empty thread. */
+async function appendRunCancelEvent(
+  queryable: Pick<DbPool, "query">,
+  kind: "worker" | "dispatcher",
+  runId: string,
+  text: string
+): Promise<void> {
+  const table = kind === "worker" ? "run_events" : "dispatcher_run_events";
+  const column = kind === "worker" ? "run_id" : "dispatcher_run_id";
+  await queryable.query(
+    `INSERT INTO ${table} (${column}, seq, event_type, text, payload)
+     VALUES ($1,
+             (SELECT COALESCE(MAX(seq), -1) + 1 FROM ${table} WHERE ${column} = $1),
+             'turn.failed', $2, $3)
+     ON CONFLICT (${column}, seq) DO NOTHING`,
+    [runId, encodePostgresText(text), encodePostgresJson({ type: "turn.failed", text })]
+  );
+}
+
 async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<void> {
   const error = "The worker turn was cancelled because thread ownership changed before it started";
   const updated = await pool.query(
@@ -2240,7 +2269,10 @@ async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<v
      RETURNING id`,
     [runId, error]
   );
-  if (updated.rows[0]) await failPendingAgentTurnInputs(pool, "worker", runId, "cancelled");
+  if (updated.rows[0]) {
+    await appendRunCancelEvent(pool, "worker", runId, error);
+    await failPendingAgentTurnInputs(pool, "worker", runId, "cancelled");
+  }
 }
 
 export async function finalizeWorkerRunState(
@@ -2738,6 +2770,7 @@ async function cancelMismatchedDispatcherRun(
       [job.id, error]
     );
     if (!updated.rows[0]) return;
+    await appendRunCancelEvent(client, "dispatcher", job.id, error);
     if (job.message_delivery_id) {
       await client.query(
         `UPDATE message_deliveries
@@ -2757,16 +2790,20 @@ async function cancelQueuedDeliveryRuns(
   messageDeliveryId: string,
   error: string
 ): Promise<void> {
-  await queryable.query(
+  const cancelled = await queryable.query<{ id: string }>(
     `UPDATE dispatcher_runs
      SET status = 'cancelled',
          finished_at = COALESCE(finished_at, now()),
          error = COALESCE(error, $2),
          updated_at = now()
      WHERE message_delivery_id = $1
-       AND (status = 'queued' OR status = 'cancel_requested')`,
+       AND (status = 'queued' OR status = 'cancel_requested')
+     RETURNING id`,
     [messageDeliveryId, encodePostgresText(error)]
   );
+  for (const run of cancelled.rows) {
+    await appendRunCancelEvent(queryable, "dispatcher", run.id, error);
+  }
 }
 
 async function createAgentToolToken(
