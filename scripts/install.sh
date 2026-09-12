@@ -127,7 +127,10 @@ install_harness_clis() {
     fi
     if [[ ! -x "${runner_home}/.local/bin/devin" ]]; then
       log "Installing Devin CLI for ${RUNNER_USER}"
-      sudo -u "${RUNNER_USER}" curl -fsSL https://cli.devin.ai/install.sh | sudo -u "${RUNNER_USER}" bash || log "Devin CLI install failed; continuing without it"
+      # The installer ends with a first-run welcome that exits nonzero without
+      # a TTY; judge success by the binary it drops instead of the exit code.
+      sudo -u "${RUNNER_USER}" bash -c 'curl -fsSL https://cli.devin.ai/install.sh | bash' || true
+      [[ -x "${runner_home}/.local/bin/devin" ]] || log "Devin CLI install failed; continuing without it"
     fi
   else
     log "curl is unavailable; skipping OpenCode/Cursor/Devin CLI provisioning"
@@ -142,9 +145,10 @@ install_harness_clis() {
   if [[ -x /usr/local/bin/opencode ]]; then
     cp -f /usr/local/bin/opencode "${HARNESS_BIN_DIR}/opencode"
   fi
-  # devin is a single static binary like opencode.
+  # devin is a single self-contained binary; ~/.local/bin/devin symlinks into
+  # a versioned bundle, so copy the resolved file.
   if [[ -x /usr/local/bin/devin ]]; then
-    cp -f /usr/local/bin/devin "${HARNESS_BIN_DIR}/devin"
+    cp -fL /usr/local/bin/devin "${HARNESS_BIN_DIR}/devin"
   fi
   if [[ -x /usr/local/bin/cursor-agent ]]; then
     cursor_version_dir="$(dirname "$(readlink -f /usr/local/bin/cursor-agent)")"
