@@ -5,6 +5,8 @@ export interface ThreadEvent {
   text?: string | null;
   payload: unknown;
   created_at?: string;
+  run_id?: string | null;
+  dispatcher_run_id?: string | null;
 }
 
 export interface ThreadRunRef {
@@ -112,10 +114,6 @@ export function deriveThreadBlocks(input: {
     blocks[index] = block;
   };
 
-  const assistantByItemId = new Map<string, Extract<ThreadBlock, { kind: "assistant" }>>();
-  const toolByItemId = new Map<string, { blockId: string; entryIndex: number }>();
-  let thinkingBlock: Extract<ThreadBlock, { kind: "thinking" }> | null = null;
-  let planBlockId: string | null = null;
   const hasUserMessageEvent = sortedEvents.some(
     (event) => event.event_type === "thread.message-sent"
   );
@@ -128,6 +126,108 @@ export function deriveThreadBlocks(input: {
       createdAt: fallbackCreatedAt
     });
   }
+
+  // A thread's event stream is the concatenation of per-run sequences — `seq`
+  // and `itemId` are only unique within one run. Group events by their run so
+  // streamed chunks accumulate into the correct message, then order run groups
+  // by their earliest event timestamp (created_at IS monotonic across runs —
+  // a later turn's events always land after the previous turn's writes).
+  const runGroups = new Map<string, ThreadEvent[]>();
+  for (const event of sortedEvents) {
+    const key = event.run_id ?? event.dispatcher_run_id ?? "";
+    const group = runGroups.get(key);
+    if (group) group.push(event);
+    else runGroups.set(key, [event]);
+  }
+  const orderedGroups = [...runGroups.values()].sort((left, right) =>
+    (left[0]?.created_at ?? "").localeCompare(right[0]?.created_at ?? "")
+  );
+
+  // Resumed provider sessions replay prior turns' content at session start
+  // (Devin re-emits the previous reasoning and assistant message as single
+  // deltas before the new turn's stream). Content emitted before this run is
+  // recorded so each group can drop verbatim replays.
+  const replay: ReplayState = {
+    assistantTexts: [],
+    thinkingTexts: new Set(),
+    toolItemIds: new Set()
+  };
+  for (const groupEvents of orderedGroups) {
+    const startIndex = blocks.length;
+    processRunGroup(groupEvents, fallbackCreatedAt, { push, replace, blockIndex, blocks }, replay);
+    for (const block of blocks.slice(startIndex)) {
+      if (block.kind === "assistant" && block.text.trim()) {
+        replay.assistantTexts.push(block.text);
+      }
+      if (block.kind === "thinking" && block.text.trim()) {
+        replay.thinkingTexts.add(block.text);
+      }
+      if (block.kind === "tools") {
+        for (const entry of block.entries) replay.toolItemIds.add(entry.id);
+      }
+    }
+  }
+
+  for (const message of input.pendingMessages ?? []) {
+    push({
+      kind: "user",
+      id: `pending:${message.id}`,
+      text: message.text,
+      createdAt: message.createdAt
+    });
+  }
+
+  // An interrupted run leaves open streaming markers; only keep them when the
+  // run is actually still active.
+  const runActive = input.run ? isActiveRunStatus(input.run.status) : false;
+  if (!runActive) {
+    for (const block of blocks) {
+      if ((block.kind === "assistant" || block.kind === "thinking") && block.streaming) {
+        block.streaming = false;
+      }
+    }
+  }
+
+  // Blocks were appended in seq order; do NOT re-sort by createdAt — those
+  // timestamps are not monotonic for batched event writes.
+  if (runActive) {
+    blocks.push({
+      kind: "working",
+      id: "working-indicator",
+      createdAt: input.run!.started_at ?? input.run!.queued_at ?? null
+    });
+  }
+
+  return blocks;
+}
+
+interface ReplayState {
+  assistantTexts: string[];
+  thinkingTexts: Set<string>;
+  toolItemIds: Set<string>;
+}
+
+function processRunGroup(
+  sortedEvents: ThreadEvent[],
+  fallbackCreatedAt: string,
+  ctx: {
+    blocks: ThreadBlock[];
+    blockIndex: Map<string, number>;
+    push: (block: ThreadBlock) => ThreadBlock;
+    replace: (block: ThreadBlock) => void;
+  },
+  replay: ReplayState
+): void {
+  const { blocks, blockIndex, push, replace } = ctx;
+  const assistantByItemId = new Map<string, Extract<ThreadBlock, { kind: "assistant" }>>();
+  const toolByItemId = new Map<string, { blockId: string; entryIndex: number }>();
+  let thinkingBlock: Extract<ThreadBlock, { kind: "thinking" }> | null = null;
+  let planBlockId: string | null = null;
+  // Leading deltas for an item that exactly match prior turns' assistant
+  // texts (in order) are session-resume replays and get dropped. The buffer
+  // holds accumulated-but-unresolved delta text; once a delta diverges from
+  // the expected replay text the whole buffer is emitted as new content.
+  const replayPending = new Map<string, { buffer: string; nextReplay: number }>();
 
   const touchThinking = (createdAt: string) => {
     if (thinkingBlock) return thinkingBlock;
@@ -243,8 +343,25 @@ export function deriveThreadBlocks(input: {
       const delta = event.text ?? stringValue(params?.delta);
       if (!delta) continue;
       thinkingBlock = null;
+      let emitted = delta;
+      if (!assistantByItemId.has(itemId) || replayPending.has(itemId)) {
+        const pending = replayPending.get(itemId) ?? { buffer: "", nextReplay: 0 };
+        pending.buffer += delta;
+        const expected = replay.assistantTexts[pending.nextReplay];
+        if (expected !== undefined && pending.buffer === expected) {
+          replayPending.set(itemId, { buffer: "", nextReplay: pending.nextReplay + 1 });
+          continue;
+        }
+        if (expected !== undefined && expected.startsWith(pending.buffer)) {
+          replayPending.set(itemId, pending);
+          continue;
+        }
+        replayPending.delete(itemId);
+        emitted = pending.buffer;
+        if (!emitted) continue;
+      }
       upsertAssistant(itemId, createdAt, (block) => {
-        block.text += delta;
+        block.text += emitted;
       });
       continue;
     }
@@ -274,7 +391,7 @@ export function deriveThreadBlocks(input: {
         stringValue(item?.content) ??
         stringArrayValue(item?.summary).join("\n") ??
         "";
-      if (!text.trim()) continue;
+      if (!text.trim() || replay.thinkingTexts.has(text)) continue;
       const block = touchThinking(createdAt);
       const merged = block.text ? `${block.text}\n\n${text}` : text;
       replace({ ...block, text: merged });
@@ -293,6 +410,7 @@ export function deriveThreadBlocks(input: {
     }
 
     if (TOOL_ITEM_TYPES.has(itemType) || event.event_type === "session/request_permission") {
+      if (replay.toolItemIds.has(itemId)) continue;
       thinkingBlock = null;
       const status = toolStatusOf(
         stringValue(item?.status) ?? stringValue(raw?.status),
@@ -382,38 +500,6 @@ export function deriveThreadBlocks(input: {
     // All other event kinds (config/mode/commands/usage/session_info/unknown)
     // are provider noise that the unified view intentionally drops.
   }
-
-  for (const message of input.pendingMessages ?? []) {
-    push({
-      kind: "user",
-      id: `pending:${message.id}`,
-      text: message.text,
-      createdAt: message.createdAt
-    });
-  }
-
-  // An interrupted run leaves open streaming markers; only keep them when the
-  // run is actually still active.
-  const runActive = input.run ? isActiveRunStatus(input.run.status) : false;
-  if (!runActive) {
-    for (const block of blocks) {
-      if ((block.kind === "assistant" || block.kind === "thinking") && block.streaming) {
-        block.streaming = false;
-      }
-    }
-  }
-
-  // Blocks were appended in seq order; do NOT re-sort by createdAt — those
-  // timestamps are not monotonic for batched event writes.
-  if (runActive) {
-    blocks.push({
-      kind: "working",
-      id: "working-indicator",
-      createdAt: input.run!.started_at ?? input.run!.queued_at ?? null
-    });
-  }
-
-  return blocks;
 }
 
 export function isActiveRunStatus(status: string): boolean {

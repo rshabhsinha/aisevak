@@ -200,6 +200,45 @@ describe("deriveThreadBlocks", () => {
     expect(done.some((b) => b.kind === "working")).toBe(false);
   });
 
+  it("separates each run's deltas into its own assistant message", () => {
+    // Regression: a thread merges events from multiple runs; seq/itemId are
+    // only unique per run, so Devin turns (all itemId="assistant") interleaved
+    // into one scrambled message, and user messages (all seq=-1) reordered.
+    const run = (id: string, deltas: string[], base: string): ThreadEvent[] => [
+      {
+        ...event("thread.message-sent", { text: `msg-${id}`, createdAt: `${base}.000Z` }),
+        seq: -1,
+        dispatcher_run_id: id
+      },
+      ...deltas.map((delta, i) => ({
+        ...acpDelta(delta, { seq: i + 1, createdAt: `${base}.0${i + 1}0Z` }),
+        dispatcher_run_id: id
+      })),
+      {
+        ...event("turn/completed", {
+          payload: { raw: { params: { turn: { status: "completed" } } } },
+          createdAt: `${base}.900Z`
+        }),
+        seq: 99,
+        dispatcher_run_id: id
+      }
+    ];
+    const blocks = deriveThreadBlocks({
+      run: null,
+      events: [
+        ...run("run-a", ["I'm powered by ", "**SWE-2 Medium**"], "2026-01-01T00:00:10"),
+        ...run("run-b", ["Those lines are ", "a job envelope"], "2026-01-01T00:01:10")
+      ]
+    });
+    expect(blockKinds(blocks)).toEqual(["user", "assistant", "user", "assistant"]);
+    expect(assistantTexts(blocks)).toEqual([
+      "I'm powered by **SWE-2 Medium**",
+      "Those lines are a job envelope"
+    ]);
+    const users = blocks.filter((b) => b.kind === "user").map((b) => (b as { text: string }).text);
+    expect(users).toEqual(["msg-run-a", "msg-run-b"]);
+  });
+
   it("renders turn failures as error blocks", () => {
     const blocks = deriveThreadBlocks({
       run: null,

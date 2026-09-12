@@ -338,6 +338,8 @@ interface RunEvent {
   text?: string | null;
   payload: unknown;
   created_at?: string;
+  run_id?: string | null;
+  dispatcher_run_id?: string | null;
 }
 
 interface Run {
