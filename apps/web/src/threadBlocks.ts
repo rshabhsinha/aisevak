@@ -219,6 +219,7 @@ export function deriveThreadBlocks(input: {
       stringValue(item?.id) ??
       stringValue(params?.itemId) ??
       stringValue(params?.item_id) ??
+      stringValue(normalized?.itemId) ??
       `event:${event.id}`;
     const itemType = stringValue(item?.type) ?? stringValue(params?.itemType) ?? "";
 
