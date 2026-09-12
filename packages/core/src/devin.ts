@@ -217,7 +217,9 @@ export function devinCredentialsPaths(home: string): string[] {
 // that key in credentials.toml, so worker homes authenticate by extracting it.
 export function extractDevinApiKey(credentialsToml: string): string | null {
   for (const line of credentialsToml.split(/\r?\n/)) {
-    const match = line.trim().match(/^api_key\s*=\s*"([^"]+)"\s*$/) ?? line.trim().match(/^api_key\s*=\s*'([^']+)'\s*$/);
+    // WindsurfCredentials serializes the ACP credential as `windsurf_api_key`;
+    // accept `api_key` too for older builds.
+    const match = line.trim().match(/^(?:windsurf_api_key|api_key)\s*=\s*"([^"]+)"\s*$/) ?? line.trim().match(/^(?:windsurf_api_key|api_key)\s*=\s*'([^']+)'\s*$/);
     if (match?.[1]) return match[1];
   }
   return null;

@@ -7,7 +7,9 @@ import {
   buildDevinAcpArgs,
   DEFAULT_DEVIN_MODEL,
   DEVIN_HARNESS_MODELS,
+  devinBundleApiKey,
   devinCredentialsPath,
+  extractDevinApiKey,
   materializeDevinAuthBundle,
   parseDevinAuthStatus,
   parseDevinLoginUrl,
@@ -127,5 +129,30 @@ describe("materializeDevinAuthBundle", () => {
       JSON.stringify({ homeFiles: { "../outside.txt": "nope" } })
     );
     await expect(readFile(join(home, "..", "outside.txt"), "utf8")).rejects.toThrow();
+  });
+});
+
+describe("extractDevinApiKey", () => {
+  it("reads windsurf_api_key and api_key entries", () => {
+    expect(
+      extractDevinApiKey(
+        'windsurf_api_key = "key-123"\napi_server_url = "https://x"\ndevin_webapp_host = "app.devin.ai"\n'
+      )
+    ).toBe("key-123");
+    expect(extractDevinApiKey("api_key = 'abc'\n")).toBe("abc");
+    expect(extractDevinApiKey("devin_api_url = \"https://api.devin.ai\"\n")).toBeNull();
+  });
+
+  it("pulls the key from a captured bundle in either namespace", () => {
+    const cliNs = JSON.stringify({
+      homeFiles: { ".local/share/devin/cli/credentials.toml": 'windsurf_api_key = "cli-key"\n' }
+    });
+    const rootNs = JSON.stringify({
+      homeFiles: { ".local/share/devin/credentials.toml": 'windsurf_api_key = "root-key"\n' }
+    });
+    expect(devinBundleApiKey(cliNs)).toBe("cli-key");
+    expect(devinBundleApiKey(rootNs)).toBe("root-key");
+    expect(devinBundleApiKey(JSON.stringify({ homeFiles: {} }))).toBeNull();
+    expect(devinBundleApiKey(undefined)).toBeNull();
   });
 });
