@@ -4,3 +4,4 @@ export { ThinkingReasoning } from "./thinking-reasoning";
 export { FileDiff } from "./file-diff";
 export { ApprovalCard } from "./approval-card";
 export { TaskList, type TaskItem, type TaskStatus } from "./task-list";
+export { ToolCall, type ToolCallEntry } from "./tool-call";

@@ -838,16 +838,16 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     const providerInstanceId = schedule.provider_instance_id ?? "codex-local";
     const existingSession = await client.query<{
       id: string; task_id: string | null; project_id: string | null; coordination_thread_id: string | null;
-      model: string; cwd: string; runtime_home: string; provider_instance_id: string | null; provider_thread_id: string | null; ownership_generation: number;
+      model: string; model_options: unknown; cwd: string; runtime_home: string; provider_thread_id: string | null; ownership_generation: number;
     }>(
-      `SELECT id, task_id, project_id, coordination_thread_id, model, cwd, runtime_home, provider_instance_id, provider_thread_id, ownership_generation
+      `SELECT id, task_id, project_id, coordination_thread_id, model, model_options, cwd, runtime_home, provider_thread_id, ownership_generation
        FROM agent_threads
        WHERE agent_id = $3 AND (task_id = $1 OR coordination_thread_id = $2)
        ORDER BY (coordination_thread_id = $2) DESC, (task_id = $1) DESC
        LIMIT 1 FOR UPDATE`,
       [sessionTaskId, coordinationThreadId, schedule.agent_id]
     );
-    let agentThread: { id: string; ownership_generation: number; provider_thread_id: string | null };
+    let agentThread: { id: string; model: string; model_options: unknown; ownership_generation: number; provider_thread_id: string | null };
     if (existingSession.rows[0]) {
       const current = existingSession.rows[0];
       if (sessionTaskId) {
@@ -856,33 +856,34 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
           [sessionTaskId, current.id]
         );
       }
+      // Provider and model are pinned when the thread is created; a later
+      // change to the agent's configured harness never retargets existing
+      // threads — only new sessions pick it up.
       const sameProviderBinding = current.task_id === sessionTaskId
         && current.project_id === projectId
         && current.coordination_thread_id === coordinationThreadId
-        && current.model === schedule.model
         && current.cwd === cwd
-        && current.runtime_home === runtimeHome
-        && (current.provider_instance_id ?? "codex-local") === providerInstanceId;
-      const updated = await client.query<{ id: string; ownership_generation: number; provider_thread_id: string | null }>(
+        && current.runtime_home === runtimeHome;
+      const updated = await client.query<{ id: string; model: string; model_options: unknown; ownership_generation: number; provider_thread_id: string | null }>(
         `UPDATE agent_threads
-         SET title = $2, task_id = $3, project_id = $4, model = $5, model_options = $6,
-             cwd = $7, runtime_home = $8, coordination_thread_id = $9, provider_instance_id = $11,
-             provider_thread_id = CASE WHEN $10::boolean THEN provider_thread_id ELSE NULL END,
-             ownership_generation = ownership_generation + CASE WHEN $10::boolean THEN 0 ELSE 1 END,
+         SET title = $2, task_id = $3, project_id = $4,
+             cwd = $5, runtime_home = $6, coordination_thread_id = $7,
+             provider_thread_id = CASE WHEN $8::boolean THEN provider_thread_id ELSE NULL END,
+             ownership_generation = ownership_generation + CASE WHEN $8::boolean THEN 0 ELSE 1 END,
              last_activity_at = now(), updated_at = now()
          WHERE id = $1
-         RETURNING id, ownership_generation, provider_thread_id`,
-        [current.id, taskTitle, sessionTaskId, projectId, schedule.model, JSON.stringify(schedule.model_options ?? []), cwd, runtimeHome, coordinationThreadId, sameProviderBinding, providerInstanceId]
+         RETURNING id, model, model_options, ownership_generation, provider_thread_id`,
+        [current.id, taskTitle, sessionTaskId, projectId, cwd, runtimeHome, coordinationThreadId, sameProviderBinding]
       );
       agentThread = mustRow(updated.rows[0]);
     } else {
-      const session = await client.query<{ id: string; ownership_generation: number; provider_thread_id: string | null }>(
+      const session = await client.query<{ id: string; model: string; model_options: unknown; ownership_generation: number; provider_thread_id: string | null }>(
         `INSERT INTO agent_threads
            (title, agent_id, task_id, project_id, provider_instance_id, model, model_options, cwd, runtime_home, coordination_thread_id)
          VALUES ($1, $2, $3, $4, $10, $5, $6, $7, $8, $9)
          ON CONFLICT (coordination_thread_id, agent_id) WHERE coordination_thread_id IS NOT NULL
          DO UPDATE SET updated_at = now()
-         RETURNING id, ownership_generation, provider_thread_id`,
+         RETURNING id, model, model_options, ownership_generation, provider_thread_id`,
         [taskTitle, schedule.agent_id, sessionTaskId, projectId, schedule.model, JSON.stringify(schedule.model_options ?? []), cwd, runtimeHome, coordinationThreadId, providerInstanceId]
       );
       agentThread = mustRow(session.rows[0]);
@@ -920,8 +921,8 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
        VALUES ($1, 'schedule', 'coordination', $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10, $11, $12, $13, $14)
        RETURNING id`,
       [taskId, agentThread.id, agentThread.ownership_generation, projectId ?? "", workspaceMode, workspaceSource,
-        delivery.rows[0]!.id, cwd, runtimeHome, agentThread.provider_thread_id, schedule.model,
-        JSON.stringify(schedule.model_options ?? []), scheduledPrompt, serializeCodexSkillSnapshots(skillsSnapshot)]
+        delivery.rows[0]!.id, cwd, runtimeHome, agentThread.provider_thread_id, agentThread.model,
+        JSON.stringify(agentThread.model_options ?? []), scheduledPrompt, serializeCodexSkillSnapshots(skillsSnapshot)]
     );
     const dispatcherRunId = mustRow(runResult.rows[0]).id;
     await client.query(

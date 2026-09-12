@@ -3235,10 +3235,16 @@ async function resolveModelSelection(
   pool: Pick<DbPool, "query">,
   input: ModelSelectionInput | undefined,
   fallbackModel: string,
-  thread?: Pick<AgentThreadRow, "provider_instance_id" | "model_options">
+  thread?: Pick<AgentThreadRow, "provider_instance_id" | "model" | "model_options">
 ): Promise<ModelSelectionInput> {
+  // A thread pins its harness and model at creation. Requests that carry a
+  // different provider or model are rejected so a later agent-config change
+  // can never retarget an existing conversation.
   if (thread && input?.providerInstanceId && input.providerInstanceId !== thread.provider_instance_id) {
     throwBadRequest("The harness for this thread cannot be changed");
+  }
+  if (thread && input?.model && input.model !== thread.model) {
+    throwBadRequest("The model for this thread cannot be changed");
   }
   const providerInstanceId = thread?.provider_instance_id ?? input?.providerInstanceId ?? "codex-local";
   const provider = await pool.query<{ driver: string; enabled: boolean }>(

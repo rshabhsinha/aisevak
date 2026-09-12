@@ -335,7 +335,6 @@ function processRunGroup(
     if (event.event_type === "item/agentMessage/delta") {
       const delta = event.text ?? stringValue(params?.delta);
       if (!delta) continue;
-      thinkingBlock = null;
       upsertAssistant(itemId, createdAt, (block) => {
         block.text += delta;
       });
@@ -388,18 +387,20 @@ function processRunGroup(
     }
 
     if (TOOL_ITEM_TYPES.has(itemType) || event.event_type === "session/request_permission") {
-      thinkingBlock = null;
       const status = toolStatusOf(
         stringValue(item?.status) ?? stringValue(raw?.status),
         numberValue(item?.exit_code) ?? numberValue(item?.exitCode)
       );
+      // Follow-up events for the same item often carry no title/command
+      // (Devin emits a bare item/completed after a titled item/started), so
+      // only overwrite fields the event actually provides — never clobber a
+      // real label with the "Tool call" fallback.
       const title =
         stringValue(item?.title) ??
         stringValue(item?.tool_name) ??
         stringValue(item?.toolName) ??
         stringValue(item?.command) ??
-        event.text ??
-        "Tool call";
+        event.text;
       const detail =
         stringValue(item?.aggregated_output) ??
         stringValue(item?.aggregatedOutput) ??
@@ -408,12 +409,14 @@ function processRunGroup(
         (item ? diffTextFromFileChange(item) : undefined) ??
         stringValue(item?.content);
       upsertTool(itemId, createdAt, (entry) => {
-        entry.title = title;
-        entry.command = stringValue(item?.command);
-        entry.detail = detail;
-        entry.status = status;
-        entry.exitCode = numberValue(item?.exit_code) ?? numberValue(item?.exitCode);
-        entry.icon = toolIcon(itemType, entry.command, title);
+        if (title?.trim()) entry.title = title;
+        const command = stringValue(item?.command);
+        if (command) entry.command = command;
+        if (detail?.trim()) entry.detail = detail;
+        const exitCode = numberValue(item?.exit_code) ?? numberValue(item?.exitCode);
+        if (exitCode !== null) entry.exitCode = exitCode;
+        if (entry.status === "running" || status !== "running") entry.status = status;
+        entry.icon = toolIcon(itemType, entry.command, entry.title);
       });
       continue;
     }
@@ -421,7 +424,6 @@ function processRunGroup(
     if (event.event_type === "item/completed" && event.text?.trim()) {
       // Fallback: completed items with no recognizable type (e.g. legacy or
       // provider-specific message items) render as assistant text.
-      thinkingBlock = null;
       upsertAssistant(itemId, createdAt, (block) => {
         block.text = event.text!;
         block.completedAt = createdAt;
