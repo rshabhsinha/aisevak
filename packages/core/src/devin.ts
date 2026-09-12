@@ -51,11 +51,19 @@ export const DEVIN_HARNESS_MODELS: CodexHarnessModel[] = [
   }
 ];
 
+// `swe` is the documented family alias but is not always present in the live
+// catalog; when it is absent, prefer the SWE-2 mid tier before generic first-entry.
+const DEVIN_MODEL_PREFERENCE = [DEFAULT_DEVIN_MODEL, "swe-2-medium", "swe-1-7", "adaptive"];
+
 export function applyDevinModelDefaults(
   models: CodexHarnessModel[],
   preferredModel = DEFAULT_DEVIN_MODEL
 ): { defaultModel: string; models: CodexHarnessModel[] } {
-  return applyCodexModelDefaults(models.length > 0 ? models : DEVIN_HARNESS_MODELS, preferredModel);
+  const list = models.length > 0 ? models : DEVIN_HARNESS_MODELS;
+  const preferred = list.some((model) => model.id === preferredModel)
+    ? preferredModel
+    : DEVIN_MODEL_PREFERENCE.find((id) => list.some((model) => model.id === id)) ?? preferredModel;
+  return applyCodexModelDefaults(list, preferred);
 }
 
 export function buildDevinAcpArgs(model?: string | null): string[] {
