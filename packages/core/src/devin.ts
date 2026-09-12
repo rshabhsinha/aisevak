@@ -203,6 +203,15 @@ export function devinCredentialsPath(home: string): string {
   return join(home, ".local", "share", "devin", "credentials.toml");
 }
 
+// Newer CLI builds namespace data under `devin/cli/`; older builds use `devin/`
+// directly. Probe both.
+export function devinCredentialsPaths(home: string): string[] {
+  return [
+    join(home, ".local", "share", "devin", "credentials.toml"),
+    join(home, ".local", "share", "devin", "cli", "credentials.toml")
+  ];
+}
+
 // `devin acp` deliberately ignores credentials.toml — ACP hosts must call the
 // `authenticate` request with `_meta.api_key`. The PKCE login exchange stores
 // that key in credentials.toml, so worker homes authenticate by extracting it.
@@ -220,7 +229,8 @@ export function devinBundleApiKey(bundle: string | undefined | null): string | n
     const parsed = JSON.parse(bundle) as { homeFiles?: Record<string, string> };
     const credentials =
       parsed.homeFiles?.[".local/share/devin/credentials.toml"] ??
-      Object.entries(parsed.homeFiles ?? {}).find(([path]) => path.endsWith("devin/credentials.toml"))?.[1];
+      parsed.homeFiles?.[".local/share/devin/cli/credentials.toml"] ??
+      Object.entries(parsed.homeFiles ?? {}).find(([path]) => path.endsWith("credentials.toml"))?.[1];
     return credentials ? extractDevinApiKey(credentials) : null;
   } catch {
     return null;

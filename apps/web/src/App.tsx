@@ -4405,8 +4405,6 @@ function DevinConnectionView() {
     needsLogin: true,
     lastError: null as string | null
   });
-  const [login, setLogin] = useState<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number } | null>(null);
-  const [loginCode, setLoginCode] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -4414,41 +4412,6 @@ function DevinConnectionView() {
   useEffect(() => {
     void loadStatus();
   }, []);
-
-  useEffect(() => {
-    if (!login || login.awaitingCode) return;
-    let stopped = false;
-    let timer: number | undefined;
-    const poll = async () => {
-      if (login.expiresAt <= Date.now()) {
-        setError("The Devin login request expired. Start a new login.");
-        setLogin(null);
-        return;
-      }
-      try {
-        const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
-          `/api/devin-auth/login/${encodeURIComponent(login.loginId)}`
-        );
-        if (stopped) return;
-        setStatus(result.auth);
-        if (result.status === "connected") {
-          setLogin(null);
-          setError(null);
-          return;
-        }
-        timer = window.setTimeout(poll, 2000);
-      } catch (pollError) {
-        if (stopped) return;
-        setError(friendlyError(pollError instanceof Error ? pollError.message : "Devin authorization failed."));
-        setLogin(null);
-      }
-    };
-    timer = window.setTimeout(poll, 1500);
-    return () => {
-      stopped = true;
-      if (timer) window.clearTimeout(timer);
-    };
-  }, [login?.loginId, login?.awaitingCode]);
 
   async function loadStatus() {
     setBusy(true);
@@ -4480,41 +4443,7 @@ function DevinConnectionView() {
     }
   }
 
-  async function startLogin() {
-    setBusy(true);
-    setError(null);
-    try {
-      const started = await api<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number }>(
-        "/api/devin-auth/login",
-        { method: "POST" }
-      );
-      setLogin(started);
-      setLoginCode("");
-      if (started.verificationUrl) window.open(started.verificationUrl, "_blank", "noopener,noreferrer");
-    } catch (loginError) {
-      setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start Devin login."));
-    } finally {
-      setBusy(false);
-    }
-  }
 
-  async function submitCode() {
-    if (!login) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const updated = await api<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number }>(
-        `/api/devin-auth/login/${encodeURIComponent(login.loginId)}/code`,
-        { method: "POST", body: JSON.stringify({ code: loginCode }) }
-      );
-      setLogin(updated);
-      setLoginCode("");
-    } catch (codeError) {
-      setError(friendlyError(codeError instanceof Error ? codeError.message : "Could not submit the Devin login code."));
-    } finally {
-      setBusy(false);
-    }
-  }
 
   async function saveApiKey() {
     setBusy(true);
@@ -4534,7 +4463,6 @@ function DevinConnectionView() {
     setError(null);
     try {
       setStatus(await api("/api/devin-auth", { method: "DELETE" }));
-      setLogin(null);
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Devin."));
     } finally {
@@ -4552,7 +4480,7 @@ function DevinConnectionView() {
           <div className="codex-connection-mark"><DevinLogo size={25} /></div>
           <div>
             <h4>Connect Devin to Aisevak</h4>
-            <p>Sign in with your Devin subscription or save an API key. Devin CLI credentials are portable, so worker homes get the same account the browser flow authorizes.</p>
+            <p>Paste a Devin API key, or run `devin auth login` in a real terminal on this host and import the credentials it writes. Devin's ACP harness authenticates worker turns with the api_key inside credentials.toml.</p>
           </div>
         </div>
         <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Login required"}</Badge>
@@ -4571,46 +4499,11 @@ function DevinConnectionView() {
           <strong>{status.version ?? (status.installed ? "Installed" : "Missing")}</strong>
         </div>
       </section>
-      {login ? (
-        <section className="codex-login-panel">
-          <div>
-            <h4>Finish Devin sign-in</h4>
-            <p>Open the authorization link, sign in, then paste the code it shows. Aisevak stores the resulting credentials.toml in encrypted secrets for isolated worker homes.</p>
-          </div>
-          {login.verificationUrl ? (
-            <a href={login.verificationUrl} target="_blank" rel="noopener noreferrer" className="codex-auth-link">
-              Open Devin authorization <ArrowUp size={14} />
-            </a>
-          ) : (
-            <span><Loader2 className="spin" size={13} /> Waiting for a login URL…</span>
-          )}
-          {login.awaitingCode ? (
-            <form
-              className="row-actions"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void submitCode();
-              }}
-            >
-              <Input
-                value={loginCode}
-                placeholder="Paste the code from the browser"
-                onChange={(event) => setLoginCode(event.target.value)}
-              />
-              <Button type="submit" variant="outline" disabled={busy || !loginCode.trim()}>
-                Submit code
-              </Button>
-            </form>
-          ) : (
-            <span><Loader2 className="spin" size={13} /> Waiting for Devin to finish signing in…</span>
-          )}
-        </section>
-      ) : null}
       <section className="api-section codex-connection-actions">
         <div className="section-title-row">
           <div>
             <h4>{status.connected ? "Connection is ready" : "Connect Devin"}</h4>
-            <p>Sign in to link a Devin subscription, or import credentials if this host already ran `devin auth login`. An API key is a simpler fallback for headless hosts.</p>
+            <p>Devin CLI's interactive sign-in needs a real terminal, so run `devin auth login` on this host (a terminal SSH/SSM session works) and click Import, or paste an API key below.</p>
           </div>
           <div className="row-actions">
             {status.connected ? (
@@ -4623,15 +4516,9 @@ function DevinConnectionView() {
                 </Button>
               </>
             ) : (
-              <>
-                <Button variant="outline" disabled={busy || Boolean(login)} onClick={() => void importHost()}>
-                  Import host credentials
-                </Button>
-                <Button disabled={busy || Boolean(login)} onClick={() => void startLogin()}>
-                  {busy ? <Loader2 className="spin" size={14} /> : <DevinLogo size={14} />}
-                  Sign in with Devin
-                </Button>
-              </>
+              <Button variant="outline" disabled={busy} onClick={() => void importHost()}>
+                Import host credentials
+              </Button>
             )}
           </div>
         </div>

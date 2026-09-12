@@ -3,7 +3,7 @@ import {
   DEVIN_AUTH_SECRET_NAME,
   decryptSecret,
   devinBundleApiKey,
-  devinCredentialsPath,
+  devinCredentialsPaths,
   encryptSecret,
   materializeDevinAuthBundle,
   parseDevinAuthStatus,
@@ -121,18 +121,24 @@ export class DevinAuthManager {
   }
 
   async importHostAuth(): Promise<DevinAuthStatusResponse> {
-    const bundle = await captureDevinAuthBundle(this.hostHome);
-    if (!bundleHasFiles(bundle)) {
-      throw new Error(
-        "No Devin CLI credentials found on this host. Run `devin auth login` first, or start a login here."
-      );
+    // The API container cannot see host home directories. Operators can run
+    // `HOME=<harness-auth>/devin-auth/host-import devin auth login` on the
+    // host so the bind-mounted harness-auth dir exposes the credentials here.
+    const candidates = [this.hostHome, join(this.authHomeRoot, "host-import")];
+    for (const home of candidates) {
+      const bundle = await captureDevinAuthBundle(home);
+      if (bundleHasFiles(bundle)) {
+        await this.upsertSecret(
+          DEVIN_AUTH_SECRET_NAME,
+          bundle,
+          "Internal Devin CLI authentication used by the runner"
+        );
+        return this.getStatus();
+      }
     }
-    await this.upsertSecret(
-      DEVIN_AUTH_SECRET_NAME,
-      bundle,
-      "Internal Devin CLI authentication used by the runner"
+    throw new Error(
+      "No Devin CLI credentials found. Run `devin auth login` on the host with HOME set to the harness-auth host-import directory, or save an API key."
     );
-    return this.getStatus();
   }
 
   async startLogin(requestedBy: string): Promise<DevinLogin> {
@@ -205,7 +211,11 @@ export class DevinAuthManager {
       this.logins.delete(loginId);
       throw new Error("The Devin login request expired");
     }
-    const credentials = await readFile(devinCredentialsPath(login.home), "utf8").catch(() => null);
+    const credentials = (
+      await Promise.all(
+        devinCredentialsPaths(login.home).map((path) => readFile(path, "utf8").catch(() => null))
+      )
+    ).find(Boolean);
     if (!credentials) {
       return { status: "pending", auth: await this.getStatus() };
     }
