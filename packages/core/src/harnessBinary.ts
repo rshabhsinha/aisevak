@@ -28,6 +28,23 @@ export function resolveCursorBinary(
   });
 }
 
+export function resolveDevinBinary(
+  configured: string | null | undefined,
+  environment: NodeJS.ProcessEnv = process.env
+): string {
+  return resolveNamedBinary({
+    configured,
+    defaultName: "devin",
+    aliases: ["devin"],
+    darwinCandidates: [
+      join(homedir(), ".local", "bin", "devin"),
+      "/Applications/Devin.app/Contents/Resources/app/extensions/windsurf/devin/bin/devin"
+    ],
+    sharedCandidates: [join(HOST_PUBLISHED_BIN_DIR, "devin")],
+    environment
+  });
+}
+
 export function resolveOpenCodeBinary(
   configured: string | null | undefined,
   environment: NodeJS.ProcessEnv = process.env

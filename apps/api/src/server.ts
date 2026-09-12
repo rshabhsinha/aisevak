@@ -15,18 +15,25 @@ import {
   newSessionToken,
   applyCodexModelDefaults,
   applyCursorModelDefaults,
+  applyDevinModelDefaults,
   applyOpenCodeModelDefaults,
   CODEX_HARNESS_MODELS,
   CURSOR_API_KEY_SECRET_NAME,
   CURSOR_HARNESS_MODELS,
+  DEVIN_API_KEY_SECRET_NAME,
+  DEVIN_AUTH_SECRET_NAME,
+  DEVIN_HARNESS_MODELS,
   OPENCODE_HARNESS_MODELS,
   defaultCodexModelOptions,
   discoverCodexModels,
   fetchZenModelCatalog,
+  materializeDevinAuthBundle,
   parseCursorModelList,
+  parseDevinModelList,
   parseOpenCodeModelList,
   resolveCodexBinary,
   resolveCursorBinary,
+  resolveDevinBinary,
   resolveOpenCodeBinary,
   resolveCodexDefaultModel,
   removeInstalledSkill,
@@ -57,6 +64,7 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 import { CursorAuthManager } from "./cursorAuth.js";
+import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
 import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
 import { runHarnessCommand } from "./harnessCommand.js";
 import {
@@ -100,6 +108,7 @@ const env = {
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
   cursorBinary: resolveCursorBinary(process.env.CURSOR_BINARY),
   openCodeBinary: resolveOpenCodeBinary(process.env.OPENCODE_BINARY),
+  devinBinary: resolveDevinBinary(process.env.DEVIN_BINARY),
   codexDefaultModel: resolveCodexDefaultModel(),
   githubHost: process.env.GITHUB_HOST ?? "github.com"
 };
@@ -114,6 +123,9 @@ let cursorModelCache:
   | undefined;
 let openCodeModelCache:
   | { expiresAt: number; models: typeof OPENCODE_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
+  | undefined;
+let devinModelCache:
+  | { expiresAt: number; models: typeof DEVIN_HARNESS_MODELS; defaultModel: string; source: "live" | "fallback" }
   | undefined;
 
 export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
@@ -130,6 +142,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     env.secretKey,
     env.openCodeBinary,
     resolve(env.managedRoot, "opencode-auth")
+  );
+  const devinAuth = new DevinAuthManager(
+    pool,
+    env.secretKey,
+    env.devinBinary,
+    resolve(env.managedRoot, "devin-auth")
   );
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
@@ -354,6 +372,49 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return openCodeAuth.disconnect();
   });
 
+  app.get("/api/devin-auth", async (request) => {
+    requireAdmin(request);
+    return devinAuth.getStatus();
+  });
+
+  app.post("/api/devin-auth/api-key", async (request) => {
+    requireAdmin(request);
+    const body = z.object({ apiKey: z.string().trim().min(1) }).parse(request.body);
+    return devinAuth.saveApiKey(body.apiKey);
+  });
+
+  app.post("/api/devin-auth/import-host", async (request) => {
+    requireAdmin(request);
+    try {
+      return await devinAuth.importHostAuth();
+    } catch (error) {
+      throw app.httpErrors.badRequest(error instanceof Error ? error.message : String(error));
+    }
+  });
+
+  app.post("/api/devin-auth/login", async (request) => {
+    const user = requireAdmin(request);
+    return devinAuth.startLogin(user.id);
+  });
+
+  app.post("/api/devin-auth/login/:id/code", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    const body = z.object({ code: z.string().trim().min(1) }).parse(request.body);
+    return devinAuth.submitLoginCode(id, user.id, body.code);
+  });
+
+  app.get("/api/devin-auth/login/:id", async (request) => {
+    const user = requireAdmin(request);
+    const { id } = codexLoginParams.parse(request.params);
+    return devinAuth.pollLogin(id, user.id);
+  });
+
+  app.delete("/api/devin-auth", async (request) => {
+    requireAdmin(request);
+    return devinAuth.disconnect();
+  });
+
   app.get("/api/codex/models", async (request) => {
     requireUser(request);
     return getCodexModelSnapshot();
@@ -361,7 +422,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/provider-instances", async (request) => {
     requireUser(request);
-    const [instances, codexCatalog, cursorCatalog, openCodeCatalog] = await Promise.all([
+    const [instances, codexCatalog, cursorCatalog, openCodeCatalog, devinCatalog] = await Promise.all([
       pool.query<{
         id: string;
         driver: string;
@@ -375,7 +436,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       ),
       getCodexModelSnapshot(),
       getCursorModelSnapshot(pool),
-      getOpenCodeModelSnapshot()
+      getOpenCodeModelSnapshot(),
+      getDevinModelSnapshot(pool)
     ]);
     return {
       instances: instances.rows.map((instance) => {
@@ -384,9 +446,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
             ? cursorCatalog
             : instance.driver === "opencode"
               ? openCodeCatalog
-              : instance.driver === "codex"
-                ? codexCatalog
-                : { models: [], defaultModel: null, source: null };
+              : instance.driver === "devin"
+                ? devinCatalog
+                : instance.driver === "codex"
+                  ? codexCatalog
+                  : { models: [], defaultModel: null, source: null };
         return {
           ...instance,
           status: "ready",
@@ -2562,6 +2626,52 @@ async function getOpenCodeModelSnapshot(): Promise<{
   return openCodeModelCache;
 }
 
+async function getDevinModelSnapshot(pool: DbPool): Promise<{
+  defaultModel: string;
+  models: typeof DEVIN_HARNESS_MODELS;
+  source: "live" | "fallback";
+}> {
+  if (devinModelCache && devinModelCache.expiresAt > Date.now()) return devinModelCache;
+  try {
+    const apiKey = await readSecret(pool, DEVIN_API_KEY_SECRET_NAME);
+    const bundle = await readSecret(pool, DEVIN_AUTH_SECRET_NAME);
+    if (!apiKey && !bundle) {
+      const configured = applyDevinModelDefaults(DEVIN_HARNESS_MODELS);
+      devinModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
+      return devinModelCache;
+    }
+    const home = resolve(env.managedRoot, "devin-auth", "models-probe");
+    if (bundle) {
+      await materializeDevinAuthBundle(home, bundle);
+    }
+    const listed = await runHarnessCommand(env.devinBinary, ["models", "list", "--format", "json"], {
+      env: { ...devinHomeEnv(home), ...(apiKey ? { WINDSURF_API_KEY: apiKey } : {}) },
+      timeoutMs: 15_000
+    });
+    if (listed.exitCode !== 0) {
+      console.warn("Devin model discovery exited nonzero; using fallback catalog", {
+        exitCode: listed.exitCode,
+        stderrTail: listed.stderr.slice(-500)
+      });
+    } else {
+      const liveModels = parseDevinModelList(listed.stdout);
+      if (liveModels.length > 0) {
+        const configured = applyDevinModelDefaults(liveModels);
+        devinModelCache = { ...configured, source: "live", expiresAt: Date.now() + 5 * 60_000 };
+        return devinModelCache;
+      }
+      console.warn("Devin model discovery returned no models; using fallback catalog", {
+        stdoutTail: listed.stdout.slice(-500)
+      });
+    }
+  } catch (error) {
+    console.warn("Devin model discovery failed; using fallback catalog", error);
+  }
+  const configured = applyDevinModelDefaults(DEVIN_HARNESS_MODELS);
+  devinModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
+  return devinModelCache;
+}
+
 async function listAgentThreads(
   pool: DbPool,
   input: z.infer<typeof agentThreadsQuerySchema>
@@ -3136,7 +3246,7 @@ async function resolveModelSelection(
   );
   const instance = mustRow(provider.rows[0]);
   if (!instance.enabled) throwBadRequest("The selected harness is disabled");
-  if (!["codex", "cursor", "opencode"].includes(instance.driver)) {
+  if (!["codex", "cursor", "opencode", "devin"].includes(instance.driver)) {
     throwBadRequest("The selected harness is not supported");
   }
   const model = input?.model ?? fallbackModel;
@@ -3724,14 +3834,16 @@ async function queueWorkerRun(
       throw new Error("Auto-route tasks must be dispatched before a worker run can start");
     }
     const projectId = task.project_id;
-    const projectPath = task.local_path;
-    const workspaceMode = task.workspace_mode;
-    const projectSource = task.source;
-    if (!projectId || !projectPath || !workspaceMode || !projectSource) {
-      throwBadRequest("Assign a project before starting a worker run");
-    }
-    if (!options.allowQueuedFollowUp) {
-      await ensureNoDirectProjectRun(client, projectId, workspaceMode);
+    const projectPath = task.local_path ?? env.managedRoot;
+    const workspaceMode = task.workspace_mode ?? "projectless";
+    const projectSource = task.source ?? "projectless";
+    const workspaceKey = projectId ?? "";
+    if (projectId && workspaceMode !== "projectless" && !options.allowQueuedFollowUp) {
+      await ensureNoDirectProjectRun(
+        client,
+        projectId,
+        workspaceMode as "direct" | "git_worktree"
+      );
     }
 
     const branch = projectSource === "github" ? taskBranchName(task.number, task.title) : null;
@@ -3805,7 +3917,7 @@ async function queueWorkerRun(
         session.id,
         agentThreadId,
         thread.ownership_generation,
-        projectId,
+        workspaceKey,
         workspaceMode,
         projectSource,
         trigger,

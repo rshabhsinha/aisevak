@@ -1038,7 +1038,8 @@ INSERT INTO provider_instances (id, driver, display_name, enabled)
 VALUES
   ('codex-local', 'codex', 'Codex', true),
   ('cursor-local', 'cursor', 'Cursor', true),
-  ('opencode-local', 'opencode', 'OpenCode', true)
+  ('opencode-local', 'opencode', 'OpenCode', true),
+  ('devin-local', 'devin', 'Devin', true)
 ON CONFLICT (id) DO UPDATE
 SET driver = EXCLUDED.driver,
     display_name = EXCLUDED.display_name,

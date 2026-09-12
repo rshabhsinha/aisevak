@@ -5,6 +5,7 @@ export * from "./codexAuth.js";
 export * from "./codexBinary.js";
 export * from "./codexModels.js";
 export * from "./cursor.js";
+export * from "./devin.js";
 export * from "./harnessBinary.js";
 export * from "./opencode.js";
 export * from "./crypto.js";

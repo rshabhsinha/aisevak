@@ -13,6 +13,7 @@ export type AppView =
   | "codex"
   | "cursor"
   | "opencode"
+  | "devin"
   | "settings";
 
 export interface AppRoute {
@@ -35,6 +36,7 @@ const VIEW_PATHS: Record<Exclude<AppView, "runs">, string> = {
   codex: "/settings/chatgpt",
   cursor: "/settings/cursor",
   opencode: "/settings/opencode",
+  devin: "/settings/devin",
   settings: "/settings"
 };
 

@@ -47,7 +47,7 @@ import { AgentAvatar } from "./components/agent-avatar";
 import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
-import { CursorLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
+import { CursorLogo, DevinLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { cn } from "./lib/utils";
@@ -166,7 +166,7 @@ interface ModelSelection {
 
 interface ProviderInstance {
   id: string;
-  driver: "codex" | "cursor" | "opencode";
+  driver: "codex" | "cursor" | "opencode" | "devin";
   display_name: string;
   enabled: boolean;
   status: "ready" | "warning" | "error";
@@ -188,7 +188,7 @@ interface AgentThread {
   project_id: string | null;
   project_name: string | null;
   provider_instance_id: string;
-  provider_driver: "codex" | "cursor" | "opencode";
+  provider_driver: "codex" | "cursor" | "opencode" | "devin";
   provider_name: string;
   model: string;
   model_options: ModelOptionSelection[];
@@ -1318,6 +1318,8 @@ export function App() {
                   ? "cursor"
                   : view === "opencode"
                   ? "opencode"
+                  : view === "devin"
+                  ? "devin"
                   : "codex"
               }
               onTabChange={(tab) => navigateToView(tab)}
@@ -4392,6 +4394,272 @@ function OpenCodeConnectionView() {
   );
 }
 
+function DevinConnectionView() {
+  const [status, setStatus] = useState({
+    connected: false,
+    activeMethod: null as "subscription" | "api_key" | null,
+    installed: true,
+    version: null as string | null,
+    email: null as string | null,
+    subscription: null as string | null,
+    needsLogin: true,
+    lastError: null as string | null
+  });
+  const [login, setLogin] = useState<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number } | null>(null);
+  const [loginCode, setLoginCode] = useState("");
+  const [apiKey, setApiKey] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  useEffect(() => {
+    if (!login || login.awaitingCode) return;
+    let stopped = false;
+    let timer: number | undefined;
+    const poll = async () => {
+      if (login.expiresAt <= Date.now()) {
+        setError("The Devin login request expired. Start a new login.");
+        setLogin(null);
+        return;
+      }
+      try {
+        const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
+          `/api/devin-auth/login/${encodeURIComponent(login.loginId)}`
+        );
+        if (stopped) return;
+        setStatus(result.auth);
+        if (result.status === "connected") {
+          setLogin(null);
+          setError(null);
+          return;
+        }
+        timer = window.setTimeout(poll, 2000);
+      } catch (pollError) {
+        if (stopped) return;
+        setError(friendlyError(pollError instanceof Error ? pollError.message : "Devin authorization failed."));
+        setLogin(null);
+      }
+    };
+    timer = window.setTimeout(poll, 1500);
+    return () => {
+      stopped = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [login?.loginId, login?.awaitingCode]);
+
+  async function loadStatus() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/devin-auth"));
+    } catch (statusError) {
+      setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Devin status."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function importHost() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/devin-auth/import-host", { method: "POST" }));
+    } catch (importError) {
+      setError(
+        friendlyError(
+          importError instanceof Error
+            ? importError.message
+            : "Could not import Devin CLI credentials from this host."
+        )
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function startLogin() {
+    setBusy(true);
+    setError(null);
+    try {
+      const started = await api<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number }>(
+        "/api/devin-auth/login",
+        { method: "POST" }
+      );
+      setLogin(started);
+      setLoginCode("");
+      if (started.verificationUrl) window.open(started.verificationUrl, "_blank", "noopener,noreferrer");
+    } catch (loginError) {
+      setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start Devin login."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitCode() {
+    if (!login) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const updated = await api<{ loginId: string; verificationUrl: string | null; awaitingCode: boolean; expiresAt: number }>(
+        `/api/devin-auth/login/${encodeURIComponent(login.loginId)}/code`,
+        { method: "POST", body: JSON.stringify({ code: loginCode }) }
+      );
+      setLogin(updated);
+      setLoginCode("");
+    } catch (codeError) {
+      setError(friendlyError(codeError instanceof Error ? codeError.message : "Could not submit the Devin login code."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveApiKey() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/devin-auth/api-key", { method: "POST", body: JSON.stringify({ apiKey }) }));
+      setApiKey("");
+    } catch (saveError) {
+      setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save Devin API key."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/devin-auth", { method: "DELETE" }));
+      setLogin(null);
+    } catch (disconnectError) {
+      setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Devin."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flat-list-view api-view codex-connection-view">
+      <div className="flat-header">
+        <h3>Devin</h3>
+      </div>
+      <section className="codex-connection-hero">
+        <div className="codex-connection-heading">
+          <div className="codex-connection-mark"><DevinLogo size={25} /></div>
+          <div>
+            <h4>Connect Devin to Aisevak</h4>
+            <p>Sign in with your Devin subscription or save an API key. Devin CLI credentials are portable, so worker homes get the same account the browser flow authorizes.</p>
+          </div>
+        </div>
+        <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Login required"}</Badge>
+      </section>
+      <section className="codex-connection-grid">
+        <div>
+          <span>Active method</span>
+          <strong>{status.activeMethod === "subscription" ? "Devin subscription" : status.activeMethod === "api_key" ? "Devin API key" : "None"}</strong>
+        </div>
+        <div>
+          <span>Account</span>
+          <strong>{status.email ?? "Not connected"}</strong>
+        </div>
+        <div>
+          <span>CLI</span>
+          <strong>{status.version ?? (status.installed ? "Installed" : "Missing")}</strong>
+        </div>
+      </section>
+      {login ? (
+        <section className="codex-login-panel">
+          <div>
+            <h4>Finish Devin sign-in</h4>
+            <p>Open the authorization link, sign in, then paste the code it shows. Aisevak stores the resulting credentials.toml in encrypted secrets for isolated worker homes.</p>
+          </div>
+          {login.verificationUrl ? (
+            <a href={login.verificationUrl} target="_blank" rel="noopener noreferrer" className="codex-auth-link">
+              Open Devin authorization <ArrowUp size={14} />
+            </a>
+          ) : (
+            <span><Loader2 className="spin" size={13} /> Waiting for a login URL…</span>
+          )}
+          {login.awaitingCode ? (
+            <form
+              className="row-actions"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submitCode();
+              }}
+            >
+              <Input
+                value={loginCode}
+                placeholder="Paste the code from the browser"
+                onChange={(event) => setLoginCode(event.target.value)}
+              />
+              <Button type="submit" variant="outline" disabled={busy || !loginCode.trim()}>
+                Submit code
+              </Button>
+            </form>
+          ) : (
+            <span><Loader2 className="spin" size={13} /> Waiting for Devin to finish signing in…</span>
+          )}
+        </section>
+      ) : null}
+      <section className="api-section codex-connection-actions">
+        <div className="section-title-row">
+          <div>
+            <h4>{status.connected ? "Connection is ready" : "Connect Devin"}</h4>
+            <p>Sign in to link a Devin subscription, or import credentials if this host already ran `devin auth login`. An API key is a simpler fallback for headless hosts.</p>
+          </div>
+          <div className="row-actions">
+            {status.connected ? (
+              <>
+                <Button variant="outline" disabled={busy} onClick={() => void loadStatus()}>
+                  <RefreshCw className={busy ? "spin" : ""} size={14} /> Refresh
+                </Button>
+                <Button variant="destructive" disabled={busy} onClick={() => void disconnect()}>
+                  Disconnect
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button variant="outline" disabled={busy || Boolean(login)} onClick={() => void importHost()}>
+                  Import host credentials
+                </Button>
+                <Button disabled={busy || Boolean(login)} onClick={() => void startLogin()}>
+                  {busy ? <Loader2 className="spin" size={14} /> : <DevinLogo size={14} />}
+                  Sign in with Devin
+                </Button>
+              </>
+            )}
+          </div>
+        </div>
+        {!status.connected ? (
+          <form
+            className="row-actions"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveApiKey();
+            }}
+          >
+            <Input
+              type="password"
+              value={apiKey}
+              placeholder="Devin API key"
+              onChange={(event) => setApiKey(event.target.value)}
+            />
+            <Button type="submit" variant="outline" disabled={busy || !apiKey.trim()}>
+              Save API key
+            </Button>
+          </form>
+        ) : null}
+        {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
+      </section>
+    </div>
+  );
+}
+
 function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void> }) {
   const [name, setName] = useState("External integration");
   const [expiresAt, setExpiresAt] = useState(() => localDateTimeInput(addDays(new Date(), 30)));
@@ -5120,7 +5388,7 @@ function githubConnectionStatus(status: GithubConnection["status"]): string {
   }
 }
 
-type SettingsTab = "codex" | "cursor" | "opencode" | "api" | "credentials" | "projects" | "connectors";
+type SettingsTab = "codex" | "cursor" | "opencode" | "devin" | "api" | "credentials" | "projects" | "connectors";
 
 function SettingsView(props: {
   activeTab: SettingsTab;
@@ -5144,6 +5412,7 @@ function SettingsView(props: {
     { id: "codex", label: "ChatGPT", icon: <OpenAILogo size={14} />, restricted: true },
     { id: "cursor", label: "Cursor", icon: <CursorLogo size={14} />, restricted: true },
     { id: "opencode", label: "OpenCode", icon: <OpenCodeLogo size={14} />, restricted: true },
+    { id: "devin", label: "Devin", icon: <DevinLogo size={14} />, restricted: true },
     { id: "api", label: "API Keys", icon: <KeyRound size={14} /> },
     { id: "credentials", label: "Credentials", icon: <LockKeyhole size={14} />, restricted: true },
     { id: "projects", label: "Projects", icon: <FolderGit2 size={14} /> },
@@ -5177,6 +5446,9 @@ function SettingsView(props: {
         ) : null}
         {props.activeTab === "opencode" && props.userRole !== "member" ? (
           <OpenCodeConnectionView />
+        ) : null}
+        {props.activeTab === "devin" && props.userRole !== "member" ? (
+          <DevinConnectionView />
         ) : null}
         {props.activeTab === "api" ? (
           <ApiView apiKeys={props.apiKeys} onSaved={props.onSavedApiKeys} />
@@ -5744,7 +6016,7 @@ function apiKeyStatus(key: ExternalApiKey): string {
 }
 
 function isSettingsView(view: View): boolean {
-  return ["settings", "codex", "cursor", "opencode", "api", "credentials", "projects", "connectors"].includes(view);
+  return ["settings", "codex", "cursor", "opencode", "devin", "api", "credentials", "projects", "connectors"].includes(view);
 }
 
 function viewTitle(view: View): string {
@@ -5761,6 +6033,7 @@ function viewTitle(view: View): string {
     codex: "Settings",
     cursor: "Settings",
     opencode: "Settings",
+    devin: "Settings",
     api: "Settings",
     credentials: "Settings",
     projects: "Settings",
