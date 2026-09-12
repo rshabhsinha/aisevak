@@ -51,6 +51,10 @@ services:
       # remain host-runner-only.
       - /srv/aisevak/skills:/srv/aisevak/skills
       - /srv/aisevak/probe-schema:/srv/aisevak/probe-schema
+      # Scratch homes for provider auth probes/logins (cursor-auth, opencode-auth,
+      # devin-auth) — the API container runs as the runner UID and cannot create
+      # siblings of the bind-mounted dirs above.
+      - /srv/aisevak/harness-auth:/srv/aisevak/harness-auth
       # Host-published harness CLIs (read-only) so status probes and model
       # discovery inside the container see the same binaries as the runner.
       - /opt/aisevak/harness-bin:/opt/aisevak/harness-bin:ro

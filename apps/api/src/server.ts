@@ -135,19 +135,19 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     pool,
     env.secretKey,
     env.cursorBinary,
-    resolve(env.managedRoot, "cursor-auth")
+    resolve(env.managedRoot, "harness-auth", "cursor-auth")
   );
   const openCodeAuth = new OpenCodeAuthManager(
     pool,
     env.secretKey,
     env.openCodeBinary,
-    resolve(env.managedRoot, "opencode-auth")
+    resolve(env.managedRoot, "harness-auth", "opencode-auth")
   );
   const devinAuth = new DevinAuthManager(
     pool,
     env.secretKey,
     env.devinBinary,
-    resolve(env.managedRoot, "devin-auth")
+    resolve(env.managedRoot, "harness-auth", "devin-auth")
   );
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
@@ -2640,7 +2640,7 @@ async function getDevinModelSnapshot(pool: DbPool): Promise<{
       devinModelCache = { ...configured, source: "fallback", expiresAt: Date.now() + 30_000 };
       return devinModelCache;
     }
-    const home = resolve(env.managedRoot, "devin-auth", "models-probe");
+    const home = resolve(env.managedRoot, "harness-auth", "devin-auth", "models-probe");
     if (bundle) {
       await materializeDevinAuthBundle(home, bundle);
     }
