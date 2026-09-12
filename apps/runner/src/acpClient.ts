@@ -75,6 +75,7 @@ class PersistentAcpSession {
   private initializePromise: Promise<void> | null = null;
   private sessionId: string | null = null;
   lastUsedAt = Date.now();
+  private lastActivityAt = Date.now();
   private readonly closePromise: Promise<{ code: number | null; error?: Error }>;
   private onNotification: ((line: string) => Promise<void>) | null = null;
 
@@ -188,7 +189,7 @@ class PersistentAcpSession {
       const promptRequest = this.request("session/prompt", {
         sessionId: this.sessionId,
         prompt: [{ type: "text", text: options.prompt }]
-      });
+      }, true);
       void promptRequest.catch(() => undefined);
       promptMayHaveBeenPresented = true;
       try {
@@ -215,7 +216,7 @@ class PersistentAcpSession {
             await this.request("session/prompt", {
               sessionId: this.sessionId,
               prompt: [{ type: "text", text: input.message }]
-            });
+            }, true);
             await options.onInputHandled?.(input);
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
@@ -309,6 +310,7 @@ class PersistentAcpSession {
   private handleLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
+    this.lastActivityAt = Date.now();
     void this.onNotification?.(trimmed).catch((error: unknown) => {
       this.rejectPending(error instanceof Error ? error : new Error(String(error)));
       void this.close().catch(() => undefined);
@@ -349,17 +351,34 @@ class PersistentAcpSession {
     }
   }
 
-  private request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private request(
+    method: string,
+    params: Record<string, unknown>,
+    idleAware = false
+  ): Promise<Record<string, unknown>> {
     if (this.closed) return Promise.reject(new Error("ACP session closed"));
     const id = this.nextId++;
-    const timeout = setTimeout(() => {
-      const pending = this.pending.get(String(id));
-      if (!pending) return;
-      this.pending.delete(String(id));
-      pending.reject(new Error(`Timed out waiting for ACP ${method}`));
-    }, 15 * 60_000);
+    // session/prompt stays open for the whole turn and turns legitimately run
+    // longer than 15 minutes, so it uses an idle window instead: keep waiting
+    // while the session keeps emitting events, and only give up after
+    // ACP_PROMPT_IDLE_MS of complete silence.
+    const idleAwareMs = 60 * 60_000;
+    const arm = (): NodeJS.Timeout =>
+      setTimeout(
+        () => {
+          const pending = this.pending.get(String(id));
+          if (!pending) return;
+          if (idleAware && Date.now() - this.lastActivityAt < idleAwareMs) {
+            pending.timeout = arm();
+            return;
+          }
+          this.pending.delete(String(id));
+          pending.reject(new Error(`Timed out waiting for ACP ${method}`));
+        },
+        idleAware ? idleAwareMs : 15 * 60_000
+      );
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
-      this.pending.set(String(id), { resolve, reject, timeout });
+      this.pending.set(String(id), { resolve, reject, timeout: arm() });
     });
     this.send({ jsonrpc: "2.0", id, method, params });
     return promise;
