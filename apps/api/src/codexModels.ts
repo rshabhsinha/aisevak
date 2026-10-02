@@ -11,6 +11,7 @@ export async function discoverAuthenticatedCodexModels(pool: DbPool, options: {
 }) {
   await mkdir(options.root, { recursive: true });
   const home = await mkdtemp(join(options.root, "codex-models-"));
+  let retainHome = false;
   try {
     const stored = await pool.query<{ name: string; encrypted_value: string }>(
       "SELECT name, encrypted_value FROM secrets WHERE name IN ($1, 'openai_api_key')",
@@ -20,11 +21,16 @@ export async function discoverAuthenticatedCodexModels(pool: DbPool, options: {
     const api = stored.rows.find(row => row.name === "openai_api_key");
     const auth = chat ? parseCodexChatGptAuthFile(decryptSecret(chat.encrypted_value, options.secretKey)) : null;
     if (auth) await writeFile(join(home, "auth.json"), serializeCodexChatGptAuthFile(auth), { mode: 0o600 });
-    const models = await discoverCodexModels({ codexBinary: options.binary, env: {
+    let probeFailed = false;
+    try {
+      return await discoverCodexModels({ codexBinary: options.binary, env: {
       ...process.env, HOME: home, CODEX_HOME: home,
       XDG_CONFIG_HOME: join(home, ".config"), XDG_CACHE_HOME: join(home, ".cache"),
       OPENAI_API_KEY: !auth && api ? decryptSecret(api.encrypted_value, options.secretKey) : undefined
     } });
+    } catch (error) { probeFailed = true; throw error; }
+    finally {
+      try {
     if (auth && chat) {
       const refreshed = parseCodexChatGptAuthFile(await readFile(join(home, "auth.json"), "utf8"));
       if (refreshed.tokens.account_id !== auth.tokens.account_id) throw new Error("Model probe changed ChatGPT accounts");
@@ -34,6 +40,14 @@ export async function discoverAuthenticatedCodexModels(pool: DbPool, options: {
         ]);
       }
     }
-    return models;
-  } finally { await rm(home, { recursive: true, force: true }); }
+      } catch (error) {
+        // Keep the private recovery copy if its rotated token cannot be saved.
+        // A model-list failure remains the primary error; neither error logs
+        // credential contents.
+        retainHome = true;
+        console.warn("Codex model probe could not save refreshed authentication; retained private recovery home");
+        if (!probeFailed) throw error;
+      }
+    }
+  } finally { if (!retainHome) await rm(home, { recursive: true, force: true }); }
 }
