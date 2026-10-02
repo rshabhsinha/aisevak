@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, writeFile, rm, lstat, symlink, realpath } from "node:fs
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { removeCleanManagedWorktree, recreateManagedWorktree } from "./worktreeCleanup.js";
+import { removeCleanManagedWorktree, recreateManagedWorktree, hasLiveWorktreeProcess } from "./worktreeCleanup.js";
 const exec=promisify(execFile); let roots:string[]=[];
 afterEach(async()=>{await Promise.all(roots.splice(0).map(root=>rm(root,{recursive:true,force:true})));});
 async function fixture() {
@@ -32,5 +32,18 @@ describe("managed worktree cleanup",()=>{
   if(kind==="symlink") {await f.git(["worktree","remove",f.path]);await symlink(f.repo,f.path);}
   if(kind==="primary") f.path=f.repo;
   await expect(removeCleanManagedWorktree(f)).rejects.toThrow();expect(await lstat(f.path)).toBeTruthy();
+ });
+});
+
+describe("Linux process liveness",()=>{
+ it("protects a still-existing process whose main thread cwd is gone",async()=>{
+  const root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-proc-test-")));roots.push(root);
+  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tS (sleeping)\nThreads:\t2\n");
+  await expect(hasLiveWorktreeProcess("/worktree",[],root)).rejects.toThrow("Cannot verify liveness");
+ });
+ it("ignores a confirmed zombie without a cwd",async()=>{
+  const root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-proc-test-")));roots.push(root);
+  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tZ (zombie)\n");
+  expect(await hasLiveWorktreeProcess("/worktree",[],root)).toBe(false);
  });
 });

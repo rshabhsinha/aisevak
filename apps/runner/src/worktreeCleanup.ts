@@ -1,6 +1,6 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { lstat, readlink, readdir, realpath, stat } from "node:fs/promises";
+import { lstat, readFile, readlink, readdir, realpath, stat } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 const exec = promisify(execFile);
 async function git(cwd: string, args: string[]) {
@@ -20,12 +20,12 @@ export async function assertNoSymlinks(path: string): Promise<void> {
 
 // Check this service user's cwd and open files, including detached terminals.
 // Unknown liveness for an existing service process defers deletion.
-export async function hasLiveWorktreeProcess(path: string, ignoredPids: number[] = []): Promise<boolean> {
-  if (process.platform !== "linux") throw new Error("Automatic process liveness checks require Linux");
+export async function hasLiveWorktreeProcess(path: string, ignoredPids: number[] = [], processRoot = "/proc"): Promise<boolean> {
+  if (processRoot === "/proc" && process.platform !== "linux") throw new Error("Automatic process liveness checks require Linux");
   const uid = process.getuid?.();
-  for (const entry of await readdir("/proc")) {
+  for (const entry of await readdir(processRoot)) {
     if (!/^\d+$/.test(entry) || ignoredPids.includes(Number(entry))) continue;
-    const proc = `/proc/${entry}`;
+    const proc = join(processRoot, entry);
     try {
       if ((await stat(proc)).uid !== uid) continue;
       const cwd = await readlink(join(proc, "cwd"));
@@ -35,7 +35,21 @@ export async function hasLiveWorktreeProcess(path: string, ignoredPids: number[]
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") continue;
+      if ((error as NodeJS.ErrnoException).code === "ENOENT" || (error as NodeJS.ErrnoException).code === "ESRCH") {
+        // cwd disappears after a multithreaded process's main thread exits,
+        // even while surviving threads still hold the checkout. Only a gone
+        // process or a confirmed zombie is safe to skip.
+        try {
+          await stat(proc);
+          if (/^State:\s+[ZX]\b/m.test(await readFile(join(proc, "status"), "utf8"))) continue;
+        } catch (checkError) {
+          if ((checkError as NodeJS.ErrnoException).code === "ENOENT") {
+            try { await stat(proc); } catch (gone) {
+              if ((gone as NodeJS.ErrnoException).code === "ENOENT" || (gone as NodeJS.ErrnoException).code === "ESRCH") continue;
+            }
+          }
+        }
+      }
       throw new Error(`Cannot verify liveness of process ${entry}`);
     }
   }
