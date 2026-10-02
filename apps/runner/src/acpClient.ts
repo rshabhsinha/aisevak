@@ -116,7 +116,8 @@ class PersistentAcpSession {
   }
 
   matches(options: AcpTurnOptions): boolean {
-    return this.connectionKey === JSON.stringify([options.binary, options.args, options.cwd, options.runtimeHome, options.apiKey ?? null]);
+    return !this.closed && this.child.exitCode === null && this.child.signalCode === null &&
+      this.connectionKey === JSON.stringify([options.binary, options.args, options.cwd, options.runtimeHome, options.apiKey ?? null]);
   }
 
   private apiKey: string | null = null;
@@ -221,7 +222,10 @@ class PersistentAcpSession {
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
           }
-        })();
+        })().catch((error: unknown) => {
+          this.rejectPending(error instanceof Error ? error : new Error(String(error)));
+          void this.close().catch(() => undefined);
+        });
       }, 750);
 
       try {

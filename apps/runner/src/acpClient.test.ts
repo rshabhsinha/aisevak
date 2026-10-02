@@ -12,6 +12,7 @@ it("handles malformed resume lines and rejects persistence failures without cras
   await writeFile(script, `const readline = require('node:readline');
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'hold') { setTimeout(() => console.log(JSON.stringify({id:m.id,result:{}})), 5000); return; }
  if(m.method === 'session/load') console.log('Loading session...');
  if(m.method === 'session/prompt') console.log(JSON.stringify({method:'session/update',params:{update:{sessionUpdate:'agent_message_chunk',content:{type:'text',text:'Hello'}}}}));
  console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
@@ -27,5 +28,8 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(lines).toContain("Loading session...");
     const failed = await runAcpTurn({ ...options, onLine: async () => { throw new Error("persistence failed"); } });
     expect(failed.status).toBe("failed");
+    const monitorFailure = await runAcpTurn({ ...options, prompt: "hold", shouldCancel: async () => { throw new Error("database deadlock"); } });
+    expect(monitorFailure.status).toBe("failed");
+    expect(monitorFailure.error).toContain("database deadlock");
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
