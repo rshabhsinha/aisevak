@@ -106,6 +106,9 @@ const pageSchema = z.object({
   status: z.string().optional(),
   query: z.string().trim().optional()
 });
+const incidentsPageSchema = pageSchema.extend({
+  includeResolved: z.enum(["true", "false"]).default("false").transform(value => value === "true")
+});
 const refParams = z.object({ ref: z.string().min(1) });
 const threadCreateSchema = z.object({
   title: z.string().trim().min(1),
@@ -1265,7 +1268,7 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
 function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot: string): void {
   app.get("/api/agent-tools/v1/incidents", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:read");
-    const query = pageSchema.parse(request.query); const cursor = parseCursor(query.cursor); const limit = pageLimit(query.limit);
+    const query = incidentsPageSchema.parse(request.query); const cursor = parseCursor(query.cursor); const limit = pageLimit(query.limit);
     const result = await pool.query(
       `SELECT incidents.*, commander.name AS commander_agent_name, creator.name AS created_by_agent_name,
               left(latest.markdown, 1000) AS content_preview, octet_length(latest.markdown) AS content_total_bytes
@@ -1273,10 +1276,11 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
        LEFT JOIN agents creator ON creator.id = incidents.created_by_agent_id
        LEFT JOIN LATERAL (SELECT markdown FROM incident_updates WHERE incident_id = incidents.id ORDER BY created_at DESC, id DESC LIMIT 1) latest ON true
        WHERE ($1::text IS NULL OR incidents.status = $1)
+         AND ($6::boolean OR $1::text IS NOT NULL OR incidents.status <> 'resolved')
          AND ($2::text IS NULL OR incidents.title ILIKE '%' || $2 || '%' OR incidents.description ILIKE '%' || $2 || '%')
          AND ($3::timestamptz IS NULL OR (incidents.updated_at, incidents.id) < ($3, $4::uuid))
        ORDER BY incidents.updated_at DESC, incidents.id DESC LIMIT $5`,
-      [query.status || null, query.query || null, cursor?.at ?? null, cursor?.id ?? null, limit + 1]
+      [query.status || null, query.query || null, cursor?.at ?? null, cursor?.id ?? null, limit + 1, query.includeResolved]
     );
     return listResponse(result.rows, limit, "updated_at", incidentResource);
   });

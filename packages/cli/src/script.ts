@@ -214,7 +214,7 @@ async function reports() {
 
 async function incidents() {
   const command = args[1] || "list";
-  if (command === "list") return print(await request("/api/agent-tools/v1/incidents" + listQuery()));
+  if (command === "list") return print(await request("/api/agent-tools/v1/incidents" + listQuery({ includeResolved: args.includes("--include-resolved") ? "true" : undefined })));
   if (command === "declare") return print(await request("/api/agent-tools/v1/incidents", { method: "POST", body: compact({
     title: option("--title", true), description: option("--description", true), severity: option("--severity"),
     markdown: await markdown("--markdown"), projectId: option("--project-id"), to: option("--to")
@@ -255,7 +255,7 @@ function option(name, requiredValue = false) {
   if (requiredValue && (!value || value.startsWith("--"))) fail(name + " is required", "USAGE");
   return value && !value.startsWith("--") ? value : undefined;
 }
-function listQuery() { return query({ cursor: option("--cursor"), limit: option("--limit"), status: option("--status"), query: option("--query") }); }
+function listQuery(extra = {}) { return query({ ...extra, cursor: option("--cursor"), limit: option("--limit"), status: option("--status"), query: option("--query") }); }
 function query(values) { const params = new URLSearchParams(); for (const [key, value] of Object.entries(values)) if (value !== undefined) params.set(key, value); const text = params.toString(); return text ? "?" + text : ""; }
 function compact(value) { return Object.fromEntries(Object.entries(value).filter(([, item]) => item !== undefined)); }
 function required(value, label) { if (!value || value.startsWith("--")) fail(label + " is required", "USAGE"); return value; }
@@ -273,7 +273,7 @@ function help() { console.log([
   "aisevak assignments list TASK | show ASSIGNMENT | create TASK --key KEY --to AGENT --instructions-stdin | send | retry | complete | block",
   "aisevak schedules list | show | create | pause | resume | delete",
   "aisevak reports list | show | create | revise | publish",
-  "aisevak incidents list | show | declare | update | resolve",
+  "aisevak incidents list [--include-resolved] | show | declare | update | resolve",
   "",
   "Markdown flags accept stdin, for example: --body-stdin, --purpose-stdin, --summary-stdin.",
   "All list commands support --limit, --cursor, --status, and --query."

@@ -245,3 +245,22 @@ describe("embedded aisevak CLI", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ assignment: { key: "ASSIGNMENT-7" } });
   });
 });
+
+
+it("sends the explicit resolved-incident flag without affecting other lists", async () => {
+  const urls: string[] = [];
+  const server = createServer((request, response) => { urls.push(request.url!); response.end("{}"); });
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("No port");
+  const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-")); cleanup.push(directory);
+  const cli = join(directory, "aisevak"); await writeFile(cli, agentToolScript());
+  try {
+    const env = { ...process.env, AISEVAK_API_URL: `http://127.0.0.1:${address.port}`, AISEVAK_AGENT_TOKEN: "test" };
+    await execFileAsync(process.execPath, [cli, "incidents", "list"], { env });
+    await execFileAsync(process.execPath, [cli, "incidents", "list", "--include-resolved", "--limit", "10"], { env });
+    expect(urls[0]).toBe("/api/agent-tools/v1/incidents");
+    expect(new URL(urls[1]!, "http://localhost").searchParams.get("includeResolved")).toBe("true");
+    expect(new URL(urls[1]!, "http://localhost").searchParams.get("limit")).toBe("10");
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});

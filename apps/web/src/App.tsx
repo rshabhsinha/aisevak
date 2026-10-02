@@ -420,6 +420,8 @@ export function App() {
   const [activityNextCursor, setActivityNextCursor] = useState<string | null>(null);
   const [activityHasMore, setActivityHasMore] = useState(false);
   const [loadingOlderActivity, setLoadingOlderActivity] = useState(false);
+  const incidentsRequestRef = useRef(0);
+  const [includeResolvedIncidents, setIncludeResolvedIncidents] = useState(false);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [incidentsNextCursor, setIncidentsNextCursor] = useState<string | null>(null);
   const [incidentsHasMore, setIncidentsHasMore] = useState(false);
@@ -520,8 +522,9 @@ export function App() {
 
   const filteredIncidents = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return incidents;
-    return incidents.filter((incident) =>
+    const visible = incidents.filter(incident => includeResolvedIncidents || incident.status !== "resolved");
+    if (!needle) return visible;
+    return visible.filter((incident) =>
       [
         incident.title,
         incident.description,
@@ -533,7 +536,7 @@ export function App() {
         `INC-${incident.number}`
       ].join(" ").toLowerCase().includes(needle)
     );
-  }, [incidents, query]);
+  }, [incidents, query, includeResolvedIncidents]);
 
   useEffect(() => {
     void boot();
@@ -590,7 +593,7 @@ export function App() {
       }, 250);
       return () => clearTimeout(timer);
     }
-  }, [user, view, query]);
+  }, [user, view, query, includeResolvedIncidents]);
 
   useEffect(() => {
     if (!user || user.role === "member") return;
@@ -731,17 +734,20 @@ export function App() {
   }
 
   async function reloadIncidents(cursor?: string, append = false) {
+    const requestId = ++incidentsRequestRef.current;
     if (append) {
       setLoadingOlderIncidents(true);
     }
     try {
       const params = new URLSearchParams();
       params.set("limit", String(RESOURCE_FEED_PAGE_SIZE));
+      if (includeResolvedIncidents) params.set("includeResolved", "true");
       if (cursor) params.set("cursor", cursor);
       if (query.trim()) params.set("query", query.trim());
       const data = await api<{ incidents: Incident[]; nextCursor: string | null; hasMore?: boolean }>(
         `/api/incidents?${params.toString()}`
       );
+      if (requestId !== incidentsRequestRef.current) return;
       setIncidents((prev) => (append ? [...prev, ...data.incidents] : data.incidents));
       setIncidentsNextCursor(data.nextCursor ?? null);
       setIncidentsHasMore(Boolean(data.hasMore));
@@ -1196,6 +1202,14 @@ export function App() {
           {view === "incidents" ? (
             <IncidentsView
               incidents={filteredIncidents}
+              includeResolved={includeResolvedIncidents}
+              onIncludeResolvedChange={value => {
+                incidentsRequestRef.current += 1;
+                setIncidents([]);
+                setIncidentsNextCursor(null);
+                setIncidentsHasMore(false);
+                setIncludeResolvedIncidents(value);
+              }}
               hasMore={incidentsHasMore}
               loadingMore={loadingOlderIncidents}
               onLoadMore={() => {
@@ -1487,6 +1501,8 @@ function ActivityView(props: {
 }
 
 function IncidentsView(props: {
+  includeResolved: boolean;
+  onIncludeResolvedChange: (value: boolean) => void;
   incidents: Incident[];
   hasMore: boolean;
   loadingMore: boolean;
@@ -1518,6 +1534,10 @@ function IncidentsView(props: {
           <h2>Incidents</h2>
           <p>Operational alerts, blockers, and issues flagged during agent execution.</p>
         </div>
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={props.includeResolved} onChange={event => props.onIncludeResolvedChange(event.target.checked)} />
+          Show resolved incidents
+        </label>
       </div>
 
       <div className="resource-card-list">

@@ -103,7 +103,7 @@ Reports keep immutable Markdown revisions. A revision returns the report to draf
 ## Incidents
 
 ```text
-aisevak incidents list [--status STATUS] [--query TEXT] [--limit N] [--cursor CURSOR]
+aisevak incidents list [--include-resolved] [--status STATUS] [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak incidents show INC
 aisevak incidents declare --title TITLE --description DESCRIPTION --severity low|medium|high|critical \
   --markdown-stdin [--project-id UUID] [--to AGENT]
@@ -122,3 +122,5 @@ aisevak credentials add NAME [--description DESCRIPTION] --value-stdin
 ```
 
 Fetch a credential only when required and never echo it into durable resources or logs. Whether credential operations are available depends on the current agent's capabilities.
+
+Incident lists hide resolved incidents by default. Use `--include-resolved` or the explicit `--status resolved` filter to retrieve them. Incident history remains available through `incidents show`.
