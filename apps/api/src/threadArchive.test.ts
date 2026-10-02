@@ -17,6 +17,9 @@ describe("chat archive",()=>{
    const update=f.queries.find(sql=>sql.startsWith(`UPDATE ${table}`));
    expect(update).toContain("status IN ('queued','running','cancel_requested')");expect(update).not.toContain("LIMIT 1");
   }
+  for (const table of ["message_deliveries", "task_assignments"]) {
+    expect(f.queries.find(sql => sql.startsWith(`UPDATE ${table}`))).toContain("UNION SELECT message_delivery_id FROM agent_turn_inputs");
+  }
   expect(f.queries.filter(sql=>sql.startsWith("DELETE"))).toEqual(["DELETE FROM agent_tool_tokens WHERE agent_thread_id = $1"]);
  });
  it("restores through a durable provider barrier",async()=>{

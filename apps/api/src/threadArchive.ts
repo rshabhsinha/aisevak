@@ -39,10 +39,12 @@ export async function setThreadArchived(pool: DbPool, id: string, archived: bool
     }
     await client.query("UPDATE agent_turn_inputs SET status = 'failed', error = 'Chat archived', updated_at = now() WHERE agent_thread_id = $1 AND status IN ('queued','delivering')", [id]);
     await client.query(`UPDATE message_deliveries SET status = 'failed', error = 'Chat archived', completed_at = now(), updated_at = now()
-      WHERE id IN (SELECT message_delivery_id FROM dispatcher_runs WHERE agent_thread_id = $1)
+      WHERE id IN (SELECT message_delivery_id FROM dispatcher_runs WHERE agent_thread_id = $1
+        UNION SELECT message_delivery_id FROM agent_turn_inputs WHERE agent_thread_id = $1)
         AND status IN ('queued','retrying','running')`,[id]);
     await client.query(`UPDATE task_assignments SET status = 'blocked', result = 'Agent chat archived', active_delivery_id = NULL, updated_at = now()
-      WHERE active_delivery_id IN (SELECT message_delivery_id FROM dispatcher_runs WHERE agent_thread_id = $1)
+      WHERE active_delivery_id IN (SELECT message_delivery_id FROM dispatcher_runs WHERE agent_thread_id = $1
+        UNION SELECT message_delivery_id FROM agent_turn_inputs WHERE agent_thread_id = $1)
         AND status IN ('queued','running')`,[id]);
     await client.query("DELETE FROM agent_tool_tokens WHERE agent_thread_id = $1",[id]);
   });
