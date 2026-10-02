@@ -55,6 +55,7 @@ import {
   runGitCommand,
   safeChildEnvironment
 } from "./githubCli.js";
+import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
 
@@ -2447,7 +2448,7 @@ async function prepareWorkspace(pool: DbPool, job: RunJob): Promise<string> {
     await mkdir(dirname(worktreePath), { recursive: true });
     if (!existsSync(join(worktreePath, ".git"))) {
       await git(["fetch", "origin"], job.cwd);
-      await git(["worktree", "add", "-B", job.branch, worktreePath, `origin/${await defaultBranch(job.cwd)}`], job.cwd);
+      await recreateManagedWorktree(job.cwd, worktreePath, job.branch, await defaultBranch(job.cwd));
     }
     await pool.query("UPDATE task_runs SET worktree_path = $2, branch = $3 WHERE id = $1", [
       job.id,
