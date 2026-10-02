@@ -1278,6 +1278,15 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 CREATE INDEX IF NOT EXISTS schedules_task_idx ON schedules(task_id) WHERE task_id IS NOT NULL;
 
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS archived_at timestamptz;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS cleanup_state text;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS cleanup_error text;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS cleanup_attempt_at timestamptz;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS provider_archived_at timestamptz;
+CREATE TABLE IF NOT EXISTS worktree_cleanup_attempts (
+  path text PRIMARY KEY, last_attempt_at timestamptz NOT NULL DEFAULT now(), cleaned_at timestamptz, error text
+);
+
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL DEFAULT 'codex-local' REFERENCES provider_instances(id) ON DELETE RESTRICT;
 `;
 
