@@ -274,6 +274,11 @@ export const agentThreads = pgTable(
     runtimeHome: text("runtime_home").notNull(),
     providerThreadId: text("provider_thread_id"),
     ownershipGeneration: integer("ownership_generation").notNull().default(0),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    cleanupState: text("cleanup_state"),
+    cleanupError: text("cleanup_error"),
+    cleanupAttemptAt: timestamp("cleanup_attempt_at", { withTimezone: true }),
+    providerArchivedAt: timestamp("provider_archived_at", { withTimezone: true }),
     coordinationThreadId: uuid("coordination_thread_id"),
     lastActivityAt: timestamp("last_activity_at", { withTimezone: true }).notNull().defaultNow(),
     createdAt,
@@ -742,4 +747,11 @@ export const pullRequests = pgTable("pull_requests", {
   error: text("error"),
   createdAt,
   updatedAt
+});
+
+export const worktreeCleanupAttempts = pgTable("worktree_cleanup_attempts", {
+  path: text("path").primaryKey(),
+  lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }).notNull().defaultNow(),
+  cleanedAt: timestamp("cleaned_at", { withTimezone: true }),
+  error: text("error")
 });

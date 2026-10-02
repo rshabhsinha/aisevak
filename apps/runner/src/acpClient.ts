@@ -58,6 +58,18 @@ export async function closeIdleAcpSessions(exceptKey?: string, idleMs = ACP_SESS
   await Promise.all(stale);
 }
 
+export function cachedAcpProcessIds(homes: string[] = [...sessions.keys()]): number[] {
+  return homes.flatMap(home => { const pid = sessions.get(home)?.processId; return pid ? [pid] : []; });
+}
+export async function closeIdleAcpSession(home: string): Promise<boolean> {
+  const session = sessions.get(home);
+  if (!session) return true;
+  if (session.isRunning) return false;
+  await session.close();
+  if (sessions.get(home) === session) sessions.delete(home);
+  return true;
+}
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
@@ -79,6 +91,8 @@ class PersistentAcpSession {
   private lastActivityAt = Date.now();
   private readonly closePromise: Promise<{ code: number | null; error?: Error }>;
   private onNotification: ((line: string) => Promise<void>) | null = null;
+
+  get processId(): number | undefined { return this.child.pid; }
 
   constructor(
     private readonly initial: AcpTurnOptions,

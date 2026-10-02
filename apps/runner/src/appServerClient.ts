@@ -107,6 +107,25 @@ export async function closeAllCodexAppServers(): Promise<void> {
   await Promise.all(active.map((session) => session.close()));
 }
 
+export function cachedCodexProcessIds(homes: string[] = [...sessions.keys()]): number[] {
+  return homes.flatMap(home => { const pid = sessions.get(home)?.processId; return pid ? [pid] : []; });
+}
+export async function closeIdleCodexSession(home: string): Promise<boolean> {
+  const session = sessions.get(home);
+  if (!session) return true;
+  if (session.isRunning) return false;
+  await session.close();
+  if (sessions.get(home) === session) sessions.delete(home);
+  return true;
+}
+export async function setCodexThreadArchived(options: Pick<AppServerTurnOptions, "codexBinary"|"cwd"|"codexHome"|"env">,
+  threadId: string, archived: boolean): Promise<void> {
+  const session = new PersistentAppServer({...options, model:"auto", prompt:"", secrets:[],
+    onLine:async()=>{}, onThreadId:async()=>{}, shouldCancel:async()=>false}, ()=>{});
+  try { await session.setArchived(threadId, archived); }
+  finally { await session.close(); }
+}
+
 class PersistentAppServer {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly connectionKey: string;
@@ -165,6 +184,19 @@ class PersistentAppServer {
     this.child.stderr.on("data", (chunk) => {
       this.rawStderr += redactText(String(chunk), [...this.redactionSecrets]);
     });
+  }
+
+  get processId(): number | undefined { return this.child.pid; }
+  get isRunning(): boolean { return this.activeTurn !== null; }
+  async setArchived(threadId: string, archived: boolean): Promise<void> {
+    await this.initialize();
+    try { await this.request(archived ? "thread/archive" : "thread/unarchive", {threadId}); }
+    catch (error) {
+      // Native 0.160.0 repeats return these exact errors after the file moved.
+      // Missing rollouts also leave the application's retained timeline intact.
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/no (archived )?rollout found for thread id/i.test(message)) throw error;
+    }
   }
 
   matches(options: AppServerTurnOptions): boolean {

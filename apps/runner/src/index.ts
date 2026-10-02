@@ -55,6 +55,7 @@ import {
   runGitCommand,
   safeChildEnvironment
 } from "./githubCli.js";
+import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
@@ -188,7 +189,15 @@ async function main(): Promise<void> {
   console.log(
     `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary}, Devin: ${env.devinBinary})`
   );
+  let cleanupJob: Promise<void> | null = null;
+  let nextCleanupAt = 0;
   while (!shuttingDown) {
+    if (process.platform === "linux" && !cleanupJob && Date.now() >= nextCleanupAt) {
+      nextCleanupAt = Date.now() + 60_000;
+      cleanupJob = sweepLifecycleCleanup(pool, env.managedRoot, env.codexBinary)
+        .catch(error => console.error("Lifecycle cleanup failed", error))
+        .finally(() => { cleanupJob = null; });
+    }
     startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     try {
       await processOneGithubConnection(pool);
@@ -202,6 +211,7 @@ async function main(): Promise<void> {
     await sleep(env.pollMs);
   }
   await waitForRunJobs(activeRunJobs);
+  if (cleanupJob) await cleanupJob;
   await closeAllCodexAppServers();
   await closeAllAcpSessions();
   await pool.end();
@@ -839,9 +849,9 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     const providerInstanceId = schedule.provider_instance_id ?? "codex-local";
     const existingSession = await client.query<{
       id: string; task_id: string | null; project_id: string | null; coordination_thread_id: string | null;
-      model: string; model_options: unknown; cwd: string; runtime_home: string; provider_thread_id: string | null; ownership_generation: number;
+      model: string; model_options: unknown; cwd: string; runtime_home: string; provider_thread_id: string | null; ownership_generation: number; archived_at?: Date|null; cleanup_state?:string|null;
     }>(
-      `SELECT id, task_id, project_id, coordination_thread_id, model, model_options, cwd, runtime_home, provider_thread_id, ownership_generation
+      `SELECT id, task_id, project_id, coordination_thread_id, model, model_options, cwd, runtime_home, provider_thread_id, ownership_generation, archived_at, cleanup_state
        FROM agent_threads
        WHERE agent_id = $3 AND (task_id = $1 OR coordination_thread_id = $2)
        ORDER BY (coordination_thread_id = $2) DESC, (task_id = $1) DESC
@@ -851,6 +861,11 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     let agentThread: { id: string; model: string; model_options: unknown; ownership_generation: number; provider_thread_id: string | null };
     if (existingSession.rows[0]) {
       const current = existingSession.rows[0];
+      if (current.archived_at || current.cleanup_state === 'restoring') {
+        await client.query("INSERT INTO schedule_runs(schedule_id, scheduled_for) VALUES($1,$2) ON CONFLICT DO NOTHING",[schedule.id,scheduledFor]);
+        await client.query("UPDATE schedules SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END, next_run_at = $2, updated_at = now() WHERE id = $1",[schedule.id,nextRunAt]);
+        return;
+      }
       if (sessionTaskId) {
         await client.query(
           "UPDATE agent_threads SET task_id = NULL, updated_at = now() WHERE task_id = $1 AND id <> $2",
@@ -1255,7 +1270,7 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
        WHERE candidate.status = 'queued'
          AND (
            candidate.agent_thread_id IS NULL
-           OR candidate.agent_thread_generation = candidate_thread.ownership_generation
+           OR (candidate.agent_thread_generation = candidate_thread.ownership_generation AND candidate_thread.archived_at IS NULL AND candidate_thread.cleanup_state IS DISTINCT FROM 'restoring')
          )
          AND (
            candidate.message_delivery_id IS NULL
@@ -1333,7 +1348,7 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
     }
     if (candidate.agent_thread_id) {
       const generation = await client.query<{ ownership_generation: number }>(
-        "SELECT ownership_generation FROM agent_threads WHERE id = $1",
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1 AND archived_at IS NULL AND cleanup_state IS DISTINCT FROM 'restoring'",
         [candidate.agent_thread_id]
       );
       if (generation.rows[0]?.ownership_generation !== candidate.agent_thread_generation) return null;
@@ -1386,7 +1401,7 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
          AND candidate.run_kind = 'worker'
          AND (
            candidate.agent_thread_id IS NULL
-           OR candidate.agent_thread_generation = candidate_thread.ownership_generation
+           OR (candidate.agent_thread_generation = candidate_thread.ownership_generation AND candidate_thread.archived_at IS NULL AND candidate_thread.cleanup_state IS DISTINCT FROM 'restoring')
          )
          AND (
            candidate.workspace_mode <> 'direct'
@@ -1453,7 +1468,7 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
     }
     if (candidate.agent_thread_id) {
       const generation = await client.query<{ ownership_generation: number }>(
-        "SELECT ownership_generation FROM agent_threads WHERE id = $1",
+        "SELECT ownership_generation FROM agent_threads WHERE id = $1 AND archived_at IS NULL AND cleanup_state IS DISTINCT FROM 'restoring'",
         [candidate.agent_thread_id]
       );
       if (generation.rows[0]?.ownership_generation !== candidate.agent_thread_generation) return null;
@@ -2178,7 +2193,7 @@ export async function acquireRunLaunchFence(
     let threadGeneration: number | null = null;
     if (input.agentThreadId) {
       const thread = await client.query<{ id: string; agent_id: string; ownership_generation: number }>(
-        "SELECT id, agent_id, ownership_generation FROM agent_threads WHERE id = $1 FOR UPDATE",
+        "SELECT id, agent_id, ownership_generation FROM agent_threads WHERE id = $1 AND archived_at IS NULL AND cleanup_state IS DISTINCT FROM 'restoring' FOR UPDATE",
         [input.agentThreadId]
       );
       threadAgentId = thread.rows[0]?.agent_id ?? null;

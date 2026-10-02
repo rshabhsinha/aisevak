@@ -12,7 +12,7 @@ RELEASES_DIR="${APP_DIR}/releases"
 BACKUP_DIR="${APP_DIR}/backups"
 SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TIMESTAMP="$(date -u +%Y%m%d%H%M%S)"
-GIT_SHA="$(git -C "${SOURCE_DIR}" rev-parse --short HEAD 2>/dev/null || echo manual)"
+GIT_SHA="${AISEVAK_GIT_SHA:-$(git -C "${SOURCE_DIR}" rev-parse --short HEAD 2>/dev/null || echo manual)}"
 RELEASE_DIR="${RELEASES_DIR}/${TIMESTAMP}-${GIT_SHA}"
 COMPOSE_PROJECT_NAME="${AISEVAK_COMPOSE_PROJECT_NAME:-current}"
 RELEASES_TO_KEEP="${AISEVAK_RELEASES_TO_KEEP:-5}"
@@ -72,7 +72,10 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
 chmod 0700 "${WORKSPACE_DIR}/aws"
 # Older API releases created Codex homes as root from inside the container.
 # The host-native runner is the only process that writes their runtime files.
-chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/codex-homes"
+# Repair only legacy homes created as root; normal deploys need not traverse
+# every transcript and provider cache just to reapply unchanged ownership.
+find "${WORKSPACE_DIR}/codex-homes" -mindepth 1 -maxdepth 1 -type d -uid 0 \
+  -exec chown -R "${RUNNER_USER}:${RUNNER_USER}" {} +
 # The API and host runner both maintain the shared installed-skill catalog.
 chown -R "${RUNNER_USER}:${RUNNER_USER}" "${WORKSPACE_DIR}/skills"
 
