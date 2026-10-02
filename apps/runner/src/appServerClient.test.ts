@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   closeAllCodexAppServers,
   runCodexAppServerTurn,
+  setCodexThreadArchived,
   type AppServerTurnInput,
   type AppServerTurnOptions
 } from "./appServerClient.js";
@@ -416,6 +417,17 @@ interface FakeFixture {
   startsFile: string;
 }
 
+describe("Codex archive protocol",()=>{
+  it("archives and restores with bounded short-lived processes",async()=>{
+    const fixture=await fakeAppServerFixture();const options=turnOptions(fixture,"unused");
+    await setCodexThreadArchived(options,"thread-1",true);
+    await setCodexThreadArchived(options,"thread-1",false);
+    await setCodexThreadArchived(options,"missing-thread",false);
+    expect((await readFile(fixture.startsFile+".rpc","utf8")).trim().split("\n")).toEqual(["thread/archive","thread/unarchive"]);
+    for(const pid of (await readFile(fixture.startsFile,"utf8")).trim().split("\n")) expect(()=>process.kill(Number(pid),0)).toThrow();
+  });
+});
+
 async function fakeAppServerFixture(): Promise<FakeFixture> {
   const directory = await mkdtemp(join(tmpdir(), "aisevak-app-server-test-"));
   cleanup.push(directory);
@@ -442,6 +454,11 @@ process.on("SIGTERM", () => {
 });
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
+  if (message.method === "thread/archive" || message.method === "thread/unarchive") {
+    if (message.params.threadId === "missing-thread") return send({id:message.id,error:{code:-32600,message:"no archived rollout found for thread id missing-thread"}});
+    fs.appendFileSync(process.env.FAKE_STARTS_FILE + ".rpc", message.method + "\\n");
+    return send({id:message.id,result:{}});
+  }
   if (message.method === "initialized") return;
   if (message.method === "initialize") return send({ id: message.id, result: {} });
   if (message.method === "thread/resume" && message.params.threadId === "missing-thread") {
