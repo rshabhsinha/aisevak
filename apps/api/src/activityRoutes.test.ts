@@ -28,13 +28,13 @@ async function activityServer(): Promise<{ app: FastifyInstance; queries: string
       }
       if (sql.includes("FROM api_keys")) return { rows: [] };
       if (sql.includes("FROM agent_tool_tokens")) return { rows: [{ agent_id: "agent", kind: "worker", role: "worker", name: "Builder", capabilities: ["incidents:read"] }] };
-      if (sql.includes("FROM agent_threads")) return {rows:[]};
       if (sql.includes("FROM reports")) {
         return { rows: [{ number: 7, title: "Daily review", markdown: "## Healthy" }] };
       }
       if (sql.includes("FROM incidents")) {
         return { rows: [{ number: 3, title: "Queue stalled", markdown: "## Investigating" }] };
       }
+      if (sql.includes("FROM agent_threads")) return {rows:[]};
       throw new Error(`Unexpected query: ${sql}`);
     }
   } as unknown as DbPool;
