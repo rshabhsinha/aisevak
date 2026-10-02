@@ -1007,6 +1007,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       conditions.push(`incidents.status = $${values.length}`);
     }
 
+    if (!query.includeResolved && !query.status) conditions.push("incidents.status <> 'resolved'");
+
     if (query.severity) {
       values.push(query.severity);
       conditions.push(`incidents.severity = $${values.length}`);
@@ -2107,6 +2109,7 @@ const reportsQuerySchema = z.object({
   status: z.string().trim().optional()
 });
 const incidentsQuerySchema = z.object({
+  includeResolved: z.enum(["true", "false"]).default("false").transform(value => value === "true"),
   limit: z.coerce.number().int().min(1).max(100).default(15),
   cursor: z.string().trim().min(1).optional(),
   query: z.string().trim().max(200).optional(),
@@ -2412,7 +2415,7 @@ async function createDefaultAgents(pool: DbPool, userId: string): Promise<void> 
       name: "Builder",
       description: "Implements tasks end to end, runs checks, and leaves a concise summary.",
       instructions:
-        "You are a senior product engineer. Make the requested change, keep edits scoped, run relevant verification, and summarize the result."
+        "You are a senior product engineer. Only fix bugs and issues. Do not introduce new features, change product decisions, redesign workflows, or expand scope. If a fix requires a product decision, report the question to the operator and wait for direction. Run relevant verification and summarize the result."
     },
     {
       kind: "worker",
