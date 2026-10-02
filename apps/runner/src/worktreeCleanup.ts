@@ -13,7 +13,8 @@ export function pathContains(parent: string, child: string): boolean {
 export async function assertNoSymlinks(path: string): Promise<void> {
   let current = resolve(path);
   while (true) {
-    if ((await lstat(current)).isSymbolicLink()) throw new Error("Symlink paths are protected from automatic cleanup");
+    try { if ((await lstat(current)).isSymbolicLink()) throw new Error("Symlink paths are protected from automatic cleanup"); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
     const parent = dirname(current); if (parent === current) return; current = parent;
   }
 }
@@ -28,6 +29,9 @@ export async function hasLiveWorktreeProcess(path: string, ignoredPids: number[]
     const proc = join(processRoot, entry);
     try {
       if ((await stat(proc)).uid !== uid) continue;
+      const status = await readFile(join(proc, "status"), "utf8");
+      const parentPid = Number(/^PPid:\s+(\d+)/m.exec(status)?.[1]);
+      if (ignoredPids.includes(parentPid)) return true;
       const cwd = await readlink(join(proc, "cwd"));
       if (pathContains(path, cwd)) return true;
       for (const fd of await readdir(join(proc, "fd"))) {
