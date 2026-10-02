@@ -41,7 +41,8 @@ export async function hasLiveWorktreeProcess(path: string, ignoredPids: number[]
         // process or a confirmed zombie is safe to skip.
         try {
           await stat(proc);
-          if (/^State:\s+[ZX]\b/m.test(await readFile(join(proc, "status"), "utf8"))) continue;
+          const status = await readFile(join(proc, "status"), "utf8");
+          if (/^State:\s+[ZX]\b/m.test(status) && /^Threads:\s+1\s*$/m.test(status)) continue;
         } catch (checkError) {
           if ((checkError as NodeJS.ErrnoException).code === "ENOENT") {
             try { await stat(proc); } catch (gone) {

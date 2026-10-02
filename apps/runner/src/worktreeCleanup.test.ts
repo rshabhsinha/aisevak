@@ -38,12 +38,12 @@ describe("managed worktree cleanup",()=>{
 describe("Linux process liveness",()=>{
  it("protects a still-existing process whose main thread cwd is gone",async()=>{
   const root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-proc-test-")));roots.push(root);
-  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tS (sleeping)\nThreads:\t2\n");
+  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tZ (zombie leader)\nThreads:\t2\n");
   await expect(hasLiveWorktreeProcess("/worktree",[],root)).rejects.toThrow("Cannot verify liveness");
  });
  it("ignores a confirmed zombie without a cwd",async()=>{
   const root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-proc-test-")));roots.push(root);
-  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tZ (zombie)\n");
+  await mkdir(join(root,"123"));await writeFile(join(root,"123","status"),"State:\tZ (zombie)\nThreads:\t1\n");
   expect(await hasLiveWorktreeProcess("/worktree",[],root)).toBe(false);
  });
 });
