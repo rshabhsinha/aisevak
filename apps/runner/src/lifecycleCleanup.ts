@@ -35,11 +35,11 @@ async function cleanWorkspace(client: PoolClient, worktree: Worktree, root: stri
 }
 
 export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: string): Promise<void> {
-  if (process.env.AISEVAK_AUTO_WORKTREE_CLEANUP === "0") return;
+  const cleanupEnabled = process.env.AISEVAK_AUTO_WORKTREE_CLEANUP !== "0";
   await pool.query("DELETE FROM agent_tool_tokens WHERE expires_at < now()");
   const pending = await pool.query<{id:string;task_id:string|null}>(`SELECT id, task_id FROM agent_threads
-    WHERE cleanup_state IN ('pending','restoring') AND (cleanup_attempt_at IS NULL OR cleanup_attempt_at < now() - interval '5 minutes')
-    ORDER BY cleanup_attempt_at NULLS FIRST, updated_at LIMIT 5`);
+    WHERE cleanup_state IN ('pending','restoring','storage_disabled') AND ($1::boolean OR cleanup_state <> 'storage_disabled') AND (cleanup_attempt_at IS NULL OR cleanup_attempt_at < now() - interval '5 minutes')
+    ORDER BY cleanup_attempt_at NULLS FIRST, updated_at LIMIT 5`,[cleanupEnabled]);
   for (const candidate of pending.rows) {
     await withTransaction(pool, async client => {
       if (candidate.task_id) await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE",[candidate.task_id]);
@@ -47,7 +47,7 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
         JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
         WHERE agent_threads.id = $1 FOR UPDATE OF agent_threads SKIP LOCKED`,[candidate.id]);
       const thread = locked.rows[0];
-      if (!thread || thread.task_id !== candidate.task_id || !['pending','restoring'].includes(thread.cleanup_state ?? '')) return;
+      if (!thread || thread.task_id !== candidate.task_id || !['pending','restoring','storage_disabled'].includes(thread.cleanup_state ?? '')) return;
       await client.query("UPDATE agent_threads SET cleanup_attempt_at = now() WHERE id = $1",[thread.id]);
       try {
         const busy = await client.query(`SELECT 1 FROM (SELECT agent_thread_id,status FROM task_runs UNION ALL
@@ -68,7 +68,7 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
             await client.query("UPDATE agent_threads SET provider_archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",[thread.id,archived]);
           }
         }
-        if (thread.archived_at) {
+        if (thread.archived_at && cleanupEnabled) {
           const worktrees = await client.query<Worktree>(`SELECT DISTINCT task_id,worktree_path AS path,cwd AS repo,branch
             FROM task_runs WHERE agent_thread_id = $1 AND workspace_mode = 'git_worktree' AND workspace_source = 'github'
               AND worktree_path IS NOT NULL AND branch IS NOT NULL`,[thread.id]);
@@ -82,19 +82,20 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
           try { await lstat(skills); await assertNoSymlinks(skills); await rm(skills,{recursive:true}); }
           catch(error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
         }
-        await client.query("UPDATE agent_threads SET cleanup_state = CASE WHEN archived_at IS NULL THEN NULL ELSE 'done' END, cleanup_error = NULL WHERE id = $1",[thread.id]);
+        await client.query("UPDATE agent_threads SET cleanup_state = CASE WHEN archived_at IS NULL THEN NULL WHEN $2::boolean THEN 'done' ELSE 'storage_disabled' END, cleanup_error = NULL WHERE id = $1",[thread.id,cleanupEnabled]);
       } catch (error) {
         await client.query("UPDATE agent_threads SET cleanup_error = $2 WHERE id = $1",[thread.id,error instanceof Error ? error.message : 'Cleanup deferred']);
       }
     });
   }
+  if (!cleanupEnabled) return;
   const completed = await pool.query<Worktree>(`SELECT DISTINCT runs.task_id,runs.worktree_path AS path,runs.cwd AS repo,runs.branch
     FROM task_runs runs JOIN tasks ON tasks.id = runs.task_id
     LEFT JOIN worktree_cleanup_attempts attempt ON attempt.path = runs.worktree_path
     WHERE tasks.status IN ('completed','cancelled') AND runs.workspace_mode = 'git_worktree' AND runs.workspace_source = 'github'
       AND runs.worktree_path IS NOT NULL AND runs.branch IS NOT NULL
       AND (attempt.last_attempt_at IS NULL OR attempt.last_attempt_at < now() - interval '5 minutes')
-      AND (attempt.cleaned_at IS NULL OR tasks.updated_at > attempt.cleaned_at) LIMIT 5`);
+      AND (attempt.cleaned_at IS NULL OR tasks.updated_at > attempt.cleaned_at OR runs.created_at > attempt.cleaned_at) LIMIT 5`);
   for (const worktree of completed.rows) {
     await withTransaction(pool, async client => {
       const task = await client.query<{status:string}>("SELECT status FROM tasks WHERE id = $1 FOR UPDATE SKIP LOCKED",[worktree.task_id]);

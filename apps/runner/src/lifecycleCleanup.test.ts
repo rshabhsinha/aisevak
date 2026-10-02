@@ -9,11 +9,11 @@ vi.mock("./acpClient.js",()=>({cachedAcpProcessIds:()=>[],closeIdleAcpSession:as
 vi.mock("./worktreeCleanup.js",async original=>({...await original<typeof import('./worktreeCleanup.js')>(),hasLiveWorktreeProcess:mocks.live,removeCleanManagedWorktree:mocks.remove}));
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 let root:string;
-afterEach(async()=>{vi.clearAllMocks();mocks.archive.mockReset();mocks.live.mockResolvedValue(false);if(root)await rm(root,{recursive:true,force:true});});
+afterEach(async()=>{vi.clearAllMocks();vi.unstubAllEnvs();mocks.archive.mockReset();mocks.live.mockResolvedValue(false);if(root)await rm(root,{recursive:true,force:true});});
 async function fixture(options:{restore?:boolean;busy?:boolean;shared?:boolean}={}) {
  root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-lifecycle-")));
  const home=join(root,"codex-homes","chat");await mkdir(join(home,".agents","skills"),{recursive:true});await writeFile(join(home,"history.jsonl"),"retained transcript");
- const thread={id:'chat',task_id:'task',runtime_home:home,provider_thread_id:'provider',driver:'codex',archived_at:options.restore?null:new Date(),cleanup_state:options.restore?'restoring':'pending',provider_archived_at:null};
+ const thread={id:'chat',task_id:'task',runtime_home:home,provider_thread_id:'provider',driver:'codex',archived_at:options.restore?null:new Date(),cleanup_state:options.restore?'restoring':'pending',provider_archived_at:null as Date|null};
  const queries:Array<{sql:string;params:unknown[]}>=[];
  const query=async(sql:string,params:unknown[]=[])=>{queries.push({sql,params});
   if(sql.includes("SELECT id, task_id FROM agent_threads"))return {rows:[{id:'chat',task_id:'task'}]};
@@ -30,7 +30,7 @@ describe('durable lifecycle cleanup',()=>{
   expect(mocks.archive).toHaveBeenCalledWith(expect.anything(),'provider',true);
   await expect(lstat(join(f.home,'.agents','skills'))).rejects.toMatchObject({code:'ENOENT'});
   expect(await readFile(join(f.home,'history.jsonl'),'utf8')).toBe('retained transcript');
-  expect(f.queries.some(q=>q.sql.includes("ELSE 'done' END"))).toBe(true);
+  expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(true);
  });
  it.each(['busy','shared'] as const)('defers %s owners without touching their provider',async(flag)=>{
   const f=await fixture({[flag]:true});await sweepLifecycleCleanup(f.pool,root,'codex');
@@ -41,7 +41,29 @@ describe('durable lifecycle cleanup',()=>{
   const f=await fixture();mocks.archive.mockRejectedValue(new Error('provider unavailable'));
   await sweepLifecycleCleanup(f.pool,root,'codex');
   expect(f.queries.find(q=>q.sql.includes('SET cleanup_error = $2'))?.params).toEqual(['chat','provider unavailable']);
-  expect(f.queries.some(q=>q.sql.includes("ELSE 'done' END"))).toBe(false);
+  expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(false);
+ });
+ it('restores provider state when filesystem cleanup is disabled',async()=>{
+  const f=await fixture({restore:true});vi.stubEnv('AISEVAK_AUTO_WORKTREE_CLEANUP','0');
+  await sweepLifecycleCleanup(f.pool,root,'codex');
+  expect(mocks.archive).toHaveBeenCalledWith(expect.anything(),'provider',false);
+  expect(mocks.remove).not.toHaveBeenCalled();
+  expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(true);
+ });
+ it('archives the provider and defers storage when cleanup is disabled',async()=>{
+  const f=await fixture();vi.stubEnv('AISEVAK_AUTO_WORKTREE_CLEANUP','0');
+  await sweepLifecycleCleanup(f.pool,root,'codex');
+  expect(mocks.archive).toHaveBeenCalledWith(expect.anything(),'provider',true);
+  expect(await lstat(join(f.home,'.agents','skills'))).toBeTruthy();
+  expect(f.queries.find(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))?.params).toEqual(['chat',false]);
+  expect(f.queries.some(q=>q.sql.includes('SELECT DISTINCT runs.task_id'))).toBe(false);
+ });
+ it('retries deferred storage after cleanup is enabled again',async()=>{
+  const f=await fixture();f.thread.cleanup_state='storage_disabled';f.thread.provider_archived_at=new Date();
+  await sweepLifecycleCleanup(f.pool,root,'codex');
+  expect(mocks.archive).not.toHaveBeenCalled();
+  await expect(lstat(join(f.home,'.agents','skills'))).rejects.toMatchObject({code:'ENOENT'});
+  expect(f.queries.find(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))?.params).toEqual(['chat',true]);
  });
  it('always unarchives a restore request, including a prior DB failure',async()=>{
   const f=await fixture({restore:true});await sweepLifecycleCleanup(f.pool,root,'codex');
