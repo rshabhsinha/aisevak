@@ -152,6 +152,10 @@ describe("extractDevinApiKey", () => {
     });
     expect(devinBundleApiKey(cliNs)).toBe("cli-key");
     expect(devinBundleApiKey(rootNs)).toBe("root-key");
+    expect(devinBundleApiKey(JSON.stringify({ homeFiles: {
+      ".local/share/devin/credentials.toml": 'email = "user@example.com"',
+      ".local/share/devin/cli/credentials.toml": 'windsurf_api_key = "current-key"'
+    } }))).toBe("current-key");
     expect(devinBundleApiKey(JSON.stringify({ homeFiles: {} }))).toBeNull();
     expect(devinBundleApiKey(undefined)).toBeNull();
   });

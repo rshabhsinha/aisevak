@@ -237,11 +237,17 @@ export function devinBundleApiKey(bundle: string | undefined | null): string | n
   if (!bundle) return null;
   try {
     const parsed = JSON.parse(bundle) as { homeFiles?: Record<string, string> };
-    const credentials =
-      parsed.homeFiles?.[".local/share/devin/credentials.toml"] ??
-      parsed.homeFiles?.[".local/share/devin/cli/credentials.toml"] ??
-      Object.entries(parsed.homeFiles ?? {}).find(([path]) => path.endsWith("credentials.toml"))?.[1];
-    return credentials ? extractDevinApiKey(credentials) : null;
+    const files = parsed.homeFiles ?? {};
+    const candidates = [
+      files[".local/share/devin/credentials.toml"],
+      files[".local/share/devin/cli/credentials.toml"],
+      ...Object.entries(files).filter(([path]) => path.endsWith("credentials.toml")).map(([, value]) => value)
+    ];
+    for (const credentials of candidates) {
+      const key = credentials ? extractDevinApiKey(credentials) : null;
+      if (key) return key;
+    }
+    return null;
   } catch {
     return null;
   }
