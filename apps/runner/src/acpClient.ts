@@ -99,6 +99,10 @@ class PersistentAcpSession {
         onClose();
       });
     });
+    this.child.stdin.on("error", (error) => {
+      this.rejectPending(error);
+      void this.close().catch(() => undefined);
+    });
     this.child.stdout.on("data", (chunk) => {
       this.stdoutBuffer += String(chunk);
       const lines = this.stdoutBuffer.split(/\r?\n/);
@@ -123,7 +127,12 @@ class PersistentAcpSession {
     const rawLines: string[] = [];
     let loadingSession = false;
     const emit = async (line: string) => {
-      if (loadingSession) line = JSON.stringify({ ...JSON.parse(line), aisevakReplay: true });
+      if (loadingSession) {
+        try {
+          const raw = JSON.parse(line);
+          if (raw && typeof raw === "object") line = JSON.stringify({ ...raw, aisevakReplay: true });
+        } catch { /* Keep malformed output for the controlled parse-error path. */ }
+      }
       seq += 1;
       rawLines.push(line);
       await options.onLine(redactSecrets(line, options.secrets), seq);
@@ -144,6 +153,7 @@ class PersistentAcpSession {
           });
           this.sessionId = options.threadId;
         } catch (error) {
+          if (this.closed) throw error;
           console.warn("ACP session/load failed; starting a fresh session and orphaning prior context", {
             threadId: options.threadId,
             error: error instanceof Error ? error.message : String(error)
@@ -299,7 +309,10 @@ class PersistentAcpSession {
   private handleLine(line: string): void {
     const trimmed = line.trim();
     if (!trimmed) return;
-    void this.onNotification?.(trimmed);
+    void this.onNotification?.(trimmed).catch((error: unknown) => {
+      this.rejectPending(error instanceof Error ? error : new Error(String(error)));
+      void this.close().catch(() => undefined);
+    });
     let message: Record<string, unknown>;
     try {
       message = JSON.parse(trimmed) as Record<string, unknown>;
@@ -337,6 +350,7 @@ class PersistentAcpSession {
   }
 
   private request(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    if (this.closed) return Promise.reject(new Error("ACP session closed"));
     const id = this.nextId++;
     const timeout = setTimeout(() => {
       const pending = this.pending.get(String(id));

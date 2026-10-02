@@ -54,6 +54,14 @@ export function extractAcpSessionId(value: unknown): string | undefined {
 }
 
 export function normalizeAcpEvent(raw: unknown, sessionId?: string | null): NormalizedCodexEvent {
+  const event = normalizeAcpEventInternal(raw, sessionId);
+  if (objectValue(raw)?.aisevakReplay === true) {
+    event.raw = { ...objectValue(event.raw), aisevakReplay: true };
+  }
+  return event;
+}
+
+function normalizeAcpEventInternal(raw: unknown, sessionId?: string | null): NormalizedCodexEvent {
   const record = objectValue(raw);
   if (!record) return { type: "unknown", raw, threadId: sessionId ?? undefined };
 
@@ -130,12 +138,12 @@ function normalizeSessionUpdate(
 
   if (kind === "agent_thought_chunk" || kind === "agent_thought_delta") {
     return {
-      type: "item/completed",
+      type: "item/reasoning/delta",
       text,
       threadId,
       itemId: itemId ?? "reasoning",
       raw: {
-        method: "item/completed",
+        method: "item/reasoning/delta",
         params: {
           threadId,
           item: { id: itemId ?? "reasoning", type: "reasoning", text }
