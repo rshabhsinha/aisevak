@@ -43,6 +43,22 @@ describe('Codex native runtime publication',()=>{
   expect((await readdir(f.harness)).filter(name=>name.startsWith('codex-runtime-'))).toHaveLength(1);
   expect((await exec(join(f.harness,'codex'),['probe'],{cwd:f.root})).stdout).toContain('host:v1|probe|');
  });
+ it('normalizes restrictive executable modes and reuses the readable bundle',async()=>{
+  const f=await fixture();
+  for(const file of ['bin/codex','bin/codex-code-mode-host','codex-path/rg'])await chmod(join(f.vendor,file),0o700);
+  await exec('bash',[publisher,f.native,f.harness,'release-1']);
+  await exec('bash',[publisher,f.native,f.harness,'release-2']);
+  const bundles=(await readdir(f.harness)).filter(name=>name.startsWith('codex-runtime-'));expect(bundles).toHaveLength(1);
+  expect((await stat(join(f.harness,bundles[0]!, 'bin/codex-code-mode-host'))).mode&0o005).toBe(5);
+  expect((await exec(join(f.harness,'codex'),['probe'],{cwd:f.root})).stdout).toContain('host:v1|probe|');
+ });
+ it('rejects changed staged contents without replacing the active runtime',async()=>{
+  const first=await fixture();await exec('bash',[publisher,first.native,first.harness,'release-1']);
+  const before=await readdir(first.harness),broken=await fixture('v2',first.root);
+  await writeFile(broken.native,`#!/bin/sh\nprintf corrupted > "$(dirname "$0")/codex-code-mode-host"\necho codex-v2\n`);
+  await expect(exec('bash',[publisher,broken.native,broken.harness,'release-2'])).rejects.toThrow('changed during publication');
+  expect(await readdir(first.harness)).toEqual(before);
+ });
  it('rejects an incomplete package without replacing the working launcher',async()=>{
   const first=await fixture();await exec('bash',[publisher,first.native,first.harness,'release-1']);
   const launcher=await readFile(join(first.harness,'codex'),'utf8');

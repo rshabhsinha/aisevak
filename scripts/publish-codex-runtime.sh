@@ -26,7 +26,7 @@ const root = process.argv[2], hash = createHash('sha256');
 async function walk(relative = '') {
   for (const name of (await readdir(join(root, relative))).sort()) {
     const child = join(relative, name), path = join(root, child), info = await lstat(path);
-    hash.update(JSON.stringify([child, info.isDirectory() ? 'dir' : info.isSymbolicLink() ? 'link' : 'file', info.isDirectory() ? 0 : info.mode & 0o111]));
+    hash.update(JSON.stringify([child, info.isDirectory() ? 'dir' : info.isSymbolicLink() ? 'link' : 'file', info.isDirectory() ? false : Boolean(info.mode & 0o111), info.isFile() ? info.size : 0]));
     if (info.isDirectory()) await walk(child);
     else if (info.isSymbolicLink()) hash.update(await readlink(path));
     else for await (const chunk of createReadStream(path)) hash.update(chunk);
@@ -52,8 +52,11 @@ if [[ -e "$bundle_path" ]]; then
 else
   staging="$(mktemp -d "$harness_dir/.codex-runtime-${release_id}-XXXXXX")"
   cp -R "$vendor_dir/." "$staging/"
-  chmod -R a+rX "$staging"
+  chmod -R a+rX,go-w "$staging"
   "$staging/bin/codex" --version >/dev/null
+  [[ "codex-runtime-$(runtime_digest "$staging")" == "$bundle_name" ]] || {
+    echo 'Codex runtime changed during publication' >&2; exit 1
+  }
   # Directory rename fails if another publisher has already installed a full
   # bundle. Never nest a staged copy into an existing runtime directory.
   node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$staging" "$bundle_path"
