@@ -9,11 +9,13 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map((app) => app.close()));
 });
 
-async function activityServer(): Promise<{ app: FastifyInstance; queries: string[] }> {
+async function activityServer(): Promise<{ app: FastifyInstance; queries: string[]; parameters: unknown[][] }> {
   const queries: string[] = [];
+  const parameters: unknown[][] = [];
   const pool = {
-    async query(sql: string) {
+    async query(sql: string, params: unknown[] = []) {
       queries.push(sql);
+      parameters.push(params);
       if (sql.includes("FROM sessions")) {
         return {
           rows: [{
@@ -24,6 +26,8 @@ async function activityServer(): Promise<{ app: FastifyInstance; queries: string
           }]
         };
       }
+      if (sql.includes("FROM api_keys")) return { rows: [] };
+      if (sql.includes("FROM agent_tool_tokens")) return { rows: [{ agent_id: "agent", kind: "worker", role: "worker", name: "Builder", capabilities: ["incidents:read"] }] };
       if (sql.includes("FROM reports")) {
         return { rows: [{ number: 7, title: "Daily review", markdown: "## Healthy" }] };
       }
@@ -35,7 +39,7 @@ async function activityServer(): Promise<{ app: FastifyInstance; queries: string
   } as unknown as DbPool;
   const app = await buildServer(pool);
   openApps.push(app);
-  return { app, queries };
+  return { app, queries, parameters };
 }
 
 describe("web activity routes", () => {
@@ -83,5 +87,30 @@ describe("web activity routes", () => {
     const { app } = await activityServer();
     const response = await app.inject({ method: "GET", url: "/api/incidents" });
     expect(response.statusCode).toBe(401);
+  });
+});
+
+
+describe("resolved incident visibility", () => {
+  it("hides resolved web incidents unless explicitly requested", async () => {
+    const { app, queries } = await activityServer();
+    const headers = { cookie: "aisevak_session=test-session" };
+    await app.inject({ method: "GET", url: "/api/incidents", headers });
+    expect(queries.at(-1)).toContain("incidents.status <> 'resolved'");
+    await app.inject({ method: "GET", url: "/api/incidents?includeResolved=false", headers });
+    expect(queries.at(-1)).toContain("incidents.status <> 'resolved'");
+    await app.inject({ method: "GET", url: "/api/incidents?includeResolved=true", headers });
+    expect(queries.at(-1)).not.toContain("incidents.status <> 'resolved'");
+    await app.inject({ method: "GET", url: "/api/incidents?status=resolved", headers });
+    expect(queries.at(-1)).not.toContain("incidents.status <> 'resolved'");
+  });
+  it("applies the same visibility policy to agent incident lists", async () => {
+    const { app, queries, parameters } = await activityServer();
+    await app.inject({ method: "GET", url: "/api/agent-tools/v1/incidents", headers: { authorization: "Bearer test" } });
+    expect(parameters.at(-1)?.[5]).toBe(false);
+    const response = await app.inject({ method: "GET", url: "/api/agent-tools/v1/incidents?includeResolved=true", headers: { authorization: "Bearer test" } });
+    expect(response.statusCode).toBe(200);
+    expect(parameters.at(-1)?.[5]).toBe(true);
+    expect(queries.at(-1)).toContain("$6::boolean OR $1::text IS NOT NULL OR incidents.status <> 'resolved'");
   });
 });
