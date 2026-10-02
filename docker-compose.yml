@@ -39,6 +39,7 @@ services:
       CODEX_BINARY: ${CODEX_BINARY:-auto}
       CURSOR_BINARY: ${CURSOR_BINARY:-auto}
       OPENCODE_BINARY: ${OPENCODE_BINARY:-auto}
+      DEVIN_BINARY: ${DEVIN_BINARY:-auto}
       CODEX_DEFAULT_MODEL: ${CODEX_DEFAULT_MODEL:-gpt-5.6-luna}
       CODEX_OAUTH_CLIENT_ID: ${CODEX_OAUTH_CLIENT_ID:-}
       GITHUB_HOST: ${GITHUB_HOST:-github.com}
@@ -50,6 +51,10 @@ services:
       # remain host-runner-only.
       - /srv/aisevak/skills:/srv/aisevak/skills
       - /srv/aisevak/probe-schema:/srv/aisevak/probe-schema
+      # Scratch homes for provider auth probes/logins (cursor-auth, opencode-auth,
+      # devin-auth) — the API container runs as the runner UID and cannot create
+      # siblings of the bind-mounted dirs above.
+      - /srv/aisevak/harness-auth:/srv/aisevak/harness-auth
       # Host-published harness CLIs (read-only) so status probes and model
       # discovery inside the container see the same binaries as the runner.
       - /opt/aisevak/harness-bin:/opt/aisevak/harness-bin:ro

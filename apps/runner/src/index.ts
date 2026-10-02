@@ -20,6 +20,7 @@ import {
   redactSecrets,
   resolveCodexBinary,
   resolveCursorBinary,
+  resolveDevinBinary,
   resolveOpenCodeBinary,
   serializeCodexChatGptAuthFile,
   runMigrations,
@@ -62,6 +63,7 @@ const env = {
   codexBinary: resolveCodexBinary(process.env.CODEX_BINARY),
   cursorBinary: resolveCursorBinary(process.env.CURSOR_BINARY),
   openCodeBinary: resolveOpenCodeBinary(process.env.OPENCODE_BINARY),
+  devinBinary: resolveDevinBinary(process.env.DEVIN_BINARY),
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
@@ -116,9 +118,9 @@ interface RunJob {
   branch: string | null;
   codex_home: string;
   codex_thread_id: string | null;
-  workspace_mode: "direct" | "git_worktree" | "unknown";
+  workspace_mode: "direct" | "git_worktree" | "unknown" | "projectless";
   workspace_key: string;
-  workspace_source: "local_path" | "github" | "unknown";
+  workspace_source: "local_path" | "github" | "unknown" | "projectless";
   skills_snapshot: CodexSkillSnapshot[];
   agent_id: string;
   coordination_thread_id: string | null;
@@ -183,7 +185,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", beginShutdown);
 
   console.log(
-    `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary})`
+    `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary}, Devin: ${env.devinBinary})`
   );
   while (!shuttingDown) {
     startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
@@ -1231,7 +1233,7 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
       agent_thread_id: string | null;
       agent_thread_generation: number;
       workspace_key: string;
-      workspace_mode: "direct" | "git_worktree" | "unknown";
+      workspace_mode: "direct" | "git_worktree" | "unknown" | "projectless";
     }>(
       `SELECT candidate.id, candidate.agent_thread_id, candidate.agent_thread_generation,
               candidate.workspace_key, candidate.workspace_mode
@@ -1361,7 +1363,7 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
       agent_thread_id: string | null;
       agent_thread_generation: number;
       workspace_key: string;
-      workspace_mode: "direct" | "git_worktree" | "unknown";
+      workspace_mode: "direct" | "git_worktree" | "unknown" | "projectless";
     }>(
       `SELECT candidate.id, candidate.agent_thread_id, candidate.agent_thread_generation,
               candidate.workspace_key, candidate.workspace_mode
@@ -1735,7 +1737,9 @@ export async function processOneDispatcherRun(
             driver,
             cursorBinary: env.cursorBinary,
             openCodeBinary: env.openCodeBinary,
+            devinBinary: env.devinBinary,
             options: turnOptions,
+            acpApiKey: harnessAuth?.acpApiKey,
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,
@@ -2023,7 +2027,9 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             driver,
             cursorBinary: env.cursorBinary,
             openCodeBinary: env.openCodeBinary,
+            devinBinary: env.devinBinary,
             options: turnOptions,
+            acpApiKey: harnessAuth?.acpApiKey,
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,
@@ -3239,7 +3245,7 @@ function mustRow<T>(row: T | undefined): T {
 }
 
 function harnessDriver(value: string | null | undefined): ProviderDriver {
-  return value === "cursor" || value === "opencode" ? value : "codex";
+  return value === "cursor" || value === "opencode" || value === "devin" ? value : "codex";
 }
 
 function sleep(ms: number): Promise<void> {

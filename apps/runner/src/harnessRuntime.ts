@@ -1,12 +1,18 @@
 import {
   buildCursorAcpArgs,
+  buildDevinAcpArgs,
   buildOpenCodeAcpArgs,
   CURSOR_API_KEY_SECRET_NAME,
   CURSOR_AUTH_SECRET_NAME,
   decryptSecret,
   defaultOpenCodeAuthPath,
+  DEVIN_ACP_AUTH_METHOD_ID,
+  DEVIN_API_KEY_SECRET_NAME,
+  DEVIN_AUTH_SECRET_NAME,
+  devinBundleApiKey,
   isCursorHostAuthBundle,
   materializeCursorAuthBundle,
+  materializeDevinAuthBundle,
   materializeOpenCodeAuthFile,
   normalizeAcpEvent,
   normalizeCodexEvent,
@@ -25,6 +31,9 @@ export interface HarnessLaunchEnv {
   driver: ProviderDriver;
   env: NodeJS.ProcessEnv;
   secrets: string[];
+  // ACP `authenticate` credential for drivers that reject CLI credential files
+  // in ACP mode (Devin). Sent as _meta.api_key on the authenticate request.
+  acpApiKey?: string;
 }
 
 export async function materializeHarnessAuth(
@@ -81,6 +90,36 @@ export async function materializeHarnessAuth(
     };
   }
 
+  if (driver === "devin") {
+    const apiKey = await readSecret(pool, DEVIN_API_KEY_SECRET_NAME, secretKey);
+    const bundle = await readSecret(pool, DEVIN_AUTH_SECRET_NAME, secretKey);
+    if (bundle) {
+      await materializeDevinAuthBundle(runtimeHome, bundle);
+    }
+    const acpApiKey = apiKey ?? devinBundleApiKey(bundle);
+    if (!apiKey && !bundle) {
+      throw new Error("Devin is not authenticated. An admin must connect Devin from Settings > Devin.");
+    }
+    if (!acpApiKey) {
+      throw new Error(
+        "Devin credentials were found but contain no api_key for ACP authentication. Reconnect Devin from Settings > Devin."
+      );
+    }
+    return {
+      driver,
+      env: {
+        ...baseEnv,
+        HOME: runtimeHome,
+        XDG_CONFIG_HOME: join(runtimeHome, ".config"),
+        XDG_DATA_HOME: join(runtimeHome, ".local", "share"),
+        XDG_CACHE_HOME: join(runtimeHome, ".cache"),
+        WINDSURF_API_KEY: acpApiKey
+      },
+      secrets: [acpApiKey],
+      acpApiKey
+    };
+  }
+
   return { driver: "codex", env: baseEnv, secrets: [] };
 }
 
@@ -88,9 +127,22 @@ export async function runHarnessTurn(input: {
   driver: ProviderDriver;
   cursorBinary: string;
   openCodeBinary: string;
+  devinBinary: string;
   options: AppServerTurnOptions;
   acpEnv?: NodeJS.ProcessEnv;
+  acpApiKey?: string | null;
 }): Promise<AppServerTurnResult> {
+  if (input.driver === "devin") {
+    return runAcpTurn({
+      ...input.options,
+      binary: input.devinBinary,
+      args: buildDevinAcpArgs(input.options.model),
+      runtimeHome: input.options.codexHome,
+      env: input.acpEnv ?? input.options.env,
+      authMethodId: DEVIN_ACP_AUTH_METHOD_ID,
+      apiKey: input.acpApiKey
+    });
+  }
   if (input.driver === "cursor") {
     return runAcpTurn({
       ...input.options,

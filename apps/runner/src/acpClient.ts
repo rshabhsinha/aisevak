@@ -14,6 +14,9 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
   args: string[];
   runtimeHome: string;
   authMethodId?: string | null;
+  // ACP `authenticate` parameter (sent as _meta.api_key). Devin requires this —
+  // it intentionally does not read CLI credentials in ACP mode.
+  apiKey?: string | null;
 }
 
 const sessions = new Map<string, PersistentAcpSession>();
@@ -79,7 +82,7 @@ class PersistentAcpSession {
     private readonly initial: AcpTurnOptions,
     onClose: () => void
   ) {
-    this.connectionKey = JSON.stringify([initial.binary, initial.args, initial.cwd, initial.runtimeHome]);
+    this.connectionKey = JSON.stringify([initial.binary, initial.args, initial.cwd, initial.runtimeHome, initial.apiKey ?? null]);
     this.child = spawn(initial.binary, initial.args, {
       cwd: initial.cwd,
       env: initial.env,
@@ -108,8 +111,10 @@ class PersistentAcpSession {
   }
 
   matches(options: AcpTurnOptions): boolean {
-    return this.connectionKey === JSON.stringify([options.binary, options.args, options.cwd, options.runtimeHome]);
+    return this.connectionKey === JSON.stringify([options.binary, options.args, options.cwd, options.runtimeHome, options.apiKey ?? null]);
   }
+
+  private apiKey: string | null = null;
 
   async runTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
     let seq = 0;
@@ -124,6 +129,7 @@ class PersistentAcpSession {
 
     this.onNotification = emit;
     this.lastUsedAt = Date.now();
+    this.apiKey = options.apiKey ?? null;
     try {
       await this.initialize(options.authMethodId);
       if (options.threadId) {
@@ -253,8 +259,11 @@ class PersistentAcpSession {
           authMethodId && methods.some((method) => method.id === authMethodId)
             ? authMethodId
             : methods[0]?.id;
-        if (methodId) {
-          await this.request("authenticate", { methodId }).catch(() => undefined);
+        if (methodId || this.apiKey) {
+          await this.request("authenticate", {
+            ...(methodId ? { methodId } : {}),
+            ...(this.apiKey ? { _meta: { api_key: this.apiKey } } : {})
+          }).catch(() => undefined);
         }
       })();
     }

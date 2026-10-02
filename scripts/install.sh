@@ -67,6 +67,7 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/aws" \
   "${WORKSPACE_DIR}/skills" \
   "${WORKSPACE_DIR}/probe-schema" \
+  "${WORKSPACE_DIR}/harness-auth" \
   "${WORKSPACE_DIR}/worktrees"
 chmod 0700 "${WORKSPACE_DIR}/aws"
 # Older API releases created Codex homes as root from inside the container.
@@ -125,17 +126,30 @@ install_harness_clis() {
       log "Installing Cursor agent CLI for ${RUNNER_USER}"
       sudo -u "${RUNNER_USER}" curl -fsSL https://cursor.com/install | sudo -u "${RUNNER_USER}" bash || log "Cursor agent install failed; continuing without it"
     fi
+    if [[ ! -x "${runner_home}/.local/bin/devin" ]]; then
+      log "Installing Devin CLI for ${RUNNER_USER}"
+      # The installer ends with a first-run welcome that exits nonzero without
+      # a TTY; judge success by the binary it drops instead of the exit code.
+      sudo -u "${RUNNER_USER}" bash -c 'curl -fsSL https://cli.devin.ai/install.sh | bash' || true
+      [[ -x "${runner_home}/.local/bin/devin" ]] || log "Devin CLI install failed; continuing without it"
+    fi
   else
-    log "curl is unavailable; skipping OpenCode/Cursor CLI provisioning"
+    log "curl is unavailable; skipping OpenCode/Cursor/Devin CLI provisioning"
   fi
   [[ -x "${runner_home}/.opencode/bin/opencode" ]] && ln -sf "${runner_home}/.opencode/bin/opencode" /usr/local/bin/opencode
   [[ -x "${runner_home}/.local/bin/agent" ]] && ln -sf "${runner_home}/.local/bin/agent" /usr/local/bin/agent
   [[ -x "${runner_home}/.local/bin/cursor-agent" ]] && ln -sf "${runner_home}/.local/bin/cursor-agent" /usr/local/bin/cursor-agent
+  [[ -x "${runner_home}/.local/bin/devin" ]] && ln -sf "${runner_home}/.local/bin/devin" /usr/local/bin/devin
   # Publish dereferenced copies for the read-only container mount.
   # opencode is a single static binary; cursor-agent is a launcher that
   # needs its sibling node runtime, so publish its whole version directory.
   if [[ -x /usr/local/bin/opencode ]]; then
     cp -f /usr/local/bin/opencode "${HARNESS_BIN_DIR}/opencode"
+  fi
+  # devin is a single self-contained binary; ~/.local/bin/devin symlinks into
+  # a versioned bundle, so copy the resolved file.
+  if [[ -x /usr/local/bin/devin ]]; then
+    cp -fL /usr/local/bin/devin "${HARNESS_BIN_DIR}/devin"
   fi
   if [[ -x /usr/local/bin/cursor-agent ]]; then
     cursor_version_dir="$(dirname "$(readlink -f /usr/local/bin/cursor-agent)")"
