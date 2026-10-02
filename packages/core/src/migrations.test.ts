@@ -1,5 +1,26 @@
-import { describe, expect, it } from "vitest";
-import { additiveSql } from "./migrations.js";
+import type { Pool } from "pg";
+import { describe, expect, it, vi } from "vitest";
+vi.mock("./installedSkills.js", () => ({ installedSkillsRoot: () => "/skills", migrateAndSynchronizeInstalledSkills: vi.fn() }));
+import { additiveSql, runMigrations } from "./migrations.js";
+
+it("applies DDL once and skips it on subsequent API/runner boots", async () => {
+  let applied = false;
+  const statements: string[] = [];
+  const client = { query: async (sql: string) => {
+    statements.push(sql);
+    if (sql.startsWith("SELECT fingerprint")) return { rows: applied ? [{ fingerprint: "existing" }] : [] };
+    if (sql.startsWith("INSERT INTO aisevak_schema_revisions")) applied = true;
+    return { rows: [] };
+  }, release: vi.fn() };
+  const pool = { connect: async () => client } as unknown as Pool;
+  await runMigrations(pool);
+  const before = statements.length;
+  await runMigrations(pool);
+  expect(statements.slice(before).some(sql => sql.includes("CREATE TABLE IF NOT EXISTS users"))).toBe(false);
+  expect(statements.filter(sql => sql.includes("CREATE TABLE IF NOT EXISTS users"))).toHaveLength(1);
+  expect(statements.filter(sql => sql.includes("pg_advisory_unlock"))).toHaveLength(2);
+  expect(client.release).toHaveBeenCalledTimes(2);
+});
 
 describe("run snapshot migration", () => {
   it("correlates task snapshots to their own task and project", () => {

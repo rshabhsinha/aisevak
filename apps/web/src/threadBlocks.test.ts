@@ -239,6 +239,64 @@ describe("deriveThreadBlocks", () => {
     expect(users).toEqual(["msg-run-a", "msg-run-b"]);
   });
 
+  it("keeps a tool's title when follow-up events carry none", () => {
+    // Regression: Devin emits item/started with the command and then bare
+    // item/started+item/completed updates for the same itemId; the updates
+    // overwrote the title with the "Tool call" fallback.
+    const toolEvent = (method: string, item: Record<string, unknown>) =>
+      event(method, {
+        payload: { raw: { method, params: { item } } }
+      });
+    const blocks = deriveThreadBlocks({
+      run: null,
+      events: [
+        toolEvent("item/started", {
+          id: "skill_0",
+          type: "command_execution",
+          status: "completed",
+          command: "Invoked skill aisevak-cli",
+          aggregated_output: "Invoked skill aisevak-cli"
+        }),
+        toolEvent("item/started", { id: "skill_0", type: "command_execution", status: "completed" }),
+        toolEvent("item/completed", { id: "skill_0", type: "command_execution", status: "completed" })
+      ]
+    });
+    expect(blockKinds(blocks)).toEqual(["tools"]);
+    const tools = blocks[0] as Extract<ThreadBlock, { kind: "tools" }>;
+    expect(tools.entries).toHaveLength(1);
+    expect(tools.entries[0]?.title).toBe("Invoked skill aisevak-cli");
+    expect(tools.entries[0]?.status).toBe("completed");
+  });
+
+  it("merges a run's reasoning steps into one thinking block", () => {
+    // Devin emits a reasoning item before each step; each used to become its
+    // own Thinking chip. One disclosure per run keeps the full reasoning.
+    const reasoning = (text: string) =>
+      acpCompletedItem(text, "reasoning", { itemId: "reasoning" });
+    const blocks = deriveThreadBlocks({
+      run: { id: "r1", status: "succeeded" },
+      events: [
+        reasoning("first step"),
+        acpDelta("narration"),
+        event("item/completed", {
+          payload: {
+            raw: {
+              method: "item/completed",
+              params: { item: { id: "cmd-1", type: "command_execution", command: "ls", status: "completed" } }
+            }
+          }
+        }),
+        reasoning("second step")
+      ]
+    });
+    const thinking = blocks.filter((b) => b.kind === "thinking");
+    expect(thinking).toHaveLength(1);
+    expect(thinking[0] && thinking[0].kind === "thinking" ? thinking[0].text : "").toBe(
+      "first step\n\nsecond step"
+    );
+    expect(blockKinds(blocks)).toEqual(["thinking", "assistant", "tools"]);
+  });
+
   it("renders turn failures as error blocks", () => {
     const blocks = deriveThreadBlocks({
       run: null,

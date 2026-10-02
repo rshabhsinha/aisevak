@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { Pool } from "pg";
 import { installedSkillsRoot, migrateAndSynchronizeInstalledSkills } from "./installedSkills.js";
 import { resolveCodexDefaultModel } from "./models.js";
@@ -1281,17 +1282,25 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL D
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
-  await pool.query("SELECT set_config('aisevak.default_model', $1, false)", [
-    resolveCodexDefaultModel()
-  ]);
-  await pool.query("SELECT set_config('aisevak.managed_root', $1, false)", [
-    process.env.MANAGED_ROOT ?? "/srv/aisevak"
-  ]);
-  await pool.query(enumSql);
-  await pool.query(tableSql);
-  await pool.query(additiveSql);
-  await migrateAndSynchronizeInstalledSkills(
-    pool,
-    installedSkillsRoot(process.env.MANAGED_ROOT ?? "/srv/aisevak")
-  );
+  const client = await pool.connect();
+  const fingerprint = createHash("sha256").update(enumSql + tableSql + additiveSql).digest("hex");
+  try {
+    // Keep settings and DDL on one connection, and serialize API/runner boot.
+    await client.query("SELECT pg_advisory_lock(hashtextextended('aisevak.schema-migrations', 0))");
+    await client.query("SELECT set_config('aisevak.default_model', $1, false)", [resolveCodexDefaultModel()]);
+    await client.query("SELECT set_config('aisevak.managed_root', $1, false)", [process.env.MANAGED_ROOT ?? "/srv/aisevak"]);
+    await client.query("CREATE TABLE IF NOT EXISTS aisevak_schema_revisions (fingerprint text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())");
+    const applied = await client.query("SELECT fingerprint FROM aisevak_schema_revisions WHERE fingerprint = $1", [fingerprint]);
+    if (applied.rows.length === 0) {
+      await client.query(enumSql);
+      await client.query(tableSql);
+      await client.query(additiveSql);
+      await client.query("INSERT INTO aisevak_schema_revisions(fingerprint) VALUES ($1) ON CONFLICT DO NOTHING", [fingerprint]);
+    }
+  } finally {
+    try { await client.query("SELECT pg_advisory_unlock(hashtextextended('aisevak.schema-migrations', 0))"); }
+    catch (error) { client.release(true); throw error; }
+    client.release();
+  }
+  await migrateAndSynchronizeInstalledSkills(pool, installedSkillsRoot(process.env.MANAGED_ROOT ?? "/srv/aisevak"));
 }

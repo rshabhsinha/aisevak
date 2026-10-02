@@ -96,6 +96,8 @@ interface AgentThreadSession {
   runtime_home: string;
   provider_thread_id: string | null;
   cwd: string;
+  model: string;
+  model_options: unknown;
 }
 
 const pageSchema = z.object({
@@ -724,6 +726,7 @@ export async function registerCoordinationRoutes(
         model: recipient.model,
         modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
         runtimeHome: managedCodexHome(options.managedRoot, id),
+        providerInstanceId: recipient.provider_instance_id ?? null,
         preserveCoordination: recipient.id !== context.agentId
       });
       await addParticipants(client, row.coordination_thread_id, [[recipient.id, "assignee"]]);
@@ -1768,7 +1771,7 @@ async function createOrReuseTaskInTransaction(
 async function getAgent(queryable: Queryable, ref: string): Promise<any> {
   const normalized = ref.replace(/^AGENT-/i, "");
   const result = await queryable.query(
-    `SELECT id, kind, name, description, model, model_options, capabilities, instructions, enabled, created_at, updated_at
+    `SELECT id, kind, name, description, model, model_options, capabilities, instructions, enabled, created_at, updated_at, provider_instance_id
      FROM agents WHERE id::text = $1 OR lower(name) = lower($1) LIMIT 1`,
     [normalized]
   );
@@ -2063,7 +2066,7 @@ async function failStaleQueuedRunInputs(
   }
 }
 
-async function queueDelivery(
+export async function queueDelivery(
   client: PoolClient,
   managedRoot: string,
   threadId: string,
@@ -2087,7 +2090,7 @@ async function queueDelivery(
     ? await client.query<{ local_path: string; workspace_mode: string; source: string }>("SELECT local_path, workspace_mode, source FROM projects WHERE id = $1", [thread.project_id])
     : null;
   const existing = await client.query<AgentThreadSession>(
-    `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd FROM agent_threads
+    `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options FROM agent_threads
      WHERE coordination_thread_id = $1 AND agent_id = $2 LIMIT 1 FOR UPDATE`, [threadId, recipientAgentId]);
   let session = existing.rows[0];
   let ownershipTransferUnsafe = false;
@@ -2132,7 +2135,7 @@ async function queueDelivery(
             END,
            updated_at = now()
        WHERE id = $1
-       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options`,
       [session.id, desiredTaskId, thread.project_id, desiredRuntimeHome, desiredCwd]
     );
     session = updated.rows[0];
@@ -2149,6 +2152,7 @@ async function queueDelivery(
       model: recipient.model,
       modelOptions: modelOptionsFor(recipient.model, recipient.model_options),
       runtimeHome: managedCodexHome(managedRoot, linkedTaskId),
+      providerInstanceId: recipient.provider_instance_id ?? null,
       preserveCoordination: true
     });
     if (session) {
@@ -2176,7 +2180,7 @@ async function queueDelivery(
              END,
              updated_at = now()
          WHERE id = $1
-         RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+         RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options`,
         [session.id, linkedTaskId, thread.project_id, desiredCwd, desiredRuntimeHome]
       );
       session = updated.rows[0];
@@ -2192,13 +2196,13 @@ async function queueDelivery(
        ON CONFLICT (coordination_thread_id, agent_id)
          WHERE coordination_thread_id IS NOT NULL
        DO NOTHING
-       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+       RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options`,
       [thread.title, recipientAgentId, linkedTaskId, thread.project_id, recipient.provider_instance_id || "codex-local", recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), desiredCwd, runtimeHome, threadId]
     );
     session = created.rows[0];
     if (!session) {
       const concurrent = await client.query<AgentThreadSession>(
-        `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd
+        `SELECT id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options
          FROM agent_threads
          WHERE coordination_thread_id = $1 AND agent_id = $2
          LIMIT 1 FOR UPDATE`, [threadId, recipientAgentId]
@@ -2246,11 +2250,11 @@ async function queueDelivery(
         codex_thread_id, model, model_options, prompt, skills_snapshot)
      VALUES ($1, $2, 'message', 'coordination', $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, $12, $13, $14, $15)
      RETURNING id`,
-    [thread.task_id, assignmentId ?? null, session!.id, session!.ownership_generation, thread.project_id ?? "",
+    [assignmentId ? thread.task_id : linkedTaskId, assignmentId ?? null, session!.id, session!.ownership_generation, thread.project_id ?? "",
       workspaceMode,
       workspaceSource,
       delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
-      recipient.model, JSON.stringify(modelOptionsFor(recipient.model, recipient.model_options)), prompt, serializeCodexSkillSnapshots(skills)]
+      session!.model, JSON.stringify(modelOptionsFor(session!.model, session!.model_options)), prompt, serializeCodexSkillSnapshots(skills)]
   );
   await migrateStaleCoordinationRuns(client, session.id, session.ownership_generation, createdRun.rows[0]!.id);
   return delivery.rows[0]!.id;
@@ -2411,6 +2415,7 @@ export async function transferTaskAgentThread(
     model: string;
     modelOptions: unknown;
     runtimeHome: string;
+    providerInstanceId?: string | null;
     preserveCoordination?: boolean;
   }
 ): Promise<AgentThreadSession | undefined> {
@@ -2424,25 +2429,30 @@ export async function transferTaskAgentThread(
          model = $4,
          model_options = $5,
          runtime_home = $6,
+         provider_instance_id = COALESCE($7, provider_instance_id),
          provider_thread_id = CASE
-           WHEN agent_id = $3 AND runtime_home = $6 THEN provider_thread_id
+           WHEN agent_id = $3 AND runtime_home = $6
+             AND provider_instance_id IS NOT DISTINCT FROM COALESCE($7, provider_instance_id)
+             THEN provider_thread_id
            ELSE NULL
          END,
          ownership_generation = ownership_generation + CASE
-           WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $6 THEN 1
+           WHEN agent_id IS DISTINCT FROM $3 OR runtime_home IS DISTINCT FROM $6
+             OR provider_instance_id IS DISTINCT FROM COALESCE($7, provider_instance_id) THEN 1
            ELSE 0
          END,
          last_activity_at = now(),
          updated_at = now()
      WHERE task_id = $2
-     RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd`,
+     RETURNING id, task_id, project_id, ownership_generation, runtime_home, provider_thread_id, cwd, model, model_options`,
     [
       input.threadId,
       input.taskId,
       input.recipientAgentId,
       input.model,
       JSON.stringify(input.modelOptions),
-      input.runtimeHome
+      input.runtimeHome,
+      input.providerInstanceId ?? null
     ]
   );
   if (result.rows[0]) {
