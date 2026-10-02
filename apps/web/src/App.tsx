@@ -626,13 +626,13 @@ export function App() {
       return;
     }
     void loadAgentThread(selectedThreadId);
-    if (!isActiveRun(selectedThread?.latest_status)) return;
+    if (!isActiveRun(selectedThread?.latest_status) && selectedThread?.cleanup_state !== "restoring" && selectedThread?.cleanup_state !== "pending") return;
     const timer = window.setInterval(() => {
       void loadAgentThread(selectedThreadId);
       void reloadAgentThreads();
     }, 2000);
     return () => window.clearInterval(timer);
-  }, [user?.id, selectedThreadId, selectedThread?.latest_status]);
+  }, [user?.id, selectedThreadId, selectedThread?.latest_status, selectedThread?.cleanup_state]);
 
   useEffect(() => {
     if (selectedThread) {
