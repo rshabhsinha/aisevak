@@ -365,9 +365,8 @@ function processRunGroup(
         event.text ??
         stringValue(item?.text) ??
         stringValue(item?.content) ??
-        stringArrayValue(item?.summary).join("\n") ??
-        "";
-      if (!text.trim()) continue;
+        (stringArrayValue(item?.summary).join("\n") || stringArrayValue(item?.content).join("\n"));
+      if (event.event_type === "item/reasoning/delta" ? !text : !text.trim()) continue;
       const block = touchThinking(createdAt);
       reasoningByItemId.set(itemId, event.event_type === "item/reasoning/delta"
         ? (reasoningByItemId.get(itemId) ?? "") + text
