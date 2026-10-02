@@ -149,6 +149,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     env.devinBinary,
     resolve(env.managedRoot, "harness-auth", "devin-auth")
   );
+  app.addHook("onClose", async () => devinAuth.dispose());
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
   await app.register(cors, {

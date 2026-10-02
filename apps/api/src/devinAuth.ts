@@ -27,6 +27,9 @@ interface LoginState {
   home: string;
   expiresAt: number;
   child: ChildProcessWithoutNullStreams;
+  launchError?: Error;
+  closed: Promise<void>;
+  expiryTimer?: NodeJS.Timeout;
 }
 
 export interface DevinAuthStatusResponse {
@@ -127,7 +130,7 @@ export class DevinAuthManager {
     const candidates = [this.hostHome, join(this.authHomeRoot, "host-import")];
     for (const home of candidates) {
       const bundle = await captureDevinAuthBundle(home);
-      if (bundleHasFiles(bundle)) {
+      if (devinBundleApiKey(bundle)) {
         await this.upsertSecret(
           DEVIN_AUTH_SECRET_NAME,
           bundle,
@@ -143,10 +146,7 @@ export class DevinAuthManager {
 
   async startLogin(requestedBy: string): Promise<DevinLogin> {
     this.pruneExpiredLogins();
-    for (const [id, login] of this.logins) {
-      login.child.kill("SIGTERM");
-      this.logins.delete(id);
-    }
+    await this.dispose();
     const loginId = randomUUID();
     const home = join(this.authHomeRoot, loginId);
     await mkdir(home, { recursive: true });
@@ -155,19 +155,30 @@ export class DevinAuthManager {
       env: devinHomeEnv(home),
       stdio: ["pipe", "pipe", "pipe"]
     });
+    const closed = new Promise<void>((resolve) => child.once("close", () => resolve()));
     const state: LoginState = {
       requestedBy,
       verificationUrl: null,
       codeSubmitted: false,
       home,
       expiresAt: Date.now() + LOGIN_TTL_MS,
-      child
+      child,
+      closed
     };
+    child.on("error", (error) => { state.launchError = error; });
     collectCliOutput(child, (text) => {
       state.verificationUrl = parseDevinLoginUrl(text) ?? state.verificationUrl;
     });
     this.logins.set(loginId, state);
+    state.expiryTimer = setTimeout(() => {
+      void this.disposeLogin(loginId).catch((error) => console.warn("Devin login cleanup failed", error));
+    }, LOGIN_TTL_MS);
+    state.expiryTimer.unref();
     await waitForLoginHint(state, 10_000);
+    if (state.launchError) {
+      await this.disposeLogin(loginId);
+      throw new Error(`Unable to start Devin login: ${state.launchError.message}`);
+    }
     return {
       loginId,
       verificationUrl: state.verificationUrl,
@@ -182,8 +193,7 @@ export class DevinAuthManager {
       throw new Error("That Devin login request is no longer available");
     }
     if (login.expiresAt <= Date.now()) {
-      login.child.kill("SIGTERM");
-      this.logins.delete(loginId);
+      await this.disposeLogin(loginId);
       throw new Error("The Devin login request expired");
     }
     const trimmed = code.trim();
@@ -207,8 +217,7 @@ export class DevinAuthManager {
       throw new Error("That Devin login request is no longer available");
     }
     if (login.expiresAt <= Date.now()) {
-      login.child.kill("SIGTERM");
-      this.logins.delete(loginId);
+      await this.disposeLogin(loginId);
       throw new Error("The Devin login request expired");
     }
     const credentials = (
@@ -220,7 +229,7 @@ export class DevinAuthManager {
       return { status: "pending", auth: await this.getStatus() };
     }
     const bundle = await captureDevinAuthBundle(login.home);
-    if (!bundleHasFiles(bundle)) {
+    if (!devinBundleApiKey(bundle)) {
       return { status: "pending", auth: await this.getStatus() };
     }
     await this.upsertSecret(
@@ -228,12 +237,12 @@ export class DevinAuthManager {
       bundle,
       "Internal Devin CLI authentication used by the runner"
     );
-    login.child.kill("SIGTERM");
-    this.logins.delete(loginId);
+    await this.disposeLogin(loginId);
     return { status: "connected", auth: await this.getStatus() };
   }
 
   async disconnect(): Promise<DevinAuthStatusResponse> {
+    await this.dispose();
     await this.pool.query("DELETE FROM secrets WHERE name = ANY($1::text[])", [
       [DEVIN_API_KEY_SECRET_NAME, DEVIN_AUTH_SECRET_NAME]
     ]);
@@ -281,12 +290,31 @@ export class DevinAuthManager {
     }
   }
 
+  async dispose(): Promise<void> {
+    await Promise.all([...this.logins.keys()].map((id) => this.disposeLogin(id)));
+  }
+
+  private async disposeLogin(id: string): Promise<void> {
+    const login = this.logins.get(id);
+    if (!login) return;
+    this.logins.delete(id);
+    clearTimeout(login.expiryTimer);
+    login.child.kill("SIGTERM");
+    const killTimer = setTimeout(() => login.child.kill("SIGKILL"), 2_000);
+    killTimer.unref();
+    try {
+      await login.closed;
+      await rm(login.home, { recursive: true, force: true });
+    } finally {
+      clearTimeout(killTimer);
+    }
+  }
+
   private pruneExpiredLogins(): void {
     const now = Date.now();
     for (const [id, login] of this.logins) {
       if (login.expiresAt <= now) {
-        login.child.kill("SIGTERM");
-        this.logins.delete(id);
+        void this.disposeLogin(id).catch((error) => console.warn("Devin login cleanup failed", error));
       }
     }
   }
@@ -326,17 +354,8 @@ export function devinHomeEnv(home: string): NodeJS.ProcessEnv {
 
 async function waitForLoginHint(state: LoginState, timeoutMs: number): Promise<void> {
   const started = Date.now();
-  while (Date.now() - started < timeoutMs && !state.verificationUrl) {
+  while (Date.now() - started < timeoutMs && !state.verificationUrl && !state.launchError) {
     await new Promise((resolve) => setTimeout(resolve, 250));
-  }
-}
-
-function bundleHasFiles(bundle: string): boolean {
-  try {
-    const parsed = JSON.parse(bundle) as { homeFiles?: Record<string, string> };
-    return Object.keys(parsed.homeFiles ?? {}).length > 0;
-  } catch {
-    return false;
   }
 }
 
