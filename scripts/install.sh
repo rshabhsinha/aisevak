@@ -171,13 +171,13 @@ install_harness_clis() {
       npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
     fi
     # The npm entry point is JavaScript with a platform package dependency.
-    # Publish its native executable, so the API container needs neither npm nor
-    # the host's global node_modules tree.
+    # Publish the complete native platform bundle: tool execution also needs
+    # code-mode-host, packaged resources and the vendor's rg on PATH. The API
+    # container needs neither npm nor the host's global node_modules tree.
     local codex_native
     for codex_native in "$(npm root -g)"/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; do
       if [[ -x "${codex_native}" ]]; then
-        install -m 0755 "${codex_native}" "${HARNESS_BIN_DIR}/.codex-${TIMESTAMP}"
-        mv -f "${HARNESS_BIN_DIR}/.codex-${TIMESTAMP}" "${HARNESS_BIN_DIR}/codex"
+        bash "${SOURCE_DIR}/scripts/publish-codex-runtime.sh" "${codex_native}" "${HARNESS_BIN_DIR}" "${TIMESTAMP}"
         break
       fi
     done
