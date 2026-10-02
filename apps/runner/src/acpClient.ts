@@ -50,7 +50,7 @@ export async function closeIdleAcpSessions(exceptKey?: string, idleMs = ACP_SESS
   const now = Date.now();
   const stale: Array<Promise<void>> = [];
   for (const [key, session] of sessions) {
-    if (key !== exceptKey && now - session.lastUsedAt > idleMs) {
+    if (key !== exceptKey && !session.isRunning && now - session.lastUsedAt > idleMs) {
       sessions.delete(key);
       stale.push(session.close());
     }
@@ -75,6 +75,7 @@ class PersistentAcpSession {
   private initializePromise: Promise<void> | null = null;
   private sessionId: string | null = null;
   lastUsedAt = Date.now();
+  isRunning = false;
   private lastActivityAt = Date.now();
   private readonly closePromise: Promise<{ code: number | null; error?: Error }>;
   private onNotification: ((line: string) => Promise<void>) | null = null;
@@ -123,6 +124,8 @@ class PersistentAcpSession {
   private apiKey: string | null = null;
 
   async runTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
+    if (this.isRunning) throw new Error("ACP session already has an active turn");
+    this.isRunning = true;
     let seq = 0;
     let promptMayHaveBeenPresented = false;
     let cancelRequested = false;
@@ -256,6 +259,8 @@ class PersistentAcpSession {
         promptMayHaveBeenPresented
       };
     } finally {
+      this.isRunning = false;
+      this.lastUsedAt = Date.now();
       this.onNotification = null;
     }
   }

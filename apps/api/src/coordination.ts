@@ -2066,7 +2066,7 @@ async function failStaleQueuedRunInputs(
   }
 }
 
-async function queueDelivery(
+export async function queueDelivery(
   client: PoolClient,
   managedRoot: string,
   threadId: string,
@@ -2250,7 +2250,7 @@ async function queueDelivery(
         codex_thread_id, model, model_options, prompt, skills_snapshot)
      VALUES ($1, $2, 'message', 'coordination', $3, $4, $5, $6, $7, $8, 'queued', $9, $10, $11, $12, $13, $14, $15)
      RETURNING id`,
-    [linkedTaskId, assignmentId ?? null, session!.id, session!.ownership_generation, thread.project_id ?? "",
+    [assignmentId ? thread.task_id : linkedTaskId, assignmentId ?? null, session!.id, session!.ownership_generation, thread.project_id ?? "",
       workspaceMode,
       workspaceSource,
       delivery.rows[0]!.id, session!.cwd, session!.runtime_home, session!.provider_thread_id,
