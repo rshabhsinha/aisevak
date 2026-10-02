@@ -72,6 +72,8 @@ export async function removeCleanManagedWorktree(options: {
   if (index <= 0 || !registered || registered.some(field => field === "locked" || field.startsWith("locked ")) || !registered.includes(`branch refs/heads/${options.branch}`)) {
     throw new Error("Worktree ownership, branch or registration is unverified");
   }
+  const common = async (cwd: string) => realpath(resolve(cwd, (await git(cwd, ["rev-parse", "--git-common-dir"])).trim()));
+  if (await common(path) !== await common(options.repo)) throw new Error("Worktree points to a different repository");
   if (await realpath(path) !== path) throw new Error("Noncanonical worktree path is protected");
   const status = await git(path, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignored=matching"]);
   const changes = status.split("\0").filter(Boolean);
