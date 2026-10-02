@@ -75,6 +75,7 @@ import {
   requireTaskOwner,
   type AgentContext
 } from "./coordination.js";
+import { assertThreadAcceptsInput, setThreadArchived } from "./threadArchive.js";
 import { agentDeletionBlockReason } from "./agents.js";
 import {
   normalizeWorkKey,
@@ -1409,6 +1410,15 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return { thread };
   });
 
+  for (const action of ["archive", "restore"] as const) {
+    app.post(`/api/agent-threads/:id/${action}`, async request => {
+      requireUser(request);
+      const { id } = idParams.parse(request.params);
+      await setThreadArchived(pool, id, action === "archive");
+      return { thread: await getAgentThread(pool, id) };
+    });
+  }
+
   app.post("/api/agent-threads/:id/messages", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
@@ -2097,6 +2107,7 @@ const patchAgentThreadSchema = z.object({
   modelSelection: modelSelectionSchema.optional()
 });
 const agentThreadsQuerySchema = z.object({
+  includeArchived: z.enum(["true", "false"]).default("false").transform(value => value === "true"),
   limit: z.coerce.number().int().min(1).max(50).default(10),
   cursor: z.string().trim().min(1).optional(),
   query: z.string().trim().max(200).optional()
@@ -2234,6 +2245,9 @@ interface AgentThreadRow {
   runtime_home: string;
   provider_thread_id: string | null;
   ownership_generation: number;
+  archived_at: string | Date | null;
+  cleanup_state: string | null;
+  cleanup_error: string | null;
   last_activity_at: string | Date;
   created_at: string | Date;
   updated_at: string | Date;
@@ -2681,7 +2695,7 @@ async function listAgentThreads(
   input: z.infer<typeof agentThreadsQuerySchema>
 ): Promise<{ threads: AgentThreadRow[]; nextCursor: string | null }> {
   const values: unknown[] = [];
-  const conditions: string[] = [];
+  const conditions: string[] = input.includeArchived ? [] : ["agent_threads.archived_at IS NULL"];
   if (input.cursor) {
     const cursor = decodeThreadCursor(input.cursor);
     values.push(cursor.lastActivityAt, cursor.id);
@@ -2833,6 +2847,7 @@ async function queueProjectlessAgentThreadMessage(
   return withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
     const thread = await getAgentThread(client, threadId);
+    await assertThreadAcceptsInput(client, threadId);
     if (thread.task_id) return null;
     const selection = await resolveModelSelection(client, input.modelSelection, thread.model, thread);
     await client.query(
@@ -2964,6 +2979,7 @@ export async function queueAgentTurnInput(
   await getAgentThread(pool, threadId);
   return withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
+    await assertThreadAcceptsInput(client, threadId);
     const active = await client.query<{ id: string; kind: "worker" | "dispatcher" }>(
       `SELECT id, kind
        FROM (
@@ -3040,6 +3056,7 @@ export async function queueIncrementalAgentTurnInput(
 ): Promise<{ input: Record<string, unknown>; run: Record<string, unknown> } | null> {
   return withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
+    await assertThreadAcceptsInput(client, threadId);
     return appendIncrementalAgentTurnInput(client, threadId, message, options);
   });
 }
@@ -3773,6 +3790,9 @@ const agentThreadSelectSql = `
          agent_threads.runtime_home,
          agent_threads.provider_thread_id,
          agent_threads.ownership_generation,
+         agent_threads.archived_at,
+         agent_threads.cleanup_state,
+         agent_threads.cleanup_error,
          agent_threads.last_activity_at,
          agent_threads.created_at,
          agent_threads.updated_at,
@@ -3901,6 +3921,7 @@ async function queueWorkerRun(
       thread.runtime_home,
       thread.provider_thread_id
     );
+    await assertThreadAcceptsInput(client, thread.id);
     const model = options.modelSelection?.model ?? thread.model;
     const modelOptions = modelOptionsFor(
       options.modelSelection?.model ?? thread.model,
@@ -4038,6 +4059,7 @@ export async function queueDispatcherMessage(
       await client.query("SELECT id FROM agent_threads WHERE id = $1 FOR UPDATE", [threadId]);
       thread = await getAgentThread(client, threadId);
     }
+    if (threadId) await assertThreadAcceptsInput(client, threadId);
     const existing = options.sourceRunId
       ? await client.query<DispatcherRunSnapshot>(
           `SELECT id, agent_thread_id, task_id, scope, cwd, codex_home, codex_thread_id, workspace_key, workspace_mode, workspace_source, model, model_options, prompt, status::text, skills_snapshot

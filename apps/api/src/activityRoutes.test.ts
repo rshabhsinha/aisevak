@@ -28,6 +28,7 @@ async function activityServer(): Promise<{ app: FastifyInstance; queries: string
       }
       if (sql.includes("FROM api_keys")) return { rows: [] };
       if (sql.includes("FROM agent_tool_tokens")) return { rows: [{ agent_id: "agent", kind: "worker", role: "worker", name: "Builder", capabilities: ["incidents:read"] }] };
+      if (sql.includes("FROM agent_threads")) return {rows:[]};
       if (sql.includes("FROM reports")) {
         return { rows: [{ number: 7, title: "Daily review", markdown: "## Healthy" }] };
       }
@@ -113,4 +114,14 @@ describe("resolved incident visibility", () => {
     expect(parameters.at(-1)?.[5]).toBe(true);
     expect(queries.at(-1)).toContain("$6::boolean OR $1::text IS NOT NULL OR incidents.status <> 'resolved'");
   });
+});
+
+describe("archived chat visibility",()=>{
+ it("hides archived chats by default and exposes them through an explicit flag",async()=>{
+  const {app,queries}=await activityServer();const headers={cookie:"aisevak_session=test-session"};
+  expect((await app.inject({method:"GET",url:"/api/agent-threads",headers})).statusCode).toBe(200);
+  expect(queries.at(-1)).toContain("WHERE agent_threads.archived_at IS NULL");
+  expect((await app.inject({method:"GET",url:"/api/agent-threads?includeArchived=true",headers})).statusCode).toBe(200);
+  expect(queries.at(-1)).not.toContain("WHERE agent_threads.archived_at IS NULL");
+ });
 });

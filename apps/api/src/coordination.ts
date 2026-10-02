@@ -88,6 +88,8 @@ export interface AgentContext {
 
 export type Queryable = DbPool | PoolClient;
 
+import { assertThreadAcceptsInput } from "./threadArchive.js";
+
 interface AgentThreadSession {
   id: string;
   task_id: string | null;
@@ -2103,6 +2105,7 @@ export async function queueDelivery(
     : managedCodexHome(managedRoot, `thread-${threadId}-${recipientAgentId}`);
   const desiredCwd = project?.rows[0]?.local_path ?? managedRoot;
   if (session) {
+    await assertThreadAcceptsInput(client, session.id);
     const desiredTaskId = linkedTaskId;
     ownershipTransferUnsafe =
       session.task_id !== desiredTaskId ||
@@ -2216,6 +2219,7 @@ export async function queueDelivery(
     if (!session) throw new Error("Agent session was created concurrently but could not be read");
   }
 
+  await assertThreadAcceptsInput(client, session.id);
   const message = await showMessage(client, messageId, true);
   const envelope = await loadJobEnvelope(client, thread.task_id, assignmentId ?? null, {
     coordinationThreadId: threadId,
