@@ -367,9 +367,14 @@ function processRunGroup(
         (stringArrayValue(item?.summary).join("\n") || stringArrayValue(item?.content).join("\n"));
       if (event.event_type === "item/reasoning/delta" ? !text : !text.trim()) continue;
       const block = touchThinking(createdAt);
+      // Older ACP records used item/completed with a shared reasoning ID.
+      // Preserve their independent steps, while true item snapshots replace
+      // the accumulated deltas for their uniquely identified item.
+      const legacyStep = event.event_type === "item/completed" && itemId === "reasoning";
+      const previous = reasoningByItemId.get(itemId) ?? "";
       reasoningByItemId.set(itemId, event.event_type === "item/reasoning/delta"
-        ? (reasoningByItemId.get(itemId) ?? "") + text
-        : text);
+        ? previous + text
+        : legacyStep && previous && previous !== text ? `${previous}\n\n${text}` : text);
       block.text = [...reasoningByItemId.values()].join("\n\n");
       replace({ ...block });
       continue;

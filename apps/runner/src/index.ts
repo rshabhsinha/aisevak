@@ -702,7 +702,7 @@ function scheduleJobEnvelopePrompt(
   return taskEnvelopePrompt(task, coordinationThreadId, agentThreadId, providerThreadId, prompt);
 }
 
-async function enqueueDueSchedule(pool: DbPool): Promise<void> {
+export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
   await withTransaction(pool, async (client) => {
     const dueResult = await client.query<DueSchedule>(
       `SELECT schedules.id,
@@ -782,8 +782,8 @@ async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     let projectId = target?.rows[0]?.project_id ?? null;
     let coordinationThreadId = target?.rows[0]?.coordination_thread_id ?? null;
     let cwd = target?.rows[0]?.local_path ?? env.managedRoot;
-    let workspaceMode = target?.rows[0]?.workspace_mode ?? "unknown";
-    let workspaceSource = target?.rows[0]?.source ?? "unknown";
+    let workspaceMode = target?.rows[0]?.project_id ? target.rows[0].workspace_mode ?? "unknown" : "projectless";
+    let workspaceSource = target?.rows[0]?.project_id ? target.rows[0].source ?? "unknown" : "projectless";
 
     if (!taskId) {
       const workScope = `schedule:${schedule.id}`;
