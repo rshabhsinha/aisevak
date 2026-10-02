@@ -48,6 +48,7 @@ describe("Codex model defaults", () => {
   });
 
   it("accepts a supported configured default and rejects unknown values", () => {
+    expect(resolveCodexDefaultModel("gpt-6.1-sol")).toBe("gpt-6.1-sol");
     expect(resolveCodexDefaultModel("gpt-5.6-terra")).toBe("gpt-5.6-terra");
     expect(resolveCodexDefaultModel("not-a-model")).toBe("gpt-5.6-luna");
     expect(resolveCodexDefaultModel("auto")).toBe("gpt-5.6-luna");

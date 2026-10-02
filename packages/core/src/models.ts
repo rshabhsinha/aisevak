@@ -44,10 +44,13 @@ function reasoning(defaultValue: string, maximum: "xhigh" | "max" | "ultra"): Co
 }
 
 // Fallback catalog used only when live `model/list` discovery fails.
-// IDs, reasoning ranges, and defaults below were verified against a live
-// `codex` app-server on 2026-09-03. The luna/max default is repo policy
-// (see migrations); the live server reports sol as its own default.
+// IDs, reasoning ranges and CLI defaults verified with Codex 0.160.0 on
+// 2026-10-02. The existing Luna/max application policy remains unchanged.
 export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
+  { id: "gpt-6.1-sol", label: "GPT-6.1-Sol", description: "Latest workhorse model for coding and everyday work.", options: reasoning("low", "ultra") },
+  { id: "gpt-6-astra", label: "GPT-6-Astra", description: "Frontier intelligence for the most demanding work.", options: reasoning("low", "ultra") },
+  { id: "gpt-6-sol", label: "GPT-6-Sol", description: "Previous generation workhorse model.", options: reasoning("medium", "ultra") },
+  { id: "gpt-6-luna", label: "GPT-6-Luna", description: "Fast and affordable model for easier tasks.", options: reasoning("medium", "max") },
   {
     id: "gpt-5.6-sol",
     label: "GPT-5.6-Sol",
@@ -72,24 +75,6 @@ export const CODEX_HARNESS_MODELS: CodexHarnessModel[] = [
     label: "GPT-5.5",
     description: "Frontier model for complex coding, research, and real-world work.",
     options: reasoning("medium", "xhigh")
-  },
-  {
-    id: "gpt-5.4",
-    label: "GPT-5.4",
-    description: "Strong model for everyday coding.",
-    options: reasoning("medium", "xhigh")
-  },
-  {
-    id: "gpt-5.4-mini",
-    label: "GPT-5.4-Mini",
-    description: "Small, fast, and cost-efficient model for simpler coding tasks.",
-    options: reasoning("medium", "xhigh")
-  },
-  {
-    id: "gpt-5.3-codex-spark",
-    label: "GPT-5.3-Codex-Spark",
-    description: "Ultra-fast coding model.",
-    options: reasoning("high", "xhigh")
   }
 ];
 
