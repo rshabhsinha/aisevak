@@ -118,15 +118,15 @@ install_harness_clis() {
   fi
   install -d -o root -g "${RUNNER_USER}" -m 0755 "${HARNESS_BIN_DIR}"
   if command_exists curl; then
-    if [[ ! -x "${runner_home}/.opencode/bin/opencode" ]]; then
+    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" || ! -x "${runner_home}/.opencode/bin/opencode" ]]; then
       log "Installing OpenCode CLI for ${RUNNER_USER}"
       sudo -u "${RUNNER_USER}" curl -fsSL https://opencode.ai/install | sudo -u "${RUNNER_USER}" bash -s -- --no-modify-path || log "OpenCode install failed; continuing without it"
     fi
-    if [[ ! -x "${runner_home}/.local/bin/cursor-agent" ]]; then
+    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" || ! -x "${runner_home}/.local/bin/cursor-agent" ]]; then
       log "Installing Cursor agent CLI for ${RUNNER_USER}"
       sudo -u "${RUNNER_USER}" curl -fsSL https://cursor.com/install | sudo -u "${RUNNER_USER}" bash || log "Cursor agent install failed; continuing without it"
     fi
-    if [[ ! -x "${runner_home}/.local/bin/devin" ]]; then
+    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" || ! -x "${runner_home}/.local/bin/devin" ]]; then
       log "Installing Devin CLI for ${RUNNER_USER}"
       # The installer ends with a first-run welcome that exits nonzero without
       # a TTY; judge success by the binary it drops instead of the exit code.
@@ -140,28 +140,44 @@ install_harness_clis() {
   [[ -x "${runner_home}/.local/bin/agent" ]] && ln -sf "${runner_home}/.local/bin/agent" /usr/local/bin/agent
   [[ -x "${runner_home}/.local/bin/cursor-agent" ]] && ln -sf "${runner_home}/.local/bin/cursor-agent" /usr/local/bin/cursor-agent
   [[ -x "${runner_home}/.local/bin/devin" ]] && ln -sf "${runner_home}/.local/bin/devin" /usr/local/bin/devin
-  # Publish dereferenced copies for the read-only container mount.
-  # opencode is a single static binary; cursor-agent is a launcher that
-  # needs its sibling node runtime, so publish its whole version directory.
-  if [[ -x /usr/local/bin/opencode ]]; then
-    cp -f /usr/local/bin/opencode "${HARNESS_BIN_DIR}/opencode"
-  fi
-  # devin is a single self-contained binary; ~/.local/bin/devin symlinks into
-  # a versioned bundle, so copy the resolved file.
-  if [[ -x /usr/local/bin/devin ]]; then
-    cp -fL /usr/local/bin/devin "${HARNESS_BIN_DIR}/devin"
-  fi
+  # Publish complete binaries atomically: running processes keep their old
+  # inode, while new host/container probes see the same refreshed executable.
+  for harness in opencode devin; do
+    if [[ -x "/usr/local/bin/${harness}" ]]; then
+      install -m 0755 "$(readlink -f "/usr/local/bin/${harness}")" "${HARNESS_BIN_DIR}/.${harness}-${TIMESTAMP}"
+      mv -f "${HARNESS_BIN_DIR}/.${harness}-${TIMESTAMP}" "${HARNESS_BIN_DIR}/${harness}"
+    fi
+  done
   if [[ -x /usr/local/bin/cursor-agent ]]; then
+    local cursor_version_dir cursor_bundle
     cursor_version_dir="$(dirname "$(readlink -f /usr/local/bin/cursor-agent)")"
-    rm -rf "${HARNESS_BIN_DIR}/cursor-dist"
-    cp -r "${cursor_version_dir}" "${HARNESS_BIN_DIR}/cursor-dist"
-    ln -sf cursor-dist/cursor-agent "${HARNESS_BIN_DIR}/cursor-agent"
-    ln -sf cursor-dist/cursor-agent "${HARNESS_BIN_DIR}/agent"
+    cursor_bundle="cursor-$(basename "${cursor_version_dir}")"
+    if [[ ! -d "${HARNESS_BIN_DIR}/${cursor_bundle}" ]]; then
+      cp -r "${cursor_version_dir}" "${HARNESS_BIN_DIR}/.${cursor_bundle}-${TIMESTAMP}"
+      chmod -R a+rX "${HARNESS_BIN_DIR}/.${cursor_bundle}-${TIMESTAMP}"
+      mv "${HARNESS_BIN_DIR}/.${cursor_bundle}-${TIMESTAMP}" "${HARNESS_BIN_DIR}/${cursor_bundle}"
+    fi
+    for launcher in cursor-agent agent; do
+      ln -s "${cursor_bundle}/cursor-agent" "${HARNESS_BIN_DIR}/.${launcher}-${TIMESTAMP}"
+      mv -Tf "${HARNESS_BIN_DIR}/.${launcher}-${TIMESTAMP}" "${HARNESS_BIN_DIR}/${launcher}"
+    done
   fi
-  chmod -R a+rX "${HARNESS_BIN_DIR}" 2>/dev/null || true
   if command_exists npm; then
-    log "Updating Codex CLI"
-    npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
+    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" ]] || ! command_exists codex; then
+      log "Updating Codex CLI"
+      npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
+    fi
+    # The npm entry point is JavaScript with a platform package dependency.
+    # Publish its native executable, so the API container needs neither npm nor
+    # the host's global node_modules tree.
+    local codex_native
+    for codex_native in "$(npm root -g)"/@openai/codex/node_modules/@openai/codex-linux-*/vendor/*/bin/codex; do
+      if [[ -x "${codex_native}" ]]; then
+        install -m 0755 "${codex_native}" "${HARNESS_BIN_DIR}/.codex-${TIMESTAMP}"
+        mv -f "${HARNESS_BIN_DIR}/.codex-${TIMESTAMP}" "${HARNESS_BIN_DIR}/codex"
+        break
+      fi
+    done
   fi
 }
 

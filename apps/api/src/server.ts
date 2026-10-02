@@ -25,7 +25,6 @@ import {
   DEVIN_HARNESS_MODELS,
   OPENCODE_HARNESS_MODELS,
   defaultCodexModelOptions,
-  discoverCodexModels,
   fetchZenModelCatalog,
   materializeDevinAuthBundle,
   parseCursorModelList,
@@ -62,6 +61,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
 import { z } from "zod";
+import { discoverAuthenticatedCodexModels } from "./codexModels.js";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
 import { CursorAuthManager } from "./cursorAuth.js";
 import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
@@ -418,7 +418,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/codex/models", async (request) => {
     requireUser(request);
-    return getCodexModelSnapshot();
+    return getCodexModelSnapshot(pool);
   });
 
   app.get("/api/provider-instances", async (request) => {
@@ -435,7 +435,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          WHERE enabled = true
          ORDER BY created_at ASC`
       ),
-      getCodexModelSnapshot(),
+      getCodexModelSnapshot(pool),
       getCursorModelSnapshot(pool),
       getOpenCodeModelSnapshot(),
       getDevinModelSnapshot(pool)
@@ -2513,14 +2513,14 @@ async function getTaskJoin(pool: Pick<DbPool, "query">, taskId: string): Promise
   return mustRow(taskResult.rows[0]);
 }
 
-async function getCodexModelSnapshot(): Promise<{
+async function getCodexModelSnapshot(pool: DbPool): Promise<{
   defaultModel: string;
   models: typeof CODEX_HARNESS_MODELS;
   source: "live" | "fallback";
 }> {
   if (codexModelCache && codexModelCache.expiresAt > Date.now()) return codexModelCache;
   try {
-    const liveModels = await discoverCodexModels({ codexBinary: env.codexBinary });
+    const liveModels = await discoverAuthenticatedCodexModels(pool, { binary: env.codexBinary, root: resolve(env.managedRoot, "harness-auth"), secretKey: env.secretKey });
     if (liveModels.length > 0) {
       const configured = applyCodexModelDefaults(liveModels, env.codexDefaultModel);
       codexModelCache = {
@@ -2532,7 +2532,7 @@ async function getCodexModelSnapshot(): Promise<{
       return codexModelCache;
     }
   } catch (error) {
-    console.warn("Codex model discovery failed; using fallback catalog", error);
+    console.warn("Codex model discovery failed; using fallback catalog", sanitizeCodexAuthError(error));
   }
   const configured = applyCodexModelDefaults(CODEX_HARNESS_MODELS, env.codexDefaultModel);
   codexModelCache = {
