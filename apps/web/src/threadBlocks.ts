@@ -143,29 +143,26 @@ export function deriveThreadBlocks(input: {
     (left[0]?.created_at ?? "").localeCompare(right[0]?.created_at ?? "")
   );
 
-  // Resumed provider sessions replay prior turns' content at session start
-  // (Devin re-emits the previous reasoning and assistant message as single
-  // deltas before the new turn's stream). Content emitted before this run is
-  // recorded so each group can drop verbatim replays.
-  const replay: ReplayState = {
-    assistantTexts: [],
-    thinkingTexts: new Set(),
-    toolItemIds: new Set()
-  };
   for (const groupEvents of orderedGroups) {
-    const startIndex = blocks.length;
-    processRunGroup(groupEvents, fallbackCreatedAt, { push, replace, blockIndex, blocks }, replay);
-    for (const block of blocks.slice(startIndex)) {
-      if (block.kind === "assistant" && block.text.trim()) {
-        replay.assistantTexts.push(block.text);
+    const providerEvents = groupEvents.filter(event => !isSteeringEvent(event));
+    const steeringEvents = groupEvents.filter(isSteeringEvent).sort((left, right) =>
+      (left.created_at ?? "").localeCompare(right.created_at ?? "") || left.id.localeCompare(right.id)
+    );
+    // Place synthetic inputs at their timestamp boundary without reordering
+    // provider chunks, whose database timestamps can arrive out of order.
+    const chronologicalEvents: ThreadEvent[] = [];
+    let steeringIndex = 0;
+    let latestTimestamp = "";
+    for (const event of providerEvents) {
+      latestTimestamp = [latestTimestamp, event.created_at ?? ""].sort().at(-1)!;
+      while (steeringIndex < steeringEvents.length &&
+        (steeringEvents[steeringIndex]!.created_at ?? "") < latestTimestamp) {
+        chronologicalEvents.push(steeringEvents[steeringIndex++]!);
       }
-      if (block.kind === "thinking" && block.text.trim()) {
-        replay.thinkingTexts.add(block.text);
-      }
-      if (block.kind === "tools") {
-        for (const entry of block.entries) replay.toolItemIds.add(entry.id);
-      }
+      chronologicalEvents.push(event);
     }
+    chronologicalEvents.push(...steeringEvents.slice(steeringIndex));
+    processRunGroup(chronologicalEvents, fallbackCreatedAt, { push, replace, blockIndex, blocks });
   }
 
   for (const message of input.pendingMessages ?? []) {
@@ -201,10 +198,8 @@ export function deriveThreadBlocks(input: {
   return blocks;
 }
 
-interface ReplayState {
-  assistantTexts: string[];
-  thinkingTexts: Set<string>;
-  toolItemIds: Set<string>;
+function isSteeringEvent(event: ThreadEvent): boolean {
+  return event.event_type === "thread.message-sent" && rawRecord(event.payload)?.steer === true;
 }
 
 function processRunGroup(
@@ -215,22 +210,19 @@ function processRunGroup(
     blockIndex: Map<string, number>;
     push: (block: ThreadBlock) => ThreadBlock;
     replace: (block: ThreadBlock) => void;
-  },
-  replay: ReplayState
+  }
 ): void {
   const { blocks, blockIndex, push, replace } = ctx;
   const assistantByItemId = new Map<string, Extract<ThreadBlock, { kind: "assistant" }>>();
   const toolByItemId = new Map<string, { blockId: string; entryIndex: number }>();
   let thinkingBlock: Extract<ThreadBlock, { kind: "thinking" }> | null = null;
   let planBlockId: string | null = null;
-  // Leading deltas for an item that exactly match prior turns' assistant
-  // texts (in order) are session-resume replays and get dropped. The buffer
-  // holds accumulated-but-unresolved delta text; once a delta diverges from
-  // the expected replay text the whole buffer is emitted as new content.
-  const replayPending = new Map<string, { buffer: string; nextReplay: number }>();
+  const reasoningByItemId = new Map<string, string>();
+  const groupStartIndex = blocks.length;
 
   const touchThinking = (createdAt: string) => {
     if (thinkingBlock) return thinkingBlock;
+    reasoningByItemId.clear();
     thinkingBlock = {
       kind: "thinking",
       id: `thinking:${createdAt}:${blocks.length}`,
@@ -285,7 +277,7 @@ function processRunGroup(
     // calls share one card.
     const previous = blocks[blocks.length - 1];
     const target: Extract<ThreadBlock, { kind: "tools" }> =
-      previous?.kind === "tools"
+      blocks.length > groupStartIndex && previous?.kind === "tools"
         ? previous
         : (push({
             kind: "tools",
@@ -313,6 +305,7 @@ function processRunGroup(
     const createdAt = event.created_at ?? fallbackCreatedAt;
     const normalized = rawRecord(event.payload);
     const raw = rawRecord(normalized?.raw) ?? normalized;
+    if (raw?.aisevakReplay === true) continue;
     const params = rawRecord(raw?.params);
     const item = rawRecord(raw?.item) ?? rawRecord(params?.item);
     const itemId =
@@ -343,25 +336,8 @@ function processRunGroup(
       const delta = event.text ?? stringValue(params?.delta);
       if (!delta) continue;
       thinkingBlock = null;
-      let emitted = delta;
-      if (!assistantByItemId.has(itemId) || replayPending.has(itemId)) {
-        const pending = replayPending.get(itemId) ?? { buffer: "", nextReplay: 0 };
-        pending.buffer += delta;
-        const expected = replay.assistantTexts[pending.nextReplay];
-        if (expected !== undefined && pending.buffer === expected) {
-          replayPending.set(itemId, { buffer: "", nextReplay: pending.nextReplay + 1 });
-          continue;
-        }
-        if (expected !== undefined && expected.startsWith(pending.buffer)) {
-          replayPending.set(itemId, pending);
-          continue;
-        }
-        replayPending.delete(itemId);
-        emitted = pending.buffer;
-        if (!emitted) continue;
-      }
       upsertAssistant(itemId, createdAt, (block) => {
-        block.text += emitted;
+        block.text += delta;
       });
       continue;
     }
@@ -391,10 +367,13 @@ function processRunGroup(
         stringValue(item?.content) ??
         stringArrayValue(item?.summary).join("\n") ??
         "";
-      if (!text.trim() || replay.thinkingTexts.has(text)) continue;
+      if (!text.trim()) continue;
       const block = touchThinking(createdAt);
-      const merged = block.text ? `${block.text}\n\n${text}` : text;
-      replace({ ...block, text: merged });
+      reasoningByItemId.set(itemId, event.event_type === "item/reasoning/delta"
+        ? (reasoningByItemId.get(itemId) ?? "") + text
+        : text);
+      block.text = [...reasoningByItemId.values()].join("\n\n");
+      replace({ ...block });
       continue;
     }
 
@@ -410,7 +389,6 @@ function processRunGroup(
     }
 
     if (TOOL_ITEM_TYPES.has(itemType) || event.event_type === "session/request_permission") {
-      if (replay.toolItemIds.has(itemId)) continue;
       thinkingBlock = null;
       const status = toolStatusOf(
         stringValue(item?.status) ?? stringValue(raw?.status),

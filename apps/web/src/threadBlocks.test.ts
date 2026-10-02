@@ -264,3 +264,42 @@ describe("deriveThreadBlocks", () => {
     expect(blockKinds(blocks)).toEqual(["user"]);
   });
 });
+
+
+describe("timeline regressions", () => {
+  it("keeps repeated replies and prefixes in separate runs", () => {
+    const events = ["Done", "Done", "All done", "All"].map((text, i) => ({
+      ...acpDelta(text, { seq: 1, createdAt: `2026-01-01T00:0${i}:00Z` }), dispatcher_run_id: `r${i}`
+    }));
+    expect(assistantTexts(deriveThreadBlocks({ run: null, events }))).toEqual(["Done", "Done", "All done", "All"]);
+  });
+  it("drops only explicitly identified session-load replay events", () => {
+    const replay = acpDelta("old");
+    replay.payload = { raw: { aisevakReplay: true } };
+    expect(assistantTexts(deriveThreadBlocks({ run: null, events: [replay, acpDelta("new")] }))).toEqual(["new"]);
+  });
+  it("accumulates reasoning deltas and replaces a completed snapshot", () => {
+    const thought = (text: string, type = "item/reasoning/delta") => event(type, {
+      text, payload: { itemId: "thought", raw: { params: { item: { id: "thought", type: "reasoning", text } } } }
+    });
+    const blocks = deriveThreadBlocks({ run: null, events: [thought("First "), thought("thought"), thought("First thought", "item/completed")] });
+    expect(blocks).toMatchObject([{ kind: "thinking", text: "First thought" }]);
+  });
+  it("keeps reused tool IDs in later runs", () => {
+    const events = ["ls", "git status"].map((command, i) => ({
+      ...event("item/completed", { createdAt: `2026-01-01T00:0${i}:00Z`, payload: { raw: { params: { item: { id: "tool-1", type: "command_execution", command, status: "completed" } } } } }),
+      dispatcher_run_id: `r${i}`
+    }));
+    const blocks = deriveThreadBlocks({ run: null, events });
+    expect(blocks.flatMap(b => b.kind === "tools" ? b.entries.map(e => e.command) : [])).toEqual(["ls", "git status"]);
+  });
+  it("places steering messages after earlier output in submission order", () => {
+    const user = (id: string, text: string, createdAt: string) => ({ ...event("thread.message-sent", { text, seq: 0, createdAt, payload: { steer: true } }), id });
+    const blocks = deriveThreadBlocks({ run: null, events: [
+      acpDelta("earlier", { seq: 1, createdAt: "2026-01-01T00:00:01Z" }),
+      user("z", "first steer", "2026-01-01T00:00:02Z"),
+      user("a", "second steer", "2026-01-01T00:00:03Z")
+    ] });
+    expect(blocks).toMatchObject([{ kind: "assistant", text: "earlier" }, { kind: "user", text: "first steer" }, { kind: "user", text: "second steer" }]);
+  });
+});

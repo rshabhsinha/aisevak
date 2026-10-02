@@ -121,7 +121,9 @@ class PersistentAcpSession {
     let promptMayHaveBeenPresented = false;
     let cancelRequested = false;
     const rawLines: string[] = [];
+    let loadingSession = false;
     const emit = async (line: string) => {
+      if (loadingSession) line = JSON.stringify({ ...JSON.parse(line), aisevakReplay: true });
       seq += 1;
       rawLines.push(line);
       await options.onLine(redactSecrets(line, options.secrets), seq);
@@ -133,6 +135,7 @@ class PersistentAcpSession {
     try {
       await this.initialize(options.authMethodId);
       if (options.threadId) {
+        loadingSession = true;
         try {
           await this.request("session/load", {
             sessionId: options.threadId,
@@ -146,6 +149,8 @@ class PersistentAcpSession {
             error: error instanceof Error ? error.message : String(error)
           });
           this.sessionId = null;
+        } finally {
+          loadingSession = false;
         }
       }
       if (!this.sessionId) {
