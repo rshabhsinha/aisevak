@@ -191,6 +191,9 @@ interface AgentThread {
   cwd: string;
   branch: string | null;
   provider_thread_id: string | null;
+  archived_at: string | null;
+  cleanup_state: string | null;
+  cleanup_error: string | null;
   last_activity_at: string;
   latest_run_id: string | null;
   latest_run_kind: "worker" | "dispatcher" | null;
@@ -430,6 +433,8 @@ export function App() {
   const [repos, setRepos] = useState<GithubRepository[]>([]);
   const [githubConnection, setGithubConnection] = useState<GithubConnection | null>(null);
   const [githubHostname, setGithubHostname] = useState("github.com");
+  const threadsRequestRef = useRef(0);
+  const [includeArchivedThreads, setIncludeArchivedThreads] = useState(false);
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(initialRoute.threadId);
@@ -478,8 +483,9 @@ export function App() {
 
   const filteredThreads = useMemo(() => {
     const needle = query.trim().toLowerCase();
-    if (!needle) return agentThreads;
-    return agentThreads.filter((thread) =>
+    const visible = agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at);
+    if (!needle) return visible;
+    return visible.filter((thread) =>
       [
         thread.title,
         thread.agent_name,
@@ -492,7 +498,7 @@ export function App() {
         .toLowerCase()
         .includes(needle)
     );
-  }, [agentThreads, query]);
+  }, [agentThreads, query, includeArchivedThreads]);
 
   const filteredSchedules = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -763,13 +769,17 @@ export function App() {
     setSchedules(data.schedules);
   }
 
+  useEffect(() => {
+    if (user) void reloadAgentThreads().catch(error => setMessage(error instanceof Error ? error.message : "Could not load chats"));
+  }, [includeArchivedThreads]);
+
   async function reloadAgentThreads(cursor?: string): Promise<AgentThread[]> {
-    const suffix = cursor
-      ? `?limit=${SIDEBAR_THREAD_PAGE_SIZE}&cursor=${encodeURIComponent(cursor)}`
-      : `?limit=${SIDEBAR_THREAD_PAGE_SIZE}`;
+    const requestId = ++threadsRequestRef.current;
+    const suffix = `?limit=${SIDEBAR_THREAD_PAGE_SIZE}&includeArchived=${includeArchivedThreads}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
     const data = await api<{ threads: AgentThread[]; nextCursor: string | null }>(
       `/api/agent-threads${suffix}`
     );
+    if (requestId !== threadsRequestRef.current) return [];
     setAgentThreads((current) => {
       return mergeRefreshedAgentThreads(current, data.threads);
     });
@@ -986,6 +996,15 @@ export function App() {
               </div>
             ) : null}
 
+            {view === "runs" ? <label className="text-muted" style={{padding:"6px 12px", fontSize:12}}>
+              <input type="checkbox" checked={includeArchivedThreads} onChange={event => {
+                threadsRequestRef.current += 1;
+                setAgentThreads(current => selectedThread ? current.filter(thread => thread.id === selectedThread.id) : []);
+                setNextThreadCursor(null);
+                setIncludeArchivedThreads(event.target.checked);
+              }} /> Show archived chats
+            </label> : null}
+
             {draftThread && view === "runs" ? (
               <button
                 type="button"
@@ -1002,7 +1021,7 @@ export function App() {
               </button>
             ) : null}
 
-            {(view === "runs" ? filteredThreads : agentThreads).map((thread) => {
+            {(view === "runs" ? filteredThreads : agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at)).map((thread) => {
               const isSelected = view === "runs" && selectedThreadId === thread.id;
               return (
                 <button
@@ -1037,7 +1056,7 @@ export function App() {
               );
             })}
 
-            {(view === "runs" ? filteredThreads : agentThreads).length === 0 && !draftThread ? (
+            {(view === "runs" ? filteredThreads : agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at)).length === 0 && !draftThread ? (
               <div className="sidebar-runs-empty">
                 {view === "runs" && query ? "No matching threads" : "No threads yet"}
               </div>
@@ -1256,6 +1275,15 @@ export function App() {
                   }}
                   onRetry={() => {
                     if (selectedThreadId) void loadAgentThread(selectedThreadId);
+                  }}
+                  onArchive={async () => {
+                    if (!selectedThread) return;
+                    try {
+                      const data = await api<{thread:AgentThread}>(`/api/agent-threads/${selectedThread.id}/${selectedThread.archived_at ? 'restore' : 'archive'}`,{method:'POST'});
+                      threadsRequestRef.current += 1;
+                      setAgentThreads(current => updateAgentThreadInPlace(current,data.thread));
+                      await loadAgentThread(selectedThread.id);
+                    } catch(error) { setMessage(error instanceof Error ? error.message : "Could not archive or restore chat"); }
                   }}
                   onCancel={async () => {
                     if (!selectedThreadId) return;
@@ -3057,6 +3085,7 @@ function AgentChatsView(props: {
   onBack?: () => void;
   onRetry: () => void;
   onCancel: () => Promise<void>;
+  onArchive: () => Promise<void>;
 }) {
   const timelineRef = useRef<HTMLDivElement>(null);
   const pinnedToBottomRef = useRef(true);
@@ -3136,6 +3165,9 @@ function AgentChatsView(props: {
           </div>
         </div>
         <div className="agent-chat-header-actions">
+          {props.thread && !props.draft ? <Button variant="secondary" size="sm" onClick={() => void props.onArchive()}>
+            {props.thread.archived_at ? "Restore" : "Archive"}
+          </Button> : null}
           {!props.draft && props.thread?.latest_status ? <TaskStatus status={props.thread.latest_status} /> : null}
           {active ? (
             <Button variant="secondary" size="sm" onClick={() => void props.onCancel()}>
@@ -3265,7 +3297,10 @@ function AgentChatsView(props: {
         ) : null}
 
         <div className="agent-chat-composer-wrap">
-          <AgentChatComposer
+          {props.thread?.archived_at || props.thread?.cleanup_state === 'restoring' ? <div className="text-muted" role="status">
+            {props.thread.archived_at ? "Chat archived. Restore it to send a message." : "Restoring chat…"}
+            {props.thread.cleanup_error ? <p>{props.thread.cleanup_error}</p> : null}
+          </div> : <AgentChatComposer
             active={active}
             providers={props.providers}
             selection={props.selection}
@@ -3275,7 +3310,7 @@ function AgentChatsView(props: {
             onSelectionChange={props.onSelectionChange}
             onSend={props.onSendMessage}
             onCancel={props.onCancel}
-          />
+          />}
         </div>
       </div>
     </div>

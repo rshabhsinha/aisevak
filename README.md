@@ -128,3 +128,17 @@ Prefer zero-maintenance infrastructure? Reserve a dedicated, single-tenant 4 vCP
 AiSevak was created by **[PromptLabs Pvt Ltd](https://promptlabs.link)** (Directors: Rishabh Sinha & Amit Kumar Modi) to orchestrate agents developing **[Embedr](https://embedr.app)**, the AI-powered IDE for embedded systems and hardware firmware.
 
 Licensed under the **[MIT License](LICENSE)**.
+
+Chat archiving retains the Aisevak timeline and provider history. Archived chats
+are hidden unless **Show archived chats** is enabled (API: `includeArchived=true`).
+Archive stops queued/active turns, archives Codex through its app-server protocol,
+and asks the runner to remove clean, idle, managed linked checkouts. Restore waits
+for provider unarchive before accepting another turn. ACP providers retain their
+session history and close their idle process because ACP has no archive method.
+
+The runner also cleans completed/cancelled task checkouts and expired tool tokens.
+It keeps branches, primary repositories, dirty/untracked/unknown ignored files,
+shared checkouts and live processes. Only ignored root `node_modules` and generated
+skill copies are disposable. Deferred cleanup records its reason and retries after
+five minutes, including after a restart. `AISEVAK_AUTO_WORKTREE_CLEANUP=0` disables
+automatic cleanup. Recreated checkouts retain existing branch commits.
