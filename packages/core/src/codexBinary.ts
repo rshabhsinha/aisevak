@@ -17,6 +17,10 @@ export function resolveCodexBinary(
     if (requested !== "codex") return requested;
   }
 
+  if (automatic && process.platform === "linux" && isExecutable("/opt/aisevak/harness-bin/codex")) {
+    return "/opt/aisevak/harness-bin/codex";
+  }
+
   const fromPath = resolvePathExecutable("codex", environment);
   if (fromPath) return fromPath;
 
