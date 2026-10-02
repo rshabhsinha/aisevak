@@ -75,6 +75,7 @@ describe("dispatcher source-run locking", () => {
       if (sql.includes("status IN ('queued', 'running')")) return { rows: [] };
       if (sql.includes("INSERT INTO dispatcher_runs")) return { rows: [{ ...sourceRun, id: "replacement-run" }] };
       if (sql.includes("INSERT INTO dispatcher_run_events")) return { rows: [] };
+      if (sql.includes("SELECT archived_at, cleanup_state")) return {rows:[{archived_at:null,cleanup_state:null}]};
       throw new Error(`Unexpected query: ${sql}`);
     };
     const client = { query, release() {} };

@@ -12,6 +12,7 @@ describe("agent turn input steering", () => {
       if (sql.includes("active_turns")) return { rows: [{ id: "run-id", kind: "worker" }] };
       if (sql.includes("INSERT INTO agent_turn_inputs")) return { rows: [] };
       if (sql.includes("FROM agent_threads")) return { rows: [{}] };
+      if (sql.includes("SELECT archived_at, cleanup_state")) return {rows:[{archived_at:null,cleanup_state:null}]};
       throw new Error(`Unexpected query: ${sql}`);
     };
     const client = { query, release() {} };
@@ -33,6 +34,7 @@ describe("agent turn input steering", () => {
         return { rows: [{ id: "input-id", message: "continue" }] };
       }
       if (sql.includes("FROM agent_threads")) return { rows: [{}] };
+      if (sql.includes("SELECT archived_at, cleanup_state")) return {rows:[{archived_at:null,cleanup_state:null}]};
       throw new Error(`Unexpected query: ${sql}`);
     };
     const client = { query, release() {} };
@@ -84,7 +86,8 @@ describe("agent turn input steering", () => {
         if (sql.includes("SELECT * FROM dispatcher_runs")) {
           return { rows: [{ id: "active-run", status: "running" }] };
         }
-        throw new Error(`Unexpected query: ${sql}`);
+        if (sql.includes("SELECT archived_at, cleanup_state")) return {rows:[{archived_at:null,cleanup_state:null}]};
+      throw new Error(`Unexpected query: ${sql}`);
       }
     };
     const pool = {
