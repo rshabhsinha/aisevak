@@ -70,14 +70,10 @@ import { Switch } from "./components/ui/switch";
 import { Textarea } from "./components/ui/textarea";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "./components/ui/tooltip";
 import {
-  deriveAgentRunTimelineRows,
-  formatElapsed,
-  normalizeCompactToolLabel,
   type AgentRunChatMessage,
-  type AgentRunTimelineRun,
-  type AgentRunTimelineRow,
-  type AgentRunWorkLogEntry
+  type AgentRunTimelineRun
 } from "./agentRunTimeline";
+import { ChatTimeline, CollapsibleText, CopyButton } from "./components/chat-timeline";
 import { mergeRefreshedAgentThreads, updateAgentThreadInPlace } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
@@ -342,6 +338,8 @@ interface RunEvent {
   text?: string | null;
   payload: unknown;
   created_at?: string;
+  run_id?: string | null;
+  dispatcher_run_id?: string | null;
 }
 
 interface Run {
@@ -3207,7 +3205,7 @@ function AgentChatsView(props: {
                 Showing the latest 2,000 events to keep this thread responsive.
               </div>
             ) : null}
-            <CodexSessionTimeline
+            <ChatTimeline
               run={props.run}
               events={props.events}
               pendingMessages={props.pendingMessages}
@@ -5362,190 +5360,6 @@ function SettingsView(props: {
   );
 }
 
-function CodexSessionTimeline({
-  run,
-  events,
-  pendingMessages = []
-}: {
-  run: AgentRunTimelineRun | null;
-  events: RunEvent[];
-  pendingMessages?: AgentRunChatMessage[];
-}) {
-  const rows = useMemo(
-    () => deriveAgentRunTimelineRows({ run, events, pendingMessages }),
-    [events, pendingMessages, run]
-  );
-
-  if (!run && events.length === 0 && pendingMessages.length === 0) {
-    return (
-      <div className="chat-timeline empty-chat">
-        <span className="text-muted">No run events yet.</span>
-      </div>
-    );
-  }
-
-  return (
-    <div className="chat-timeline">
-      {rows.length === 0 ? <span className="text-muted">No run events yet.</span> : null}
-      {rows.map((row) => (
-        <TimelineRow row={row} key={row.id} />
-      ))}
-    </div>
-  );
-}
-
-function TimelineRow({ row }: { row: AgentRunTimelineRow }) {
-  if (row.kind === "comment") return <TaskCommentTimelineRow row={row} />;
-  if (row.kind === "work") return <WorkGroupSection groupedEntries={row.groupedEntries} />;
-  if (row.kind === "working") return <WorkingTimelineRow row={row} />;
-  if (row.message.role === "user") return <UserTimelineRow row={row} />;
-  if (row.message.role === "assistant") return <AssistantTimelineRow row={row} />;
-  return <SystemTimelineRow row={row} />;
-}
-
-function TaskCommentTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "comment" }> }) {
-  return (
-    <div className="task-comment-row">
-      <div className="task-comment-bubble">
-        <div className="task-comment-label">Task comment</div>
-        <MarkdownContent text={row.text} plain />
-        <TimelineMeta createdAt={row.createdAt} />
-      </div>
-    </div>
-  );
-}
-
-function UserTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
-  return (
-    <div className="timeline-user-row">
-      <div className="user-bubble">
-        <CollapsibleText text={row.message.text} />
-        <TimelineMeta createdAt={row.message.createdAt} completedAt={row.message.completedAt} />
-      </div>
-    </div>
-  );
-}
-
-function AssistantTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
-  return (
-    <div className="timeline-assistant-row">
-      <div className="assistant-message group-assistant">
-        <MarkdownContent text={row.message.text || (row.message.streaming ? "" : "(empty response)")} />
-        <div className="assistant-meta-row">
-          <TimelineMeta
-            createdAt={row.message.createdAt}
-            completedAt={row.message.completedAt}
-            durationStart={row.durationStart}
-          />
-          {!row.message.streaming && row.message.text.trim() ? (
-            <CopyButton text={row.message.text} label="Copy message" />
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function SystemTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "message" }> }) {
-  return (
-    <div className="system-row">
-      <span>{row.message.text}</span>
-    </div>
-  );
-}
-
-function WorkGroupSection({ groupedEntries }: { groupedEntries: AgentRunWorkLogEntry[] }) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const maxVisible = 6;
-  const hasOverflow = groupedEntries.length > maxVisible;
-  const visibleEntries =
-    hasOverflow && !isExpanded ? groupedEntries.slice(-maxVisible) : groupedEntries;
-  const hiddenCount = groupedEntries.length - visibleEntries.length;
-  const onlyToolEntries = groupedEntries.every((entry) => entry.tone === "tool");
-
-  return (
-    <div className="work-group">
-      {hasOverflow || !onlyToolEntries ? (
-        <div className="work-group-head">
-          <span>{onlyToolEntries ? "Tool calls" : "Work log"} ({groupedEntries.length})</span>
-          {hasOverflow ? (
-            <button type="button" onClick={() => setIsExpanded((value) => !value)}>
-              {isExpanded ? "Show less" : `Show ${hiddenCount} more`}
-            </button>
-          ) : null}
-        </div>
-      ) : null}
-      <div className="work-group-rows">
-        {visibleEntries.map((entry) => (
-          <SimpleWorkEntryRow workEntry={entry} key={entry.id} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function SimpleWorkEntryRow({ workEntry }: { workEntry: AgentRunWorkLogEntry }) {
-  const [expanded, setExpanded] = useState(false);
-  const Icon = workEntryIcon(workEntry);
-  const heading = toolWorkEntryHeading(workEntry);
-  const preview = workEntryPreview(workEntry);
-  const displayText = preview ? `${heading} - ${preview}` : heading;
-  const hasDetail = Boolean(workEntry.detail?.trim());
-  const isDiff = Boolean(
-    workEntry.detail &&
-      (workEntry.detail.includes("--- a/") ||
-        workEntry.detail.includes("+++ b/") ||
-        (workEntry.detail.includes("@@") && workEntry.detail.includes("\n+")))
-  );
-
-  return (
-    <div className={`work-entry ${workEntry.tone}`}>
-      <button
-        type="button"
-        className="work-entry-main"
-        onClick={() => setExpanded((value) => !value)}
-        title={displayText}
-      >
-        <span className="work-entry-icon">
-          <Icon size={13} />
-        </span>
-        <span className="work-entry-text">
-          <strong>{heading}</strong>
-          {preview ? <span> - {preview}</span> : null}
-        </span>
-        {hasDetail ? (
-          <span className="work-entry-chevron">
-            {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-          </span>
-        ) : null}
-      </button>
-      {expanded && hasDetail ? (
-        isDiff ? (
-          <div className="px-2 pb-2">
-            <FileDiff filename={preview || heading} diff={workEntry.detail!} defaultExpanded={true} />
-          </div>
-        ) : (
-          <pre className="work-entry-detail">{workEntry.detail}</pre>
-        )
-      ) : null}
-    </div>
-  );
-}
-
-function WorkingTimelineRow({ row }: { row: Extract<AgentRunTimelineRow, { kind: "working" }> }) {
-  return (
-    <div className="working-row py-1 max-w-fit">
-      <ThinkingReasoning
-        label="Agent active"
-        isStreaming={true}
-        defaultExpanded={false}
-        liveElapsed={row.createdAt ? <LiveElapsed createdAt={row.createdAt} /> : undefined}
-        rawText={row.createdAt ? `Run in progress · Started at ${new Date(row.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}` : undefined}
-      />
-    </div>
-  );
-}
-
 function cleanReportMarkdown(markdown: string, title?: string): string {
   if (!markdown) return "";
   let clean = markdown.trim();
@@ -5560,36 +5374,6 @@ function cleanReportMarkdown(markdown: string, title?: string): string {
   return clean;
 }
 
-function CollapsibleText({ text }: { text: string }) {
-  const [expanded, setExpanded] = useState(false);
-  const shouldCollapse = text.length > 500 || text.split("\n").length > 7;
-  const collapsed = shouldCollapse && !expanded;
-
-  return (
-    <div className="agent-collapsible-container">
-      <div className={`collapsible-message ${collapsed ? "collapsed" : ""}`}>
-        <MarkdownContent text={text} plain />
-      </div>
-      {shouldCollapse ? (
-        <button
-          className="collapsible-toggle-btn"
-          type="button"
-          onClick={() => setExpanded((value) => !value)}
-        >
-          <span>{expanded ? "Show less" : "Show full report"}</span>
-          <ChevronDown
-            size={12}
-            style={{
-              transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
-              transition: "transform 140ms ease"
-            }}
-          />
-        </button>
-      ) : null}
-    </div>
-  );
-}
-
 function CodeBlock({ code, language }: { code: string; language?: string }) {
   return (
     <div className="code-block">
@@ -5600,81 +5384,6 @@ function CodeBlock({ code, language }: { code: string; language?: string }) {
       <pre>{code}</pre>
     </div>
   );
-}
-
-function CopyButton({ text, label }: { text: string; label: string }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <Button
-      className="copy-button"
-      variant="ghost"
-      size="icon"
-      type="button"
-      title={copied ? "Copied" : label}
-      onClick={async () => {
-        await navigator.clipboard?.writeText(text);
-        setCopied(true);
-        window.setTimeout(() => setCopied(false), 1200);
-      }}
-    >
-      {copied ? <CheckCircle2 size={13} /> : <Copy size={13} />}
-    </Button>
-  );
-}
-
-function TimelineMeta(props: {
-  createdAt: string;
-  completedAt?: string;
-  durationStart?: string;
-}) {
-  const duration = props.durationStart ? formatElapsed(props.durationStart, props.completedAt) : null;
-  return (
-    <span className="timeline-meta">
-      {formatTimestamp(props.createdAt)}
-      {duration ? ` · ${duration}` : ""}
-    </span>
-  );
-}
-
-function LiveElapsed({ createdAt }: { createdAt: string }) {
-  const [now, setNow] = useState(() => new Date().toISOString());
-  useEffect(() => {
-    const id = window.setInterval(() => setNow(new Date().toISOString()), 1000);
-    return () => window.clearInterval(id);
-  }, []);
-  return (
-    <span className="font-mono text-[10.5px] text-muted-foreground/75 tabular-nums">
-      {formatElapsed(createdAt, now) ?? "0s"}
-    </span>
-  );
-}
-
-function workEntryIcon(workEntry: AgentRunWorkLogEntry) {
-  if (workEntry.itemType === "command_execution" || workEntry.itemType === "commandExecution" || workEntry.command) {
-    return Terminal;
-  }
-  if (workEntry.itemType === "web_search" || workEntry.itemType === "webSearch") return Eye;
-  if (workEntry.itemType === "mcp_tool_call" || workEntry.itemType === "mcpToolCall") return Wrench;
-  if (workEntry.itemType === "dynamic_tool_call" || workEntry.itemType === "dynamicToolCall") return Hammer;
-  if (workEntry.tone === "error") return CircleAlert;
-  if (workEntry.tone === "thinking") return Bot;
-  if (workEntry.tone === "info") return CheckCircle2;
-  return Activity;
-}
-
-function toolWorkEntryHeading(workEntry: AgentRunWorkLogEntry): string {
-  const raw = workEntry.toolTitle || workEntry.label;
-  const normalized = normalizeCompactToolLabel(raw);
-  return `${normalized.charAt(0).toUpperCase()}${normalized.slice(1)}`;
-}
-
-function workEntryPreview(workEntry: AgentRunWorkLogEntry): string | null {
-  const preview = workEntry.command || workEntry.detail;
-  if (!preview) return null;
-  const normalizedPreview = normalizeCompactToolLabel(preview).toLowerCase();
-  const normalizedHeading = normalizeCompactToolLabel(toolWorkEntryHeading(workEntry)).toLowerCase();
-  if (normalizedPreview === normalizedHeading) return null;
-  return preview.replace(/\s+/g, " ").trim();
 }
 
 function TaskStatus({ status }: { status?: string | null }) {
