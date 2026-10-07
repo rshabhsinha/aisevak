@@ -153,7 +153,7 @@ export function PromptComposer(props: PromptComposerProps) {
                 aria-selected={index === activeIndex}
                 className={`prompt-command-option ${index === activeIndex ? "active" : ""}`}
                 key={option.id}
-                onMouseDown={(event) => event.preventDefault()}
+                onPointerDown={(event) => event.preventDefault()}
                 onClick={() => choose(option)}
               >
                 <span className="prompt-command-icon">{option.kind.slice(0, 1).toUpperCase()}</span>
