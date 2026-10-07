@@ -80,6 +80,7 @@ import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
 import { createTaskAndQueueRun } from "./taskCreation";
 import { createThreadLoadGuard } from "./threadLoadGuard";
+import { MOBILE_BREAKPOINT, shouldSubmitComposer, startsWithThreadDraft, trackVisualViewport } from "./mobileLayout";
 import {
   threadDetailFailed,
   threadDetailIdle,
@@ -438,7 +439,7 @@ export function App() {
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(initialRoute.threadId);
-  const [draftThread, setDraftThread] = useState(!initialRoute.threadId);
+  const [draftThread, setDraftThread] = useState(() => startsWithThreadDraft(initialRoute.threadId, window.innerWidth));
   const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
   const [agentThreadEvents, setAgentThreadEvents] = useState<RunEvent[]>([]);
   const [agentThreadEventsTruncated, setAgentThreadEventsTruncated] = useState(false);
@@ -446,6 +447,7 @@ export function App() {
   const [composerSelection, setComposerSelection] = useState<ModelSelection | null>(null);
   const [pendingThreadMessages, setPendingThreadMessages] = useState<AgentRunChatMessage[]>([]);
   const [taskComposerOpen, setTaskComposerOpen] = useState(false);
+  const [mobileMoreOpen, setMobileMoreOpen] = useState(false);
   const [editingAgent, setEditingAgent] = useState<Agent | null>(null);
   const [editingSkill, setEditingSkill] = useState<Skill | null>(null);
   const [scheduleComposerOpen, setScheduleComposerOpen] = useState(false);
@@ -472,6 +474,11 @@ export function App() {
     () => agentThreads.find((thread) => thread.id === selectedThreadId) ?? null,
     [agentThreads, selectedThreadId]
   );
+
+  const filteredAgents = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return agents.filter((agent) => [agent.name, agent.description, agent.model].join(" ").toLowerCase().includes(needle));
+  }, [agents, query]);
 
   const filteredSkills = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -544,6 +551,8 @@ export function App() {
     );
   }, [incidents, query, includeResolvedIncidents]);
 
+  useLayoutEffect(() => trackVisualViewport(window), []);
+
   useEffect(() => {
     void boot();
   }, []);
@@ -554,13 +563,14 @@ export function App() {
     }
     const handlePopState = () => {
       const route = parseAppRoute(window.location.pathname);
+      setMobileMoreOpen(false);
       setView(route.view);
       setQuery("");
       setMessage(null);
       if (route.view !== "runs") return;
       threadLoadGuardRef.current.select(route.threadId);
       setSelectedThreadId(route.threadId);
-      setDraftThread(!route.threadId);
+      setDraftThread(startsWithThreadDraft(route.threadId, window.innerWidth));
       setSelectedThreadRun(null);
       setAgentThreadEvents([]);
       setThreadDetailState(route.threadId ? threadDetailLoading() : threadDetailIdle());
@@ -844,6 +854,7 @@ export function App() {
   }
 
   function navigateToView(nextView: View, threadId: string | null = null) {
+    setMobileMoreOpen(false);
     const path = appPath(nextView, nextView === "runs" ? threadId : null);
     if (window.location.pathname !== path) window.history.pushState(null, "", path);
     setView(nextView);
@@ -958,16 +969,45 @@ export function App() {
           </div>
         </div>
 
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" aria-label="Main navigation">
           <span className="nav-label">Overview</span>
           <NavButton icon={<LayoutDashboard />} label="Tasks" active={view === "tasks"} onClick={() => navigateToView("tasks")} />
           <NavButton className="nav-item-threads" icon={<ChatsIcon />} label="Threads" active={view === "runs"} onClick={() => { selectAgentThread(""); navigateToView("runs"); }} />
           <NavButton icon={<Activity />} label="Activity" active={view === "activity"} onClick={() => navigateToView("activity")} />
-          <NavButton icon={<CircleAlert />} label="Incidents" active={view === "incidents"} onClick={() => navigateToView("incidents")} />
-          <NavButton icon={<Bot />} label="Agent setup" active={view === "agents"} onClick={() => { if (window.innerWidth <= 700) setEditingAgent(null); navigateToView("agents"); }} />
-          <NavButton icon={<BookOpen />} label="Skills" active={view === "skills"} onClick={() => { if (window.innerWidth <= 700) setEditingSkill(null); navigateToView("skills"); }} />
+          <NavButton icon={<CircleAlert />} className="nav-item-secondary" label="Incidents" active={view === "incidents"} onClick={() => navigateToView("incidents")} />
+          <NavButton icon={<Bot />} className="nav-item-secondary" label="Agent setup" active={view === "agents"} onClick={() => { if (window.innerWidth <= MOBILE_BREAKPOINT) setEditingAgent(null); navigateToView("agents"); }} />
+          <NavButton icon={<BookOpen />} className="nav-item-secondary" label="Skills" active={view === "skills"} onClick={() => { if (window.innerWidth <= MOBILE_BREAKPOINT) setEditingSkill(null); navigateToView("skills"); }} />
           <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
-          <NavButton className="nav-item-settings" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")} />
+          <NavButton className="nav-item-settings nav-item-secondary" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")} />
+
+          <Popover open={mobileMoreOpen} onOpenChange={setMobileMoreOpen}>
+            <PopoverTrigger asChild>
+              <Button variant="ghost" className={`nav-item mobile-more ${["incidents", "agents", "skills"].includes(view) || isSettingsView(view) ? "active" : ""}`} aria-label="More navigation">
+                <ListIcon size={20} />
+                <span>More</span>
+              </Button>
+            </PopoverTrigger>
+            <PopoverContent className="mobile-navigation-popover" side="top" align="end" aria-label="More navigation">
+              <div className="mobile-menu-heading">{user.name}</div>
+              {([
+                ["incidents", "Incidents", <CircleAlert size={18} />],
+                ["agents", "Agent setup", <Bot size={18} />],
+                ["skills", "Skills", <BookOpen size={18} />],
+                [user.role !== "member" ? "codex" : "api", "Settings", <SettingsIcon size={18} />]
+              ] as Array<[View, string, ReactNode]>).map(([nextView, label, icon]) => (
+                <Button key={label} variant="ghost" className="mobile-menu-button" onClick={() => {
+                  if (nextView === "agents") setEditingAgent(null);
+                  if (nextView === "skills") setEditingSkill(null);
+                  navigateToView(nextView);
+                }}>{icon}{label}</Button>
+              ))}
+              <Button variant="ghost" className="mobile-menu-button" onClick={async () => {
+                await api("/api/logout", { method: "POST" });
+                setMobileMoreOpen(false);
+                setUser(null);
+              }}><LogOut size={18} />Log out</Button>
+            </PopoverContent>
+          </Popover>
 
           <div className="sidebar-agent-heading">
             <span className="nav-label">Threads</span>
@@ -1184,16 +1224,16 @@ export function App() {
                 <span>New schedule</span>
               </Button>
             ) : null}
-            <div className="search-bar">
-              <Search size={14} className="text-muted" />
-              <Input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} placeholder={`Search ${viewTitle(view).toLowerCase()}`} />
-              <kbd>⌘K</kbd>
-            </div>
             <ThemeToggle />
             <Button variant="ghost" size="icon" onClick={() => void reloadAll()} title="Refresh" aria-label="Refresh">
               <RefreshCw size={14} />
             </Button>
           </div>
+          {!isSettingsView(view) ? <div className="search-bar">
+            <Search size={14} className="text-muted" />
+            <Input ref={searchRef} value={query} onChange={(event) => setQuery(event.target.value)} aria-label={`Search ${viewTitle(view).toLowerCase()}`} placeholder={`Search ${viewTitle(view).toLowerCase()}`} />
+            {query ? <Button variant="ghost" size="icon" aria-label="Clear search" onClick={() => setQuery("")}><X size={14} /></Button> : <kbd>⌘K</kbd>}
+          </div> : null}
         </header> : null}
 
         {message ? <div className="notice">{message}</div> : null}
@@ -1243,6 +1283,8 @@ export function App() {
               <div className={`mobile-threads-view ${selectedThreadId || draftThread ? "mobile-hide-threads" : ""}`}>
                 <MobileThreadListView
                   threads={filteredThreads}
+                  includeArchived={includeArchivedThreads}
+                  onIncludeArchivedChange={setIncludeArchivedThreads}
                   query={query}
                   hasMore={Boolean(nextThreadCursor)}
                   loadingMore={loadingOlderThreads}
@@ -1302,6 +1344,7 @@ export function App() {
           {view === "agents" ? (
             <AgentsView
               agents={agents}
+              visibleAgents={filteredAgents}
               skills={skills}
               tasks={tasks}
               providers={providerInstances}
@@ -1722,14 +1765,23 @@ function TasksView(props: {
   tasks: Task[];
   onSelect: (task: Task) => void;
 }) {
+  const [mobileColumn, setMobileColumn] = useState<(typeof BOARD_COLUMNS)[number]["id"]>("open");
   return (
     <div className="board-layout">
       <div className="board-main">
+        <nav className="mobile-board-tabs" aria-label="Task status">
+          {BOARD_COLUMNS.map((column) => (
+            <button type="button" key={column.id} aria-pressed={mobileColumn === column.id} onClick={() => setMobileColumn(column.id)}>
+              <span>{column.title}</span>
+              <span className="count-badge">{props.tasks.filter((task) => taskBucket(task) === column.id).length}</span>
+            </button>
+          ))}
+        </nav>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
             const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
             return (
-              <div className={`kanban-col col-${column.id}`} key={column.id}>
+              <div className={`kanban-col col-${column.id} ${mobileColumn === column.id ? "mobile-current-column" : ""}`} key={column.id}>
                 <div className="kanban-head">
                   <span className="kanban-head-title">
                     {column.id === "running" ? (
@@ -1876,8 +1928,7 @@ function TaskComposer(props: {
           placeholder="Assign a task or prompt to an agent… (e.g. Audit codebase, implement auth, refactor UI)"
           onChange={(event) => setPrompt(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter" && (event.metaKey || event.ctrlKey || !event.shiftKey)) {
-              if (event.shiftKey) return;
+            if (shouldSubmitComposer({ ...event, isComposing: event.nativeEvent.isComposing }, window.matchMedia("(pointer: coarse)").matches)) {
               event.preventDefault();
               void handleSubmit();
             }
@@ -2012,11 +2063,35 @@ function ModalBackdrop(props: {
   onClose: () => void;
   children: ReactNode;
   className?: string;
+  ariaLabel?: string;
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const closeRef = useRef(props.onClose);
+  closeRef.current = props.onClose;
   useEffect(() => {
+    const previousFocus = document.activeElement as HTMLElement | null;
+    const focusable = () => Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), a[href], [tabindex="0"]'
+    ) ?? []).filter((element) => element.getClientRects().length > 0);
+    (focusable()[0] ?? dialogRef.current)?.focus();
     function handleKeyDown(event: KeyboardEvent) {
       if (event.key === "Escape") {
-        props.onClose();
+        event.preventDefault();
+        closeRef.current();
+      } else if (event.key === "Tab") {
+        const items = focusable();
+        const first = items[0];
+        const last = items[items.length - 1];
+        if (!first || !last) {
+          event.preventDefault();
+          dialogRef.current?.focus();
+        } else if (event.shiftKey && (document.activeElement === first || document.activeElement === dialogRef.current)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first.focus();
+        }
       }
     }
     window.addEventListener("keydown", handleKeyDown);
@@ -2025,13 +2100,19 @@ function ModalBackdrop(props: {
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       document.body.style.overflow = originalOverflow;
+      if (previousFocus?.isConnected) previousFocus.focus();
     };
-  }, [props.onClose]);
+  }, []);
 
   return (
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label={props.ariaLabel ?? "Schedule details"}
+      tabIndex={-1}
       className={cn("calendar-modal-backdrop", props.className)}
-      onClick={props.onClose}
+      onClick={(event) => { if (event.target === event.currentTarget) props.onClose(); }}
     >
       {props.children}
     </div>
@@ -2602,6 +2683,7 @@ function SchedulesView(props: {
 
       {props.composerOpen ? (
         <ModalBackdrop
+          ariaLabel="Schedule an agent"
           onClose={() => {
             props.onComposerOpenChange(false);
             props.onEditingScheduleChange(null);
@@ -2629,7 +2711,7 @@ function SchedulesView(props: {
       ) : null}
 
       {calendarOverflow ? (
-        <ModalBackdrop onClose={() => setCalendarOverflow(null)}>
+        <ModalBackdrop ariaLabel="Day overview" onClose={() => setCalendarOverflow(null)}>
           <div className="calendar-modal-content max-w-lg" onClick={(e) => e.stopPropagation()}>
             <div className="day-overview-dialog">
               <div className="day-overview-header">
@@ -2961,6 +3043,8 @@ function AgentThreadSidebar(props: {
 
 function MobileThreadListView(props: {
   threads: AgentThread[];
+  includeArchived: boolean;
+  onIncludeArchivedChange: (value: boolean) => void;
   query: string;
   hasMore: boolean;
   loadingMore: boolean;
@@ -2997,6 +3081,10 @@ function MobileThreadListView(props: {
         </div>
       </div>
 
+      <label className="mobile-thread-filter">
+        <input type="checkbox" checked={props.includeArchived} onChange={(event) => props.onIncludeArchivedChange(event.target.checked)} />
+        Show archived chats
+      </label>
       <div className="mobile-thread-list-scroll">
         {props.threads.map((thread) => {
           const active = isActiveRun(thread.latest_status);
@@ -3373,10 +3461,11 @@ function AgentChatComposer(props: {
           value={message}
           disabled={sending}
           rows={2}
+          aria-label="Message the agent"
           placeholder={props.active ? "Send guidance to the active turn…" : "Ask the agent to build, inspect, or change something"}
           onChange={(event) => setMessage(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key !== "Enter" || event.shiftKey) return;
+            if (!shouldSubmitComposer({ ...event, isComposing: event.nativeEvent.isComposing }, window.matchMedia("(pointer: coarse)").matches)) return;
             event.preventDefault();
             void submit();
           }}
@@ -3428,6 +3517,7 @@ function AgentChatComposer(props: {
                   variant="ghost"
                   size="sm"
                   className="agent-model-trigger"
+                  aria-label="Choose a model"
                   type="button"
                   disabled={!provider}
                 >
@@ -3538,6 +3628,7 @@ function AgentChatComposer(props: {
 
 function AgentsView(props: {
   agents: Agent[];
+  visibleAgents: Agent[];
   skills: Skill[];
   tasks: Task[];
   providers: ProviderInstance[];
@@ -3547,7 +3638,7 @@ function AgentsView(props: {
 }) {
   const { editing, onSelectAgent: setEditing } = props;
   useEffect(() => {
-    if (typeof window !== "undefined" && window.innerWidth <= 700) {
+    if (typeof window !== "undefined" && window.innerWidth <= MOBILE_BREAKPOINT) {
       if (editing?.id) {
         setEditing(props.agents.find((a) => a.id === editing.id) ?? null);
       }
@@ -3563,7 +3654,7 @@ function AgentsView(props: {
           <h3>Agents</h3>
         </div>
         <div className="list-scroll">
-          {props.agents.map((agent) => (
+          {props.visibleAgents.map((agent) => (
             <button
               className={`list-item ${editing?.id === agent.id ? "selected" : ""}`}
               key={agent.id}
@@ -4912,7 +5003,7 @@ function SkillsView(props: {
 }) {
   const { editing, onSelectSkill: setEditing } = props;
   useEffect(() => {
-    if (typeof window !== "undefined" && window.innerWidth <= 700) {
+    if (typeof window !== "undefined" && window.innerWidth <= MOBILE_BREAKPOINT) {
       if (editing?.id) {
         setEditing(props.skills.find((s) => s.id === editing.id) ?? null);
       }
@@ -5359,11 +5450,16 @@ function SettingsView(props: {
     { id: "connectors", label: "Connectors", icon: <Github size={14} /> }
   ];
 
+  const tabsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    tabsRef.current?.querySelector(".active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
+  }, [props.activeTab]);
+
   const visibleTabs = tabs.filter((t) => !t.restricted || props.userRole !== "member");
 
   return (
     <div className="settings-container">
-      <div className="settings-tabs-bar">
+      <div className="settings-tabs-bar" ref={tabsRef} aria-label="Settings sections">
         {visibleTabs.map((tab) => (
           <button
             key={tab.id}
@@ -5498,6 +5594,8 @@ function Onboarding({ onDone }: { onDone: () => Promise<void> }) {
 function Login({ onDone }: { onDone: () => Promise<void> }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
   return (
     <div className="auth-container">
       <div className="auth-theme-toggle"><ThemeToggle /></div>
@@ -5505,16 +5603,26 @@ function Login({ onDone }: { onDone: () => Promise<void> }) {
         className="auth-box"
         onSubmit={async (event: FormEvent) => {
           event.preventDefault();
-          await api("/api/login", { method: "POST", body: JSON.stringify({ email, password }) });
-          await onDone();
+          if (busy) return;
+          setBusy(true);
+          setError(null);
+          try {
+            await api("/api/login", { method: "POST", body: JSON.stringify({ email, password }) });
+            await onDone();
+          } catch (loginError) {
+            setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not sign in."));
+          } finally {
+            setBusy(false);
+          }
         }}
       >
         <h1>Sign in</h1>
         <p>Open the task board.</p>
         <div className="stack">
-          <Input value={email} onChange={(event) => setEmail(event.target.value)} placeholder="Email address" type="email" required />
-          <Input value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Password" type="password" required />
-          <Button type="submit" size="lg" style={{ width: "100%" }}>Sign in</Button>
+          <Input value={email} onChange={(event) => setEmail(event.target.value)} aria-label="Email address" placeholder="Email address" type="email" autoComplete="username" required />
+          <Input value={password} onChange={(event) => setPassword(event.target.value)} aria-label="Password" placeholder="Password" type="password" autoComplete="current-password" required />
+          {error ? <div className="notice error" role="alert">{error}</div> : null}
+          <Button type="submit" size="lg" disabled={busy} style={{ width: "100%" }}>{busy ? "Signing in…" : "Sign in"}</Button>
         </div>
       </form>
     </div>
@@ -5533,7 +5641,7 @@ function NavButton({ icon, label, active, onClick, className }: { icon: ReactNod
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <Button variant="ghost" className={`nav-item ${active ? "active" : ""} ${className ?? ""}`} aria-current={active ? "page" : undefined} onClick={onClick}>
+        <Button variant="ghost" className={`nav-item ${active ? "active" : ""} ${className ?? ""}`} aria-label={label} aria-current={active ? "page" : undefined} onClick={onClick}>
           <AnimatedIcon icon={icon as ReactElement} active={active} />
           <span>{label}</span>
         </Button>
