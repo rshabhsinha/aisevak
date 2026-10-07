@@ -35,8 +35,12 @@ describe("visual viewport", () => {
   it("responds to keyboard changes, preserves pinch zoom, and removes listeners", () => {
     const viewport = Object.assign(new EventTarget(), { height: 812, offsetTop: 0, scale: 1 });
     const values = new Map<string, string>();
+    const attributes = new Set<string>();
     const target = Object.assign(new EventTarget(), { innerHeight: 812, visualViewport: viewport,
-      document: { documentElement: { style: {
+      document: { documentElement: {
+        toggleAttribute: (name: string, enabled: boolean) => enabled ? attributes.add(name) : attributes.delete(name),
+        removeAttribute: (name: string) => attributes.delete(name),
+        style: {
         setProperty: (key: string, value: string) => values.set(key, value),
         removeProperty: (key: string) => values.delete(key)
       } } }
@@ -47,6 +51,15 @@ describe("visual viewport", () => {
     viewport.dispatchEvent(new Event("resize"));
     expect(values.get("--app-height")).toBe("450px");
     expect(values.get("--viewport-bottom")).toBe("300px");
+    expect(attributes.has("data-short-viewport")).toBe(false);
+    // Keyboard overlays can leave a short visual viewport without changing
+    // innerHeight, so a CSS max-height media query alone cannot handle them.
+    viewport.height = 280;
+    viewport.dispatchEvent(new Event("resize"));
+    expect(attributes.has("data-short-viewport")).toBe(true);
+    viewport.height = 450;
+    viewport.dispatchEvent(new Event("resize"));
+    expect(attributes.has("data-short-viewport")).toBe(false);
     viewport.scale = 2;
     viewport.height = 225;
     viewport.dispatchEvent(new Event("resize"));
@@ -56,5 +69,6 @@ describe("visual viewport", () => {
     viewport.dispatchEvent(new Event("scroll"));
     target.dispatchEvent(new Event("resize"));
     expect(values.size).toBe(0);
+    expect(attributes.size).toBe(0);
   });
 });

@@ -8,6 +8,9 @@ Worktree cleanup tests require a Git version supporting `git worktree list --por
 
 Use 320×568, 375×812, 430×932, 844×390, and 1280×800 viewports. The mobile
 layout applies through 920px, including phone landscape and smaller tablets.
+Repeat chat and schedule forms at 844×280, 844×200, and 320×200 to represent
+keyboard-shortened viewports. Compact controls and scrolling must keep Send,
+form inputs, Cancel, and Create reachable even when they cannot all fit at once.
 
 - Open Tasks, filter and clear search, switch each status, and scroll its cards.
   Open New task, select an agent/project, and verify Cancel and Create stay reachable.

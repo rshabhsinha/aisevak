@@ -6473,6 +6473,44 @@ label {
   .code-block pre, .markdown-table-wrap, .aicss-diff-body { overflow-x: auto; overscroll-behavior-x: contain; }
   .copy-button { opacity: 1; min-width: 36px; min-height: 36px; }
 
+  /* Use the measured visual height: an overlay keyboard need not resize the
+     layout viewport, and very short screens need a scrolling fallback. */
+  :root[data-short-viewport] .agent-composer-controls {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  :root[data-short-viewport] .agent-composer-controls > * { min-width: 0; }
+  :root[data-short-viewport] .agent-composer .textarea {
+    min-height: 44px;
+    max-height: 64px;
+    padding-block: 6px;
+  }
+  :root[data-short-viewport] .agent-chat-stage,
+  :root[data-short-viewport] .is-draft .agent-chat-stage {
+    overflow-y: auto;
+    overscroll-behavior-y: contain;
+  }
+  :root[data-short-viewport] .is-draft .agent-chat-hero { display: none; }
+  :root[data-short-viewport] .agent-chat-timeline-wrap {
+    flex: 0 0 auto;
+    max-height: max(80px, calc(var(--app-height) * 0.4));
+  }
+  :root[data-short-viewport] .schedule-composer-form {
+    height: auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  :root[data-short-viewport] .schedule-composer-header { padding: 4px 8px; }
+  :root[data-short-viewport] .schedule-composer-body {
+    flex: 0 0 auto;
+    overflow: visible;
+    padding: 12px;
+  }
+  :root[data-short-viewport] .schedule-composer-footer {
+    flex-direction: row;
+    padding: 8px;
+  }
+  :root[data-short-viewport] .schedule-composer-footer > * { flex: 1; min-width: 0; }
+
 }
 
 @media (max-height: 620px) and (min-width: 921px) {

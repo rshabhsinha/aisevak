@@ -22,13 +22,15 @@ export function viewportFrame(layoutHeight: number, viewport?: { height: number;
 // app and portalled sheets in that visible area, without interfering with zoom.
 export function trackVisualViewport(target: Window): () => void {
   const viewport = target.visualViewport;
-  const style = target.document.documentElement.style;
+  const root = target.document.documentElement;
+  const style = root.style;
   const update = () => {
     if (viewport && viewport.scale !== 1) return;
     const frame = viewportFrame(target.innerHeight, viewport ?? undefined);
     style.setProperty("--app-height", `${frame.height}px`);
     style.setProperty("--app-top", `${frame.top}px`);
     style.setProperty("--viewport-bottom", `${frame.bottom}px`);
+    root.toggleAttribute("data-short-viewport", frame.height <= 420);
   };
   update();
   target.addEventListener("resize", update);
@@ -39,5 +41,6 @@ export function trackVisualViewport(target: Window): () => void {
     viewport?.removeEventListener("resize", update);
     viewport?.removeEventListener("scroll", update);
     ["--app-height", "--app-top", "--viewport-bottom"].forEach((name) => style.removeProperty(name));
+    root.removeAttribute("data-short-viewport");
   };
 }
