@@ -1,7 +1,7 @@
 import {
   contentPage,
   decodePageCursor,
-  defaultCodexModelOptions,
+  defaultHarnessModelOptions,
   encodeCursor,
   hashToken,
   installedSkillsRoot,
@@ -2809,7 +2809,7 @@ function modelOptionsFor(
         return [{ id: entry.id, value: entry.value as string | number | boolean }];
       })
     : [];
-  return options.length ? options : defaultCodexModelOptions(model);
+  return options.length ? options : defaultHarnessModelOptions(model);
 }
 
 function unauthorized(message: string): never { throw httpError(401, message); }

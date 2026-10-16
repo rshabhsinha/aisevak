@@ -26,6 +26,9 @@ import {
   DEVIN_HARNESS_MODELS,
   OPENCODE_HARNESS_MODELS,
   defaultCodexModelOptions,
+  defaultHarnessModelOptions,
+  defaultModelForDriver,
+  isClaudeModelId,
   fetchZenModelCatalog,
   materializeDevinAuthBundle,
   parseCursorModelList,
@@ -78,7 +81,7 @@ import {
   type AgentContext
 } from "./coordination.js";
 import { assertThreadAcceptsInput, setThreadArchived } from "./threadArchive.js";
-import { agentDeletionBlockReason } from "./agents.js";
+import { agentDeletionBlockReason, planAgentModelUpdate } from "./agents.js";
 import {
   normalizeWorkKey,
   normalizeWorkScope,
@@ -728,8 +731,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/agents", async (request) => {
     const user = requireAdmin(request);
     const body = agentSchema.parse(request.body);
-    const model = body.model ?? env.codexDefaultModel;
     const providerInstanceId = await resolveAgentProviderInstanceId(pool, body.providerInstanceId);
+    const driver = await providerDriver(pool, providerInstanceId);
+    const model = body.model ?? defaultModelForDriver(driver, env.codexDefaultModel);
+    assertModelFitsDriver(driver, model);
     const result = await pool.query(
       `INSERT INTO agents (name, description, provider_instance_id, model, model_options, capabilities, instructions, enabled)
        VALUES ($1, $2, $3, $4, $5, $6, $7, true)
@@ -757,6 +762,25 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const providerInstanceId = body.providerInstanceId
       ? await resolveAgentProviderInstanceId(pool, body.providerInstanceId)
       : null;
+    let model = body.model ?? null;
+    let modelOptions = body.modelOptions ?? null;
+    if (providerInstanceId || model) {
+      const current = mustRow(
+        (await pool.query<{ provider_instance_id: string; model: string }>(
+          "SELECT provider_instance_id, model FROM agents WHERE id = $1",
+          [id]
+        )).rows[0]
+      );
+      const plan = planAgentModelUpdate({
+        driver: await providerDriver(pool, providerInstanceId ?? current.provider_instance_id),
+        currentModel: current.model,
+        requestedModel: model,
+        requestedOptions: modelOptions
+      });
+      if (plan.error) throwBadRequest(plan.error);
+      model = plan.model;
+      modelOptions = plan.modelOptions;
+    }
     const result = await pool.query(
       `UPDATE agents
        SET name = COALESCE($2, name),
@@ -775,8 +799,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.name ?? null,
         body.description ?? null,
         providerInstanceId,
-        body.model ?? null,
-        body.modelOptions ? JSON.stringify(body.modelOptions) : null,
+        model,
+        modelOptions ? JSON.stringify(modelOptions) : null,
         body.capabilities ? JSON.stringify(body.capabilities) : null,
         body.instructions ?? null,
         body.enabled ?? null
@@ -3277,6 +3301,21 @@ async function resolveAgentProviderInstanceId(
   return id;
 }
 
+async function providerDriver(pool: Pick<DbPool, "query">, providerInstanceId: string): Promise<string> {
+  const result = await pool.query<{ driver: string }>("SELECT driver FROM provider_instances WHERE id = $1", [
+    providerInstanceId
+  ]);
+  const row = result.rows[0];
+  if (!row) throwBadRequest("The selected harness was not found");
+  return row.driver;
+}
+
+function assertModelFitsDriver(driver: string, model: string): void {
+  if (driver === "claude" && !isClaudeModelId(model)) {
+    throwBadRequest(`Claude Code agents need a Claude model such as claude-opus-5-5, not ${model}`);
+  }
+}
+
 async function resolveModelSelection(
   pool: Pick<DbPool, "query">,
   input: ModelSelectionInput | undefined,
@@ -3302,7 +3341,8 @@ async function resolveModelSelection(
   if (!["codex", "cursor", "opencode", "devin", "claude"].includes(instance.driver)) {
     throwBadRequest("The selected harness is not supported");
   }
-  const model = input?.model ?? fallbackModel;
+  const model = input?.model ?? (thread ? fallbackModel : defaultModelForDriver(instance.driver, fallbackModel));
+  if (!thread) assertModelFitsDriver(instance.driver, model);
   return {
     providerInstanceId,
     model,
@@ -3740,7 +3780,7 @@ function normalizeModelOptions(value: unknown): ModelSelectionInput["options"] {
 
 function modelOptionsFor(model: string | null | undefined, value: unknown): ModelSelectionInput["options"] {
   const normalized = normalizeModelOptions(value);
-  return normalized.length ? normalized : defaultCodexModelOptions(model ?? env.codexDefaultModel);
+  return normalized.length ? normalized : defaultHarnessModelOptions(model ?? env.codexDefaultModel);
 }
 
 function threadTitleFromMessage(message: string): string {

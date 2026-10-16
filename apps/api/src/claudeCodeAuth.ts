@@ -66,7 +66,8 @@ export class ClaudeCodeAuthManager {
       `INSERT INTO secrets (name, description, encrypted_value, agent_accessible)
        VALUES ($1, $2, $3, false)
        ON CONFLICT (name) DO UPDATE
-       SET description = excluded.description, encrypted_value = excluded.encrypted_value, updated_at = now()`,
+       SET description = excluded.description, encrypted_value = excluded.encrypted_value,
+           agent_accessible = false, updated_at = now()`,
       [
         CLAUDE_CODE_TOKEN_SECRET_NAME,
         kind === "oauth_token"
@@ -79,13 +80,17 @@ export class ClaudeCodeAuthManager {
   }
 
   async disconnect(): Promise<ClaudeCodeAuthStatus> {
-    await this.pool.query("DELETE FROM secrets WHERE name = $1", [CLAUDE_CODE_TOKEN_SECRET_NAME]);
+    await this.pool.query("DELETE FROM secrets WHERE name = $1 AND agent_accessible = false", [
+      CLAUDE_CODE_TOKEN_SECRET_NAME
+    ]);
     return this.getStatus();
   }
 
   private async readSecret(): Promise<{ value: string; updatedAt: string | null } | undefined> {
     const result = await this.pool.query<{ encrypted_value: string; updated_at: Date | string | null }>(
-      "SELECT encrypted_value, updated_at FROM secrets WHERE name = $1",
+      // Only the internal (never agent-visible) row counts: an agent credential
+      // that happens to share the name must not become the harness credential.
+      "SELECT encrypted_value, updated_at FROM secrets WHERE name = $1 AND agent_accessible = false",
       [CLAUDE_CODE_TOKEN_SECRET_NAME]
     );
     const row = result.rows[0];

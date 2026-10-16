@@ -68,6 +68,23 @@ async function requests(log: string): Promise<Array<{ pid: number; method: strin
 }
 
 describe("Claude Code harness", () => {
+  it("refuses a non-Claude model before launching", async () => {
+    const root = await mkdtemp(join(tmpdir(), "aisevak-claude-")); roots.push(root);
+    await expect(materializeHarnessAuth(poolWith(OAUTH), "claude", root, secretKey, {}, "gpt-5.6-luna"))
+      .rejects.toThrow(/cannot run gpt-5.6-luna/);
+  });
+
+  it("ignores an agent-visible secret that shares the credential name", async () => {
+    const root = await mkdtemp(join(tmpdir(), "aisevak-claude-")); roots.push(root);
+    const pool = {
+      async query(sql: string) {
+        return { rows: sql.includes("agent_accessible = false") ? [] : [{ encrypted_value: encryptSecret(OAUTH, secretKey) }] };
+      }
+    } as unknown as DbPool;
+    await expect(materializeHarnessAuth(pool, "claude", root, secretKey, {}, "claude-opus-5-5"))
+      .rejects.toThrow(/Settings > Claude Code/);
+  });
+
   it("requires a stored credential", async () => {
     const root = await mkdtemp(join(tmpdir(), "aisevak-claude-")); roots.push(root);
     await expect(materializeHarnessAuth(poolWith(), "claude", root, secretKey, {}, "claude-opus-5-5"))

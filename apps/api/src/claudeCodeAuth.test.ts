@@ -55,6 +55,15 @@ describe("Claude Code credential management", () => {
     expect(stored.size).toBe(0);
   });
 
+  it("forces the stored credential to stay hidden from agents", async () => {
+    const queries: string[] = [];
+    const pool = { async query(sql: string) { queries.push(sql); return { rows: [] }; } } as unknown as DbPool;
+    await new ClaudeCodeAuthManager(pool, key, async () => "valid").saveCredential(OAUTH);
+    const upsert = queries.find((sql) => sql.includes("INSERT INTO secrets"));
+    expect(upsert).toMatch(/agent_accessible = false/);
+    expect(queries.filter((sql) => sql.startsWith("SELECT")).every((sql) => sql.includes("agent_accessible = false"))).toBe(true);
+  });
+
   it("disconnects by deleting the stored credential", async () => {
     const { manager, stored } = setup();
     await manager.saveCredential(OAUTH);

@@ -6,7 +6,10 @@ import {
   claudeConnectionTag,
   claudeCredentialEnv,
   classifyClaudeCredential,
-  DEFAULT_CLAUDE_MODEL
+  DEFAULT_CLAUDE_MODEL,
+  defaultHarnessModelOptions,
+  defaultModelForDriver,
+  isClaudeModelId
 } from "./claude.js";
 
 const OAUTH = "sk-ant-oat01-example-token";
@@ -77,5 +80,22 @@ describe("Claude Code harness helpers", () => {
     expect(tag).toMatch(/^claude:[0-9a-f]{16}:claude-opus-5-5$/);
     expect(claudeConnectionTag(API_KEY, "claude-opus-5-5")).not.toBe(tag);
     expect(claudeConnectionTag(OAUTH, "claude-sonnet-5-5")).not.toBe(tag);
+  });
+
+  it("recognises Claude models and aliases only", () => {
+    expect(isClaudeModelId("claude-opus-5-5")).toBe(true);
+    expect(isClaudeModelId("opus")).toBe(true);
+    expect(isClaudeModelId("claude-sonnet-5-5[1m]")).toBe(false);
+    expect(isClaudeModelId("gpt-5.6-luna")).toBe(false);
+    expect(isClaudeModelId("")).toBe(false);
+  });
+
+  it("defaults a Claude Code agent to Opus 5.5 at medium effort", () => {
+    expect(defaultModelForDriver("claude", "gpt-5.6-luna")).toBe("claude-opus-5-5");
+    expect(defaultModelForDriver("claude", "claude-sonnet-5-5")).toBe("claude-sonnet-5-5");
+    expect(defaultModelForDriver("codex", "gpt-5.6-luna")).toBe("gpt-5.6-luna");
+    expect(defaultHarnessModelOptions("claude-opus-5-5")).toEqual([{ id: "reasoningEffort", value: "medium" }]);
+    expect(defaultHarnessModelOptions("claude-sonnet-5-5")).toEqual([{ id: "reasoningEffort", value: "high" }]);
+    expect(defaultHarnessModelOptions("gpt-5.6-luna")).toEqual([{ id: "reasoningEffort", value: "max" }]);
   });
 });

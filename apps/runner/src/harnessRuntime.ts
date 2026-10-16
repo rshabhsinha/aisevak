@@ -4,6 +4,7 @@ import {
   CLAUDE_CODE_TOKEN_SECRET_NAME,
   claudeConnectionTag,
   classifyClaudeCredential,
+  isClaudeModelId,
   buildDevinAcpArgs,
   buildOpenCodeAcpArgs,
   CURSOR_API_KEY_SECRET_NAME,
@@ -52,7 +53,10 @@ export async function materializeHarnessAuth(
   model?: string | null
 ): Promise<HarnessLaunchEnv> {
   if (driver === "claude") {
-    const credential = (await readSecret(pool, CLAUDE_CODE_TOKEN_SECRET_NAME, secretKey))?.trim();
+    if (model && !isClaudeModelId(model)) {
+      throw new Error(`Claude Code cannot run ${model}. Give this agent a Claude model such as claude-opus-5-5.`);
+    }
+    const credential = (await readInternalSecret(pool, CLAUDE_CODE_TOKEN_SECRET_NAME, secretKey))?.trim();
     if (!credential) {
       throw new Error("Claude Code is not authenticated. An admin must connect Claude Code from Settings > Claude Code.");
     }
@@ -224,6 +228,15 @@ async function readHostOpenCodeAuth(): Promise<string | undefined> {
   } catch {
     return undefined;
   }
+}
+
+async function readInternalSecret(pool: DbPool, name: string, secretKey: string): Promise<string | undefined> {
+  const result = await pool.query<{ encrypted_value: string }>(
+    "SELECT encrypted_value FROM secrets WHERE name = $1 AND agent_accessible = false",
+    [name]
+  );
+  const row = result.rows[0];
+  return row ? decryptSecret(row.encrypted_value, secretKey) : undefined;
 }
 
 async function readSecret(pool: DbPool, name: string, secretKey: string): Promise<string | undefined> {

@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import type { CodexHarnessModel } from "./models.js";
-import { applyCodexModelDefaults, reasoningEffortOptions } from "./models.js";
+import { applyCodexModelDefaults, defaultCodexModelOptions, reasoningEffortOptions } from "./models.js";
+import type { ModelOptionSelection } from "./types.js";
 
 // One encrypted secret holds whichever Claude credential the admin pasted:
 // a long-lived subscription token from `claude setup-token` (sk-ant-oat…) or
@@ -48,6 +49,33 @@ export function applyClaudeModelDefaults(
   preferredModel = DEFAULT_CLAUDE_MODEL
 ): { defaultModel: string; models: CodexHarnessModel[] } {
   return applyCodexModelDefaults(models.length > 0 ? models : CLAUDE_HARNESS_MODELS, preferredModel);
+}
+
+// Claude Code accepts full model IDs and its picker aliases. Anything else
+// (for example a Codex model left on an agent that moved harness) would be
+// sent to Anthropic as ANTHROPIC_MODEL and fail every turn.
+const CLAUDE_MODEL_ALIASES = new Set(["default", "opus", "fable", "sonnet", "haiku", "opusplan"]);
+
+export function isClaudeModelId(model: string | null | undefined): boolean {
+  const value = model?.trim().toLowerCase() ?? "";
+  if (!value) return false;
+  return CLAUDE_HARNESS_MODELS.some((entry) => entry.id === value) || CLAUDE_MODEL_ALIASES.has(value) || /^claude-[a-z0-9.-]+$/.test(value);
+}
+
+export function defaultModelForDriver(driver: string, fallbackModel: string): string {
+  return driver === "claude" && !isClaudeModelId(fallbackModel) ? DEFAULT_CLAUDE_MODEL : fallbackModel;
+}
+
+// Default model options for any harness model: Claude catalog entries carry
+// their own effort defaults (Opus 5.5 → medium); everything else keeps the
+// Codex defaults it had before.
+export function defaultHarnessModelOptions(model: string | null | undefined): ModelOptionSelection[] {
+  const claude = CLAUDE_HARNESS_MODELS.find((entry) => entry.id === model?.trim());
+  if (!claude) return defaultCodexModelOptions(model ?? undefined);
+  return (claude.options ?? []).flatMap((option): ModelOptionSelection[] => {
+    const value = option.defaultValue ?? option.values[0]?.id;
+    return value ? [{ id: option.id, value }] : [];
+  });
 }
 
 export type ClaudeCredentialKind = "oauth_token" | "api_key";
