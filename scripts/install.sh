@@ -170,6 +170,16 @@ install_harness_clis() {
       log "Updating Codex CLI"
       npm install -g @openai/codex@latest || log "Codex update failed; continuing with the installed version"
     fi
+    # Claude Code runs through the ACP adapter, which depends on the Claude
+    # Agent SDK and its platform-native Claude Code executable. The runner
+    # executes it on the host, so it is not published into HARNESS_BIN_DIR.
+    # Pinned for reproducible releases; override with CLAUDE_AGENT_ACP_VERSION.
+    local claude_acp_version="${CLAUDE_AGENT_ACP_VERSION:-0.91.0}"
+    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" ]] || ! command_exists claude-agent-acp; then
+      log "Installing Claude Code ACP adapter ${claude_acp_version}"
+      npm install -g "@agentclientprotocol/claude-agent-acp@${claude_acp_version}" \
+        || log "Claude Code ACP adapter install failed; continuing without it"
+    fi
     # The npm entry point is JavaScript with a platform package dependency.
     # Publish the complete native platform bundle: tool execution also needs
     # code-mode-host, packaged resources and the vendor's rg on PATH. The API
