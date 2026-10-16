@@ -81,3 +81,40 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(handled).toEqual([{ id: "input-1", error: undefined }]);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
+
+it("keeps honoring cancel while an injected prompt is still running", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  // The injected prompt is held open until session/cancel arrives.
+  await writeFile(script, `const readline = require('node:readline');
+const held = [];
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'hold') { setTimeout(() => console.log(JSON.stringify({id:m.id,result:{}})), 1500); return; }
+ if(m.method === 'session/prompt') { held.push(m.id); return; }
+ if(m.method === 'session/cancel') { for (const id of held.splice(0)) console.log(JSON.stringify({id,result:{stopReason:'cancelled'}})); }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  let injected = false;
+  let stopAfter = Number.POSITIVE_INFINITY;
+  try {
+    const started = Date.now();
+    const result = await runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+      model: "auto", prompt: "hold", threadId: null, env: process.env, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {},
+      // Stop is pressed after the main prompt has finished, while the
+      // injected prompt is still open.
+      shouldCancel: async () => Date.now() > stopAfter,
+      nextInput: async () => {
+        if (injected) return null;
+        injected = true;
+        stopAfter = Date.now() + 1500;
+        return { id: "input-1", message: "follow-up", messageDeliveryId: null };
+      },
+      onInputHandled: async () => {}
+    });
+    expect(result.status).toBe("interrupted");
+    expect(Date.now() - started).toBeLessThan(8000);
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+}, 15000);

@@ -164,7 +164,8 @@ class PersistentAcpSession {
     const rawLines: string[] = [];
     let loadingSession = false;
     let monitor: NodeJS.Timeout | null = null;
-    let monitorTask: Promise<void> = Promise.resolve();
+    let injectTask: Promise<void> = Promise.resolve();
+    let cancelTask: Promise<void> = Promise.resolve();
     const emit = async (line: string) => {
       if (loadingSession) {
         try {
@@ -240,22 +241,37 @@ class PersistentAcpSession {
 
       await options.onTurnAccepted?.();
 
-      // One monitor pass at a time: overlapping passes could claim several
-      // queued inputs and issue concurrent session/prompt calls. The task is
-      // drained before the run finalizes so an injection that is already in
-      // flight records its outcome before the run's inputs are settled.
+      // Cancellation and input injection are polled on separate guarded
+      // paths. An injected session/prompt stays open for its whole turn, so
+      // folding the cancel check into the injection pass would stop honoring
+      // Stop and ownership fencing until that turn ended. One injection runs
+      // at a time so overlapping ticks cannot claim several inputs or send
+      // concurrent prompts, and it is drained (with cancel still polled)
+      // before the run finalizes so its outcome is recorded first.
+      const failMonitor = (error: unknown) => {
+        this.rejectPending(error instanceof Error ? error : new Error(String(error)));
+        void this.close().catch(() => undefined);
+      };
       let turnFinished = false;
-      let monitorBusy = false;
-      monitor = setInterval(() => {
-        if (monitorBusy || turnFinished || cancelRequested) return;
-        monitorBusy = true;
-        monitorTask = (async () => {
-          if (await options.shouldCancel()) {
-            cancelRequested = true;
-            await this.request("session/cancel", { sessionId: this.sessionId }).catch(() => this.close());
-            return;
-          }
-          if (turnFinished) return;
+      let cancelBusy = false;
+      let injectBusy = false;
+      const pollCancel = () => {
+        if (cancelBusy || cancelRequested) return;
+        cancelBusy = true;
+        cancelTask = (async () => {
+          if (!(await options.shouldCancel())) return;
+          cancelRequested = true;
+          await this.request("session/cancel", { sessionId: this.sessionId }).catch(() => this.close());
+        })()
+          .catch(failMonitor)
+          .finally(() => {
+            cancelBusy = false;
+          });
+      };
+      const pollInput = () => {
+        if (injectBusy || turnFinished || cancelRequested || !options.nextInput) return;
+        injectBusy = true;
+        injectTask = (async () => {
           const input = await options.nextInput?.();
           if (!input) return;
           try {
@@ -268,23 +284,25 @@ class PersistentAcpSession {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
           }
         })()
-          .catch((error: unknown) => {
-            this.rejectPending(error instanceof Error ? error : new Error(String(error)));
-            void this.close().catch(() => undefined);
-          })
+          .catch(failMonitor)
           .finally(() => {
-            monitorBusy = false;
+            injectBusy = false;
           });
+      };
+      monitor = setInterval(() => {
+        pollCancel();
+        pollInput();
       }, 750);
 
       try {
         await promptRequest;
       } finally {
         turnFinished = true;
-        clearInterval(monitor);
-        monitor = null;
       }
-      await monitorTask;
+      await injectTask;
+      clearInterval(monitor);
+      monitor = null;
+      await cancelTask;
       if (this.closed) throw new Error("ACP session closed while handling a mid-turn input");
 
       return {
@@ -298,9 +316,11 @@ class PersistentAcpSession {
         promptMayHaveBeenPresented
       };
     } catch (error) {
+      // Keep polling cancel while an in-flight injection drains.
+      await injectTask;
       if (monitor) clearInterval(monitor);
       monitor = null;
-      await monitorTask;
+      await cancelTask;
       return {
         status: cancelRequested ? "interrupted" : "failed",
         threadId: this.sessionId ?? "",

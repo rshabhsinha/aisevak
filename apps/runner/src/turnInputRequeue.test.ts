@@ -9,6 +9,8 @@ interface Scenario {
   terminalInputs?: Array<{ input_id: string; message_delivery_id: string; input_status: "queued" | "delivering"; run_status: string }>;
   activeRunId?: string | null;
   runQueuedInputs?: string[];
+  sourceStatus?: string;
+  providerThreadId?: string | null;
 }
 
 function recoveryPool(scenario: Scenario): { pool: DbPool; queries: Entry[] } {
@@ -42,11 +44,17 @@ function recoveryPool(scenario: Scenario): { pool: DbPool; queries: Entry[] } {
     if (normalized.includes("SELECT agent_turn_inputs.id AS input_id")) {
       return { rows: scenario.terminalInputs ?? [] };
     }
-    if (normalized.startsWith("SELECT agent_thread_id FROM agent_turn_inputs")) {
-      return { rows: [{ agent_thread_id: "agent-thread" }] };
+    if (normalized.startsWith("SELECT agent_thread_id, message_delivery_id FROM agent_turn_inputs")) {
+      return { rows: [{ agent_thread_id: "agent-thread", message_delivery_id: `${params?.[0]}-delivery` }] };
     }
     if (normalized.includes("FROM agent_threads") && normalized.includes("archived_at IS NULL") && normalized.includes("FOR UPDATE")) {
-      return { rows: [{ ownership_generation: 2, provider_thread_id: "provider-thread", task_id: null }] };
+      return {
+        rows: [{
+          ownership_generation: 2,
+          provider_thread_id: scenario.providerThreadId === undefined ? "provider-thread" : scenario.providerThreadId,
+          task_id: null
+        }]
+      };
     }
     if (normalized.includes("FROM agent_turn_inputs input")) {
       const id = params?.[0];
@@ -57,7 +65,7 @@ function recoveryPool(scenario: Scenario): { pool: DbPool; queries: Entry[] } {
           message: `message for ${id}`,
           source_run_id: "ended-run",
           source_generation: 2,
-          source_status: "succeeded",
+          source_status: scenario.sourceStatus ?? "succeeded",
           delivery_status: "queued"
         }]
       };
@@ -182,5 +190,53 @@ describe("never-presented coordination messages", () => {
     )).toBe(true);
     expect(failedDelivery(queries, "queued-input-delivery")).toBe(false);
     expect(failedDelivery(queries, "run-delivery")).toBe(true);
+  });
+
+  it("fails messages pending on a run the user stopped instead of relaunching them", async () => {
+    const { pool, queries } = recoveryPool({
+      terminalInputs: [
+        { input_id: "queued-input", message_delivery_id: "queued-input-delivery", input_status: "queued", run_status: "cancelled" }
+      ],
+      sourceStatus: "cancelled"
+    });
+
+    await recoverInterruptedCoordinationRuns(pool);
+
+    expect(queries.some((entry) => entry.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+    expect(queries.some((entry) => entry.sql.startsWith("DELETE FROM agent_turn_inputs"))).toBe(false);
+    expect(failedDelivery(queries, "queued-input-delivery")).toBe(true);
+  });
+
+  it("does not start a fresh run from incremental text when the thread has no provider session", async () => {
+    const { pool, queries } = recoveryPool({
+      terminalInputs: [
+        { input_id: "queued-input", message_delivery_id: "queued-input-delivery", input_status: "queued", run_status: "failed" }
+      ],
+      providerThreadId: null
+    });
+
+    await recoverInterruptedCoordinationRuns(pool);
+
+    expect(queries.some((entry) => entry.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+    expect(failedDelivery(queries, "queued-input-delivery")).toBe(true);
+  });
+
+  it("locks the delivery before the agent thread when requeueing", async () => {
+    const { pool, queries } = recoveryPool({
+      terminalInputs: [
+        { input_id: "queued-input", message_delivery_id: "queued-input-delivery", input_status: "queued", run_status: "failed" }
+      ]
+    });
+
+    await recoverInterruptedCoordinationRuns(pool);
+
+    const deliveryLock = queries.findIndex((entry) =>
+      entry.sql.includes("FROM message_deliveries WHERE id = $1 FOR UPDATE") && entry.params?.[0] === "queued-input-delivery"
+    );
+    const threadLock = queries.findIndex((entry) =>
+      entry.sql.includes("FROM agent_threads") && entry.sql.includes("archived_at IS NULL") && entry.sql.includes("FOR UPDATE")
+    );
+    expect(deliveryLock).toBeGreaterThanOrEqual(0);
+    expect(threadLock).toBeGreaterThan(deliveryLock);
   });
 });

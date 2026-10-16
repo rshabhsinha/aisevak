@@ -2853,7 +2853,8 @@ async function cancelDispatcherRunForInactiveDelivery(
     );
     if (!updated.rows[0]) return;
     await appendRunCancelEvent(client, "dispatcher", job.id, error);
-    await failPendingAgentTurnInputsInTransaction(client, "dispatcher", job.id, "cancelled");
+    // Nobody stopped this thread; its pending messages still belong to it.
+    await failPendingAgentTurnInputsInTransaction(client, "dispatcher", job.id, "cancelled", { requeueCancelled: true });
   });
 }
 
@@ -3090,9 +3091,37 @@ async function failPendingAgentTurnInputsInTransaction(
   kind: "worker" | "dispatcher",
   runId: string,
   finalStatus: "succeeded" | "failed" | "cancelled",
-  options: { requeueQueued?: boolean } = {}
+  options: { requeueQueued?: boolean; requeueCancelled?: boolean } = {}
 ): Promise<void> {
   const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  if (kind === "dispatcher") {
+    // queueIncrementalCoordinationInput attaches inputs to an active run while
+    // holding the agent thread lock. Taking that lock here (after the run's
+    // terminal status is committed) means no input can still be attaching to
+    // this run while its inputs are settled. Deliveries are locked first to
+    // keep queueDelivery's delivery-then-thread order.
+    const pendingDeliveries = await client.query<{ message_delivery_id: string }>(
+      `SELECT DISTINCT message_delivery_id
+       FROM agent_turn_inputs
+       WHERE dispatcher_run_id = $1 AND status IN ('queued', 'delivering') AND message_delivery_id IS NOT NULL`,
+      [runId]
+    );
+    const pendingDeliveryIds = pendingDeliveries.rows.map((row) => row.message_delivery_id);
+    if (pendingDeliveryIds.length > 0) {
+      await client.query(
+        "SELECT id FROM message_deliveries WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+        [pendingDeliveryIds]
+      );
+    }
+    await client.query(
+      `SELECT agent_threads.id
+       FROM dispatcher_runs
+       JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+       WHERE dispatcher_runs.id = $1
+       FOR UPDATE OF agent_threads`,
+      [runId]
+    );
+  }
   if (kind === "dispatcher" && options.requeueQueued !== false) {
     // Inputs still 'queued' were never presented to the provider: the run just
     // ended before its monitor picked them up. Hand them to another turn
@@ -3106,7 +3135,7 @@ async function failPendingAgentTurnInputsInTransaction(
       [runId]
     );
     for (const input of queued.rows) {
-      await requeueUnpresentedAgentTurnInput(client, input.id);
+      await requeueUnpresentedAgentTurnInput(client, input.id, { requeueCancelled: options.requeueCancelled });
     }
   }
   const result = await client.query<{ message_delivery_id: string | null }>(
@@ -3150,15 +3179,19 @@ async function failPendingAgentTurnInputsInTransaction(
 // pending, thread archived, or ownership moved with no active run to adopt it).
 export async function requeueUnpresentedAgentTurnInput(
   client: Pick<DbPool, "query">,
-  inputId: string
+  inputId: string,
+  options: { requeueCancelled?: boolean } = {}
 ): Promise<boolean> {
-  const located = await client.query<{ agent_thread_id: string }>(
-    "SELECT agent_thread_id FROM agent_turn_inputs WHERE id = $1",
+  const located = await client.query<{ agent_thread_id: string; message_delivery_id: string | null }>(
+    "SELECT agent_thread_id, message_delivery_id FROM agent_turn_inputs WHERE id = $1",
     [inputId]
   );
   const agentThreadId = located.rows[0]?.agent_thread_id;
-  if (!agentThreadId) return false;
-  // Lock order matches queueDelivery: agent thread, then its inputs.
+  const deliveryId = located.rows[0]?.message_delivery_id;
+  if (!agentThreadId || !deliveryId) return false;
+  // Lock order matches queueDelivery: the delivery, then the agent thread,
+  // then the input row.
+  await client.query("SELECT id FROM message_deliveries WHERE id = $1 FOR UPDATE", [deliveryId]);
   const thread = await client.query<{ ownership_generation: number; provider_thread_id: string | null; task_id: string | null }>(
     `SELECT ownership_generation, provider_thread_id, task_id
      FROM agent_threads
@@ -3189,14 +3222,24 @@ export async function requeueUnpresentedAgentTurnInput(
      JOIN message_deliveries delivery ON delivery.id = input.message_delivery_id
      WHERE input.id = $1
        AND input.agent_thread_id = $2
+       AND input.message_delivery_id = $3
        AND input.status = 'queued'
        AND source_run.scope = 'coordination'
-     FOR UPDATE OF input, delivery`,
-    [inputId, agentThreadId]
+     FOR UPDATE OF input`,
+    [inputId, agentThreadId, deliveryId]
   );
   const input = locked.rows[0];
   if (!input || !["queued", "retrying"].includes(input.delivery_status)) return false;
   if (["queued", "running", "cancel_requested"].includes(input.source_status)) return false;
+  // A run cancelled within its own ownership generation was stopped by the
+  // user (thread or run Stop), and Stop drops the messages pending on it.
+  // Cancellations caused by an ownership change land here with a stale
+  // generation and may still move onto the new owner's active run.
+  if (
+    input.source_status === "cancelled" &&
+    input.source_generation === currentThread.ownership_generation &&
+    options.requeueCancelled !== true
+  ) return false;
 
   const active = await client.query<{ id: string }>(
     `SELECT id
@@ -3222,6 +3265,10 @@ export async function requeueUnpresentedAgentTurnInput(
   // A fresh run inherits the ended run's workspace, so it is only safe while
   // that run still belongs to the thread's current ownership generation.
   if (input.source_generation !== currentThread.ownership_generation) return false;
+  // Without an established provider session a fresh run would need the full
+  // coordination prompt (thread, instructions, history), which only the API
+  // builds; the stored input is the incremental text.
+  if (!currentThread.provider_thread_id) return false;
 
   const created = await client.query<{ id: string }>(
     `INSERT INTO dispatcher_runs
