@@ -14,6 +14,7 @@ import {
   managedGithubRepoPath,
   newSessionToken,
   applyCodexModelDefaults,
+  applyClaudeModelDefaults,
   applyCursorModelDefaults,
   applyDevinModelDefaults,
   applyOpenCodeModelDefaults,
@@ -63,6 +64,7 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { discoverAuthenticatedCodexModels } from "./codexModels.js";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
+import { ClaudeCodeAuthManager } from "./claudeCodeAuth.js";
 import { CursorAuthManager } from "./cursorAuth.js";
 import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
 import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
@@ -150,6 +152,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     env.devinBinary,
     resolve(env.managedRoot, "harness-auth", "devin-auth")
   );
+  const claudeCodeAuth = new ClaudeCodeAuthManager(pool, env.secretKey);
   app.addHook("onClose", async () => devinAuth.dispose());
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
@@ -374,6 +377,26 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return openCodeAuth.disconnect();
   });
 
+  app.get("/api/claude-code-auth", async (request) => {
+    requireAdmin(request);
+    return claudeCodeAuth.getStatus();
+  });
+
+  app.post("/api/claude-code-auth/token", async (request) => {
+    requireAdmin(request);
+    const body = z.object({ token: z.string().trim().min(1) }).parse(request.body);
+    try {
+      return await claudeCodeAuth.saveCredential(body.token);
+    } catch (error) {
+      throw app.httpErrors.badRequest(error instanceof Error ? error.message : "Could not save the Claude credential.");
+    }
+  });
+
+  app.delete("/api/claude-code-auth", async (request) => {
+    requireAdmin(request);
+    return claudeCodeAuth.disconnect();
+  });
+
   app.get("/api/devin-auth", async (request) => {
     requireAdmin(request);
     return devinAuth.getStatus();
@@ -441,6 +464,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       getOpenCodeModelSnapshot(),
       getDevinModelSnapshot(pool)
     ]);
+    const claudeCatalog = { ...applyClaudeModelDefaults(), source: "fallback" as const };
     return {
       instances: instances.rows.map((instance) => {
         const catalog =
@@ -450,6 +474,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
               ? openCodeCatalog
               : instance.driver === "devin"
                 ? devinCatalog
+                : instance.driver === "claude"
+                  ? claudeCatalog
                 : instance.driver === "codex"
                   ? codexCatalog
                   : { models: [], defaultModel: null, source: null };
@@ -3273,7 +3299,7 @@ async function resolveModelSelection(
   );
   const instance = mustRow(provider.rows[0]);
   if (!instance.enabled) throwBadRequest("The selected harness is disabled");
-  if (!["codex", "cursor", "opencode", "devin"].includes(instance.driver)) {
+  if (!["codex", "cursor", "opencode", "devin", "claude"].includes(instance.driver)) {
     throwBadRequest("The selected harness is not supported");
   }
   const model = input?.model ?? fallbackModel;
