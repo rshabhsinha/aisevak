@@ -1,0 +1,339 @@
+[
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "thread.started",
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "session.configured",
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "content.delta",
+    "itemId": "turn-1:assistant:1",
+    "text": "Let me check the config.",
+    "delta": {
+      "stream": "assistant",
+      "text": "Let me check the config."
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "turn.plan.updated",
+    "plan": {
+      "entries": [
+        {
+          "step": "Read config",
+          "status": "in_progress"
+        },
+        {
+          "step": "Update timeout",
+          "status": "pending"
+        }
+      ]
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.started",
+    "itemId": "toolu_bash",
+    "text": "cat config.json",
+    "item": {
+      "itemType": "command_execution",
+      "status": "in_progress",
+      "title": "cat config.json",
+      "command": "cat config.json",
+      "toolName": "Bash",
+      "input": {
+        "command": "cat config.json",
+        "description": "Show config"
+      }
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.updated",
+    "itemId": "toolu_bash",
+    "text": "cat config.json",
+    "item": {
+      "itemType": "command_execution",
+      "status": "in_progress",
+      "title": "cat config.json",
+      "command": "cat config.json",
+      "output": "{\"timeout\": 10}",
+      "toolName": "Bash",
+      "input": {
+        "command": "cat config.json",
+        "description": "Show config"
+      }
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.completed",
+    "itemId": "toolu_bash",
+    "text": "cat config.json",
+    "item": {
+      "itemType": "command_execution",
+      "status": "completed",
+      "title": "cat config.json",
+      "command": "cat config.json",
+      "output": "{\"timeout\": 10}",
+      "toolName": "Bash",
+      "input": {
+        "command": "cat config.json",
+        "description": "Show config"
+      }
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.started",
+    "itemId": "toolu_edit",
+    "text": "Edit config.json",
+    "item": {
+      "itemType": "file_change",
+      "status": "in_progress",
+      "title": "Edit config.json",
+      "changes": [
+        {
+          "path": "/srv/project/config.json",
+          "kind": "update",
+          "diff": "--- a/srv/project/config.json\n+++ b/srv/project/config.json\n@@ -1,4 +1,4 @@\n {\n   \"name\": \"app\",\n-  \"timeout\": 10\n+  \"timeout\": 30\n }"
+        }
+      ],
+      "toolName": "Edit",
+      "input": {
+        "file_path": "/srv/project/config.json",
+        "old_string": "10",
+        "new_string": "30"
+      },
+      "locations": [
+        "/srv/project/config.json"
+      ]
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.completed",
+    "itemId": "toolu_edit",
+    "text": "Edit config.json",
+    "item": {
+      "itemType": "file_change",
+      "status": "completed",
+      "title": "Edit config.json",
+      "changes": [
+        {
+          "path": "/srv/project/config.json",
+          "kind": "update",
+          "diff": "--- a/srv/project/config.json\n+++ b/srv/project/config.json\n@@ -1,4 +1,4 @@\n {\n   \"name\": \"app\",\n-  \"timeout\": 10\n+  \"timeout\": 30\n }"
+        }
+      ],
+      "toolName": "Edit",
+      "input": {
+        "file_path": "/srv/project/config.json",
+        "old_string": "10",
+        "new_string": "30"
+      },
+      "locations": [
+        "/srv/project/config.json"
+      ]
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.completed",
+    "itemId": "toolu_write",
+    "text": "Write NOTES.md",
+    "item": {
+      "itemType": "file_change",
+      "status": "completed",
+      "title": "Write NOTES.md",
+      "changes": [
+        {
+          "path": "/srv/project/NOTES.md",
+          "kind": "add",
+          "diff": "--- /dev/null\n+++ b/srv/project/NOTES.md\n@@ -0,0 +1,1 @@\n+hello"
+        }
+      ],
+      "toolName": "Write"
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.started",
+    "itemId": "toolu_task",
+    "text": "Review the change",
+    "item": {
+      "itemType": "subagent",
+      "status": "in_progress",
+      "title": "Review the change",
+      "toolName": "Task",
+      "input": {
+        "description": "Review the change",
+        "prompt": "Review it"
+      }
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "item.completed",
+    "itemId": "toolu_mcp",
+    "text": "github.get_issue",
+    "item": {
+      "itemType": "mcp_tool_call",
+      "status": "completed",
+      "title": "github.get_issue",
+      "toolName": "mcp__github__get_issue",
+      "input": {
+        "number": 7
+      }
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "content.delta",
+    "itemId": "turn-1:assistant:2",
+    "text": "Raised the timeout to 30.",
+    "delta": {
+      "stream": "assistant",
+      "text": "Raised the timeout to 30."
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "turn.completed",
+    "turn": {
+      "state": "completed",
+      "stopReason": "end_turn"
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "content.delta",
+    "itemId": "turn-2:assistant:1",
+    "text": "Starting the second task",
+    "delta": {
+      "stream": "assistant",
+      "text": "Starting the second task"
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-2",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "claude",
+    "type": "turn.completed",
+    "text": "The turn was cancelled",
+    "turn": {
+      "state": "cancelled",
+      "stopReason": "cancelled"
+    },
+    "threadId": "ses_cc1",
+    "turnId": "turn-2",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  }
+]

@@ -1,0 +1,7 @@
+{"id":3,"error":{"code":-32600,"message":"no rollout found for thread id thr_x"}}
+{"id":7,"method":"item/commandExecution/requestApproval","params":{"threadId":"thr_2","turnId":"turn_2","itemId":"call_9","command":"rm -rf build","reason":"Needs to delete build output"}}
+{"method":"item/completed","params":{"item":{"id":"dyn_1","type":"dynamicToolCall","tool":"lookup","arguments":{},"status":"completed","success":false,"contentItems":[{"type":"inputText","text":"not found"}]},"turnId":"turn_2","threadId":"thr_2"}}
+{"method":"error","params":{"error":{"message":"Context window exceeded","codexErrorInfo":"contextWindowExceeded"},"willRetry":false,"threadId":"thr_2","turnId":"turn_2"}}
+{"method":"turn/completed","params":{"turn":{"id":"turn_2","error":{"message":"Context window exceeded","codexErrorInfo":"contextWindowExceeded"},"items":[],"status":"failed","durationMs":1200},"threadId":"thr_2"}}
+{"method":"turn/completed","params":{"turn":{"id":"turn_3","error":null,"items":[],"status":"interrupted","durationMs":300},"threadId":"thr_2"}}
+not json at all

@@ -1,0 +1,14 @@
+{"id":1,"result":{"agentInfo":{"name":"OpenCode","version":"1.18.15"},"authMethods":[{"id":"opencode-login","name":"Login with opencode"}],"protocolVersion":1,"agentCapabilities":{"loadSession":true}},"jsonrpc":"2.0"}
+{"id":2,"result":{},"jsonrpc":"2.0"}
+{"id":3,"result":{"sessionId":"ses_oc1","configOptions":[{"id":"model","name":"Model","type":"select","options":[]}]},"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"available_commands_update","availableCommands":[{"name":"aisevak-cli","description":"Use the Aisevak CLI"}]}}}
+{"id":4,"result":{},"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"The user wants"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":" a listing."}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"tool_call","toolCallId":"call_ls","title":"ls","kind":"execute","status":"pending","locations":[],"rawInput":{}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_ls","status":"in_progress","kind":"execute","title":"List files","rawInput":{"command":"ls -la","description":"List files"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call_ls","status":"completed","kind":"execute","content":[{"type":"content","content":{"type":"text","text":"README.md\nsrc\n"}}],"rawOutput":{"output":"README.md\nsrc\n","metadata":{"exit":0}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Two entries"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_oc1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":": README.md and src."}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"update":{"cost":{"amount":0,"currency":"USD"},"size":200000,"used":8467,"sessionUpdate":"usage_update"},"sessionId":"ses_oc1"}}
+{"id":5,"result":{"_meta":{},"usage":{"inputTokens":6675,"totalTokens":8488,"outputTokens":21,"cachedReadTokens":1792},"stopReason":"end_turn"},"jsonrpc":"2.0"}

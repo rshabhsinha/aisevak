@@ -45,3 +45,7 @@ export { Sun } from "@phosphor-icons/react/dist/icons/Sun";
 export { CaretDown } from "@phosphor-icons/react/dist/icons/CaretDown";
 export { ChatCircleDots as ChatsIcon } from "@phosphor-icons/react/dist/icons/ChatCircleDots";
 
+export { PencilSimple } from "@phosphor-icons/react/dist/icons/PencilSimple";
+export { FileText } from "@phosphor-icons/react/dist/icons/FileText";
+export { Globe } from "@phosphor-icons/react/dist/icons/Globe";
+export { Gauge } from "@phosphor-icons/react/dist/icons/Gauge";

@@ -1,0 +1,8 @@
+{"id":1,"result":{"authMethods":[{"id":"cursor_login","name":"Cursor Login"}],"protocolVersion":1,"agentCapabilities":{"loadSession":true}},"jsonrpc":"2.0"}
+{"id":3,"error":{"code":-32603,"data":{"message":"Failed to initialize session services"},"message":"Internal error"},"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_cu1","update":{"sessionUpdate":"tool_call","toolCallId":"read_1","title":"Read src/app.ts","kind":"read","status":"in_progress","locations":[{"path":"/srv/project/src/app.ts","line":1}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_cu1","update":{"sessionUpdate":"tool_call_update","toolCallId":"read_1","status":"completed"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_cu1","update":{"sessionUpdate":"tool_call","toolCallId":"edit_1","title":"Edit src/app.ts","kind":"edit","status":"in_progress"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_cu1","update":{"sessionUpdate":"tool_call_update","toolCallId":"edit_1","status":"failed","content":[{"type":"content","content":{"type":"text","text":"File is read-only"}}]}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_cu1","update":{"sessionUpdate":"tool_call","toolCallId":"grep_1","title":"grep TODO","kind":"search","status":"completed"}}}
+{"id":9,"result":{"stopReason":"max_turn_requests"},"jsonrpc":"2.0"}

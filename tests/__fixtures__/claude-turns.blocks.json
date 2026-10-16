@@ -1,0 +1,95 @@
+[
+  {
+    "kind": "system",
+    "text": "Session ses_cc1"
+  },
+  {
+    "kind": "assistant",
+    "itemId": "turn-1:assistant:1",
+    "text": "Let me check the config.",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:03Z"
+  },
+  {
+    "kind": "plan",
+    "items": [
+      {
+        "id": "plan-0",
+        "title": "Read config",
+        "status": "running"
+      },
+      {
+        "id": "plan-1",
+        "title": "Update timeout",
+        "status": "pending"
+      }
+    ]
+  },
+  {
+    "kind": "tools",
+    "entries": [
+      {
+        "id": "toolu_bash",
+        "title": "cat config.json",
+        "status": "completed",
+        "icon": "terminal",
+        "command": "cat config.json",
+        "output": "{\"timeout\": 10}"
+      },
+      {
+        "id": "toolu_edit",
+        "title": "Edit config.json",
+        "status": "completed",
+        "icon": "edit",
+        "diffs": [
+          {
+            "path": "/srv/project/config.json",
+            "diff": "--- a/srv/project/config.json\n+++ b/srv/project/config.json\n@@ -1,4 +1,4 @@\n {\n   \"name\": \"app\",\n-  \"timeout\": 10\n+  \"timeout\": 30\n }"
+          }
+        ]
+      },
+      {
+        "id": "toolu_write",
+        "title": "Write NOTES.md",
+        "status": "completed",
+        "icon": "edit",
+        "diffs": [
+          {
+            "path": "/srv/project/NOTES.md",
+            "diff": "--- /dev/null\n+++ b/srv/project/NOTES.md\n@@ -0,0 +1,1 @@\n+hello"
+          }
+        ]
+      },
+      {
+        "id": "toolu_task",
+        "title": "Review the change",
+        "status": "running",
+        "icon": "agent"
+      },
+      {
+        "id": "toolu_mcp",
+        "title": "github.get_issue",
+        "status": "completed",
+        "icon": "wrench"
+      }
+    ]
+  },
+  {
+    "kind": "assistant",
+    "itemId": "turn-1:assistant:2",
+    "text": "Raised the timeout to 30.",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:13Z"
+  },
+  {
+    "kind": "assistant",
+    "itemId": "turn-2:assistant:1",
+    "text": "Starting the second task",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:15Z"
+  },
+  {
+    "kind": "system",
+    "text": "Turn cancelled"
+  }
+]

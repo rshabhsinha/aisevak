@@ -1,0 +1,33 @@
+[
+  {
+    "kind": "error",
+    "label": "Provider error",
+    "detail": "no rollout found for thread id thr_x"
+  },
+  {
+    "kind": "tools",
+    "entries": [
+      {
+        "id": "dyn_1",
+        "title": "lookup",
+        "status": "failed",
+        "icon": "hammer",
+        "output": "not found"
+      }
+    ]
+  },
+  {
+    "kind": "error",
+    "label": "Turn failed",
+    "detail": "Context window exceeded"
+  },
+  {
+    "kind": "system",
+    "text": "Turn interrupted"
+  },
+  {
+    "kind": "error",
+    "label": "Malformed provider output",
+    "detail": "not json at all"
+  }
+]

@@ -1,0 +1,45 @@
+[
+  {
+    "kind": "system",
+    "text": "Session ses_oc1"
+  },
+  {
+    "kind": "thinking",
+    "text": "The user wants a listing.",
+    "streaming": false
+  },
+  {
+    "kind": "tools",
+    "entries": [
+      {
+        "id": "call_ls",
+        "title": "List files",
+        "status": "completed",
+        "icon": "terminal",
+        "command": "ls -la",
+        "output": "README.md\nsrc\n"
+      }
+    ]
+  },
+  {
+    "kind": "assistant",
+    "itemId": "turn-1:assistant:2",
+    "text": "Two entries: README.md and src.",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:13Z"
+  },
+  {
+    "kind": "usage",
+    "usage": {
+      "contextUsedTokens": 8467,
+      "contextMaxTokens": 200000,
+      "inputTokens": 6675,
+      "cachedInputTokens": 1792,
+      "outputTokens": 21,
+      "cost": {
+        "amount": 0,
+        "currency": "USD"
+      }
+    }
+  }
+]

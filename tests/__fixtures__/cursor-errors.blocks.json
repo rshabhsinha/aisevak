@@ -1,0 +1,36 @@
+[
+  {
+    "kind": "error",
+    "label": "Provider error",
+    "detail": "Failed to initialize session services"
+  },
+  {
+    "kind": "tools",
+    "entries": [
+      {
+        "id": "read_1",
+        "title": "Read src/app.ts",
+        "status": "completed",
+        "icon": "read"
+      },
+      {
+        "id": "edit_1",
+        "title": "Edit src/app.ts",
+        "status": "failed",
+        "icon": "edit",
+        "output": "File is read-only"
+      },
+      {
+        "id": "grep_1",
+        "title": "grep TODO",
+        "status": "completed",
+        "icon": "search"
+      }
+    ]
+  },
+  {
+    "kind": "error",
+    "label": "Turn failed",
+    "detail": "The agent hit its per-turn request limit"
+  }
+]

@@ -1,0 +1,11 @@
+{"aisevakReplay":true,"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"Earlier question"}}}}
+{"aisevakReplay":true,"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Earlier answer"}}}}
+{"aisevakReplay":true,"id":2,"result":{},"jsonrpc":"2.0"}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"agent_message_chunk","messageId":"m_42","content":{"type":"text","text":"Working"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"notice","severity":"warning","title":"Approaching usage limit","description":"80% of the monthly quota used"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"compaction_update","compactionId":"cmp_1","status":"in_progress"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"compaction_update","compactionId":"cmp_1","status":"completed","summary":"Summarized 40 messages"}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"session_info_update","title":"Fix login"}}}
+{"jsonrpc":"2.0","id":0,"method":"session/request_permission","params":{"sessionId":"ses_dv1","toolCall":{"toolCallId":"tc_1","title":"Run migrations"},"options":[{"optionId":"allow","kind":"allow_once"}]}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"ses_dv1","update":{"sessionUpdate":"notice","severity":"error","title":"Model unavailable"}}}
+{"id":6,"result":{"stopReason":"max_tokens"},"jsonrpc":"2.0"}

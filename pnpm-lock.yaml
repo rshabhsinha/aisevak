@@ -143,6 +143,9 @@ importers:
 
   apps/web:
     dependencies:
+      '@aisevak/core':
+        specifier: workspace:*
+        version: link:../../packages/core
       '@blobatar/react':
         specifier: 2.4.0
         version: 2.4.0(blobatar@2.4.0(react@19.2.6))(react@19.2.6)

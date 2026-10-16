@@ -1,0 +1,467 @@
+[
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "session.configured",
+    "raw": {
+      "source": "codex.app-server"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "thread.started",
+    "threadId": "thr_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "thread/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "provider.event",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "mcpServer/startupStatus/updated"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "provider.event",
+    "threadId": "thr_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "thread/status/changed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.started",
+    "turn": {
+      "state": "in_progress"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "user.message",
+    "itemId": "u_1",
+    "text": "Fix the failing test",
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.started",
+    "itemId": "rs_1",
+    "item": {
+      "itemType": "reasoning",
+      "status": "in_progress"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "content.delta",
+    "itemId": "rs_1",
+    "text": "Looking at the test",
+    "delta": {
+      "stream": "reasoning_summary",
+      "text": "Looking at the test"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/reasoning/summaryTextDelta"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "content.delta",
+    "itemId": "rs_1",
+    "text": " output first.",
+    "delta": {
+      "stream": "reasoning_summary",
+      "text": " output first."
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/reasoning/summaryTextDelta"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "rs_1",
+    "text": "Looking at the test output first.",
+    "item": {
+      "itemType": "reasoning",
+      "status": "completed",
+      "text": "Looking at the test output first."
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.plan.updated",
+    "plan": {
+      "explanation": "Two steps",
+      "entries": [
+        {
+          "step": "Reproduce the failure",
+          "status": "in_progress"
+        },
+        {
+          "step": "Patch the parser",
+          "status": "pending"
+        }
+      ]
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/plan/updated"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.started",
+    "itemId": "call_1",
+    "text": "pnpm test",
+    "item": {
+      "itemType": "command_execution",
+      "status": "in_progress",
+      "title": "pnpm test",
+      "command": "pnpm test",
+      "cwd": "/srv/project"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "content.delta",
+    "itemId": "call_1",
+    "text": "FAIL parser.test.ts\n",
+    "delta": {
+      "stream": "command_output",
+      "text": "FAIL parser.test.ts\n"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/commandExecution/outputDelta"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "call_1",
+    "text": "pnpm test",
+    "item": {
+      "itemType": "command_execution",
+      "status": "failed",
+      "title": "pnpm test",
+      "command": "pnpm test",
+      "cwd": "/srv/project",
+      "exitCode": 1,
+      "output": "FAIL parser.test.ts\n"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.started",
+    "itemId": "fc_1",
+    "text": "src/parser.ts",
+    "item": {
+      "itemType": "file_change",
+      "status": "in_progress",
+      "title": "src/parser.ts",
+      "changes": [
+        {
+          "path": "src/parser.ts",
+          "kind": "update",
+          "diff": "@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"
+        }
+      ]
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "fc_1",
+    "text": "src/parser.ts",
+    "item": {
+      "itemType": "file_change",
+      "status": "completed",
+      "title": "src/parser.ts",
+      "changes": [
+        {
+          "path": "src/parser.ts",
+          "kind": "update",
+          "diff": "@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"
+        }
+      ]
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.diff.updated",
+    "diff": {
+      "unifiedDiff": "diff --git a/src/parser.ts b/src/parser.ts\n--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/diff/updated"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "mcp_1",
+    "text": "github.get_issue",
+    "item": {
+      "itemType": "mcp_tool_call",
+      "status": "completed",
+      "title": "github.get_issue",
+      "toolName": "github.get_issue",
+      "input": {
+        "number": 7
+      },
+      "output": "Issue 7: parser bug"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "ws_1",
+    "text": "vitest parser error",
+    "item": {
+      "itemType": "web_search",
+      "status": "completed",
+      "title": "vitest parser error"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "runtime.warning",
+    "text": "Rate limited, retrying",
+    "notice": {
+      "level": "warning",
+      "message": "Rate limited, retrying",
+      "detail": "rateLimitExceeded"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "error"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "runtime.warning",
+    "text": "This session was recorded with model `a` but is resuming with `b`.",
+    "notice": {
+      "level": "warning",
+      "message": "This session was recorded with model `a` but is resuming with `b`."
+    },
+    "threadId": "thr_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "warning"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.started",
+    "itemId": "msg_1",
+    "item": {
+      "itemType": "assistant_message",
+      "status": "in_progress"
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/started"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "content.delta",
+    "itemId": "msg_1",
+    "text": "Fixed the ",
+    "delta": {
+      "stream": "assistant",
+      "text": "Fixed the "
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/agentMessage/delta"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "content.delta",
+    "itemId": "msg_1",
+    "text": "parser.",
+    "delta": {
+      "stream": "assistant",
+      "text": "parser."
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/agentMessage/delta"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "msg_1",
+    "text": "Fixed the parser.",
+    "item": {
+      "itemType": "assistant_message",
+      "status": "completed",
+      "text": "Fixed the parser."
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "usage.updated",
+    "usage": {
+      "scope": "context",
+      "usedTokens": 18655,
+      "maxTokens": 258400,
+      "inputTokens": 18522,
+      "cachedInputTokens": 2432,
+      "outputTokens": 133,
+      "reasoningTokens": 37,
+      "totalTokens": 41546
+    },
+    "threadId": "thr_1",
+    "turnId": "turn_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "thread/tokenUsage/updated"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "provider.event",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "account/rateLimits/updated"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.completed",
+    "turnId": "turn_1",
+    "turn": {
+      "state": "completed",
+      "durationMs": 6350
+    },
+    "threadId": "thr_1",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/completed"
+    }
+  }
+]

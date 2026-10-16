@@ -1,0 +1,103 @@
+[
+  {
+    "kind": "system",
+    "text": "Session thr_1"
+  },
+  {
+    "kind": "thinking",
+    "text": "Looking at the test output first.",
+    "streaming": false
+  },
+  {
+    "kind": "plan",
+    "items": [
+      {
+        "id": "plan-0",
+        "title": "Reproduce the failure",
+        "status": "running"
+      },
+      {
+        "id": "plan-1",
+        "title": "Patch the parser",
+        "status": "pending"
+      }
+    ]
+  },
+  {
+    "kind": "tools",
+    "entries": [
+      {
+        "id": "call_1",
+        "title": "pnpm test",
+        "status": "failed",
+        "icon": "terminal",
+        "command": "pnpm test",
+        "output": "FAIL parser.test.ts\n",
+        "exitCode": 1
+      },
+      {
+        "id": "fc_1",
+        "title": "src/parser.ts",
+        "status": "completed",
+        "icon": "edit",
+        "diffs": [
+          {
+            "path": "src/parser.ts",
+            "diff": "--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"
+          }
+        ]
+      },
+      {
+        "id": "mcp_1",
+        "title": "github.get_issue",
+        "status": "completed",
+        "icon": "wrench",
+        "output": "Issue 7: parser bug"
+      },
+      {
+        "id": "ws_1",
+        "title": "vitest parser error",
+        "status": "completed",
+        "icon": "web"
+      }
+    ]
+  },
+  {
+    "kind": "notice",
+    "level": "warning",
+    "text": "Rate limited, retrying",
+    "detail": "rateLimitExceeded"
+  },
+  {
+    "kind": "notice",
+    "level": "warning",
+    "text": "This session was recorded with model `a` but is resuming with `b`."
+  },
+  {
+    "kind": "assistant",
+    "itemId": "msg_1",
+    "text": "Fixed the parser.",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:24Z"
+  },
+  {
+    "kind": "diff",
+    "diffs": [
+      {
+        "path": "src/parser.ts",
+        "diff": "--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -1 +1 @@\n-const a = 1\n+const a = 2"
+      }
+    ]
+  },
+  {
+    "kind": "usage",
+    "usage": {
+      "contextUsedTokens": 18655,
+      "contextMaxTokens": 258400,
+      "inputTokens": 18522,
+      "cachedInputTokens": 2432,
+      "outputTokens": 133,
+      "reasoningTokens": 37
+    }
+  }
+]

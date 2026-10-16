@@ -2,8 +2,6 @@ import {
   acpPermissionDecision,
   buildAcpInitializeParams,
   extractAcpSessionId,
-  normalizeAcpEvent,
-  parseCodexJsonLine,
   redactSecrets
 } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -477,15 +475,6 @@ class PersistentAcpSession {
       this.pending.delete(id);
     }
   }
-}
-
-export function persistAcpLine(
-  line: string,
-  sessionId: string | null
-): { type: string; text?: string; threadId?: string; raw: unknown } {
-  const raw = parseCodexJsonLine(line);
-  const normalized = normalizeAcpEvent(raw, sessionId);
-  return normalized;
 }
 
 export type { AppServerTurnInput };

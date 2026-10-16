@@ -1,4 +1,4 @@
-import { normalizeCodexEvent, redactSecrets, type DbPool } from "@aisevak/core";
+import { normalizeCodexMessage, redactSecrets, type DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import { persistCodexLine, persistDispatcherCodexLine } from "./index.js";
 import { decodePostgresJson, decodePostgresText, POSTGRES_TEXT_ESCAPE_PREFIX } from "./postgresText.js";
@@ -37,7 +37,7 @@ describe("normalized provider event storage", () => {
     const raw = {
       method: "item/completed",
       params: {
-        item: { type: "commandExecution", aggregatedOutput: `binary\u0000${secret}\ud800` },
+        item: { type: "commandExecution", command: `cat binary\u0000${secret}\ud800`, aggregatedOutput: `binary\u0000${secret}\ud800` },
         nested: { ["key\u0000"]: ["\u0000", String.raw`\u0000`, POSTGRES_TEXT_ESCAPE_PREFIX] }
       }
     };
@@ -50,9 +50,9 @@ describe("normalized provider event storage", () => {
       await persistDispatcherCodexLine(pool, { id: "run-1" }, line, 7);
     }
     const stored = queries.at(-1)!;
-    const normalized = normalizeCodexEvent(JSON.parse(line));
+    const normalized = normalizeCodexMessage(JSON.parse(line));
     expect(stored.sql).toContain(kind === "worker" ? "INSERT INTO run_events" : "INSERT INTO dispatcher_run_events");
-    expect(stored.params.slice(0, 3)).toEqual(["run-1", 7, "item/completed"]);
+    expect(stored.params.slice(0, 3)).toEqual(["run-1", 7, "item.completed"]);
     expect(decodePostgresText(stored.params[3] as string)).toBe(normalized.text);
     expect(decodePostgresJson(stored.params[4])).toEqual(normalized);
     expect(JSON.stringify(stored.params)).not.toContain(secret);
@@ -63,7 +63,7 @@ describe("normalized provider event storage", () => {
     const { pool, queries } = recordingPool();
     const raw = { method: "item/agentMessage/delta", params: { delta: "normal 日本語 😀" } };
     await persistDispatcherCodexLine(pool, { id: "run-1" }, JSON.stringify(raw), 42);
-    expect(queries[0]?.params).toEqual(["run-1", 42, raw.method, raw.params.delta, normalizeCodexEvent(raw)]);
+    expect(queries[0]?.params).toEqual(["run-1", 42, "content.delta", raw.params.delta, normalizeCodexMessage(raw)]);
   });
 
   it("stores a malformed/non-JSON provider line with NUL as an explicit parse error", async () => {
@@ -71,8 +71,6 @@ describe("normalized provider event storage", () => {
     const line = "non-JSON tool output\u0000\udc00";
     await persistDispatcherCodexLine(pool, { id: "run-1" }, line, 2);
     expect(queries[0]?.params[2]).toBe("parse.error");
-    expect(decodePostgresJson(queries[0]?.params[4])).toEqual({
-      ...normalizeCodexEvent({ type: "parse.error", rawLine: line })
-    });
+    expect(decodePostgresJson(queries[0]?.params[4])).toMatchObject({ v: 2, type: "parse.error", raw: { payload: line } });
   });
 });
