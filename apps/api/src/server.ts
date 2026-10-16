@@ -773,6 +773,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       );
       const plan = planAgentModelUpdate({
         driver: await providerDriver(pool, providerInstanceId ?? current.provider_instance_id),
+        previousDriver: await providerDriver(pool, current.provider_instance_id),
         currentModel: current.model,
         requestedModel: model,
         requestedOptions: modelOptions

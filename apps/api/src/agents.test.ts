@@ -41,24 +41,31 @@ describe("agentDeletionBlockReason", () => {
 
 describe("planAgentModelUpdate", () => {
   it("moves a Codex agent onto Claude Code with Opus 5.5 at medium effort", () => {
-    expect(planAgentModelUpdate({ driver: "claude", currentModel: "gpt-5.6-luna", requestedModel: null, requestedOptions: null }))
+    expect(planAgentModelUpdate({ driver: "claude", previousDriver: "codex", currentModel: "gpt-5.6-luna", requestedModel: null, requestedOptions: null }))
       .toEqual({ model: "claude-opus-5-5", modelOptions: [{ id: "reasoningEffort", value: "medium" }], error: null });
   });
 
   it("keeps explicit Claude choices and options", () => {
     expect(planAgentModelUpdate({
-      driver: "claude", currentModel: "swe-2-high", requestedModel: "claude-sonnet-5-5",
+      driver: "claude", previousDriver: "devin", currentModel: "swe-2-high", requestedModel: "claude-sonnet-5-5",
       requestedOptions: [{ id: "reasoningEffort", value: "low" }]
     })).toEqual({ model: "claude-sonnet-5-5", modelOptions: [{ id: "reasoningEffort", value: "low" }], error: null });
   });
 
   it("refuses a non-Claude model for Claude Code", () => {
-    expect(planAgentModelUpdate({ driver: "claude", currentModel: "claude-opus-5-5", requestedModel: "gpt-5.6-luna", requestedOptions: null }).error)
+    expect(planAgentModelUpdate({ driver: "claude", previousDriver: "claude", currentModel: "claude-opus-5-5", requestedModel: "gpt-5.6-luna", requestedOptions: null }).error)
       .toMatch(/need a Claude model/);
   });
 
   it("leaves other harnesses untouched", () => {
-    expect(planAgentModelUpdate({ driver: "devin", currentModel: "swe-2-high", requestedModel: null, requestedOptions: null }))
+    expect(planAgentModelUpdate({ driver: "devin", previousDriver: "devin", currentModel: "swe-2-high", requestedModel: null, requestedOptions: null }))
       .toEqual({ model: null, modelOptions: null, error: null });
+  });
+
+  it("requires a model when an agent leaves Claude Code", () => {
+    expect(planAgentModelUpdate({ driver: "codex", previousDriver: "claude", currentModel: "claude-opus-5-5", requestedModel: null, requestedOptions: null }).error)
+      .toMatch(/Choose a model/);
+    expect(planAgentModelUpdate({ driver: "codex", previousDriver: "claude", currentModel: "claude-opus-5-5", requestedModel: "gpt-5.6-luna", requestedOptions: null }))
+      .toEqual({ model: "gpt-5.6-luna", modelOptions: null, error: null });
   });
 });
