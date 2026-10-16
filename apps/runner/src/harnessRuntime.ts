@@ -1,5 +1,9 @@
 import {
+  buildClaudeAcpEnv,
   buildCursorAcpArgs,
+  CLAUDE_CODE_TOKEN_SECRET_NAME,
+  claudeConnectionTag,
+  classifyClaudeCredential,
   buildDevinAcpArgs,
   buildOpenCodeAcpArgs,
   CURSOR_API_KEY_SECRET_NAME,
@@ -34,6 +38,9 @@ export interface HarnessLaunchEnv {
   // ACP `authenticate` credential for drivers that reject CLI credential files
   // in ACP mode (Devin). Sent as _meta.api_key on the authenticate request.
   acpApiKey?: string;
+  // Identity of the credential and model baked into the harness environment,
+  // so the runner restarts a cached ACP process when either changes.
+  connectionTag?: string;
 }
 
 export async function materializeHarnessAuth(
@@ -41,8 +48,24 @@ export async function materializeHarnessAuth(
   driver: ProviderDriver,
   runtimeHome: string,
   secretKey: string,
-  baseEnv: NodeJS.ProcessEnv
+  baseEnv: NodeJS.ProcessEnv,
+  model?: string | null
 ): Promise<HarnessLaunchEnv> {
+  if (driver === "claude") {
+    const credential = (await readSecret(pool, CLAUDE_CODE_TOKEN_SECRET_NAME, secretKey))?.trim();
+    if (!credential) {
+      throw new Error("Claude Code is not authenticated. An admin must connect Claude Code from Settings > Claude Code.");
+    }
+    classifyClaudeCredential(credential);
+    await mkdir(join(runtimeHome, ".claude"), { recursive: true });
+    return {
+      driver,
+      env: buildClaudeAcpEnv({ baseEnv, runtimeHome, credential, model }),
+      secrets: [credential],
+      connectionTag: claudeConnectionTag(credential, model)
+    };
+  }
+
   if (driver === "cursor") {
     const apiKey = await readSecret(pool, CURSOR_API_KEY_SECRET_NAME, secretKey);
     const bundle = await readSecret(pool, CURSOR_AUTH_SECRET_NAME, secretKey);
@@ -128,10 +151,26 @@ export async function runHarnessTurn(input: {
   cursorBinary: string;
   openCodeBinary: string;
   devinBinary: string;
+  claudeBinary: string;
   options: AppServerTurnOptions;
   acpEnv?: NodeJS.ProcessEnv;
   acpApiKey?: string | null;
+  connectionTag?: string | null;
 }): Promise<AppServerTurnResult> {
+  if (input.driver === "claude") {
+    return runAcpTurn({
+      ...input.options,
+      binary: input.claudeBinary,
+      args: [],
+      runtimeHome: input.options.codexHome,
+      env: input.acpEnv ?? input.options.env,
+      // Claude Code reads its credential from the environment; the adapter's
+      // auth methods are interactive terminal logins, so skip `authenticate`.
+      authMethodId: null,
+      skipAuthenticate: true,
+      connectionTag: input.connectionTag
+    });
+  }
   if (input.driver === "devin") {
     return runAcpTurn({
       ...input.options,

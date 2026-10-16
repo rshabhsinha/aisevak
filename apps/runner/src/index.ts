@@ -20,6 +20,7 @@ import {
   redactSecrets,
   resolveCodexBinary,
   resolveCursorBinary,
+  resolveClaudeAcpBinary,
   resolveDevinBinary,
   resolveOpenCodeBinary,
   serializeCodexChatGptAuthFile,
@@ -66,6 +67,7 @@ const env = {
   cursorBinary: resolveCursorBinary(process.env.CURSOR_BINARY),
   openCodeBinary: resolveOpenCodeBinary(process.env.OPENCODE_BINARY),
   devinBinary: resolveDevinBinary(process.env.DEVIN_BINARY),
+  claudeBinary: resolveClaudeAcpBinary(process.env.CLAUDE_ACP_BINARY),
   codexHostAuthJson: process.env.CODEX_HOST_AUTH_JSON ?? join(homedir(), ".codex", "auth.json"),
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
@@ -187,7 +189,7 @@ async function main(): Promise<void> {
   process.on("SIGTERM", beginShutdown);
 
   console.log(
-    `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary}, Devin: ${env.devinBinary})`
+    `Aisevak runner started (Codex: ${env.codexBinary}, Cursor: ${env.cursorBinary}, OpenCode: ${env.openCodeBinary}, Devin: ${env.devinBinary}, Claude Code: ${env.claudeBinary})`
   );
   let cleanupJob: Promise<void> | null = null;
   let nextCleanupAt = 0;
@@ -1606,7 +1608,7 @@ export async function processOneDispatcherRun(
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          });
+          }, job.model);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await dispatcherRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -1767,8 +1769,10 @@ export async function processOneDispatcherRun(
             cursorBinary: env.cursorBinary,
             openCodeBinary: env.openCodeBinary,
             devinBinary: env.devinBinary,
+            claudeBinary: env.claudeBinary,
             options: turnOptions,
             acpApiKey: harnessAuth?.acpApiKey,
+            connectionTag: harnessAuth?.connectionTag,
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,
@@ -1939,7 +1943,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          });
+          }, job.model);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await workerRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -2059,8 +2063,10 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             cursorBinary: env.cursorBinary,
             openCodeBinary: env.openCodeBinary,
             devinBinary: env.devinBinary,
+            claudeBinary: env.claudeBinary,
             options: turnOptions,
             acpApiKey: harnessAuth?.acpApiKey,
+            connectionTag: harnessAuth?.connectionTag,
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,
@@ -3303,7 +3309,7 @@ function mustRow<T>(row: T | undefined): T {
 }
 
 function harnessDriver(value: string | null | undefined): ProviderDriver {
-  return value === "cursor" || value === "opencode" || value === "devin" ? value : "codex";
+  return value === "cursor" || value === "opencode" || value === "devin" || value === "claude" ? value : "codex";
 }
 
 function sleep(ms: number): Promise<void> {
