@@ -96,7 +96,7 @@ aisevak incidents declare --title "Queue latency high" --severity high --markdow
 - **Harnesses**: worker turns require a connected provider. Codex uses device-code auth (API key fallback); Cursor turns require a `CURSOR_API_KEY` (keychain subscriptions never reach worker homes); OpenCode reads stored or host `auth.json`; Devin runs over ACP using a portable `credentials.toml` (browser sign-in with manual code paste, host import, or API key). Claude Code runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`) with a `claude setup-token` subscription token or an Anthropic API key saved in **Manage → Claude Code**; Opus 5.5 at medium effort is its default.
 - **Skills vs capabilities**: installed skills live in `${MANAGED_ROOT}/skills` and are mounted per-thread as `$AISEVAK_SKILLS_DIR`; backend-enforced capabilities gate which CLI mutations each agent may perform.
 - **GitHub**: connect via **Manage → Connectors** with a classic PAT (`repo`, `read:org`, `gist`). The runner signs in `gh`, shares the CLI credential helper with agents, and discards the token.
-- **Security model**: for trusted small teams. Harnesses run with approvals disabled and full host access — use a dedicated machine or VM.
+- **Security model**: for trusted small teams. Harnesses run with approvals disabled and full host access — use a dedicated machine or VM. Harness credentials (Cursor and Devin keys, the Claude Code token) are in each harness process's environment, so the agent's own shell commands can read them; run logs redact them.
 
 ---
 

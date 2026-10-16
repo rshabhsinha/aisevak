@@ -184,13 +184,6 @@ install_harness_clis() {
       npm install -g "@agentclientprotocol/claude-agent-acp@${claude_acp_version}" \
         || log "Claude Code ACP adapter install failed; continuing without it"
     fi
-    # Expose the adapter where the runner user resolves it even when root's
-    # npm prefix is a per-user Node install.
-    local claude_acp_bin
-    claude_acp_bin="$(npm prefix -g)/bin/claude-agent-acp"
-    if [[ -x "${claude_acp_bin}" && "${claude_acp_bin}" != /usr/local/bin/claude-agent-acp ]]; then
-      ln -sf "${claude_acp_bin}" /usr/local/bin/claude-agent-acp
-    fi
     # The npm entry point is JavaScript with a platform package dependency.
     # Publish the complete native platform bundle: tool execution also needs
     # code-mode-host, packaged resources and the vendor's rg on PATH. The API
