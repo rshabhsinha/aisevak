@@ -1,5 +1,6 @@
 export * from "./acp.js";
 export * from "./auth.js";
+export * from "./claude.js";
 export * from "./codex.js";
 export * from "./codexAuth.js";
 export * from "./codexBinary.js";

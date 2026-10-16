@@ -32,6 +32,10 @@ const EXTENDED_REASONING: CodexModelOption = {
   defaultValue: "low"
 };
 
+export function reasoningEffortOptions(defaultValue: string, maximum: "xhigh" | "max" | "ultra"): CodexModelOption[] {
+  return reasoning(defaultValue, maximum);
+}
+
 function reasoning(defaultValue: string, maximum: "xhigh" | "max" | "ultra"): CodexModelOption[] {
   const maximumIndex = EXTENDED_REASONING.values.findIndex((value) => value.id === maximum);
   return [

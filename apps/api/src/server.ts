@@ -14,6 +14,7 @@ import {
   managedGithubRepoPath,
   newSessionToken,
   applyCodexModelDefaults,
+  applyClaudeModelDefaults,
   applyCursorModelDefaults,
   applyDevinModelDefaults,
   applyOpenCodeModelDefaults,
@@ -25,6 +26,9 @@ import {
   DEVIN_HARNESS_MODELS,
   OPENCODE_HARNESS_MODELS,
   defaultCodexModelOptions,
+  defaultHarnessModelOptions,
+  defaultModelForDriver,
+  isClaudeModelId,
   fetchZenModelCatalog,
   materializeDevinAuthBundle,
   parseCursorModelList,
@@ -63,6 +67,7 @@ import type { PoolClient } from "pg";
 import { z } from "zod";
 import { discoverAuthenticatedCodexModels } from "./codexModels.js";
 import { CodexAuthManager, sanitizeCodexAuthError } from "./codexAuth.js";
+import { ClaudeCodeAuthManager } from "./claudeCodeAuth.js";
 import { CursorAuthManager } from "./cursorAuth.js";
 import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
 import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
@@ -76,7 +81,7 @@ import {
   type AgentContext
 } from "./coordination.js";
 import { assertThreadAcceptsInput, setThreadArchived } from "./threadArchive.js";
-import { agentDeletionBlockReason } from "./agents.js";
+import { agentDeletionBlockReason, planAgentModelUpdate } from "./agents.js";
 import {
   normalizeWorkKey,
   normalizeWorkScope,
@@ -150,6 +155,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     env.devinBinary,
     resolve(env.managedRoot, "harness-auth", "devin-auth")
   );
+  const claudeCodeAuth = new ClaudeCodeAuthManager(pool, env.secretKey);
   app.addHook("onClose", async () => devinAuth.dispose());
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
@@ -374,6 +380,26 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     return openCodeAuth.disconnect();
   });
 
+  app.get("/api/claude-code-auth", async (request) => {
+    requireAdmin(request);
+    return claudeCodeAuth.getStatus();
+  });
+
+  app.post("/api/claude-code-auth/token", async (request) => {
+    requireAdmin(request);
+    const body = z.object({ token: z.string().trim().min(1) }).parse(request.body);
+    try {
+      return await claudeCodeAuth.saveCredential(body.token);
+    } catch (error) {
+      throw app.httpErrors.badRequest(error instanceof Error ? error.message : "Could not save the Claude credential.");
+    }
+  });
+
+  app.delete("/api/claude-code-auth", async (request) => {
+    requireAdmin(request);
+    return claudeCodeAuth.disconnect();
+  });
+
   app.get("/api/devin-auth", async (request) => {
     requireAdmin(request);
     return devinAuth.getStatus();
@@ -441,6 +467,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       getOpenCodeModelSnapshot(),
       getDevinModelSnapshot(pool)
     ]);
+    const claudeCatalog = { ...applyClaudeModelDefaults(), source: "fallback" as const };
     return {
       instances: instances.rows.map((instance) => {
         const catalog =
@@ -450,6 +477,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
               ? openCodeCatalog
               : instance.driver === "devin"
                 ? devinCatalog
+                : instance.driver === "claude"
+                  ? claudeCatalog
                 : instance.driver === "codex"
                   ? codexCatalog
                   : { models: [], defaultModel: null, source: null };
@@ -702,8 +731,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.post("/api/agents", async (request) => {
     const user = requireAdmin(request);
     const body = agentSchema.parse(request.body);
-    const model = body.model ?? env.codexDefaultModel;
     const providerInstanceId = await resolveAgentProviderInstanceId(pool, body.providerInstanceId);
+    const driver = await providerDriver(pool, providerInstanceId);
+    const model = body.model ?? defaultModelForDriver(driver, env.codexDefaultModel);
+    assertModelFitsDriver(driver, model);
     const result = await pool.query(
       `INSERT INTO agents (name, description, provider_instance_id, model, model_options, capabilities, instructions, enabled)
        VALUES ($1, $2, $3, $4, $5, $6, $7, true)
@@ -731,6 +762,26 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const providerInstanceId = body.providerInstanceId
       ? await resolveAgentProviderInstanceId(pool, body.providerInstanceId)
       : null;
+    let model = body.model ?? null;
+    let modelOptions = body.modelOptions ?? null;
+    if (providerInstanceId || model) {
+      const current = mustRow(
+        (await pool.query<{ provider_instance_id: string; model: string }>(
+          "SELECT provider_instance_id, model FROM agents WHERE id = $1",
+          [id]
+        )).rows[0]
+      );
+      const plan = planAgentModelUpdate({
+        driver: await providerDriver(pool, providerInstanceId ?? current.provider_instance_id),
+        previousDriver: await providerDriver(pool, current.provider_instance_id),
+        currentModel: current.model,
+        requestedModel: model,
+        requestedOptions: modelOptions
+      });
+      if (plan.error) throwBadRequest(plan.error);
+      model = plan.model;
+      modelOptions = plan.modelOptions;
+    }
     const result = await pool.query(
       `UPDATE agents
        SET name = COALESCE($2, name),
@@ -749,8 +800,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.name ?? null,
         body.description ?? null,
         providerInstanceId,
-        body.model ?? null,
-        body.modelOptions ? JSON.stringify(body.modelOptions) : null,
+        model,
+        modelOptions ? JSON.stringify(modelOptions) : null,
         body.capabilities ? JSON.stringify(body.capabilities) : null,
         body.instructions ?? null,
         body.enabled ?? null
@@ -3251,6 +3302,21 @@ async function resolveAgentProviderInstanceId(
   return id;
 }
 
+async function providerDriver(pool: Pick<DbPool, "query">, providerInstanceId: string): Promise<string> {
+  const result = await pool.query<{ driver: string }>("SELECT driver FROM provider_instances WHERE id = $1", [
+    providerInstanceId
+  ]);
+  const row = result.rows[0];
+  if (!row) throwBadRequest("The selected harness was not found");
+  return row.driver;
+}
+
+function assertModelFitsDriver(driver: string, model: string): void {
+  if (driver === "claude" && !isClaudeModelId(model)) {
+    throwBadRequest(`Claude Code agents need a Claude model such as claude-opus-5-5, not ${model}`);
+  }
+}
+
 async function resolveModelSelection(
   pool: Pick<DbPool, "query">,
   input: ModelSelectionInput | undefined,
@@ -3273,10 +3339,11 @@ async function resolveModelSelection(
   );
   const instance = mustRow(provider.rows[0]);
   if (!instance.enabled) throwBadRequest("The selected harness is disabled");
-  if (!["codex", "cursor", "opencode", "devin"].includes(instance.driver)) {
+  if (!["codex", "cursor", "opencode", "devin", "claude"].includes(instance.driver)) {
     throwBadRequest("The selected harness is not supported");
   }
-  const model = input?.model ?? fallbackModel;
+  const model = input?.model ?? (thread ? fallbackModel : defaultModelForDriver(instance.driver, fallbackModel));
+  if (!thread) assertModelFitsDriver(instance.driver, model);
   return {
     providerInstanceId,
     model,
@@ -3714,7 +3781,7 @@ function normalizeModelOptions(value: unknown): ModelSelectionInput["options"] {
 
 function modelOptionsFor(model: string | null | undefined, value: unknown): ModelSelectionInput["options"] {
   const normalized = normalizeModelOptions(value);
-  return normalized.length ? normalized : defaultCodexModelOptions(model ?? env.codexDefaultModel);
+  return normalized.length ? normalized : defaultHarnessModelOptions(model ?? env.codexDefaultModel);
 }
 
 function threadTitleFromMessage(message: string): string {

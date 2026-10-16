@@ -47,7 +47,7 @@ import { AgentAvatar } from "./components/agent-avatar";
 import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
-import { CursorLogo, DevinLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
+import { ClaudeCodeLogo, CursorLogo, DevinLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { cn } from "./lib/utils";
@@ -163,7 +163,7 @@ interface ModelSelection {
 
 interface ProviderInstance {
   id: string;
-  driver: "codex" | "cursor" | "opencode" | "devin";
+  driver: "codex" | "cursor" | "opencode" | "devin" | "claude";
   display_name: string;
   enabled: boolean;
   status: "ready" | "warning" | "error";
@@ -185,7 +185,7 @@ interface AgentThread {
   project_id: string | null;
   project_name: string | null;
   provider_instance_id: string;
-  provider_driver: "codex" | "cursor" | "opencode" | "devin";
+  provider_driver: "codex" | "cursor" | "opencode" | "devin" | "claude";
   provider_name: string;
   model: string;
   model_options: ModelOptionSelection[];
@@ -1403,6 +1403,8 @@ export function App() {
                   ? "opencode"
                   : view === "devin"
                   ? "devin"
+                  : view === "claude"
+                  ? "claude"
                   : "codex"
               }
               onTabChange={(tab) => navigateToView(tab)}
@@ -4691,6 +4693,129 @@ function DevinConnectionView() {
   );
 }
 
+function ClaudeCodeConnectionView() {
+  const [status, setStatus] = useState({
+    connected: false,
+    activeMethod: null as "subscription" | "api_key" | null,
+    credentialHint: null as string | null,
+    updatedAt: null as string | null,
+    lastError: null as string | null
+  });
+  const [token, setToken] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    void loadStatus();
+  }, []);
+
+  async function loadStatus() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/claude-code-auth"));
+    } catch (statusError) {
+      setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Claude Code status."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function saveToken() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/claude-code-auth/token", { method: "POST", body: JSON.stringify({ token }) }));
+      setToken("");
+    } catch (saveError) {
+      setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save the Claude credential."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function disconnect() {
+    setBusy(true);
+    setError(null);
+    try {
+      setStatus(await api("/api/claude-code-auth", { method: "DELETE" }));
+    } catch (disconnectError) {
+      setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Claude Code."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flat-list-view api-view codex-connection-view">
+      <div className="flat-header">
+        <h3>Claude Code</h3>
+      </div>
+      <section className="codex-connection-hero">
+        <div className="codex-connection-heading">
+          <div className="codex-connection-mark"><ClaudeCodeLogo size={25} /></div>
+          <div>
+            <h4>Connect Claude Code to Aisevak</h4>
+            <p>Worker turns run Claude Code on this host through the claude-agent-acp adapter. Run `claude setup-token` on any machine signed in to your Claude subscription and paste the token, or paste an Anthropic API key.</p>
+          </div>
+        </div>
+        <Badge variant={status.connected ? "success" : "warning"}>{status.connected ? "Connected" : "Token required"}</Badge>
+      </section>
+      <section className="codex-connection-grid">
+        <div>
+          <span>Active method</span>
+          <strong>{status.activeMethod === "subscription" ? "Claude subscription token" : status.activeMethod === "api_key" ? "Anthropic API key" : "None"}</strong>
+        </div>
+        <div>
+          <span>Credential</span>
+          <strong>{status.credentialHint ?? "Not connected"}</strong>
+        </div>
+        <div>
+          <span>Saved</span>
+          <strong>{status.updatedAt ? new Date(status.updatedAt).toLocaleString() : "Never"}</strong>
+        </div>
+      </section>
+      <section className="api-section codex-connection-actions">
+        <div className="section-title-row">
+          <div>
+            <h4>{status.connected ? "Connection is ready" : "Connect Claude Code"}</h4>
+            <p>The credential is encrypted, injected only into Claude Code worker processes, and redacted from run logs. Saving a new one replaces the old one on the next turn.</p>
+          </div>
+          {status.connected ? (
+            <div className="row-actions">
+              <Button variant="outline" disabled={busy} onClick={() => void loadStatus()}>
+                <RefreshCw className={busy ? "spin" : ""} size={14} /> Refresh
+              </Button>
+              <Button variant="destructive" disabled={busy} onClick={() => void disconnect()}>
+                Disconnect
+              </Button>
+            </div>
+          ) : null}
+        </div>
+        <form
+          className="row-actions"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void saveToken();
+          }}
+        >
+          <Input
+            type="password"
+            value={token}
+            autoComplete="off"
+            placeholder={status.connected ? "Replace with a new token or API key" : "sk-ant-oat… or sk-ant-api…"}
+            onChange={(event) => setToken(event.target.value)}
+          />
+          <Button type="submit" variant="outline" disabled={busy || !token.trim()}>
+            Save
+          </Button>
+        </form>
+        {error || status.lastError ? <div className="notice error codex-inline-notice">{error ?? status.lastError}</div> : null}
+      </section>
+    </div>
+  );
+}
+
 function ApiView(props: { apiKeys: ExternalApiKey[]; onSaved: () => Promise<void> }) {
   const [name, setName] = useState("External integration");
   const [expiresAt, setExpiresAt] = useState(() => localDateTimeInput(addDays(new Date(), 30)));
@@ -5419,7 +5544,7 @@ function githubConnectionStatus(status: GithubConnection["status"]): string {
   }
 }
 
-type SettingsTab = "codex" | "cursor" | "opencode" | "devin" | "api" | "credentials" | "projects" | "connectors";
+type SettingsTab = "codex" | "cursor" | "opencode" | "devin" | "claude" | "api" | "credentials" | "projects" | "connectors";
 
 function SettingsView(props: {
   activeTab: SettingsTab;
@@ -5444,6 +5569,7 @@ function SettingsView(props: {
     { id: "cursor", label: "Cursor", icon: <CursorLogo size={14} />, restricted: true },
     { id: "opencode", label: "OpenCode", icon: <OpenCodeLogo size={14} />, restricted: true },
     { id: "devin", label: "Devin", icon: <DevinLogo size={14} />, restricted: true },
+    { id: "claude", label: "Claude Code", icon: <ClaudeCodeLogo size={14} />, restricted: true },
     { id: "api", label: "API Keys", icon: <KeyRound size={14} /> },
     { id: "credentials", label: "Credentials", icon: <LockKeyhole size={14} />, restricted: true },
     { id: "projects", label: "Projects", icon: <FolderGit2 size={14} /> },
@@ -5485,6 +5611,9 @@ function SettingsView(props: {
         ) : null}
         {props.activeTab === "devin" && props.userRole !== "member" ? (
           <DevinConnectionView />
+        ) : null}
+        {props.activeTab === "claude" && props.userRole !== "member" ? (
+          <ClaudeCodeConnectionView />
         ) : null}
         {props.activeTab === "api" ? (
           <ApiView apiKeys={props.apiKeys} onSaved={props.onSavedApiKeys} />
@@ -5775,7 +5904,7 @@ function apiKeyStatus(key: ExternalApiKey): string {
 }
 
 function isSettingsView(view: View): boolean {
-  return ["settings", "codex", "cursor", "opencode", "devin", "api", "credentials", "projects", "connectors"].includes(view);
+  return ["settings", "codex", "cursor", "opencode", "devin", "claude", "api", "credentials", "projects", "connectors"].includes(view);
 }
 
 function viewTitle(view: View): string {
@@ -5793,6 +5922,7 @@ function viewTitle(view: View): string {
     cursor: "Settings",
     opencode: "Settings",
     devin: "Settings",
+    claude: "Settings",
     api: "Settings",
     credentials: "Settings",
     projects: "Settings",

@@ -26,9 +26,24 @@ export function DevinLogo({ size = 16, className, ...props }: React.SVGProps<SVG
   );
 }
 
+// Generic eight-ray starburst used as the Claude Code harness mark.
+export function ClaudeCodeLogo({ size = 16, className, ...props }: React.SVGProps<SVGSVGElement> & { size?: number | string }) {
+  return (
+    <svg viewBox="0 0 24 24" width={size} height={size} fill="none" className={className} aria-hidden="true" {...props}>
+      <path
+        d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6L5.6 18.4"
+        stroke="currentColor"
+        strokeWidth="2.4"
+        strokeLinecap="round"
+      />
+    </svg>
+  );
+}
+
 export function HarnessMark({ driver, size = 14 }: { driver: string; size?: number }) {
   if (driver === "cursor") return <CursorLogo size={size} />;
   if (driver === "opencode") return <OpenCodeLogo size={size} />;
   if (driver === "devin") return <DevinLogo size={size} />;
+  if (driver === "claude") return <ClaudeCodeLogo size={size} />;
   return <OpenAILogo size={size} />;
 }

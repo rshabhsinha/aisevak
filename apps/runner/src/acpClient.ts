@@ -14,9 +14,16 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
   args: string[];
   runtimeHome: string;
   authMethodId?: string | null;
+  // Skip the ACP `authenticate` request for harnesses that read credentials
+  // from their environment and only advertise interactive login methods.
+  skipAuthenticate?: boolean;
   // ACP `authenticate` parameter (sent as _meta.api_key). Devin requires this —
   // it intentionally does not read CLI credentials in ACP mode.
   apiKey?: string | null;
+  // Extra identity for the cached harness process. Drivers that take their
+  // credential or model from the environment (Claude Code) set this so a new
+  // credential or model starts a fresh process instead of reusing the old one.
+  connectionTag?: string | null;
 }
 
 const sessions = new Map<string, PersistentAcpSession>();
@@ -70,6 +77,17 @@ export async function closeIdleAcpSession(home: string): Promise<boolean> {
   return true;
 }
 
+export function acpConnectionKey(options: AcpTurnOptions): string {
+  return JSON.stringify([
+    options.binary,
+    options.args,
+    options.cwd,
+    options.runtimeHome,
+    options.apiKey ?? null,
+    options.connectionTag ?? null
+  ]);
+}
+
 interface PendingRequest {
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
@@ -98,7 +116,7 @@ class PersistentAcpSession {
     private readonly initial: AcpTurnOptions,
     onClose: () => void
   ) {
-    this.connectionKey = JSON.stringify([initial.binary, initial.args, initial.cwd, initial.runtimeHome, initial.apiKey ?? null]);
+    this.connectionKey = acpConnectionKey(initial);
     this.child = spawn(initial.binary, initial.args, {
       cwd: initial.cwd,
       env: initial.env,
@@ -132,7 +150,7 @@ class PersistentAcpSession {
 
   matches(options: AcpTurnOptions): boolean {
     return !this.closed && this.child.exitCode === null && this.child.signalCode === null &&
-      this.connectionKey === JSON.stringify([options.binary, options.args, options.cwd, options.runtimeHome, options.apiKey ?? null]);
+      this.connectionKey === acpConnectionKey(options);
   }
 
   private apiKey: string | null = null;
@@ -161,7 +179,7 @@ class PersistentAcpSession {
     this.lastUsedAt = Date.now();
     this.apiKey = options.apiKey ?? null;
     try {
-      await this.initialize(options.authMethodId);
+      await this.initialize(options.authMethodId, options.skipAuthenticate === true);
       if (options.threadId) {
         loadingSession = true;
         try {
@@ -287,7 +305,7 @@ class PersistentAcpSession {
     await this.closePromise;
   }
 
-  private async initialize(authMethodId?: string | null): Promise<void> {
+  private async initialize(authMethodId?: string | null, skipAuthenticate = false): Promise<void> {
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
         const result = await this.request("initialize", buildAcpInitializeParams());
@@ -298,7 +316,7 @@ class PersistentAcpSession {
           authMethodId && methods.some((method) => method.id === authMethodId)
             ? authMethodId
             : methods[0]?.id;
-        if (methodId || this.apiKey) {
+        if (!skipAuthenticate && (methodId || this.apiKey)) {
           await this.request("authenticate", {
             ...(methodId ? { methodId } : {}),
             ...(this.apiKey ? { _meta: { api_key: this.apiKey } } : {})

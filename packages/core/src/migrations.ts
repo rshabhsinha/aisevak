@@ -1040,7 +1040,8 @@ VALUES
   ('codex-local', 'codex', 'Codex', true),
   ('cursor-local', 'cursor', 'Cursor', true),
   ('opencode-local', 'opencode', 'OpenCode', true),
-  ('devin-local', 'devin', 'Devin', true)
+  ('devin-local', 'devin', 'Devin', true),
+  ('claude-local', 'claude', 'Claude Code', true)
 ON CONFLICT (id) DO UPDATE
 SET driver = EXCLUDED.driver,
     display_name = EXCLUDED.display_name,

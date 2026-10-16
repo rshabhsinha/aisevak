@@ -45,6 +45,25 @@ export function resolveDevinBinary(
   });
 }
 
+// Claude Code runs through the ACP adapter `claude-agent-acp`
+// (@agentclientprotocol/claude-agent-acp), which bundles the Claude Agent SDK
+// and its native Claude Code executable. It is a Node package, so it is
+// installed globally on the host for the runner and not published into
+// HARNESS_BIN_DIR for the API container.
+export function resolveClaudeAcpBinary(
+  configured: string | null | undefined,
+  environment: NodeJS.ProcessEnv = process.env
+): string {
+  return resolveNamedBinary({
+    configured,
+    defaultName: "claude-agent-acp",
+    aliases: ["claude-agent-acp"],
+    darwinCandidates: [join(homedir(), ".local", "bin", "claude-agent-acp"), "/opt/homebrew/bin/claude-agent-acp"],
+    sharedCandidates: ["/usr/local/bin/claude-agent-acp", "/usr/bin/claude-agent-acp"],
+    environment
+  });
+}
+
 export function resolveOpenCodeBinary(
   configured: string | null | undefined,
   environment: NodeJS.ProcessEnv = process.env
