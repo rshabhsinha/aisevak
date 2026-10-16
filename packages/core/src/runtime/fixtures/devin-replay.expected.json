@@ -1,0 +1,168 @@
+[
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "user.message",
+    "text": "Earlier question",
+    "threadId": "ses_dv1",
+    "turnId": "replay",
+    "replay": true,
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "content.delta",
+    "itemId": "replay:assistant:1",
+    "text": "Earlier answer",
+    "delta": {
+      "stream": "assistant",
+      "text": "Earlier answer"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "replay",
+    "replay": true,
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "session.configured",
+    "threadId": "ses_dv1",
+    "turnId": "replay",
+    "replay": true,
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "content.delta",
+    "itemId": "m_42",
+    "text": "Working",
+    "delta": {
+      "stream": "assistant",
+      "text": "Working"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "runtime.warning",
+    "text": "Approaching usage limit",
+    "notice": {
+      "level": "warning",
+      "message": "Approaching usage limit",
+      "detail": "80% of the monthly quota used"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "item.started",
+    "itemId": "cmp_1",
+    "item": {
+      "itemType": "context_compaction",
+      "status": "in_progress",
+      "title": "Context compacted"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "item.completed",
+    "itemId": "cmp_1",
+    "item": {
+      "itemType": "context_compaction",
+      "status": "completed",
+      "title": "Context compacted",
+      "text": "Summarized 40 messages"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "session.configured",
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "request.opened",
+    "itemId": "tc_1",
+    "text": "Run migrations",
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/request_permission"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "runtime.error",
+    "text": "Model unavailable",
+    "error": {
+      "message": "Model unavailable"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "devin",
+    "type": "turn.completed",
+    "text": "The model hit its output token limit",
+    "turn": {
+      "state": "failed",
+      "stopReason": "max_tokens",
+      "errorMessage": "The model hit its output token limit"
+    },
+    "threadId": "ses_dv1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  }
+]

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { acpPermissionDecision, extractAcpSessionId, normalizeAcpEvent } from "./acp.js";
+import { acpPermissionDecision, extractAcpSessionId } from "./acp.js";
 
 describe("ACP helpers", () => {
   it("prefers an always-allow permission option", () => {
@@ -35,25 +35,6 @@ describe("ACP helpers", () => {
     expect(acpPermissionDecision({ options: exitPlan }).outcome.optionId).toBe("exit-plan-bypass");
     const withoutBypass = exitPlan.filter((option) => !option.optionId.includes("bypass"));
     expect(acpPermissionDecision({ options: withoutBypass }).outcome.optionId).toBe("exit-plan-auto");
-  });
-
-  it("maps assistant chunks onto the Codex timeline shape", () => {
-    const event = normalizeAcpEvent(
-      {
-        method: "session/update",
-        params: {
-          sessionId: "ses_1",
-          update: {
-            sessionUpdate: "agent_message_chunk",
-            content: { type: "text", text: "Hello" }
-          }
-        }
-      },
-      "ses_1"
-    );
-    expect(event.type).toBe("item/agentMessage/delta");
-    expect(event.threadId).toBe("ses_1");
-    expect(event.text).toBe("Hello");
   });
 
   it("extracts a session id from session/new results", () => {

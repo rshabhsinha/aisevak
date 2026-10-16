@@ -4,8 +4,6 @@ import {
   buildCodexConfigToml,
   buildCodexPrompt,
   buildDispatcherPrompt,
-  normalizeCodexEvent,
-  parseCodexJsonLine,
   redactSecrets
 } from "./codex.js";
 
@@ -69,35 +67,6 @@ describe("codex helpers", () => {
     });
     expect(prompt).toContain("aisevak task complete TASK-123");
     expect(prompt).toContain("If you can fully answer a task without a worker run");
-  });
-
-  it("normalizes current JSONL events", () => {
-    const raw = parseCodexJsonLine(
-      JSON.stringify({ method: "thread.started", params: { thread_id: "abc" } })
-    );
-    expect(normalizeCodexEvent(raw).threadId).toBe("abc");
-  });
-
-  it("normalizes app-server notifications", () => {
-    const raw = parseCodexJsonLine(
-      JSON.stringify({
-        method: "item/completed",
-        params: {
-          threadId: "thread_123",
-          turnId: "turn_123",
-          item: { id: "item_1", type: "agentMessage", text: "Done" }
-        }
-      })
-    );
-    const event = normalizeCodexEvent(raw);
-    expect(event.threadId).toBe("thread_123");
-    expect(event.itemId).toBe("item_1");
-    expect(event.text).toBe("Done");
-  });
-
-  it("keeps malformed lines as parse events", () => {
-    const raw = parseCodexJsonLine("{nope");
-    expect(normalizeCodexEvent(raw).type).toBe("parse.error");
   });
 
   it("redacts configured secrets", () => {
