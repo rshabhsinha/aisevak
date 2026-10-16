@@ -14,6 +14,7 @@ export type AppView =
   | "cursor"
   | "opencode"
   | "devin"
+  | "claude"
   | "settings";
 
 export interface AppRoute {
@@ -37,6 +38,7 @@ const VIEW_PATHS: Record<Exclude<AppView, "runs">, string> = {
   cursor: "/settings/cursor",
   opencode: "/settings/opencode",
   devin: "/settings/devin",
+  claude: "/settings/claude-code",
   settings: "/settings"
 };
 
