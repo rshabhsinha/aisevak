@@ -175,10 +175,21 @@ install_harness_clis() {
     # executes it on the host, so it is not published into HARNESS_BIN_DIR.
     # Pinned for reproducible releases; override with CLAUDE_AGENT_ACP_VERSION.
     local claude_acp_version="${CLAUDE_AGENT_ACP_VERSION:-0.91.0}"
-    if [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" ]] || ! command_exists claude-agent-acp; then
+    local node_major
+    node_major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
+    if (( node_major < 22 )); then
+      log "Node.js ${node_major} is older than 22; skipping the Claude Code ACP adapter"
+    elif [[ "${AISEVAK_UPDATE_HARNESS_CLIS:-1}" == "1" ]] || ! command_exists claude-agent-acp; then
       log "Installing Claude Code ACP adapter ${claude_acp_version}"
       npm install -g "@agentclientprotocol/claude-agent-acp@${claude_acp_version}" \
         || log "Claude Code ACP adapter install failed; continuing without it"
+    fi
+    # Expose the adapter where the runner user resolves it even when root's
+    # npm prefix is a per-user Node install.
+    local claude_acp_bin
+    claude_acp_bin="$(npm prefix -g)/bin/claude-agent-acp"
+    if [[ -x "${claude_acp_bin}" && "${claude_acp_bin}" != /usr/local/bin/claude-agent-acp ]]; then
+      ln -sf "${claude_acp_bin}" /usr/local/bin/claude-agent-acp
     fi
     # The npm entry point is JavaScript with a platform package dependency.
     # Publish the complete native platform bundle: tool execution also needs
