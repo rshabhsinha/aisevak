@@ -210,11 +210,12 @@ export function codexItem(item: JsonRecord, started: boolean): RuntimeItem {
       return compact({ itemType: "plan" as const, status, text: stringValue(item.text) });
     case "commandExecution": {
       const exitCode = numberValue(item.exitCode);
+      const command = unwrapShell(stringValue(item.command));
       return compact({
         itemType: "command_execution" as const,
         status: exitCode !== undefined && exitCode !== 0 && status === "completed" ? "failed" : status,
-        title: stringValue(item.command),
-        command: stringValue(item.command),
+        title: command,
+        command,
         cwd: stringValue(item.cwd),
         exitCode,
         output: stringValue(item.aggregatedOutput)
@@ -267,6 +268,12 @@ export function codexItem(item: JsonRecord, started: boolean): RuntimeItem {
     default:
       return compact({ itemType: "other" as const, status, title: stringValue(item.type) });
   }
+}
+
+/** Codex runs commands as `/bin/zsh -lc '<command>'`; show the command itself. */
+export function unwrapShell(command: string | undefined): string | undefined {
+  const match = command && /^(?:\/usr)?\/bin\/(?:ba|z)?sh -lc '(.*)'$/s.exec(command);
+  return match ? match[1]!.replace(/'\\''/g, "'") : command;
 }
 
 function itemStatus(value: unknown, started: boolean): RuntimeItemStatus {

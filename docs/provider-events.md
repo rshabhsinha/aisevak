@@ -152,8 +152,8 @@ their current types. `turn.failed` is treated as `turn.completed{state:"failed"}
   created once per turn in the runner. `persistCodexLine` takes the resulting event. **One input
   line produces at most one stored row**, so seq handling and the delivery and acpClient logic are
   unchanged.
-- `normalizeAcpEvent` / `normalizeCodexEvent` remain as thin wrappers for one release (the tests
-  and `eventPersistence` use them).
+- `normalizeAcpEvent` / `normalizeCodexEvent` / `NormalizedCodexEvent` are removed (no legacy rows
+  are rendered, so nothing needs the old shape).
 
 ### Old rows
 Events already in the database (`payload` without `v: 2`) go through an
@@ -182,7 +182,8 @@ The dead `agentRunTimeline.ts` deriver is removed; `formatElapsed` and the types
   because those binaries aren't installed here.
 - Next to each fixture, `*.expected.json` holds the normalized events, compared by one table-driven
   vitest.
-- A second test per fixture feeds the events through `deriveThreadBlocks` and snapshots the blocks.
+- A second test per fixture (`tests/threadTimeline.test.ts`) feeds the events through
+  `deriveThreadBlocks` and snapshots the blocks in `tests/__fixtures__/`.
 - The legacy-row shim gets fixtures taken from current dev-DB payloads.
 
 ### Order of work (one PR, small commits)

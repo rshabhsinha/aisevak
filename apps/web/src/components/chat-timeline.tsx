@@ -3,9 +3,11 @@ import {
   CheckCircle2,
   ChevronDown,
   CircleAlert,
-  Copy
+  Copy,
+  Gauge,
+  Info
 } from "./icons";
-import { TaskList, ThinkingReasoning, ToolCall } from "./aicss";
+import { FileDiff, TaskList, ThinkingReasoning, ToolCall } from "./aicss";
 import { MarkdownContent } from "./markdown";
 import { Button } from "./ui/button";
 import {
@@ -13,7 +15,8 @@ import {
   type PendingUserMessage,
   type ThreadBlock,
   type ThreadEvent,
-  type ThreadRunRef
+  type ThreadRunRef,
+  type ThreadUsage
 } from "../threadBlocks";
 import { formatElapsed } from "../agentRunTimeline";
 
@@ -56,6 +59,12 @@ function ThreadBlockView({ block }: { block: ThreadBlock }) {
       return <ToolsBlock block={block} />;
     case "plan":
       return <PlanBlock block={block} />;
+    case "diff":
+      return <DiffBlock block={block} />;
+    case "usage":
+      return <UsageBlock block={block} />;
+    case "notice":
+      return <NoticeBlock block={block} />;
     case "comment":
       return <CommentBlock block={block} />;
     case "error":
@@ -141,6 +150,49 @@ function ToolsBlock({ block }: { block: Extract<ThreadBlock, { kind: "tools" }> 
 
 function PlanBlock({ block }: { block: Extract<ThreadBlock, { kind: "plan" }> }) {
   return <TaskList title="Plan" tasks={block.items.map((item) => ({ ...item, detail: undefined }))} />;
+}
+
+function DiffBlock({ block }: { block: Extract<ThreadBlock, { kind: "diff" }> }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="turn-diff">
+      <button type="button" className="turn-diff-toggle" onClick={() => setOpen((value) => !value)}>
+        <ChevronDown size={12} style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform 140ms ease" }} />
+        <span>
+          Changed {block.diffs.length} {block.diffs.length === 1 ? "file" : "files"}
+        </span>
+      </button>
+      {open ? block.diffs.map((diff) => <FileDiff key={diff.path} filename={diff.path} diff={diff.diff} defaultExpanded={false} />) : null}
+    </div>
+  );
+}
+
+function UsageBlock({ block }: { block: Extract<ThreadBlock, { kind: "usage" }> }) {
+  const parts = usageParts(block.usage);
+  const percent = contextPercent(block.usage);
+  return (
+    <div className="usage-row" title={usageTitle(block.usage)}>
+      <Gauge size={12} />
+      {percent !== null ? (
+        <span className="usage-meter" aria-label={`Context ${percent}% full`}>
+          <span className="usage-meter-fill" style={{ width: `${Math.min(100, percent)}%` }} />
+        </span>
+      ) : null}
+      <span>{parts.join(" · ")}</span>
+    </div>
+  );
+}
+
+function NoticeBlock({ block }: { block: Extract<ThreadBlock, { kind: "notice" }> }) {
+  return (
+    <div className={`notice-row notice-${block.level}`} role="status">
+      <Info size={13} />
+      <span>
+        {block.text}
+        {block.detail ? <small> · {block.detail}</small> : null}
+      </span>
+    </div>
+  );
 }
 
 function CommentBlock({ block }: { block: Extract<ThreadBlock, { kind: "comment" }> }) {
@@ -256,6 +308,41 @@ function LiveElapsed({ createdAt }: { createdAt: string }) {
       {formatElapsed(createdAt, now) ?? "0s"}
     </span>
   );
+}
+
+function contextPercent(usage: ThreadUsage): number | null {
+  if (!usage.contextUsedTokens || !usage.contextMaxTokens) return null;
+  return Math.round((usage.contextUsedTokens / usage.contextMaxTokens) * 100);
+}
+
+function usageParts(usage: ThreadUsage): string[] {
+  const parts: string[] = [];
+  const percent = contextPercent(usage);
+  if (percent !== null) parts.push(`${percent}% context`);
+  if (usage.inputTokens !== undefined) parts.push(`${formatTokens(usage.inputTokens)} in`);
+  if (usage.outputTokens !== undefined) parts.push(`${formatTokens(usage.outputTokens)} out`);
+  if (usage.cost && usage.cost.amount > 0) parts.push(`${usage.cost.currency === "USD" ? "$" : `${usage.cost.currency} `}${usage.cost.amount.toFixed(2)}`);
+  return parts;
+}
+
+function usageTitle(usage: ThreadUsage): string {
+  return [
+    usage.contextUsedTokens !== undefined && usage.contextMaxTokens !== undefined
+      ? `Context: ${usage.contextUsedTokens.toLocaleString()} / ${usage.contextMaxTokens.toLocaleString()} tokens`
+      : null,
+    usage.inputTokens !== undefined ? `Input: ${usage.inputTokens.toLocaleString()}` : null,
+    usage.cachedInputTokens !== undefined ? `Cached input: ${usage.cachedInputTokens.toLocaleString()}` : null,
+    usage.outputTokens !== undefined ? `Output: ${usage.outputTokens.toLocaleString()}` : null,
+    usage.reasoningTokens !== undefined ? `Reasoning: ${usage.reasoningTokens.toLocaleString()}` : null
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+function formatTokens(value: number): string {
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1)}k`;
+  return String(value);
 }
 
 function formatTime(value: string): string {

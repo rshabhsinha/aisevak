@@ -10,6 +10,10 @@
       "development": "./src/index.ts",
       "types": "./src/index.ts",
       "default": "./dist/index.js"
+    },
+    "./runtime-events": {
+      "types": "./src/runtime/events.ts",
+      "default": "./src/runtime/events.ts"
     }
   },
   "scripts": {

@@ -160,12 +160,12 @@
     "provider": "codex",
     "type": "item.started",
     "itemId": "call_1",
-    "text": "/bin/zsh -lc 'pnpm test'",
+    "text": "pnpm test",
     "item": {
       "itemType": "command_execution",
       "status": "in_progress",
-      "title": "/bin/zsh -lc 'pnpm test'",
-      "command": "/bin/zsh -lc 'pnpm test'",
+      "title": "pnpm test",
+      "command": "pnpm test",
       "cwd": "/srv/project"
     },
     "threadId": "thr_1",
@@ -197,12 +197,12 @@
     "provider": "codex",
     "type": "item.completed",
     "itemId": "call_1",
-    "text": "/bin/zsh -lc 'pnpm test'",
+    "text": "pnpm test",
     "item": {
       "itemType": "command_execution",
       "status": "failed",
-      "title": "/bin/zsh -lc 'pnpm test'",
-      "command": "/bin/zsh -lc 'pnpm test'",
+      "title": "pnpm test",
+      "command": "pnpm test",
       "cwd": "/srv/project",
       "exitCode": 1,
       "output": "FAIL parser.test.ts\n"

@@ -120,7 +120,7 @@
       "status": "completed",
       "title": "cat config.json",
       "command": "cat config.json",
-      "output": "```console\n{\"timeout\": 10}\n```",
+      "output": "{\"timeout\": 10}",
       "toolName": "Bash",
       "input": {
         "command": "cat config.json",
@@ -256,11 +256,11 @@
     "provider": "claude",
     "type": "item.completed",
     "itemId": "toolu_mcp",
-    "text": "mcp__github__get_issue",
+    "text": "github.get_issue",
     "item": {
       "itemType": "mcp_tool_call",
       "status": "completed",
-      "title": "mcp__github__get_issue",
+      "title": "github.get_issue",
       "toolName": "mcp__github__get_issue",
       "input": {
         "number": 7

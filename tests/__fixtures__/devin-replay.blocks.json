@@ -1,0 +1,29 @@
+[
+  {
+    "kind": "assistant",
+    "itemId": "m_42",
+    "text": "Working",
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:10Z"
+  },
+  {
+    "kind": "notice",
+    "level": "warning",
+    "text": "Approaching usage limit",
+    "detail": "80% of the monthly quota used"
+  },
+  {
+    "kind": "system",
+    "text": "Context compacted: Summarized 40 messages"
+  },
+  {
+    "kind": "error",
+    "label": "Provider error",
+    "detail": "Model unavailable"
+  },
+  {
+    "kind": "error",
+    "label": "Turn failed",
+    "detail": "The model hit its output token limit"
+  }
+]

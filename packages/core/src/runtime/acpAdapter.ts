@@ -223,8 +223,8 @@ function mergeToolItem(previous: RuntimeItem | undefined, update: JsonRecord): R
   const status = toolStatus(stringValue(update.status), previous?.status);
   // A pending tool_call's text content is its description (Claude Code), not output.
   const output =
-    (status !== "in_progress" ? contentOutput : "") ||
     rawOutputText(update.rawOutput) ||
+    (status !== "in_progress" ? stripFence(contentOutput) : "") ||
     stringValue(objectValue(claude?.toolResponse)?.stdout) ||
     previous?.output;
   const locations = arrayValue(update.locations).flatMap((location) => {
@@ -232,10 +232,11 @@ function mergeToolItem(previous: RuntimeItem | undefined, update: JsonRecord): R
     return path ? [path] : [];
   });
   const title = plainTitle(stringValue(update.title)) ?? previous?.title ?? command ?? toolName;
+  const displayTitle = title && title === toolName ? mcpToolLabel(title) : title;
   return compact({
     itemType,
     status,
-    title,
+    title: displayTitle,
     command: itemType === "command_execution" ? command : undefined,
     exitCode: numberValue(objectValue(update.rawOutput)?.exitCode) ?? numberValue(objectValue(update.rawOutput)?.exit_code) ?? previous?.exitCode,
     output,
@@ -244,6 +245,17 @@ function mergeToolItem(previous: RuntimeItem | undefined, update: JsonRecord): R
     input: update.rawInput ?? previous?.input,
     locations: locations.length > 0 ? locations : previous?.locations
   });
+}
+
+/** Claude Code fences tool output as markdown (```console ... ```). */
+function stripFence(text: string): string {
+  return /^```[\w-]*\n([\s\S]*?)\n?```$/.exec(text.trim())?.[1] ?? text;
+}
+
+/** `mcp__github__get_issue` → `github.get_issue`. */
+function mcpToolLabel(name: string): string {
+  const match = /^mcp__(.+?)__(.+)$/.exec(name);
+  return match ? `${match[1]}.${match[2]}` : name;
 }
 
 /** Claude Code titles tool calls with markdown code spans ("Edit `config.json`"). */

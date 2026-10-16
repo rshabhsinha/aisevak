@@ -1,5 +1,6 @@
 import { useState, type ReactElement } from "react";
 import { AgentOrb } from "./agent-orbs";
+import { CodeBlock } from "./code-block";
 import { FileDiff } from "./file-diff";
 import {
   Activity,
@@ -8,68 +9,63 @@ import {
   ChevronRight,
   CircleAlert,
   Eye,
+  FileText,
+  Globe,
   Hammer,
+  PencilSimple,
   Terminal,
   Wrench
 } from "../icons";
 import type { ThreadToolCall } from "../../threadBlocks";
 import { normalizeCompactToolLabel } from "../../agentRunTimeline";
 
-export interface ToolCallEntry {
-  title: string;
-  command?: string;
-  detail?: string;
-  status: "running" | "completed" | "failed";
-  exitCode?: number | null;
-  icon: "terminal" | "search" | "wrench" | "hammer" | "edit" | "info";
-}
+export type ToolCallEntry = Pick<ThreadToolCall, "title" | "command" | "output" | "diffs" | "status" | "exitCode" | "icon">;
 
 export function ToolCall({ entry }: { entry: ToolCallEntry }): ReactElement {
-  const [expanded, setExpanded] = useState(false);
+  const running = entry.status === "running";
+  const hasOutput = Boolean(entry.output?.trim());
+  const hasDiffs = Boolean(entry.diffs?.length);
+  // Live output opens by itself; finished tools stay compact until clicked.
+  const [expanded, setExpanded] = useState<boolean | null>(null);
+  const isExpanded = expanded ?? (running && hasOutput);
   const Icon = toolCallIcon(entry);
   const heading = normalizeCompactToolLabel(entry.title) || "Tool call";
   const preview = toolCallPreview(entry, heading);
-  const hasDetail = Boolean(entry.detail?.trim());
-  const isDiff = Boolean(
-    entry.detail &&
-      (entry.detail.includes("--- a/") ||
-        entry.detail.includes("+++ b/") ||
-        (entry.detail.includes("@@") && entry.detail.includes("\n+")))
-  );
+  const expandable = hasOutput || hasDiffs;
 
   return (
     <div className={`work-entry ${entry.status === "failed" ? "error" : "tool"}`}>
       <button
         type="button"
         className="work-entry-main"
-        onClick={() => setExpanded((value) => !value)}
+        onClick={() => setExpanded(!isExpanded)}
         title={preview ? `${heading} - ${preview}` : heading}
       >
         <span className="work-entry-icon">
-          {entry.status === "running" ? (
-            <AgentOrb variant="working" size={13} color="var(--primary)" />
-          ) : (
-            <Icon size={13} />
-          )}
+          {running ? <AgentOrb variant="working" size={13} color="var(--primary)" /> : <Icon size={13} />}
         </span>
         <span className="work-entry-text">
           <strong>{heading}</strong>
           {preview ? <span> - {preview}</span> : null}
         </span>
-        {hasDetail ? (
+        {entry.exitCode !== undefined && entry.exitCode !== null && entry.exitCode !== 0 ? (
+          <span className="work-entry-exit">exit {entry.exitCode}</span>
+        ) : null}
+        {expandable ? (
           <span className="work-entry-chevron">
-            {expanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            {isExpanded ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
           </span>
         ) : null}
       </button>
-      {expanded && hasDetail ? (
-        isDiff ? (
-          <div className="px-2 pb-2">
-            <FileDiff filename={preview || heading} diff={entry.detail!} defaultExpanded={true} />
-          </div>
-        ) : (
-          <pre className="work-entry-detail">{entry.detail}</pre>
-        )
+      {isExpanded && expandable ? (
+        <div className="work-entry-body">
+          {entry.diffs?.map((diff) => (
+            <FileDiff key={diff.path} filename={diff.path} diff={diff.diff} defaultExpanded={true} />
+          ))}
+          {hasOutput ? (
+            <CodeBlock label={entry.icon === "terminal" ? "output" : "result"} code={entry.output!} streaming={running} />
+          ) : null}
+        </div>
       ) : null}
     </div>
   );
@@ -81,11 +77,17 @@ function toolCallIcon(entry: ToolCallEntry) {
       return Terminal;
     case "search":
       return Eye;
+    case "read":
+      return FileText;
+    case "web":
+      return Globe;
     case "wrench":
       return Wrench;
     case "hammer":
       return Hammer;
     case "edit":
+      return PencilSimple;
+    case "agent":
       return Bot;
     default:
       return entry.status === "failed" ? CircleAlert : Activity;
@@ -93,7 +95,7 @@ function toolCallIcon(entry: ToolCallEntry) {
 }
 
 function toolCallPreview(entry: ToolCallEntry, heading: string): string | null {
-  const preview = entry.command || entry.detail;
+  const preview = entry.command;
   if (!preview) return null;
   const normalizedPreview = normalizeCompactToolLabel(preview).toLowerCase();
   const normalizedHeading = normalizeCompactToolLabel(heading).toLowerCase();
