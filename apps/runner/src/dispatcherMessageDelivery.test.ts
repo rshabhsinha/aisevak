@@ -52,6 +52,30 @@ describe("dispatcher message delivery", () => {
     expect(deliveryStatus()).toBe("retrying");
   });
 
+  it("cancels a picked run whose delivery was cancelled before it started", async () => {
+    const codexHome = join(runtimeRoot, "codex-home");
+    const { pool, queries, deliveryStatus } = dispatcherPool(codexHome, "failed");
+    let launched = false;
+
+    await processOneDispatcherRun(pool, async () => {
+      launched = true;
+      throw new Error("a run for an inactive delivery must not launch");
+    });
+
+    expect(launched).toBe(false);
+    const claim = queries.find((query) =>
+      query.sql.includes("SET status = 'running', attempt_count = attempt_count + 1")
+    );
+    expect(claim?.sql).toContain("AND status IN ('queued', 'retrying')");
+    const cancel = queries.find((query) =>
+      query.sql.includes("UPDATE dispatcher_runs") && query.sql.includes("SET status = 'cancelled'")
+    );
+    expect(cancel?.params?.[0]).toBe("dispatcher-run");
+    expect(cancel?.sql).toContain("WHERE id = $1 AND status = 'running'");
+    expect(deliveryStatus()).toBe("failed");
+    expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+  });
+
   it("does not pick a queued run after its delivery has failed", async () => {
     let picked = false;
     const query = async (sql: string) => {
@@ -74,13 +98,13 @@ describe("dispatcher message delivery", () => {
   });
 });
 
-function dispatcherPool(codexHome: string): {
+function dispatcherPool(codexHome: string, initialStatus = "queued"): {
   pool: DbPool;
   queries: Array<{ sql: string; params?: unknown[] }>;
   deliveryStatus: () => string;
 } {
   const queries: Array<{ sql: string; params?: unknown[] }> = [];
-  let status = "pending";
+  let status = initialStatus;
   let attemptCount = 0;
   const query = async (sql: string, params?: unknown[]) => {
     queries.push({ sql, params });
@@ -136,9 +160,12 @@ function dispatcherPool(codexHome: string): {
       };
     }
     if (sql.includes("SET status = 'running', attempt_count = attempt_count + 1")) {
+      if (sql.includes("status IN ('queued', 'retrying')") && !["queued", "retrying"].includes(status)) {
+        return { rows: [] };
+      }
       status = "running";
       attemptCount += 1;
-      return { rows: [] };
+      return { rows: [{ id: "delivery" }] };
     }
     if (sql.includes("SELECT encrypted_value FROM secrets")) return { rows: [] };
     if (sql.includes("SELECT delivery.status")) {

@@ -1289,6 +1289,13 @@ CREATE TABLE IF NOT EXISTS worktree_cleanup_attempts (
 );
 
 ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL DEFAULT 'codex-local' REFERENCES provider_instances(id) ON DELETE RESTRICT;
+
+-- Set before a dispatcher run sends its prompt to the provider. Crash recovery
+-- only retries a delivery whose run never reached this point. Rows that exist
+-- when the column is added (runs from an older runner, which never wrote it)
+-- get now() so they are treated as possibly launched; new rows start NULL.
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS launch_attempted_at timestamptz DEFAULT now();
+ALTER TABLE dispatcher_runs ALTER COLUMN launch_attempted_at DROP DEFAULT;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

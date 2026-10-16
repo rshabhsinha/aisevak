@@ -322,7 +322,8 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
         await markAssignmentDeliveryTerminal(client, run.message_delivery_id, error, "cancelled");
         await cancelQueuedDeliveryRuns(client, run.message_delivery_id, error);
       }
-      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, "cancelled");
+      // A requeued run would inherit the same unavailable workspace snapshot.
+      await failPendingAgentTurnInputsInTransaction(client, "dispatcher", run.id, "cancelled", { requeueQueued: false });
     }
   });
 }
@@ -367,7 +368,14 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       );
       await appendRunCancelEvent(client, "dispatcher", run.id, error);
       const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
-      if (deliveryId) {
+      // A delivery the provider never acknowledged was not seen by the
+      // recipient, so a runner restart retries it rather than dropping it.
+      const requeued = Boolean(
+        deliveryId &&
+          finalStatus === "failed" &&
+          await requeueUnpresentedRunDelivery(client, run.id, deliveryId, error)
+      );
+      if (deliveryId && !requeued) {
         await client.query(
           `UPDATE message_deliveries
            SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
@@ -434,6 +442,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
         ? "The coordination turn was stopped before this message could be delivered"
         : "The coordination turn finished before this message could be delivered";
     await withTransaction(pool, async (client) => {
+      if (input.input_status === "queued" && await requeueUnpresentedAgentTurnInput(client, input.input_id)) return;
       const updated = await client.query(
         `UPDATE agent_turn_inputs
          SET status = $2,
@@ -1572,13 +1581,21 @@ export async function processOneDispatcherRun(
     return true;
   }
   if (job.message_delivery_id) {
-    await pool.query(
+    const started = await pool.query(
       `UPDATE message_deliveries
        SET status = 'running', attempt_count = attempt_count + 1,
            updated_at = now()
-       WHERE id = $1`,
+       WHERE id = $1 AND status IN ('queued', 'retrying')
+       RETURNING id`,
       [job.message_delivery_id]
     );
+    if (!started.rows[0]) {
+      // The delivery was cancelled, finished, or claimed by another run after
+      // this run was picked. Running it anyway would deliver the message twice
+      // or resurrect a cancelled one.
+      await cancelDispatcherRunForInactiveDelivery(pool, job);
+      return true;
+    }
     if (job.assignment_id) {
       await pool.query("UPDATE task_assignments SET status = 'running', active_delivery_id = $2, updated_at = now() WHERE id = $1 AND status IN ('queued', 'blocked')", [job.assignment_id, job.message_delivery_id]);
     }
@@ -1714,6 +1731,12 @@ export async function processOneDispatcherRun(
         }
       },
       onBeforeTurnStart: async () => {
+        // Durable before the prompt can reach the provider, so crash recovery
+        // never mistakes a possibly presented message for an unsent one.
+        await pool.query(
+          "UPDATE dispatcher_runs SET launch_attempted_at = COALESCE(launch_attempted_at, now()), updated_at = now() WHERE id = $1",
+          [job.id]
+        );
         const fence = await acquireRunLaunchFence(pool, {
           kind: "dispatcher",
           runId: job.id,
@@ -2812,6 +2835,29 @@ async function cancelMismatchedDispatcherRun(
   await failPendingAgentTurnInputs(pool, "dispatcher", job.id, "cancelled");
 }
 
+async function cancelDispatcherRunForInactiveDelivery(
+  pool: DbPool,
+  job: Pick<DispatcherJob, "id">
+): Promise<void> {
+  const error = "The dispatcher turn was cancelled because its message delivery was no longer pending";
+  await withTransaction(pool, async (client) => {
+    const updated = await client.query(
+      `UPDATE dispatcher_runs
+       SET status = 'cancelled',
+           error = $2,
+           finished_at = now(),
+           updated_at = now()
+       WHERE id = $1 AND status = 'running'
+       RETURNING id`,
+      [job.id, error]
+    );
+    if (!updated.rows[0]) return;
+    await appendRunCancelEvent(client, "dispatcher", job.id, error);
+    // Nobody stopped this thread; its pending messages still belong to it.
+    await failPendingAgentTurnInputsInTransaction(client, "dispatcher", job.id, "cancelled", { requeueCancelled: true });
+  });
+}
+
 async function cancelQueuedDeliveryRuns(
   queryable: Pick<DbPool, "query">,
   messageDeliveryId: string,
@@ -3044,9 +3090,54 @@ async function failPendingAgentTurnInputsInTransaction(
   client: Pick<DbPool, "query">,
   kind: "worker" | "dispatcher",
   runId: string,
-  finalStatus: "succeeded" | "failed" | "cancelled"
+  finalStatus: "succeeded" | "failed" | "cancelled",
+  options: { requeueQueued?: boolean; requeueCancelled?: boolean } = {}
 ): Promise<void> {
   const runColumn = kind === "worker" ? "task_run_id" : "dispatcher_run_id";
+  if (kind === "dispatcher") {
+    // queueIncrementalCoordinationInput attaches inputs to an active run while
+    // holding the agent thread lock. Taking that lock here (after the run's
+    // terminal status is committed) means no input can still be attaching to
+    // this run while its inputs are settled. Deliveries are locked first to
+    // keep queueDelivery's delivery-then-thread order.
+    const pendingDeliveries = await client.query<{ message_delivery_id: string }>(
+      `SELECT DISTINCT message_delivery_id
+       FROM agent_turn_inputs
+       WHERE dispatcher_run_id = $1 AND status IN ('queued', 'delivering') AND message_delivery_id IS NOT NULL`,
+      [runId]
+    );
+    const pendingDeliveryIds = pendingDeliveries.rows.map((row) => row.message_delivery_id);
+    if (pendingDeliveryIds.length > 0) {
+      await client.query(
+        "SELECT id FROM message_deliveries WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+        [pendingDeliveryIds]
+      );
+    }
+    await client.query(
+      `SELECT agent_threads.id
+       FROM dispatcher_runs
+       JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
+       WHERE dispatcher_runs.id = $1
+       FOR UPDATE OF agent_threads`,
+      [runId]
+    );
+  }
+  if (kind === "dispatcher" && options.requeueQueued !== false) {
+    // Inputs still 'queued' were never presented to the provider: the run just
+    // ended before its monitor picked them up. Hand them to another turn
+    // instead of failing a message the recipient never saw. Only inputs that
+    // were already 'delivering' have an ambiguous outcome and are failed below.
+    const queued = await client.query<{ id: string }>(
+      `SELECT id
+       FROM agent_turn_inputs
+       WHERE dispatcher_run_id = $1 AND status = 'queued' AND message_delivery_id IS NOT NULL
+       ORDER BY created_at ASC, id ASC`,
+      [runId]
+    );
+    for (const input of queued.rows) {
+      await requeueUnpresentedAgentTurnInput(client, input.id, { requeueCancelled: options.requeueCancelled });
+    }
+  }
   const result = await client.query<{ message_delivery_id: string | null }>(
       `UPDATE agent_turn_inputs
        SET status = 'failed',
@@ -3079,6 +3170,199 @@ async function failPendingAgentTurnInputsInTransaction(
     await markAssignmentDeliveryTerminal(client, deliveryId, deliveryError, finalStatus === "cancelled" ? "cancelled" : "blocked");
     await cancelQueuedDeliveryRuns(client, deliveryId, deliveryError);
   }
+}
+
+// Moves a never-presented coordination input off a run that has ended, the
+// same way queueDelivery routes a new message: onto the agent thread's active
+// coordination run when there is one, otherwise into a fresh dispatcher run.
+// Returns false when the input cannot be requeued safely (delivery no longer
+// pending, thread archived, or ownership moved with no active run to adopt it).
+export async function requeueUnpresentedAgentTurnInput(
+  client: Pick<DbPool, "query">,
+  inputId: string,
+  options: { requeueCancelled?: boolean } = {}
+): Promise<boolean> {
+  const located = await client.query<{ agent_thread_id: string; message_delivery_id: string | null }>(
+    "SELECT agent_thread_id, message_delivery_id FROM agent_turn_inputs WHERE id = $1",
+    [inputId]
+  );
+  const agentThreadId = located.rows[0]?.agent_thread_id;
+  const deliveryId = located.rows[0]?.message_delivery_id;
+  if (!agentThreadId || !deliveryId) return false;
+  // Lock order matches queueDelivery: the delivery, then the agent thread,
+  // then the input row.
+  await client.query("SELECT id FROM message_deliveries WHERE id = $1 FOR UPDATE", [deliveryId]);
+  const thread = await client.query<{ ownership_generation: number; provider_thread_id: string | null; task_id: string | null }>(
+    `SELECT ownership_generation, provider_thread_id, task_id
+     FROM agent_threads
+     WHERE id = $1 AND archived_at IS NULL
+     FOR UPDATE`,
+    [agentThreadId]
+  );
+  const currentThread = thread.rows[0];
+  if (!currentThread) return false;
+  const locked = await client.query<{
+    message_delivery_id: string;
+    assignment_id: string | null;
+    message: string;
+    source_run_id: string;
+    source_generation: number;
+    source_status: string;
+    delivery_status: string;
+  }>(
+    `SELECT input.message_delivery_id,
+            COALESCE(input.assignment_id, delivery.assignment_id) AS assignment_id,
+            input.message,
+            source_run.id AS source_run_id,
+            source_run.agent_thread_generation AS source_generation,
+            source_run.status::text AS source_status,
+            delivery.status AS delivery_status
+     FROM agent_turn_inputs input
+     JOIN dispatcher_runs source_run ON source_run.id = input.dispatcher_run_id
+     JOIN message_deliveries delivery ON delivery.id = input.message_delivery_id
+     WHERE input.id = $1
+       AND input.agent_thread_id = $2
+       AND input.message_delivery_id = $3
+       AND input.status = 'queued'
+       AND source_run.scope = 'coordination'
+     FOR UPDATE OF input`,
+    [inputId, agentThreadId, deliveryId]
+  );
+  const input = locked.rows[0];
+  if (!input || !["queued", "retrying"].includes(input.delivery_status)) return false;
+  if (["queued", "running", "cancel_requested"].includes(input.source_status)) return false;
+  // A run cancelled within its own ownership generation was stopped by the
+  // user (thread or run Stop), and Stop drops the messages pending on it.
+  // Cancellations caused by an ownership change land here with a stale
+  // generation and may still move onto the new owner's active run.
+  if (
+    input.source_status === "cancelled" &&
+    input.source_generation === currentThread.ownership_generation &&
+    options.requeueCancelled !== true
+  ) return false;
+
+  const active = await client.query<{ id: string }>(
+    `SELECT id
+     FROM dispatcher_runs
+     WHERE agent_thread_id = $1
+       AND scope = 'coordination'
+       AND agent_thread_generation = $2
+       AND status IN ('queued', 'running')
+       AND id <> $3
+     ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END,
+              CASE WHEN status = 'running' THEN started_at ELSE queued_at END ASC NULLS LAST,
+              id ASC
+     LIMIT 1`,
+    [agentThreadId, currentThread.ownership_generation, input.source_run_id]
+  );
+  if (active.rows[0]) {
+    await client.query(
+      "UPDATE agent_turn_inputs SET dispatcher_run_id = $2, updated_at = now() WHERE id = $1",
+      [inputId, active.rows[0].id]
+    );
+    return true;
+  }
+  // A fresh run inherits the ended run's workspace, so it is only safe while
+  // that run still belongs to the thread's current ownership generation.
+  if (input.source_generation !== currentThread.ownership_generation) return false;
+  // Without an established provider session a fresh run would need the full
+  // coordination prompt (thread, instructions, history), which only the API
+  // builds; the stored input is the incremental text.
+  if (!currentThread.provider_thread_id) return false;
+
+  const created = await client.query<{ id: string }>(
+    `INSERT INTO dispatcher_runs
+       (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+        codex_thread_id, model, model_options, prompt, skills_snapshot)
+     SELECT CASE WHEN $2::uuid IS NULL THEN $3::uuid ELSE (SELECT task_id FROM task_assignments WHERE id = $2::uuid) END,
+            $2::uuid, 'message', 'coordination', source_run.agent_thread_id,
+            source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, $4::uuid, 'queued', source_run.cwd, source_run.codex_home,
+            $5, source_run.model, source_run.model_options, $6, source_run.skills_snapshot
+     FROM dispatcher_runs source_run
+     WHERE source_run.id = $1
+     RETURNING id`,
+    [
+      input.source_run_id,
+      input.assignment_id,
+      currentThread.task_id,
+      input.message_delivery_id,
+      currentThread.provider_thread_id,
+      input.message
+    ]
+  );
+  if (!created.rows[0]) return false;
+  // The new run carries the message as its own prompt, so the input row is
+  // gone rather than terminal: a later supersede may need to re-add it.
+  await client.query("DELETE FROM agent_turn_inputs WHERE id = $1", [inputId]);
+  return true;
+}
+
+// Crash recovery for a coordination run that stopped before it ever sent its
+// prompt (no launch attempt, nothing presented): queue a retry run instead of
+// failing a message the recipient never saw.
+async function requeueUnpresentedRunDelivery(
+  client: Pick<DbPool, "query">,
+  runId: string,
+  deliveryId: string,
+  error: string
+): Promise<boolean> {
+  const result = await client.query<{
+    status: string;
+    attempt_count: number;
+    presented_at: Date | null;
+    agent_thread_id: string | null;
+    agent_thread_generation: number;
+    ownership_generation: number | null;
+    launch_attempted_at: Date | null;
+  }>(
+    `SELECT delivery.status,
+            delivery.attempt_count,
+            delivery.presented_at,
+            source_run.launch_attempted_at,
+            source_run.agent_thread_id,
+            source_run.agent_thread_generation,
+            agent_threads.ownership_generation
+     FROM message_deliveries delivery
+     JOIN dispatcher_runs source_run
+       ON source_run.id = $2 AND source_run.message_delivery_id = delivery.id
+     LEFT JOIN agent_threads ON agent_threads.id = source_run.agent_thread_id AND agent_threads.archived_at IS NULL
+     WHERE delivery.id = $1
+     FOR UPDATE OF delivery`,
+    [deliveryId, runId]
+  );
+  const delivery = result.rows[0];
+  if (!delivery || delivery.presented_at || delivery.launch_attempted_at) return false;
+  if (!["queued", "retrying", "running"].includes(delivery.status) || delivery.attempt_count >= 3) return false;
+  if (delivery.agent_thread_id && delivery.agent_thread_generation !== delivery.ownership_generation) return false;
+  const retry = await client.query<{ id: string }>(
+    `INSERT INTO dispatcher_runs
+       (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+        codex_thread_id, model, model_options, prompt, skills_snapshot)
+     SELECT source_run.task_id, source_run.assignment_id, 'retry', source_run.scope, source_run.agent_thread_id,
+            source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+            source_run.codex_thread_id, source_run.model, source_run.model_options,
+            source_run.prompt, source_run.skills_snapshot
+     FROM dispatcher_runs source_run
+     WHERE source_run.id = $1
+       AND source_run.message_delivery_id = $2
+       AND NOT EXISTS (
+         SELECT 1
+         FROM dispatcher_runs overlapping_run
+         WHERE overlapping_run.message_delivery_id = $2
+           AND overlapping_run.id <> source_run.id
+           AND overlapping_run.status IN ('queued', 'running', 'cancel_requested')
+       )
+     RETURNING id`,
+    [runId, deliveryId]
+  );
+  if (!retry.rows[0]) return false;
+  await client.query(
+    `UPDATE message_deliveries
+     SET status = 'retrying', available_at = now(), error = $2, updated_at = now()
+     WHERE id = $1`,
+    [deliveryId, error]
+  );
+  return true;
 }
 
 async function failPendingAgentTurnInputs(
