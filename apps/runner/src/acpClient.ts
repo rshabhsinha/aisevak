@@ -163,6 +163,8 @@ class PersistentAcpSession {
     let cancelRequested = false;
     const rawLines: string[] = [];
     let loadingSession = false;
+    let monitor: NodeJS.Timeout | null = null;
+    let monitorTask: Promise<void> = Promise.resolve();
     const emit = async (line: string) => {
       if (loadingSession) {
         try {
@@ -238,14 +240,22 @@ class PersistentAcpSession {
 
       await options.onTurnAccepted?.();
 
-      const monitor = setInterval(() => {
-        void (async () => {
-          if (cancelRequested) return;
+      // One monitor pass at a time: overlapping passes could claim several
+      // queued inputs and issue concurrent session/prompt calls. The task is
+      // drained before the run finalizes so an injection that is already in
+      // flight records its outcome before the run's inputs are settled.
+      let turnFinished = false;
+      let monitorBusy = false;
+      monitor = setInterval(() => {
+        if (monitorBusy || turnFinished || cancelRequested) return;
+        monitorBusy = true;
+        monitorTask = (async () => {
           if (await options.shouldCancel()) {
             cancelRequested = true;
             await this.request("session/cancel", { sessionId: this.sessionId }).catch(() => this.close());
             return;
           }
+          if (turnFinished) return;
           const input = await options.nextInput?.();
           if (!input) return;
           try {
@@ -257,17 +267,25 @@ class PersistentAcpSession {
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
           }
-        })().catch((error: unknown) => {
-          this.rejectPending(error instanceof Error ? error : new Error(String(error)));
-          void this.close().catch(() => undefined);
-        });
+        })()
+          .catch((error: unknown) => {
+            this.rejectPending(error instanceof Error ? error : new Error(String(error)));
+            void this.close().catch(() => undefined);
+          })
+          .finally(() => {
+            monitorBusy = false;
+          });
       }, 750);
 
       try {
         await promptRequest;
       } finally {
+        turnFinished = true;
         clearInterval(monitor);
+        monitor = null;
       }
+      await monitorTask;
+      if (this.closed) throw new Error("ACP session closed while handling a mid-turn input");
 
       return {
         status: cancelRequested ? "interrupted" : "completed",
@@ -280,6 +298,9 @@ class PersistentAcpSession {
         promptMayHaveBeenPresented
       };
     } catch (error) {
+      if (monitor) clearInterval(monitor);
+      monitor = null;
+      await monitorTask;
       return {
         status: cancelRequested ? "interrupted" : "failed",
         threadId: this.sessionId ?? "",
