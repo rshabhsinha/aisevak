@@ -354,6 +354,7 @@ interface Run {
 
 const SIDEBAR_THREAD_PAGE_SIZE = 10;
 const RESOURCE_FEED_PAGE_SIZE = 15;
+const TASK_COLUMN_PAGE_SIZE = 25;
 
 interface ExternalApiKey {
   id: string;
@@ -404,6 +405,31 @@ const BOARD_COLUMNS = [
   { id: "failed", title: "Needs attention", icon: <CircleX size={15} /> }
 ] as const;
 
+type TaskRef = Pick<Task, "id" | "number" | "title">;
+
+type BoardColumnId = (typeof BOARD_COLUMNS)[number]["id"];
+
+interface BoardColumnState {
+  tasks: Task[];
+  total: number;
+  nextCursor: string | null;
+  loadingMore: boolean;
+}
+
+type BoardState = Record<BoardColumnId, BoardColumnState>;
+
+interface TaskPage {
+  tasks: Task[];
+  nextCursor: string | null;
+  hasMore: boolean;
+  total: number;
+}
+
+const emptyBoard = (): BoardState =>
+  Object.fromEntries(
+    BOARD_COLUMNS.map((column) => [column.id, { tasks: [], total: 0, nextCursor: null, loadingMore: false }])
+  ) as unknown as BoardState;
+
 export function App() {
   const initialRoute = useMemo(() => parseAppRoute(window.location.pathname), []);
   const [user, setUser] = useState<User | null>(null);
@@ -419,7 +445,12 @@ export function App() {
   const [providerInstances, setProviderInstances] = useState<ProviderInstance[]>([]);
   const [apiKeys, setApiKeys] = useState<ExternalApiKey[]>([]);
   const [credentials, setCredentials] = useState<Credential[]>([]);
-  const [tasks, setTasks] = useState<Task[]>([]);
+  // The board holds one bounded, paged list per column; composers get a
+  // lightweight reference list for task mentions.
+  const [board, setBoard] = useState<BoardState>(emptyBoard);
+  const boardRef = useRef(board);
+  boardRef.current = board;
+  const [taskRefs, setTaskRefs] = useState<TaskRef[]>([]);
   const [activityReports, setActivityReports] = useState<ActivityReport[]>([]);
   const [activityNextCursor, setActivityNextCursor] = useState<string | null>(null);
   const [activityHasMore, setActivityHasMore] = useState(false);
@@ -458,17 +489,6 @@ export function App() {
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const threadLoadGuardRef = useRef(createThreadLoadGuard(initialRoute.threadId));
-
-  const filteredTasks = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (!needle) return tasks;
-    return tasks.filter((task) =>
-      [task.title, task.body, task.project_name, task.agent_name, `#${task.number}`]
-        .join(" ")
-        .toLowerCase()
-        .includes(needle)
-    );
-  }, [query, tasks]);
 
   const selectedThread = useMemo(
     () => agentThreads.find((thread) => thread.id === selectedThreadId) ?? null,
@@ -609,6 +629,12 @@ export function App() {
       }, 250);
       return () => clearTimeout(timer);
     }
+    if (view === "tasks") {
+      const timer = setTimeout(() => {
+        void reloadTasks();
+      }, 250);
+      return () => clearTimeout(timer);
+    }
   }, [user, view, query, includeResolvedIncidents]);
 
   useEffect(() => {
@@ -722,9 +748,57 @@ export function App() {
     }
   }
 
+  function taskPageUrl(bucket: BoardColumnId, limit: number, cursor?: string | null) {
+    const params = new URLSearchParams({ bucket, limit: String(limit) });
+    if (cursor) params.set("cursor", cursor);
+    if (query.trim()) params.set("query", query.trim());
+    return `/api/tasks?${params.toString()}`;
+  }
+
   async function reloadTasks() {
-    const data = await api<{ tasks: Task[] }>("/api/tasks");
-    setTasks(data.tasks);
+    // Refresh every column, keeping as many cards as are already loaded.
+    const current = boardRef.current;
+    const [pages, refs] = await Promise.all([
+      Promise.all(
+        BOARD_COLUMNS.map((column) =>
+          api<TaskPage>(taskPageUrl(column.id, Math.min(200, Math.max(TASK_COLUMN_PAGE_SIZE, current[column.id].tasks.length))))
+        )
+      ),
+      api<{ tasks: TaskRef[] }>("/api/tasks/references")
+    ]);
+    setBoard(
+      Object.fromEntries(
+        BOARD_COLUMNS.map((column, index) => [
+          column.id,
+          { tasks: pages[index]!.tasks, total: pages[index]!.total, nextCursor: pages[index]!.nextCursor, loadingMore: false }
+        ])
+      ) as BoardState
+    );
+    setTaskRefs(refs.tasks);
+  }
+
+  async function loadMoreTasks(bucket: BoardColumnId) {
+    const column = boardRef.current[bucket];
+    if (!column.nextCursor || column.loadingMore) return;
+    setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: true } }));
+    try {
+      const page = await api<TaskPage>(taskPageUrl(bucket, TASK_COLUMN_PAGE_SIZE, column.nextCursor));
+      setBoard((board) => {
+        const seen = new Set(board[bucket].tasks.map((task) => task.id));
+        return {
+          ...board,
+          [bucket]: {
+            tasks: [...board[bucket].tasks, ...page.tasks.filter((task) => !seen.has(task.id))],
+            total: page.total,
+            nextCursor: page.nextCursor,
+            loadingMore: false
+          }
+        };
+      });
+    } catch (error) {
+      setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: false } }));
+      throw error;
+    }
   }
 
   async function reloadActivityReports(cursor?: string, append = false) {
@@ -1241,7 +1315,8 @@ export function App() {
         <main className="view-container">
           {view === "tasks" ? (
             <TasksView
-              tasks={filteredTasks}
+              board={board}
+              onLoadMore={(bucket) => void loadMoreTasks(bucket)}
               onSelect={(task) => void openTaskThread(task)}
             />
           ) : null}
@@ -1346,7 +1421,7 @@ export function App() {
               agents={agents}
               visibleAgents={filteredAgents}
               skills={skills}
-              tasks={tasks}
+              tasks={taskRefs}
               providers={providerInstances}
               editing={editingAgent}
               onSelectAgent={setEditingAgent}
@@ -1360,7 +1435,7 @@ export function App() {
               threads={agentThreads}
               agents={agents}
               skills={skills}
-              tasks={tasks}
+              tasks={taskRefs}
               composerOpen={scheduleComposerOpen}
               onComposerOpenChange={setScheduleComposerOpen}
               composerDate={scheduleComposerDate}
@@ -1764,10 +1839,11 @@ function incidentSeverityVariant(severity: Incident["severity"]): "secondary" | 
 }
 
 function TasksView(props: {
-  tasks: Task[];
+  board: BoardState;
+  onLoadMore: (bucket: BoardColumnId) => void;
   onSelect: (task: Task) => void;
 }) {
-  const [mobileColumn, setMobileColumn] = useState<(typeof BOARD_COLUMNS)[number]["id"]>("open");
+  const [mobileColumn, setMobileColumn] = useState<BoardColumnId>("open");
   return (
     <div className="board-layout">
       <div className="board-main">
@@ -1775,13 +1851,14 @@ function TasksView(props: {
           {BOARD_COLUMNS.map((column) => (
             <button type="button" key={column.id} aria-pressed={mobileColumn === column.id} onClick={() => setMobileColumn(column.id)}>
               <span>{column.title}</span>
-              <span className="count-badge">{props.tasks.filter((task) => taskBucket(task) === column.id).length}</span>
+              <span className="count-badge">{props.board[column.id].total}</span>
             </button>
           ))}
         </nav>
         <div className="board-columns">
           {BOARD_COLUMNS.map((column) => {
-            const tasks = props.tasks.filter((task) => taskBucket(task) === column.id);
+            const columnState = props.board[column.id];
+            const tasks = columnState.tasks;
             return (
               <div className={`kanban-col col-${column.id} ${mobileColumn === column.id ? "mobile-current-column" : ""}`} key={column.id}>
                 <div className="kanban-head">
@@ -1793,7 +1870,7 @@ function TasksView(props: {
                     )}
                     <span>{column.title}</span>
                   </span>
-                  <span className="count-badge">{tasks.length}</span>
+                  <span className="count-badge">{columnState.total}</span>
                 </div>
                 <div className="kanban-cards">
                   {tasks.map((task) => {
@@ -1869,6 +1946,18 @@ function TasksView(props: {
                     <div className="kanban-column-empty">
                       <span>No {column.title.toLowerCase()}</span>
                     </div>
+                  ) : null}
+                  {columnState.nextCursor ? (
+                    <button
+                      type="button"
+                      className="kanban-load-more"
+                      disabled={columnState.loadingMore}
+                      onClick={() => props.onLoadMore(column.id)}
+                    >
+                      {columnState.loadingMore
+                        ? "Loading…"
+                        : `Show ${Math.min(TASK_COLUMN_PAGE_SIZE, columnState.total - tasks.length)} more · ${tasks.length} of ${columnState.total}`}
+                    </button>
                   ) : null}
                 </div>
               </div>
@@ -2124,7 +2213,7 @@ function ModalBackdrop(props: {
 function ScheduleComposer(props: {
   agents: Agent[];
   skills: Skill[];
-  tasks: Task[];
+  tasks: TaskRef[];
   initialDate?: Date | null;
   scheduleToEdit?: Schedule | null;
   onSaved: () => Promise<void>;
@@ -2356,7 +2445,7 @@ function SchedulesView(props: {
   threads: AgentThread[];
   agents: Agent[];
   skills: Skill[];
-  tasks: Task[];
+  tasks: TaskRef[];
   composerOpen: boolean;
   onComposerOpenChange: (open: boolean) => void;
   composerDate: Date | null;
@@ -3632,7 +3721,7 @@ function AgentsView(props: {
   agents: Agent[];
   visibleAgents: Agent[];
   skills: Skill[];
-  tasks: Task[];
+  tasks: TaskRef[];
   providers: ProviderInstance[];
   editing: Agent | null;
   onSelectAgent: (agent: Agent | null) => void;
@@ -3719,7 +3808,7 @@ function AgentEditor(props: {
   agent: Agent;
   agents: Agent[];
   skills: Skill[];
-  tasks: Task[];
+  tasks: TaskRef[];
   providers: ProviderInstance[];
   onSaved: (agent: Agent) => Promise<void>;
   onDeleted: () => Promise<void>;
@@ -5823,10 +5912,6 @@ function normalizeFilesDraft(value: unknown): Record<string, string> {
     files[path] = content;
   }
   return files;
-}
-
-function taskBucket(task: Task): (typeof BOARD_COLUMNS)[number]["id"] {
-  return runBucket(task.latest_run_status ?? task.status);
 }
 
 function runBucket(status?: string | null): (typeof BOARD_COLUMNS)[number]["id"] {

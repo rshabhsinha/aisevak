@@ -1114,65 +1114,74 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/tasks", async (request) => {
     requireUser(request);
+    const query = tasksQuerySchema.parse(request.query);
+    // Without paging parameters the endpoint keeps returning every task, for
+    // API clients that predate the bounded board.
+    if (!query.bucket && query.limit === undefined && !query.cursor && !query.query) {
+      const result = await pool.query(`${TASK_LIST_SELECT}
+       ORDER BY tasks.created_at DESC`);
+      return { tasks: result.rows };
+    }
+
+    const limit = query.limit ?? 25;
+    const values: unknown[] = [];
+    const filters: string[] = [];
+    if (query.bucket) filters.push(taskBucketCondition(query.bucket));
+    if (query.query) {
+      values.push(`%${query.query}%`);
+      const needle = `$${values.length}`;
+      filters.push(`(
+        tasks.title ILIKE ${needle}
+        OR COALESCE(tasks.body, '') ILIKE ${needle}
+        OR COALESCE(projects.name, '') ILIKE ${needle}
+        OR agents.name ILIKE ${needle}
+        OR ('#' || tasks.number::text) ILIKE ${needle}
+        OR ('TASK-' || tasks.number::text) ILIKE ${needle}
+      )`);
+    }
+    const filterValues = [...values];
+    const conditions = [...filters];
+    if (query.cursor) {
+      const { updatedAt: createdAt, id } = decodeResourceCursor(query.cursor);
+      values.push(createdAt, id);
+      conditions.push(`(tasks.created_at, tasks.id) < ($${values.length - 1}::timestamptz, $${values.length}::uuid)`);
+    }
+    values.push(limit + 1);
+    const [result, count] = await Promise.all([
+      pool.query(
+        `${TASK_LIST_SELECT}
+       ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
+       ORDER BY tasks.created_at DESC, tasks.id DESC
+       LIMIT $${values.length}`,
+        values
+      ),
+      pool.query<{ total: number }>(
+        `SELECT count(*)::int AS total
+         FROM tasks
+         LEFT JOIN projects ON projects.id = tasks.project_id
+         JOIN agents ON agents.id = tasks.agent_id
+         LEFT JOIN LATERAL (
+           SELECT status FROM task_runs
+           WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+           ORDER BY created_at DESC
+           LIMIT 1
+         ) latest ON true
+         ${filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : ""}`,
+        filterValues
+      )
+    ]);
+    const hasMore = result.rows.length > limit;
+    const tasks = result.rows.slice(0, limit);
+    const last = tasks.at(-1) as { created_at?: string; id?: string } | undefined;
+    const nextCursor = hasMore && last?.created_at && last?.id ? encodeResourceCursor(last.created_at, last.id) : null;
+    return { tasks, nextCursor, hasMore, total: count.rows[0]?.total ?? tasks.length };
+  });
+
+  // Lightweight id/number/title list for task mentions in prompt composers.
+  app.get("/api/tasks/references", async (request) => {
+    requireUser(request);
     const result = await pool.query(
-      `SELECT tasks.*,
-              projects.name AS project_name,
-              CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
-              agents.kind AS agent_kind,
-              parent.number AS parent_task_number,
-              (SELECT count(*)::int FROM tasks child
-                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
-              (SELECT count(*)::int FROM task_assignments assignment
-                 WHERE assignment.task_id = tasks.id) AS assignment_count,
-              (SELECT count(*)::int FROM task_assignments assignment
-                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignment_count,
-              COALESCE((SELECT json_agg(json_build_object(
-                'id', assignment.id,
-                'number', assignment.number,
-                'key', 'ASSIGNMENT-' || assignment.number,
-                'assignment_key', assignment.assignment_key,
-                'status', assignment.status,
-                'attempt_count', assignment.attempt_count,
-                'assigned_agent_name', assigned.name,
-                'created_by_agent_name', creator.name,
-                'active_delivery_id', assignment.active_delivery_id,
-                'updated_at', assignment.updated_at
-              ) ORDER BY assignment.number)
-                FROM task_assignments assignment
-                JOIN agents assigned ON assigned.id = assignment.assigned_agent_id
-                LEFT JOIN agents creator ON creator.id = assignment.created_by_agent_id
-                WHERE assignment.task_id = tasks.id), '[]'::json) AS assignments,
-              (SELECT count(*)::int FROM job_safety_events safety_event
-                 WHERE safety_event.task_id = tasks.id) AS safety_event_count,
-              (SELECT json_build_object(
-                'operation', safety_event.operation,
-                'work_scope', safety_event.work_scope,
-                'work_key', safety_event.work_key,
-                'would_reject', safety_event.would_reject,
-                'details', safety_event.details,
-                'created_at', safety_event.created_at
-              ) FROM job_safety_events safety_event
-                 WHERE safety_event.task_id = tasks.id
-                 ORDER BY safety_event.created_at DESC, safety_event.id DESC LIMIT 1) AS latest_safety_event,
-              latest.status AS latest_run_status,
-              latest.id AS latest_run_id,
-              EXISTS (
-                SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id
-                UNION ALL
-                SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.task_id = tasks.id
-              ) AS has_runs
-       FROM tasks
-       LEFT JOIN projects ON projects.id = tasks.project_id
-       LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
-       JOIN agents ON agents.id = tasks.agent_id
-       LEFT JOIN LATERAL (
-         SELECT id, status
-         FROM task_runs
-         WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
-         ORDER BY created_at DESC
-         LIMIT 1
-       ) latest ON true
-       ORDER BY tasks.created_at DESC`
+      `SELECT id, number, title FROM tasks ORDER BY created_at DESC, id DESC LIMIT 500`
     );
     return { tasks: result.rows };
   });
@@ -2157,6 +2166,85 @@ const patchAgentThreadSchema = z.object({
   title: z.string().trim().min(1).max(120).optional(),
   modelSelection: modelSelectionSchema.optional()
 });
+const TASK_BUCKETS = ["open", "running", "completed", "failed"] as const;
+const tasksQuerySchema = z.object({
+  bucket: z.enum(TASK_BUCKETS).optional(),
+  limit: z.coerce.number().int().min(1).max(200).optional(),
+  cursor: z.string().trim().min(1).optional(),
+  query: z.string().trim().max(200).optional()
+});
+// Mirrors the board's runBucket(): a task sits in the column of its latest
+// worker run's status, or its own status when it has never run.
+const TASK_BUCKET_STATUSES = {
+  running: ["queued", "running", "cancel_requested"],
+  completed: ["succeeded", "done", "completed", "active", "enabled", "published", "resolved"],
+  failed: ["failed", "cancelled", "canceled", "needs_attention", "blocked", "expired", "revoked", "disabled"]
+} as const;
+function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
+  const status = "COALESCE(latest.status::text, tasks.status::text)";
+  const list = (statuses: readonly string[]) => statuses.map((value) => `'${value}'`).join(", ");
+  if (bucket === "open") {
+    return `(${status} IS NULL OR ${status} NOT IN (${list(Object.values(TASK_BUCKET_STATUSES).flat())}))`;
+  }
+  return `${status} IN (${list(TASK_BUCKET_STATUSES[bucket])})`;
+}
+const TASK_LIST_SELECT = `SELECT tasks.*,
+              projects.name AS project_name,
+              CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
+              agents.kind AS agent_kind,
+              parent.number AS parent_task_number,
+              (SELECT count(*)::int FROM tasks child
+                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id) AS assignment_count,
+              (SELECT count(*)::int FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')) AS active_assignment_count,
+              COALESCE((SELECT json_agg(json_build_object(
+                'id', assignment.id,
+                'number', assignment.number,
+                'key', 'ASSIGNMENT-' || assignment.number,
+                'assignment_key', assignment.assignment_key,
+                'status', assignment.status,
+                'attempt_count', assignment.attempt_count,
+                'assigned_agent_name', assigned.name,
+                'created_by_agent_name', creator.name,
+                'active_delivery_id', assignment.active_delivery_id,
+                'updated_at', assignment.updated_at
+              ) ORDER BY assignment.number)
+                FROM task_assignments assignment
+                JOIN agents assigned ON assigned.id = assignment.assigned_agent_id
+                LEFT JOIN agents creator ON creator.id = assignment.created_by_agent_id
+                WHERE assignment.task_id = tasks.id), '[]'::json) AS assignments,
+              (SELECT count(*)::int FROM job_safety_events safety_event
+                 WHERE safety_event.task_id = tasks.id) AS safety_event_count,
+              (SELECT json_build_object(
+                'operation', safety_event.operation,
+                'work_scope', safety_event.work_scope,
+                'work_key', safety_event.work_key,
+                'would_reject', safety_event.would_reject,
+                'details', safety_event.details,
+                'created_at', safety_event.created_at
+              ) FROM job_safety_events safety_event
+                 WHERE safety_event.task_id = tasks.id
+                 ORDER BY safety_event.created_at DESC, safety_event.id DESC LIMIT 1) AS latest_safety_event,
+              latest.status AS latest_run_status,
+              latest.id AS latest_run_id,
+              EXISTS (
+                SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id
+                UNION ALL
+                SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.task_id = tasks.id
+              ) AS has_runs
+       FROM tasks
+       LEFT JOIN projects ON projects.id = tasks.project_id
+       LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
+       JOIN agents ON agents.id = tasks.agent_id
+       LEFT JOIN LATERAL (
+         SELECT id, status
+         FROM task_runs
+         WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) latest ON true`;
 const agentThreadsQuerySchema = z.object({
   includeArchived: z.enum(["true", "false"]).default("false").transform(value => value === "true"),
   limit: z.coerce.number().int().min(1).max(50).default(10),
