@@ -111,7 +111,7 @@ User messages use a compact muted bubble. Assistant content remains unboxed for 
 
 ### Workspace frame
 
-Desktop uses a 242px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
+Desktop uses a 240px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
 
 ### Board
 
