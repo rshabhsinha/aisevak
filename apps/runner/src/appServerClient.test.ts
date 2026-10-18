@@ -122,6 +122,24 @@ describe("persistent Codex app-server", () => {
     expect(new Set(seenThreadIds)).toEqual(new Set(["thread-1"]));
   });
 
+  it("marks the recovered missing-rollout error and leaves fatal setup errors unmarked", async () => {
+    const fixture = await fakeAppServerFixture();
+    const recoveredLines: string[] = [];
+    const recovered = turnOptions(fixture, "mark-missing-rollout", "missing-thread");
+    recovered.onLine = async (line) => { recoveredLines.push(line); };
+    expect((await runCodexAppServerTurn(recovered)).status).toBe("completed");
+    const resumeError = recoveredLines.map((line) => JSON.parse(line)).find((message) => message.error);
+    expect(resumeError).toMatchObject({ aisevakRecovered: true });
+
+    const fatalLines: string[] = [];
+    const fatal = turnOptions(fixture, "mark-setup-failure", "broken-thread");
+    fatal.onLine = async (line) => { fatalLines.push(line); };
+    expect((await runCodexAppServerTurn(fatal)).status).toBe("failed");
+    const fatalErrors = fatalLines.map((line) => JSON.parse(line)).filter((message) => message.error);
+    expect(fatalErrors).toHaveLength(1);
+    expect(fatalErrors[0].aisevakRecovered).toBeUndefined();
+  });
+
   it("does not cross the presentation boundary when thread setup fails", async () => {
     const fixture = await fakeAppServerFixture();
     let turnAccepted = false;

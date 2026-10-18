@@ -1,0 +1,226 @@
+[
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "session.configured",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "session.configured",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "thread.started",
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "session.configured",
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "session.configured",
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "content.delta",
+    "itemId": "turn-1:reasoning:1",
+    "text": "The user wants",
+    "delta": {
+      "stream": "reasoning",
+      "text": "The user wants"
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "content.delta",
+    "itemId": "turn-1:reasoning:1",
+    "text": " a listing.",
+    "delta": {
+      "stream": "reasoning",
+      "text": " a listing."
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "item.started",
+    "itemId": "call_ls",
+    "text": "ls",
+    "item": {
+      "itemType": "command_execution",
+      "status": "in_progress",
+      "title": "ls",
+      "input": {}
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "item.updated",
+    "itemId": "call_ls",
+    "text": "List files",
+    "item": {
+      "itemType": "command_execution",
+      "status": "in_progress",
+      "title": "List files",
+      "command": "ls -la",
+      "input": {
+        "command": "ls -la",
+        "description": "List files"
+      }
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "item.completed",
+    "itemId": "call_ls",
+    "text": "List files",
+    "item": {
+      "itemType": "command_execution",
+      "status": "completed",
+      "title": "List files",
+      "command": "ls -la",
+      "output": "README.md\nsrc\n",
+      "input": {
+        "command": "ls -la",
+        "description": "List files"
+      }
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "content.delta",
+    "itemId": "turn-1:assistant:2",
+    "text": "Two entries",
+    "delta": {
+      "stream": "assistant",
+      "text": "Two entries"
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "content.delta",
+    "itemId": "turn-1:assistant:2",
+    "text": ": README.md and src.",
+    "delta": {
+      "stream": "assistant",
+      "text": ": README.md and src."
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "usage.updated",
+    "usage": {
+      "scope": "context",
+      "usedTokens": 8467,
+      "maxTokens": 200000,
+      "cost": {
+        "amount": 0,
+        "currency": "USD"
+      }
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "opencode",
+    "type": "turn.completed",
+    "turn": {
+      "state": "completed",
+      "stopReason": "end_turn"
+    },
+    "usage": {
+      "scope": "turn",
+      "inputTokens": 6675,
+      "cachedInputTokens": 1792,
+      "outputTokens": 21,
+      "totalTokens": 8488
+    },
+    "threadId": "ses_oc1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  }
+]

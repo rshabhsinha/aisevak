@@ -51,16 +51,6 @@ export interface CodexPromptOptions {
   skills?: CodexSkillReference[];
 }
 
-export interface NormalizedCodexEvent {
-  type: string;
-  text?: string;
-  threadId?: string;
-  itemId?: string;
-  status?: string;
-  usage?: Record<string, unknown>;
-  raw: unknown;
-}
-
 export interface DispatcherPromptOptions {
   dispatcherInstructions: string;
   tasksJson: string;

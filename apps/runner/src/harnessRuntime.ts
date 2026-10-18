@@ -19,10 +19,7 @@ import {
   materializeCursorAuthBundle,
   materializeDevinAuthBundle,
   materializeOpenCodeAuthFile,
-  normalizeAcpEvent,
-  normalizeCodexEvent,
   OPENCODE_AUTH_SECRET_NAME,
-  parseCodexJsonLine,
   parseOpenCodeAuthFile,
   type DbPool,
   type ProviderDriver
@@ -207,12 +204,6 @@ export async function runHarnessTurn(input: {
     });
   }
   return runCodexAppServerTurn(input.options);
-}
-
-export function normalizeHarnessLine(driver: ProviderDriver, line: string, sessionId?: string | null) {
-  const raw = parseCodexJsonLine(line);
-  if (!raw) return null;
-  return driver === "codex" ? normalizeCodexEvent(raw) : normalizeAcpEvent(raw, sessionId);
 }
 
 export async function writePlaceholderConfig(runtimeHome: string, model: string): Promise<void> {

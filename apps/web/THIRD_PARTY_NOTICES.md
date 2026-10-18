@@ -10,3 +10,13 @@ Copyright (c) 2026 Alain
 Licensed under the MIT License. The source and complete license text are
 available at <https://github.com/Alain00/blobatar> and
 <https://github.com/Alain00/blobatar/blob/main/LICENSE>.
+
+## AICSS
+
+The chat timeline's thinking, task list, file diff, tool call and code block
+components are adapted from AICSS (<https://www.aicss.dev>).
+
+Copyright (c) 2026 AICSS
+
+Licensed under the MIT License. The source and complete license text are
+available at <https://github.com/kvnkld/aicss>.

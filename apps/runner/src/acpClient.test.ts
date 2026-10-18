@@ -118,3 +118,34 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(Date.now() - started).toBeLessThan(8000);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 }, 15000);
+
+it("marks failed requests the session recovers from so they are not shown as provider errors", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  await writeFile(script, `const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/set_model' || m.method === 'session/set_config_option') { console.log(JSON.stringify({id:m.id,error:{code:-32601,message:'Method not found'}})); return; }
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'boom') { console.log(JSON.stringify({id:m.id,error:{code:-32603,message:'Prompt failed'}})); return; }
+ if(m.method === 'session/prompt') { console.log(JSON.stringify({id:m.id,result:{stopReason:'end_turn'}})); return; }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const lines: string[] = [];
+  const options = {
+    binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+    model: "fast-model", prompt: "hello", threadId: null, env: process.env, secrets: [],
+    onLine: async (line: string) => { lines.push(line); }, onThreadId: async () => {}, shouldCancel: async () => false
+  };
+  try {
+    expect((await runAcpTurn(options)).status).toBe("completed");
+    const errors = lines.map((line) => JSON.parse(line)).filter((message) => message.error);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(errors.every((message) => message.aisevakRecovered === true)).toBe(true);
+
+    lines.length = 0;
+    expect((await runAcpTurn({ ...options, prompt: "boom" })).status).toBe("failed");
+    const promptError = lines.map((line) => JSON.parse(line)).find((message) => message.error?.message === "Prompt failed");
+    expect(promptError).toBeDefined();
+    expect(promptError.aisevakRecovered).toBeUndefined();
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});

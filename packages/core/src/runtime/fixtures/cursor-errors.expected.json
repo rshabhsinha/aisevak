@@ -1,0 +1,138 @@
+[
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "session.configured",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "runtime.error",
+    "text": "Failed to initialize session services",
+    "error": {
+      "message": "Failed to initialize session services",
+      "code": "-32603"
+    },
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "item.started",
+    "itemId": "read_1",
+    "text": "Read src/app.ts",
+    "item": {
+      "itemType": "file_read",
+      "status": "in_progress",
+      "title": "Read src/app.ts",
+      "locations": [
+        "/srv/project/src/app.ts"
+      ]
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "item.completed",
+    "itemId": "read_1",
+    "text": "Read src/app.ts",
+    "item": {
+      "itemType": "file_read",
+      "status": "completed",
+      "title": "Read src/app.ts",
+      "locations": [
+        "/srv/project/src/app.ts"
+      ]
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "item.started",
+    "itemId": "edit_1",
+    "text": "Edit src/app.ts",
+    "item": {
+      "itemType": "file_change",
+      "status": "in_progress",
+      "title": "Edit src/app.ts"
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "item.completed",
+    "itemId": "edit_1",
+    "text": "Edit src/app.ts",
+    "item": {
+      "itemType": "file_change",
+      "status": "failed",
+      "title": "Edit src/app.ts",
+      "output": "File is read-only"
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "item.completed",
+    "itemId": "grep_1",
+    "text": "grep TODO",
+    "item": {
+      "itemType": "search",
+      "status": "completed",
+      "title": "grep TODO"
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc",
+      "method": "session/update"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "cursor",
+    "type": "turn.completed",
+    "text": "The agent hit its per-turn request limit",
+    "turn": {
+      "state": "failed",
+      "stopReason": "max_turn_requests",
+      "errorMessage": "The agent hit its per-turn request limit"
+    },
+    "threadId": "ses_cu1",
+    "turnId": "turn-1",
+    "raw": {
+      "source": "acp.jsonrpc"
+    }
+  }
+]

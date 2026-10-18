@@ -1,0 +1,115 @@
+[
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "provider.event",
+    "raw": {
+      "source": "codex.app-server"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "runtime.error",
+    "text": "model gpt-x is not available",
+    "error": {
+      "message": "model gpt-x is not available",
+      "code": "-32600"
+    },
+    "raw": {
+      "source": "codex.app-server"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "request.opened",
+    "text": "Needs to delete build output",
+    "itemId": "call_9",
+    "threadId": "thr_2",
+    "turnId": "turn_2",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/commandExecution/requestApproval"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "item.completed",
+    "itemId": "dyn_1",
+    "text": "lookup",
+    "item": {
+      "itemType": "dynamic_tool_call",
+      "status": "failed",
+      "title": "lookup",
+      "toolName": "lookup",
+      "input": {},
+      "output": "not found"
+    },
+    "threadId": "thr_2",
+    "turnId": "turn_2",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "item/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "runtime.error",
+    "text": "Context window exceeded",
+    "error": {
+      "message": "Context window exceeded",
+      "code": "contextWindowExceeded"
+    },
+    "threadId": "thr_2",
+    "turnId": "turn_2",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "error"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.completed",
+    "turnId": "turn_2",
+    "text": "Context window exceeded",
+    "turn": {
+      "state": "failed",
+      "errorMessage": "Context window exceeded",
+      "errorCode": "contextWindowExceeded",
+      "durationMs": 1200
+    },
+    "threadId": "thr_2",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/completed"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
+    "type": "turn.completed",
+    "turnId": "turn_3",
+    "turn": {
+      "state": "interrupted",
+      "durationMs": 300
+    },
+    "threadId": "thr_2",
+    "raw": {
+      "source": "codex.app-server",
+      "method": "turn/completed"
+    }
+  },
+  {
+    "v": 2,
+    "type": "parse.error",
+    "provider": "codex",
+    "text": "not json at all",
+    "raw": {
+      "source": "codex.app-server"
+    }
+  }
+]

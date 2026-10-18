@@ -1,0 +1,28 @@
+{"id":"aisevak-1","result":{"codexHome":"/srv/aisevak/codex-homes/agent","userAgent":"Codex Desktop/0.137.0 (aisevak; 0.1.0)","platformOs":"macos","platformFamily":"unix"}}
+{"method":"thread/started","params":{"thread":{"id":"thr_1","preview":"","modelProvider":"openai"}}}
+{"method":"mcpServer/startupStatus/updated","params":{"name":"github","status":"ready"}}
+{"method":"thread/status/changed","params":{"status":{"type":"active","activeFlags":[]},"threadId":"thr_1"}}
+{"method":"turn/started","params":{"turn":{"id":"turn_1","error":null,"items":[],"status":"inProgress","itemsView":"notLoaded","startedAt":1781082408,"durationMs":null,"completedAt":null},"threadId":"thr_1"}}
+{"method":"item/started","params":{"item":{"id":"u_1","type":"userMessage","content":[{"type":"text","text":"Fix the failing test"}]},"turnId":"turn_1","threadId":"thr_1","startedAtMs":1781082408100}}
+{"method":"item/started","params":{"item":{"id":"rs_1","type":"reasoning","summary":[],"content":[]},"turnId":"turn_1","threadId":"thr_1","startedAtMs":1781082408200}}
+{"method":"item/reasoning/summaryTextDelta","params":{"delta":"Looking at the test","itemId":"rs_1","summaryIndex":0,"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/reasoning/summaryTextDelta","params":{"delta":" output first.","itemId":"rs_1","summaryIndex":0,"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/completed","params":{"item":{"id":"rs_1","type":"reasoning","summary":["Looking at the test output first."],"content":[]},"turnId":"turn_1","threadId":"thr_1","completedAtMs":1781082409000}}
+{"method":"turn/plan/updated","params":{"threadId":"thr_1","turnId":"turn_1","explanation":"Two steps","plan":[{"step":"Reproduce the failure","status":"inProgress"},{"step":"Patch the parser","status":"pending"}]}}
+{"method":"item/started","params":{"item":{"id":"call_1","cwd":"/srv/project","type":"commandExecution","source":"agent","status":"inProgress","command":"/bin/zsh -lc 'pnpm test'","commandActions":[{"type":"unknown","command":"pnpm test"}]},"turnId":"turn_1","threadId":"thr_1","startedAtMs":1781082409100}}
+{"method":"item/commandExecution/outputDelta","params":{"delta":"FAIL parser.test.ts\n","itemId":"call_1","turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/completed","params":{"item":{"id":"call_1","cwd":"/srv/project","type":"commandExecution","source":"agent","status":"completed","command":"/bin/zsh -lc 'pnpm test'","exitCode":1,"durationMs":900,"aggregatedOutput":"FAIL parser.test.ts\n"},"turnId":"turn_1","threadId":"thr_1","completedAtMs":1781082410000}}
+{"method":"item/started","params":{"item":{"id":"fc_1","type":"fileChange","status":"inProgress","changes":[{"path":"src/parser.ts","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"}]},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/completed","params":{"item":{"id":"fc_1","type":"fileChange","status":"completed","changes":[{"path":"src/parser.ts","kind":{"type":"update","move_path":null},"diff":"@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"}]},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"turn/diff/updated","params":{"threadId":"thr_1","turnId":"turn_1","diff":"diff --git a/src/parser.ts b/src/parser.ts\n--- a/src/parser.ts\n+++ b/src/parser.ts\n@@ -1 +1 @@\n-const a = 1\n+const a = 2\n"}}
+{"method":"item/completed","params":{"item":{"id":"mcp_1","type":"mcpToolCall","server":"github","tool":"get_issue","status":"completed","arguments":{"number":7},"result":{"content":[{"type":"text","text":"Issue 7: parser bug"}]},"durationMs":120},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/completed","params":{"item":{"id":"ws_1","type":"webSearch","query":"vitest parser error","results":[]},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"error","params":{"error":{"message":"Rate limited, retrying","codexErrorInfo":"rateLimitExceeded"},"willRetry":true,"threadId":"thr_1","turnId":"turn_1"}}
+{"method":"warning","params":{"message":"This session was recorded with model `a` but is resuming with `b`.","threadId":"thr_1"},"emittedAtMs":1786177232924}
+{"method":"item/started","params":{"item":{"id":"msg_1","type":"agentMessage","text":""},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/agentMessage/delta","params":{"delta":"Fixed the ","itemId":"msg_1","turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/agentMessage/delta","params":{"delta":"parser.","itemId":"msg_1","turnId":"turn_1","threadId":"thr_1"}}
+{"method":"item/completed","params":{"item":{"id":"msg_1","type":"agentMessage","text":"Fixed the parser."},"turnId":"turn_1","threadId":"thr_1"}}
+{"method":"thread/tokenUsage/updated","params":{"turnId":"turn_1","threadId":"thr_1","tokenUsage":{"last":{"inputTokens":18522,"totalTokens":18655,"outputTokens":133,"cachedInputTokens":2432,"reasoningOutputTokens":37},"total":{"inputTokens":40895,"totalTokens":41546,"outputTokens":651,"cachedInputTokens":17536,"reasoningOutputTokens":109},"modelContextWindow":258400}}}
+{"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":12}}}}
+{"method":"turn/completed","params":{"turn":{"id":"turn_1","error":null,"items":[],"status":"completed","itemsView":"notLoaded","startedAt":1781086015,"durationMs":6350,"completedAt":1781086021},"threadId":"thr_1"}}

@@ -8,7 +8,7 @@ import {
   decryptSecret,
   encryptSecret,
   extractPromptSkillNames,
-  extractThreadId,
+  createRuntimeNormalizer,
   hashToken,
   managedCodexHome,
   managedGithubRepoPath,
@@ -30,7 +30,8 @@ import {
   type CodexSkillSnapshot,
   type CodexChatGptAuthFile,
   type DbPool,
-  type ProviderDriver
+  type ProviderDriver,
+  type RuntimeNormalizer
 } from "@aisevak/core";
 import { agentToolScript } from "@aisevak/cli";
 import { createHash, randomUUID } from "node:crypto";
@@ -46,7 +47,7 @@ import {
   type AppServerTurnOptions
 } from "./appServerClient.js";
 import { closeAllAcpSessions } from "./acpClient.js";
-import { materializeHarnessAuth, normalizeHarnessLine, runHarnessTurn } from "./harnessRuntime.js";
+import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
 import {
   agentGithubEnvironment,
   authenticateGithubCli,
@@ -1611,6 +1612,8 @@ export async function processOneDispatcherRun(
   try {
     await mkdir(job.codex_home, { recursive: true });
     const driver = harnessDriver(job.provider_driver);
+    // One normalizer per provider turn: ACP adapters number turns and messages.
+    const normalizer = createRuntimeNormalizer(driver, { sessionId: job.codex_thread_id });
     if (driver === "codex") {
       await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
     }
@@ -1715,7 +1718,7 @@ export async function processOneDispatcherRun(
           : {})
       },
       secrets: [...codexAuth.redactionSecrets, ...(harnessAuth?.secrets ?? []), toolToken, ...credentialSecrets],
-      onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq),
+      onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq, normalizer),
       onThreadId: async (threadId) => {
         await pool.query(
           "UPDATE dispatcher_runs SET codex_thread_id = $2, updated_at = now() WHERE id = $1",
@@ -1952,6 +1955,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     ]);
     await mkdir(job.codex_home, { recursive: true });
     const driver = harnessDriver(job.provider_driver);
+    // One normalizer per provider turn: ACP adapters number turns and messages.
+    const normalizer = createRuntimeNormalizer(driver, { sessionId: job.codex_thread_id });
     if (driver === "codex") {
       await writeFile(join(job.codex_home, "config.toml"), buildCodexConfigToml(job.model), "utf8");
     }
@@ -2022,7 +2027,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
           : {})
       },
       secrets: [...codexAuth.redactionSecrets, ...(harnessAuth?.secrets ?? []), toolToken, ...credentialSecrets],
-      onLine: (line, seq) => persistCodexLine(pool, job, line, seq),
+      onLine: (line, seq) => persistCodexLine(pool, job, line, seq, normalizer),
       onThreadId: async (threadId) => {
         if (!job.agent_thread_id) {
           await pool.query(
@@ -2557,10 +2562,18 @@ function safeSkillFilePath(skillDir: string, relativePath: string): string {
   return join(skillDir, ...parts);
 }
 
-export async function persistCodexLine(pool: DbPool, job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id"> & Partial<Pick<RunJob, "provider_driver" | "codex_thread_id">>, line: string, seq: number): Promise<void> {
-  const normalized = normalizeHarnessLine(harnessDriver(job.provider_driver), line, job.codex_thread_id);
+export async function persistCodexLine(
+  pool: DbPool,
+  job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id"> & Partial<Pick<RunJob, "provider_driver" | "codex_thread_id">>,
+  line: string,
+  seq: number,
+  // Required: ACP adapters carry per-run state, so every line of a run must
+  // go through that run's one normalizer.
+  normalizer: RuntimeNormalizer
+): Promise<void> {
+  const normalized = normalizer.normalize(line);
   if (!normalized) return;
-  const threadId = extractThreadId(normalized);
+  const threadId = normalized.threadId;
   if (threadId) {
     if (!job.agent_thread_id) {
       await pool.query(
@@ -2582,11 +2595,14 @@ export async function persistDispatcherCodexLine(
   pool: DbPool,
   job: Pick<DispatcherJob, "id"> & Partial<Pick<DispatcherJob, "provider_driver" | "codex_thread_id">>,
   line: string,
-  seq: number
+  seq: number,
+  // Required: ACP adapters carry per-run state, so every line of a run must
+  // go through that run's one normalizer.
+  normalizer: RuntimeNormalizer
 ): Promise<void> {
-  const normalized = normalizeHarnessLine(harnessDriver(job.provider_driver), line, job.codex_thread_id);
+  const normalized = normalizer.normalize(line);
   if (!normalized) return;
-  const threadId = extractThreadId(normalized);
+  const threadId = normalized.threadId;
   if (threadId) {
     await pool.query(
       "UPDATE dispatcher_runs SET codex_thread_id = $2, updated_at = now() WHERE id = $1",

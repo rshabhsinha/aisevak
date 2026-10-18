@@ -1,3 +1,11 @@
+import type {
+  RuntimeEvent,
+  RuntimeFileChange,
+  RuntimeItem,
+  RuntimeItemType,
+  RuntimeUsage
+} from "@aisevak/core/runtime-events";
+
 export interface ThreadEvent {
   id: string;
   seq: number;
@@ -25,14 +33,23 @@ export interface PendingUserMessage {
 
 export type ToolStatus = "running" | "completed" | "failed";
 
+export type ToolIcon = "terminal" | "search" | "read" | "web" | "wrench" | "hammer" | "edit" | "agent" | "info";
+
+export interface ThreadFileDiff {
+  path: string;
+  diff: string;
+}
+
 export interface ThreadToolCall {
   id: string;
   title: string;
   command?: string;
-  detail?: string;
+  /** Final or streamed output (command stdout, tool result). */
+  output?: string;
+  diffs?: ThreadFileDiff[];
   status: ToolStatus;
   exitCode?: number | null;
-  icon: "terminal" | "search" | "wrench" | "hammer" | "edit" | "info";
+  icon: ToolIcon;
   createdAt: string;
 }
 
@@ -40,6 +57,16 @@ export interface ThreadPlanItem {
   id: string;
   title: string;
   status: "pending" | "running" | "completed" | "failed";
+}
+
+export interface ThreadUsage {
+  contextUsedTokens?: number;
+  contextMaxTokens?: number;
+  inputTokens?: number;
+  cachedInputTokens?: number;
+  outputTokens?: number;
+  reasoningTokens?: number;
+  cost?: { amount: number; currency: string };
 }
 
 export type ThreadBlock =
@@ -56,29 +83,13 @@ export type ThreadBlock =
   | { kind: "thinking"; id: string; text: string; createdAt: string; streaming: boolean }
   | { kind: "tools"; id: string; entries: ThreadToolCall[]; createdAt: string }
   | { kind: "plan"; id: string; items: ThreadPlanItem[]; createdAt: string }
+  | { kind: "diff"; id: string; diffs: ThreadFileDiff[]; createdAt: string }
+  | { kind: "usage"; id: string; usage: ThreadUsage; createdAt: string }
   | { kind: "comment"; id: string; text: string; createdAt: string }
   | { kind: "error"; id: string; label: string; detail?: string; createdAt: string }
+  | { kind: "notice"; id: string; level: "info" | "warning"; text: string; detail?: string; createdAt: string }
   | { kind: "system"; id: string; text: string; createdAt: string }
   | { kind: "working"; id: string; createdAt: string | null };
-
-const ASSISTANT_ITEM_TYPES = new Set(["agent_message", "agentMessage", "agent_message_chunk"]);
-const REASONING_ITEM_TYPES = new Set(["reasoning", "agent_thought", "thought"]);
-const TOOL_ITEM_TYPES = new Set([
-  "command_execution",
-  "commandExecution",
-  "mcp_tool_call",
-  "mcpToolCall",
-  "dynamic_tool_call",
-  "dynamicToolCall",
-  "web_search",
-  "webSearch",
-  "file_change",
-  "fileChange",
-  "collab_agent_tool_call",
-  "image_view",
-  "review",
-  "tool_call"
-]);
 
 // Persisted `seq` is the authoritative event order: the runner assigns it per
 // line it reads, while `created_at` comes from whichever insert statement
@@ -202,6 +213,8 @@ function isSteeringEvent(event: ThreadEvent): boolean {
   return event.event_type === "thread.message-sent" && rawRecord(event.payload)?.steer === true;
 }
 
+type BlockOf<K extends ThreadBlock["kind"]> = Extract<ThreadBlock, { kind: K }>;
+
 function processRunGroup(
   sortedEvents: ThreadEvent[],
   fallbackCreatedAt: string,
@@ -213,382 +226,365 @@ function processRunGroup(
   }
 ): void {
   const { blocks, blockIndex, push, replace } = ctx;
-  const assistantByItemId = new Map<string, Extract<ThreadBlock, { kind: "assistant" }>>();
+  const assistantByItemId = new Map<string, BlockOf<"assistant">>();
   const toolByItemId = new Map<string, { blockId: string; entryIndex: number }>();
-  let thinkingBlock: Extract<ThreadBlock, { kind: "thinking" }> | null = null;
-  let planBlockId: string | null = null;
   const reasoningByItemId = new Map<string, string>();
+  let thinkingBlock: BlockOf<"thinking"> | null = null;
+  let planBlockId: string | null = null;
+  // Shown once at the end of the run, holding the latest values.
+  const summary: {
+    turnDiff: { diffs: ThreadFileDiff[]; createdAt: string } | null;
+    usage: { usage: ThreadUsage; createdAt: string } | null;
+  } = { turnDiff: null, usage: null };
   const groupStartIndex = blocks.length;
 
-  const touchThinking = (createdAt: string) => {
-    if (thinkingBlock) return thinkingBlock;
-    reasoningByItemId.clear();
-    thinkingBlock = {
-      kind: "thinking",
-      id: `thinking:${createdAt}:${blocks.length}`,
-      text: "",
-      createdAt,
-      streaming: true
-    };
-    push(thinkingBlock);
-    return thinkingBlock;
+  // Text from a message is final once anything else happens in the run.
+  const settleStreams = (createdAt: string) => {
+    for (const block of assistantByItemId.values()) {
+      if (block.streaming) {
+        const next = { ...block, streaming: false, completedAt: block.completedAt ?? createdAt };
+        assistantByItemId.set(block.itemId, next);
+        replace(next);
+      }
+    }
   };
 
-  const upsertAssistant = (
-    itemId: string,
-    createdAt: string,
-    mutate: (block: Extract<ThreadBlock, { kind: "assistant" }>) => void
-  ) => {
+  const upsertAssistant = (itemId: string, createdAt: string, mutate: (block: BlockOf<"assistant">) => void) => {
     let block = assistantByItemId.get(itemId);
     if (!block) {
-      block = {
-        kind: "assistant",
-        id: `assistant:${itemId}:${blocks.length}`,
-        itemId,
-        text: "",
-        createdAt,
-        streaming: true
-      };
-      assistantByItemId.set(itemId, block);
+      settleStreams(createdAt);
+      block = { kind: "assistant", id: `assistant:${itemId}:${blocks.length}`, itemId, text: "", createdAt, streaming: true };
       push(block);
     }
-    mutate(block);
-    replace({ ...block });
+    const next = { ...block };
+    mutate(next);
+    assistantByItemId.set(itemId, next);
+    replace(next);
   };
 
-  const upsertTool = (
-    itemId: string,
-    createdAt: string,
-    mutate: (entry: ThreadToolCall) => void
-  ) => {
+  const updateThinking = (itemId: string, createdAt: string, text: string, mode: "append" | "replace") => {
+    if (!thinkingBlock) {
+      thinkingBlock = { kind: "thinking", id: `thinking:${createdAt}:${blocks.length}`, text: "", createdAt, streaming: true };
+      push(thinkingBlock);
+    }
+    reasoningByItemId.set(itemId, mode === "append" ? (reasoningByItemId.get(itemId) ?? "") + text : text);
+    thinkingBlock = { ...thinkingBlock, text: [...reasoningByItemId.values()].filter((part) => part.trim()).join("\n\n") };
+    replace(thinkingBlock);
+  };
+
+  const upsertTool = (itemId: string, createdAt: string, mutate: (entry: ThreadToolCall) => void) => {
     const existing = toolByItemId.get(itemId);
     if (existing) {
       const block = blocks[blockIndex.get(existing.blockId) ?? -1];
       if (block?.kind === "tools") {
-        const entry = block.entries[existing.entryIndex];
+        const entries = [...block.entries];
+        const entry = entries[existing.entryIndex];
         if (entry) {
-          mutate(entry);
-          replace({ ...block, entries: [...block.entries] });
+          const next = { ...entry };
+          mutate(next);
+          entries[existing.entryIndex] = next;
+          replace({ ...block, entries });
         }
       }
       return;
     }
-    // Attach to the immediately-preceding tools block so consecutive tool
-    // calls share one card.
+    settleStreams(createdAt);
+    // Consecutive tool calls in one run share a card.
     const previous = blocks[blocks.length - 1];
-    const target: Extract<ThreadBlock, { kind: "tools" }> =
+    const target: BlockOf<"tools"> =
       blocks.length > groupStartIndex && previous?.kind === "tools"
         ? previous
-        : (push({
-            kind: "tools",
-            id: `tools:${createdAt}:${blocks.length}`,
-            entries: [],
-            createdAt
-          }) as Extract<ThreadBlock, { kind: "tools" }>);
-    const entry: ThreadToolCall = {
-      id: itemId,
-      title: "",
-      status: "running",
-      icon: "info",
-      createdAt
-    };
+        : (push({ kind: "tools", id: `tools:${createdAt}:${blocks.length}`, entries: [], createdAt }) as BlockOf<"tools">);
+    const entry: ThreadToolCall = { id: itemId, title: "", status: "running", icon: "info", createdAt };
     mutate(entry);
     const entries = [...target.entries, entry];
-    toolByItemId.set(itemId, {
-      blockId: target.id,
-      entryIndex: entries.length - 1
-    });
+    toolByItemId.set(itemId, { blockId: target.id, entryIndex: entries.length - 1 });
     replace({ ...target, entries });
+  };
+
+  const mergeUsage = (next: RuntimeUsage, createdAt: string) => {
+    const current = summary.usage?.usage ?? {};
+    summary.usage = {
+      createdAt: summary.usage?.createdAt ?? createdAt,
+      usage:
+        next.scope === "context"
+          ? {
+              ...current,
+              contextUsedTokens: next.usedTokens ?? current.contextUsedTokens,
+              contextMaxTokens: next.maxTokens ?? current.contextMaxTokens,
+              // Codex reports per-request counts alongside its context gauge.
+              inputTokens: next.inputTokens ?? current.inputTokens,
+              cachedInputTokens: next.cachedInputTokens ?? current.cachedInputTokens,
+              outputTokens: next.outputTokens ?? current.outputTokens,
+              reasoningTokens: next.reasoningTokens ?? current.reasoningTokens,
+              cost: next.cost ?? current.cost
+            }
+          : {
+              ...current,
+              inputTokens: next.inputTokens ?? current.inputTokens,
+              cachedInputTokens: next.cachedInputTokens ?? current.cachedInputTokens,
+              outputTokens: next.outputTokens ?? current.outputTokens,
+              reasoningTokens: next.reasoningTokens ?? current.reasoningTokens,
+              cost: next.cost ?? current.cost
+            }
+    };
+  };
+
+  const closeTurn = (createdAt: string) => {
+    for (const block of assistantByItemId.values()) {
+      if (block.streaming || !block.completedAt) {
+        const next = { ...block, streaming: false, completedAt: block.completedAt ?? createdAt };
+        assistantByItemId.set(block.itemId, next);
+        replace(next);
+      }
+    }
+    if (thinkingBlock?.streaming) {
+      thinkingBlock = { ...thinkingBlock, streaming: false };
+      replace(thinkingBlock);
+    }
   };
 
   for (const event of sortedEvents) {
     const createdAt = event.created_at ?? fallbackCreatedAt;
-    const normalized = rawRecord(event.payload);
-    const raw = rawRecord(normalized?.raw) ?? normalized;
-    if (raw?.aisevakReplay === true) continue;
-    const params = rawRecord(raw?.params);
-    const item = rawRecord(raw?.item) ?? rawRecord(params?.item);
-    const itemId =
-      stringValue(item?.id) ??
-      stringValue(params?.itemId) ??
-      stringValue(params?.item_id) ??
-      stringValue(normalized?.itemId) ??
-      `event:${event.id}`;
-    const itemType = stringValue(item?.type) ?? stringValue(params?.itemType) ?? "";
+    const payload = rawRecord(event.payload);
 
+    // Rows aisevak writes itself (not provider output).
     if (event.event_type === "thread.message-sent") {
-      const text = stringValue(normalized?.text) ?? event.text;
-      if (text?.trim()) {
-        push({ kind: "user", id: `user:${event.id}`, text, createdAt });
-      }
+      const text = stringValue(payload?.text) ?? event.text;
+      if (text) push({ kind: "user", id: `user:${event.id}`, text, createdAt });
       continue;
     }
-
     if (event.event_type === "task.comment") {
-      const text = event.text ?? stringValue(normalized?.text);
-      if (text?.trim()) {
-        push({ kind: "comment", id: `comment:${event.id}`, text, createdAt });
-      }
+      const text = stringValue(payload?.text) ?? event.text;
+      if (text) push({ kind: "comment", id: `comment:${event.id}`, text, createdAt });
+      continue;
+    }
+    if (event.event_type === "turn.failed") {
+      push({ kind: "error", id: `error:${event.id}`, label: "Turn failed", detail: event.text ?? undefined, createdAt });
+      closeTurn(createdAt);
       continue;
     }
 
-    if (event.event_type === "item/agentMessage/delta") {
-      const delta = event.text ?? stringValue(params?.delta);
-      if (!delta) continue;
-      upsertAssistant(itemId, createdAt, (block) => {
-        block.text += delta;
-      });
-      continue;
-    }
+    if (!isRuntimeEventPayload(payload) || payload.replay) continue;
+    const runtime = payload;
+    const itemId = runtime.itemId ?? `event:${event.id}`;
 
-    if (event.event_type === "plan" || event.event_type === "turn_plan_updated" || itemType === "plan") {
-      const items = extractPlanItems(raw, params, item);
-      if (items.length > 0) {
-        const blockId: string = planBlockId ?? `plan:${event.id}`;
-        planBlockId = blockId;
-        const previous = blockIndex.has(blockId)
-          ? (blocks[blockIndex.get(blockId)!] as Extract<ThreadBlock, { kind: "plan" }>)
-          : undefined;
-        replace({
-          kind: "plan",
-          id: blockId,
-          items,
-          createdAt: previous?.createdAt ?? createdAt
-        });
-      }
-      continue;
-    }
-
-    if (REASONING_ITEM_TYPES.has(itemType) || event.event_type === "item/reasoning/delta") {
-      const text =
-        event.text ??
-        stringValue(item?.text) ??
-        stringValue(item?.content) ??
-        (stringArrayValue(item?.summary).join("\n") || stringArrayValue(item?.content).join("\n"));
-      if (event.event_type === "item/reasoning/delta" ? !text : !text.trim()) continue;
-      const block = touchThinking(createdAt);
-      // Older ACP records used item/completed with a shared reasoning ID.
-      // Preserve their independent steps, while true item snapshots replace
-      // the accumulated deltas for their uniquely identified item.
-      const legacyStep = event.event_type === "item/completed" && itemId === "reasoning";
-      const previous = reasoningByItemId.get(itemId) ?? "";
-      reasoningByItemId.set(itemId, event.event_type === "item/reasoning/delta"
-        ? previous + text
-        : legacyStep && previous && previous !== text ? `${previous}\n\n${text}` : text);
-      block.text = [...reasoningByItemId.values()].join("\n\n");
-      replace({ ...block });
-      continue;
-    }
-
-    if (ASSISTANT_ITEM_TYPES.has(itemType)) {
-      const text = stringValue(item?.text) ?? stringValue(item?.content) ?? event.text;
-      if (!text?.trim()) continue;
-      upsertAssistant(itemId, createdAt, (block) => {
-        block.text = text;
-        block.completedAt = createdAt;
-        block.streaming = false;
-      });
-      continue;
-    }
-
-    if (TOOL_ITEM_TYPES.has(itemType) || event.event_type === "session/request_permission") {
-      const status = toolStatusOf(
-        stringValue(item?.status) ?? stringValue(raw?.status),
-        numberValue(item?.exit_code) ?? numberValue(item?.exitCode)
-      );
-      // Follow-up events for the same item often carry no title/command
-      // (Devin emits a bare item/completed after a titled item/started), so
-      // only overwrite fields the event actually provides — never clobber a
-      // real label with the "Tool call" fallback.
-      const title =
-        stringValue(item?.title) ??
-        stringValue(item?.tool_name) ??
-        stringValue(item?.toolName) ??
-        stringValue(item?.command) ??
-        event.text;
-      const detail =
-        stringValue(item?.aggregated_output) ??
-        stringValue(item?.aggregatedOutput) ??
-        stringValue(item?.output) ??
-        stringValue(item?.result) ??
-        (item ? diffTextFromFileChange(item) : undefined) ??
-        stringValue(item?.content);
-      upsertTool(itemId, createdAt, (entry) => {
-        if (title?.trim()) entry.title = title;
-        const command = stringValue(item?.command);
-        if (command) entry.command = command;
-        if (detail?.trim()) entry.detail = detail;
-        const exitCode = numberValue(item?.exit_code) ?? numberValue(item?.exitCode);
-        if (exitCode !== null) entry.exitCode = exitCode;
-        if (entry.status === "running" || status !== "running") entry.status = status;
-        entry.icon = toolIcon(itemType, entry.command, entry.title);
-      });
-      continue;
-    }
-
-    if (event.event_type === "item/completed" && event.text?.trim()) {
-      // Fallback: completed items with no recognizable type (e.g. legacy or
-      // provider-specific message items) render as assistant text.
-      upsertAssistant(itemId, createdAt, (block) => {
-        block.text = event.text!;
-        block.completedAt = createdAt;
-        block.streaming = false;
-      });
-      continue;
-    }
-
-    if (
-      event.event_type === "turn.failed" ||
-      event.event_type === "parse.error" ||
-      (event.event_type === "turn/completed" &&
-        stringValue(rawRecord(rawRecord(raw?.params)?.turn)?.status) === "failed")
-    ) {
-      push({
-        kind: "error",
-        id: `error:${event.id}`,
-        label: event.event_type === "parse.error" ? "Malformed JSONL event" : "Turn failed",
-        detail: event.text ?? undefined,
-        createdAt
-      });
-      continue;
-    }
-
-    if (event.event_type === "turn/completed") {
-      for (const block of blocks) {
-        if (block.kind === "assistant" && block.streaming) {
-          block.completedAt = createdAt;
-          block.streaming = false;
+    switch (runtime.type) {
+      case "content.delta": {
+        const delta = runtime.delta;
+        if (!delta) break;
+        if (delta.stream === "assistant" || delta.stream === "plan") {
+          upsertAssistant(itemId, createdAt, (block) => {
+            block.text += delta.text;
+            block.streaming = true;
+          });
+        } else if (delta.stream === "reasoning" || delta.stream === "reasoning_summary") {
+          updateThinking(itemId, createdAt, delta.text, "append");
+        } else {
+          upsertTool(itemId, createdAt, (entry) => {
+            entry.output = (entry.output ?? "") + delta.text;
+          });
         }
-        if (block.kind === "thinking" && block.streaming) block.streaming = false;
+        break;
       }
-      continue;
-    }
-
-    if (event.event_type === "thread.started" || event.event_type === "thread/started") {
-      const rawParams = rawRecord(raw?.params);
-      const threadId =
-        stringValue(raw?.thread_id) ??
-        stringValue(rawParams?.threadId) ??
-        stringValue(rawRecord(rawParams?.thread)?.id) ??
-        stringValue(normalized?.threadId);
-      if (threadId) {
+      case "item.started":
+      case "item.updated":
+      case "item.completed": {
+        const item = runtime.item;
+        if (!item) break;
+        const completed = runtime.type === "item.completed";
+        if (item.itemType === "assistant_message" || item.itemType === "plan") {
+          if (!completed && !item.text) break;
+          upsertAssistant(itemId, createdAt, (block) => {
+            if (item.text) block.text = item.text;
+            if (completed) {
+              block.streaming = false;
+              block.completedAt = createdAt;
+            }
+          });
+        } else if (item.itemType === "reasoning") {
+          if (item.text) updateThinking(itemId, createdAt, item.text, "replace");
+        } else if (item.itemType === "context_compaction") {
+          if (completed) push({ kind: "system", id: `system:${event.id}`, text: item.text ? `Context compacted: ${item.text}` : "Context compacted", createdAt });
+        } else {
+          upsertTool(itemId, createdAt, (entry) => applyToolItem(entry, item));
+        }
+        break;
+      }
+      case "turn.plan.updated": {
+        const entries = runtime.plan?.entries ?? [];
+        if (entries.length === 0) break;
+        const items = entries.map((entry, index): ThreadPlanItem => ({
+          id: `plan-${index}`,
+          title: entry.step,
+          status: entry.status === "in_progress" ? "running" : entry.status
+        }));
+        if (planBlockId) {
+          const existing = blocks[blockIndex.get(planBlockId) ?? -1];
+          if (existing?.kind === "plan") {
+            replace({ ...existing, items });
+            break;
+          }
+        }
+        settleStreams(createdAt);
+        planBlockId = `plan:${event.id}`;
+        push({ kind: "plan", id: planBlockId, items, createdAt });
+        break;
+      }
+      case "turn.diff.updated":
+        if (runtime.diff?.unifiedDiff) {
+          summary.turnDiff = { diffs: splitUnifiedDiff(runtime.diff.unifiedDiff), createdAt: summary.turnDiff?.createdAt ?? createdAt };
+        }
+        break;
+      case "usage.updated":
+        if (runtime.usage) mergeUsage(runtime.usage, createdAt);
+        break;
+      case "turn.completed": {
+        closeTurn(createdAt);
+        if (runtime.usage) mergeUsage(runtime.usage, createdAt);
+        const turn = runtime.turn;
+        if (turn?.state === "failed") {
+          const detail = turnFailureDetail(turn);
+          const previous = blocks[blocks.length - 1];
+          // Codex reports a fatal error and then fails the turn with the same message.
+          if (previous?.kind === "error" && blocks.length > groupStartIndex && previous.detail === detail) {
+            replace({ ...previous, label: "Turn failed" });
+          } else {
+            push({ kind: "error", id: `error:${event.id}`, label: "Turn failed", detail, createdAt });
+          }
+        } else if (turn?.state === "cancelled" || turn?.state === "interrupted") {
+          push({ kind: "system", id: `system:${event.id}`, text: turn.state === "cancelled" ? "Turn cancelled" : "Turn interrupted", createdAt });
+        }
+        break;
+      }
+      case "runtime.error":
         push({
-          kind: "system",
-          id: `system:${event.id}`,
-          text: `Session ${threadId}`,
+          kind: "error",
+          id: `error:${event.id}`,
+          label: "Provider error",
+          detail: [runtime.error?.message ?? runtime.text, runtime.error?.detail].filter(Boolean).join(" — ") || undefined,
           createdAt
         });
-      }
-      continue;
+        break;
+      case "runtime.warning":
+        push({
+          kind: "notice",
+          id: `notice:${event.id}`,
+          level: runtime.notice?.level === "info" ? "info" : "warning",
+          text: runtime.notice?.message ?? runtime.text ?? "Warning",
+          detail: runtime.notice?.detail,
+          createdAt
+        });
+        break;
+      case "parse.error":
+        push({ kind: "error", id: `error:${event.id}`, label: "Malformed provider output", detail: runtime.text, createdAt });
+        break;
+      case "thread.started":
+        if (runtime.threadId) push({ kind: "system", id: `system:${event.id}`, text: `Session ${runtime.threadId}`, createdAt });
+        break;
+      default:
+        // session.configured, request.opened (auto-approved), user.message
+        // (aisevak records prompts itself), turn.started, provider.event.
+        break;
     }
-    // All other event kinds (config/mode/commands/usage/session_info/unknown)
-    // are provider noise that the unified view intentionally drops.
+  }
+
+  const { turnDiff, usage } = summary;
+  if (turnDiff && turnDiff.diffs.length > 0) {
+    push({ kind: "diff", id: `diff:${groupStartIndex}:${turnDiff.createdAt}`, diffs: turnDiff.diffs, createdAt: turnDiff.createdAt });
+  }
+  if (usage && hasUsage(usage.usage)) {
+    push({ kind: "usage", id: `usage:${groupStartIndex}:${usage.createdAt}`, usage: usage.usage, createdAt: usage.createdAt });
   }
 }
 
-export function isActiveRunStatus(status: string): boolean {
-  return ["queued", "running", "cancel_requested"].includes(status);
+function applyToolItem(entry: ThreadToolCall, item: RuntimeItem): void {
+  if (item.title) entry.title = item.title;
+  else if (!entry.title) entry.title = item.toolName ?? TOOL_LABELS[item.itemType];
+  if (item.command) entry.command = item.command;
+  if (item.output) entry.output = item.output;
+  if (item.exitCode !== undefined) entry.exitCode = item.exitCode;
+  if (item.changes?.length) entry.diffs = item.changes.flatMap(fileDiff);
+  entry.icon = toolIcon(item.itemType);
+  const status: ToolStatus = item.status === "in_progress" ? "running" : item.status === "completed" ? "completed" : "failed";
+  // A late progress update never reopens a finished tool.
+  if (!(status === "running" && entry.status !== "running")) entry.status = status;
 }
 
-function toolStatusOf(status: string | undefined, exitCode: number | null): ToolStatus {
-  if (exitCode !== null && exitCode !== 0) return "failed";
-  if (!status) return "completed";
-  const lowered = status.toLowerCase();
-  if (lowered === "failed" || lowered === "error") return "failed";
-  if (["in_progress", "inprogress", "pending", "running", "started"].includes(lowered)) {
-    return "running";
-  }
-  return "completed";
-}
+const TOOL_LABELS: Record<RuntimeItemType, string> = {
+  assistant_message: "Message",
+  reasoning: "Reasoning",
+  plan: "Plan",
+  command_execution: "Command",
+  file_change: "Edit",
+  file_read: "Read",
+  search: "Search",
+  web_fetch: "Fetch",
+  web_search: "Web search",
+  mcp_tool_call: "MCP tool",
+  dynamic_tool_call: "Tool call",
+  subagent: "Subagent",
+  image_view: "View image",
+  context_compaction: "Compaction",
+  other: "Tool call"
+};
 
-function toolIcon(
-  itemType: string,
-  command: string | undefined,
-  title: string
-): ThreadToolCall["icon"] {
-  if (itemType === "command_execution" || itemType === "commandExecution" || command) {
-    return "terminal";
-  }
-  if (itemType === "web_search" || itemType === "webSearch") return "search";
-  if (itemType === "mcp_tool_call" || itemType === "mcpToolCall") return "wrench";
-  if (itemType === "dynamic_tool_call" || itemType === "dynamicToolCall") return "hammer";
-  if (itemType === "file_change" || itemType === "fileChange" || itemType === "review") return "edit";
-  if (/search|fetch|browse/i.test(title)) return "search";
-  return "info";
-}
-
-function diffTextFromFileChange(item: Record<string, unknown>): string | undefined {
-  const changes = item.changes;
-  if (!Array.isArray(changes)) return undefined;
-  const diffs = changes
-    .map((change) => {
-      const record = rawRecord(change);
-      const path = stringValue(record?.path) ?? "file";
-      const diff = stringValue(record?.diff) ?? stringValue(record?.content);
-      return diff ? `--- a/${path}\n+++ b/${path}\n${diff}` : null;
-    })
-    .filter((diff): diff is string => Boolean(diff));
-  return diffs.length > 0 ? diffs.join("\n") : undefined;
-}
-
-function extractPlanItems(
-  raw: Record<string, unknown> | undefined,
-  params: Record<string, unknown> | undefined,
-  item: Record<string, unknown> | undefined
-): ThreadPlanItem[] {
-  // ACP `plan` updates carry params.update.entries; Codex plan items carry
-  // item.plan/todo arrays. Cover both.
-  const update = rawRecord(params?.update);
-  const candidates = [
-    update?.entries,
-    rawRecord(raw?.update)?.entries,
-    item?.plan,
-    item?.todos,
-    item?.entries,
-    params?.plan,
-    params?.entries
-  ];
-  for (const candidate of candidates) {
-    if (!Array.isArray(candidate) || candidate.length === 0) continue;
-    const items = candidate
-      .map((entry, index): ThreadPlanItem | null => {
-        const record = rawRecord(entry);
-        const title =
-          stringValue(record?.content) ??
-          stringValue(record?.title) ??
-          stringValue(record?.text) ??
-          stringValue(record?.step) ??
-          (typeof entry === "string" ? entry : undefined);
-        if (!title) return null;
-        return {
-          id: stringValue(record?.id) ?? `plan-${index}`,
-          title,
-          status: planItemStatus(stringValue(record?.status))
-        };
-      })
-      .filter((entry): entry is ThreadPlanItem => entry !== null);
-    if (items.length > 0) return items;
-  }
-  return [];
-}
-
-function planItemStatus(status: string | undefined): ThreadPlanItem["status"] {
-  switch (status?.toLowerCase()) {
-    case "completed":
-    case "complete":
-    case "done":
-      return "completed";
-    case "in_progress":
-    case "inprogress":
-    case "running":
-      return "running";
-    case "failed":
-    case "error":
-    case "cancelled":
-      return "failed";
+function toolIcon(itemType: RuntimeItemType): ToolIcon {
+  switch (itemType) {
+    case "command_execution":
+      return "terminal";
+    case "file_change":
+      return "edit";
+    case "file_read":
+    case "image_view":
+      return "read";
+    case "search":
+      return "search";
+    case "web_search":
+    case "web_fetch":
+      return "web";
+    case "mcp_tool_call":
+      return "wrench";
+    case "dynamic_tool_call":
+      return "hammer";
+    case "subagent":
+      return "agent";
     default:
-      return "pending";
+      return "info";
   }
+}
+
+function fileDiff(change: RuntimeFileChange): ThreadFileDiff[] {
+  if (!change.diff) return [];
+  // Codex sends hunks only; ACP diffs already carry file headers.
+  const diff = change.diff.startsWith("--- ")
+    ? change.diff
+    : `--- ${change.kind === "add" ? "/dev/null" : `a/${change.path}`}\n+++ b/${change.movePath ?? change.path}\n${change.diff}`;
+  return [{ path: change.movePath ?? change.path, diff }];
+}
+
+/** Split a multi-file unified diff (`diff --git` sections) into per-file diffs. */
+export function splitUnifiedDiff(unified: string): ThreadFileDiff[] {
+  const sections = unified.split(/^(?=diff --git )/m).filter((section) => section.trim());
+  return sections.map((section) => {
+    const path =
+      /^\+\+\+ b\/(.+)$/m.exec(section)?.[1] ??
+      /^diff --git a\/\S+ b\/(\S+)/m.exec(section)?.[1] ??
+      "changes";
+    return { path, diff: section.replace(/^diff --git .*\n/, "").replace(/^index .*\n/m, "").trimEnd() };
+  });
+}
+
+function turnFailureDetail(turn: NonNullable<RuntimeEvent["turn"]>): string | undefined {
+  return turn.errorMessage ?? (turn.stopReason ? `Stopped: ${turn.stopReason}` : undefined);
+}
+
+function hasUsage(usage: ThreadUsage): boolean {
+  return Object.values(usage).some((value) => value !== undefined);
+}
+
+function isRuntimeEventPayload(value: Record<string, unknown> | undefined): value is Record<string, unknown> & RuntimeEvent {
+  return value?.v === 2 && typeof value.type === "string";
 }
 
 function rawRecord(value: unknown): Record<string, unknown> | undefined {
@@ -602,10 +598,7 @@ function stringValue(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function numberValue(value: unknown): number | null {
-  return typeof value === "number" ? value : null;
+export function isActiveRunStatus(status: string): boolean {
+  return ["queued", "running", "cancel_requested"].includes(status);
 }
 
-function stringArrayValue(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
-}

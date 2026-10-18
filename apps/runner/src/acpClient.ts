@@ -2,8 +2,6 @@ import {
   acpPermissionDecision,
   buildAcpInitializeParams,
   extractAcpSessionId,
-  normalizeAcpEvent,
-  parseCodexJsonLine,
   redactSecrets
 } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
@@ -89,10 +87,16 @@ export function acpConnectionKey(options: AcpTurnOptions): string {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
 }
+
+// Requests whose failure the session recovers from: authentication is
+// best-effort, model/option changes fall back or are skipped, and a failed
+// session/load starts a fresh session.
+const RECOVERABLE_ACP_METHODS = new Set(["authenticate", "session/set_model", "session/set_config_option", "session/load"]);
 
 class PersistentAcpSession {
   private readonly child: ChildProcessWithoutNullStreams;
@@ -393,16 +397,21 @@ class PersistentAcpSession {
     const trimmed = line.trim();
     if (!trimmed) return;
     this.lastActivityAt = Date.now();
-    void this.onNotification?.(trimmed).catch((error: unknown) => {
+    let message: Record<string, unknown> | null = null;
+    try {
+      message = JSON.parse(trimmed) as Record<string, unknown>;
+    } catch { /* Malformed output still reaches the event log as a parse error. */ }
+    const recovered =
+      message?.method === undefined &&
+      message?.id !== undefined &&
+      Boolean(message.error) &&
+      RECOVERABLE_ACP_METHODS.has(this.pending.get(String(message.id))?.method ?? "");
+    const persisted = recovered ? JSON.stringify({ ...message, aisevakRecovered: true }) : trimmed;
+    void this.onNotification?.(persisted).catch((error: unknown) => {
       this.rejectPending(error instanceof Error ? error : new Error(String(error)));
       void this.close().catch(() => undefined);
     });
-    let message: Record<string, unknown>;
-    try {
-      message = JSON.parse(trimmed) as Record<string, unknown>;
-    } catch {
-      return;
-    }
+    if (!message) return;
     if (typeof message.method === "string" && message.id !== undefined) {
       if (message.method === "session/request_permission") {
         this.send({
@@ -460,7 +469,7 @@ class PersistentAcpSession {
         idleAware ? idleAwareMs : 15 * 60_000
       );
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
-      this.pending.set(String(id), { resolve, reject, timeout: arm() });
+      this.pending.set(String(id), { method, resolve, reject, timeout: arm() });
     });
     this.send({ jsonrpc: "2.0", id, method, params });
     return promise;
@@ -477,15 +486,6 @@ class PersistentAcpSession {
       this.pending.delete(id);
     }
   }
-}
-
-export function persistAcpLine(
-  line: string,
-  sessionId: string | null
-): { type: string; text?: string; threadId?: string; raw: unknown } {
-  const raw = parseCodexJsonLine(line);
-  const normalized = normalizeAcpEvent(raw, sessionId);
-  return normalized;
 }
 
 export type { AppServerTurnInput };
