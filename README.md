@@ -1,36 +1,44 @@
 <div align="center">
-  <img src="apps/site/public/favicon.svg" width="64" height="64" alt="AiSevak Logo" />
-  <h1>AiSevak</h1>
-  <p><strong>The host-native autonomous operating system and multi-agent coordination layer for software engineers.</strong></p>
-
+  <img src="apps/web/public/favicon.svg" width="56" height="56" alt="" />
+  <h1>Aisevak</h1>
+  <p>A self-hosted workspace where coding agents take tasks, work in their own git worktrees, and coordinate with each other through durable threads.</p>
   <p>
-    <a href="https://aisevak.com"><img src="https://img.shields.io/badge/Website-aisevak.com-7c72ff?style=flat-square" alt="Website" /></a>
-    <a href="https://aisevak.embedr.dev"><img src="https://img.shields.io/badge/Live%20Demo-aisevak.embedr.dev-34d399?style=flat-square" alt="Live Demo" /></a>
-    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-blue?style=flat-square" alt="MIT License" /></a>
-    <a href="https://github.com/rshabhsinha/aisevak/stargazers"><img src="https://img.shields.io/github/stars/rshabhsinha/aisevak?style=flat-square&color=fbbf24" alt="GitHub Stars" /></a>
+    <a href="#quick-start">Quick start</a> ·
+    <a href="#how-it-works">How it works</a> ·
+    <a href="#the-aisevak-cli">CLI</a> ·
+    <a href="#deploying-to-a-server">Deploy</a> ·
+    <a href="CONTRIBUTING.md">Contributing</a>
   </p>
 </div>
 
----
+<p align="center">
+  <img src="docs/images/thread.png" alt="An Orchestrator thread: the agent plans the work, delegates to Builder and Reviewer through the aisevak CLI, and reports the result" width="100%" />
+</p>
 
-## ⚡ The Multi-Agent Problem & AiSevak Solution
+## What it does
 
-Running isolated coding agents (OpenAI Codex, Claude Code, Cursor, OpenCode) in single chat tabs causes severe context degradation, uncoordinated branch collisions, and exponential token waste.
+You give Aisevak a task. An **Orchestrator** agent breaks it down, hands pieces to specialised agents (a Builder, a Reviewer, whatever you define), and reports back when the work is done. Every agent runs a real coding harness on your machine, with real shells, compilers, and test runners.
 
-**AiSevak** transforms isolated LLMs into a coordinated autonomous engineering squad with deterministic host guarantees:
+- **Use the harnesses you already have.** Codex, Claude Code, Cursor, OpenCode, and Devin, each signed in with your own account or API key. Mix them freely: one agent can run on Codex while another runs on Claude Code.
+- **Threads that last.** A conversation outlives a single model turn. Each agent keeps its own provider session, so follow-ups, retries, and steering messages pick up where they left off.
+- **One worktree per task.** Agents never trip over each other's branches. Each task gets its own git worktree, so many can run in parallel.
+- **Agents coordinate through a CLI.** Agents create tasks, message each other, and close out work with the same `aisevak` command you can run yourself.
+- **Built-in operations.** Schedules for recurring jobs, incidents for things that break, and reports for things worth writing down.
 
-1. **Durable Multi-Agent Threads**: Conversations outlive individual model turns; each agent retains its own private provider session for serialized follow-ups with zero context drift.
-2. **Isolated Git Worktrees**: Every task executes in its own dedicated, sandboxed branch worktree (`/srv/aisevak/worktrees/task-xxx`), allowing parallel work without Git locks.
-3. **Host-Native Linux Execution**: Runs real bash commands, Playwright headless browsers, compilers, Docker services, and AST-grep directly on host hardware.
-4. **$0 Token Markup (BYO AI)**: Connect your existing OpenAI Codex (device-code auth), Anthropic Claude Code (`claude setup-token`), Cursor, or local Ollama subscriptions directly. No middleman fee.
-5. **Unified CLI Socket (`aisevak`)**: Human engineers and autonomous agents discover tasks, inspect state, and exchange steering instructions through the exact same CLI.
-6. **Autonomous Sentry & Scheduled Cron**: Agents continuously probe endpoints, triage CloudWatch 500 error spikes, and open automated fix PRs.
+## A look around
 
----
+**Tasks.** Every piece of work is a task, tracked from open to done. Tasks can be routed by the Orchestrator or assigned straight to an agent.
 
-## 🚀 Quick Start (Local Development)
+<img src="docs/images/tasks.png" alt="Task board with Todo, Running, Completed, and Needs attention columns" width="100%" />
 
-### 1. Clone & Setup
+**Agents.** Define as many agents as you like. Each one has a harness, a model, a reasoning level, and a prompt describing its job.
+
+<img src="docs/images/agents.png" alt="Agent setup showing Builder, Reviewer, Orchestrator, Frontend, Triage, and Docs agents across Codex, Cursor, Devin, and OpenCode" width="100%" />
+
+## Quick start
+
+You need Node.js 20+, pnpm 9+, Docker, and at least one harness installed (`codex`, `claude-agent-acp` for Claude Code, `cursor-agent`, `opencode`, or `devin`).
+
 ```bash
 git clone https://github.com/rshabhsinha/aisevak.git
 cd aisevak
@@ -38,107 +46,114 @@ pnpm install
 cp .env.example .env
 ```
 
-### 2. Start PostgreSQL & Run Migrations
+Start PostgreSQL and apply migrations:
+
 ```bash
 docker compose up -d postgres
 pnpm db:migrate
 ```
 
-### 3. Launch Development Stack
+Run the API, runner, and web app together:
+
 ```bash
 pnpm dev
 ```
 
-- **Web Control Room**: [`http://localhost:5173`](http://localhost:5173)
-- **Marketing Site (`apps/site`)**: [`http://localhost:5174`](http://localhost:5174)
-- **Coordination API**: [`http://localhost:8787`](http://localhost:8787)
+Open [localhost:5173](http://localhost:5173), create the owner account, connect a harness under **Settings**, and add a repository under **Settings → Projects**. Codex signs in with a device code, so it works on remote and headless machines too.
 
----
+| Service | Address |
+| --- | --- |
+| Web app | `http://localhost:5173` |
+| API | `http://localhost:8787` |
 
-Tasks are the durable job identity: every task has an immutable `work_scope`/`work_key`
-and exactly one coordination thread. Orchestrators delegate through keyed assignments;
-assignment retries reuse the same assignment, agent thread, and provider session whenever
-possible. The API records would-reject operations in `job_safety_events`. Set
-`AISEVAK_JOB_SAFETY_MODE=audit` during a rollout canary to observe violations without
-rejecting them, then switch to `enforce` (the default) after the audit window.
+## How it works
 
-After creating the first owner account, open **Manage → ChatGPT** to connect a ChatGPT subscription through the browser. Aisevak uses Codex device-code authentication for remote and headless hosts, encrypts the shared credential in PostgreSQL, and materializes it only into runner-owned Codex homes. An OpenAI API key entered during onboarding remains supported as a fallback.
+```
+apps/
+  api/      Fastify API, PostgreSQL state, and the coordination layer
+  runner/   Picks up queued turns and runs harnesses in isolated worktrees
+  web/      React control room
+packages/
+  cli/      The `aisevak` CLI used by people and agents
+  core/     Shared types, migrations, and harness adapters
+```
 
-## 💻 CLI Coordination Surface
+A **task** is the durable unit of work. It has a stable work key and exactly one coordination thread. When the Orchestrator delegates, it creates a keyed **assignment**. Retrying an assignment reuses the same agent thread and provider session wherever possible, so agents don't lose context or duplicate work.
 
-Human developers and autonomous agents coordinate through the identical CLI:
+The **runner** polls for queued turns and executes them on the host. Turns on the same agent thread run one at a time; independent turns run in parallel.
+
+## The aisevak CLI
+
+Agents get the CLI on their `PATH` inside every run. You can use the same commands from your own terminal.
 
 ```bash
-# Identity & capabilities
 aisevak whoami
-aisevak capabilities
-aisevak agents list --limit 20
+aisevak agents list
 
-# Create orchestrated task and worktree
-aisevak tasks create --title "Refactor USB-C staggered footprint" \
-  --description "Apply 0.65mm pin offset" --to "Builder Prime" --body-stdin
+# Create a task and hand it to an agent
+aisevak tasks create --title "Paginate GET /api/orders" \
+  --description "Cursor pagination, 50 per page" --agent Builder
 
-# Steer active turn stream via stdin
-aisevak threads send THREAD-08 --to "Lead Code Reviewer" --body-stdin
+# Message another agent on a thread
+aisevak threads send THREAD-8 --to Reviewer --body-stdin < notes.md
 
-# Atomic thread completion
-aisevak threads complete THREAD-08 --summary-stdin
+# Finish a thread with a summary
+aisevak threads complete THREAD-8 --summary-stdin < summary.md
 
-# Sentry & incident triage
+# Open an incident
 aisevak incidents declare --title "Queue latency high" --severity high --markdown-stdin
 ```
 
----
+Every command prints JSON. Run `aisevak --help` for the full list.
 
-## 🔧 Operator Notes
+## Configuration
 
-- **Runner pool**: independent turns run in parallel. Tune with `RUNNER_MAX_CONCURRENCY` (default `4`, max `32`) and `RUNNER_POLL_MS` (default `1500`). Turns on one agent thread stay serialized.
-- **Harnesses**: worker turns require a connected provider. Codex uses device-code auth (API key fallback); Cursor turns require a `CURSOR_API_KEY` (keychain subscriptions never reach worker homes); OpenCode reads stored or host `auth.json`; Devin runs over ACP using a portable `credentials.toml` (browser sign-in with manual code paste, host import, or API key). Claude Code runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`) with a `claude setup-token` subscription token or an Anthropic API key saved in **Manage → Claude Code**; Opus 5.5 at medium effort is its default.
-- **Skills vs capabilities**: installed skills live in `${MANAGED_ROOT}/skills` and are mounted per-thread as `$AISEVAK_SKILLS_DIR`; backend-enforced capabilities gate which CLI mutations each agent may perform.
-- **GitHub**: connect via **Manage → Connectors** with a classic PAT (`repo`, `read:org`, `gist`). The runner signs in `gh`, shares the CLI credential helper with agents, and discards the token.
-- **Security model**: for trusted small teams. Harnesses run with approvals disabled and full host access — use a dedicated machine or VM. Harness credentials (Cursor and Devin keys, the Claude Code token) are in each harness process's environment, so the agent's own shell commands can read them; run logs redact them.
+| Variable | Default | What it does |
+| --- | --- | --- |
+| `RUNNER_MAX_CONCURRENCY` | `4` | Independent turns the runner executes at once (max `32`) |
+| `RUNNER_POLL_MS` | `1500` | How often the runner checks for queued work |
+| `MANAGED_ROOT` | `.aisevak-managed` | Where worktrees, harness homes, and skills live |
+| `AISEVAK_JOB_SAFETY_MODE` | `enforce` | Set to `audit` to log unsafe duplicate work instead of rejecting it |
+| `AISEVAK_AUTO_WORKTREE_CLEANUP` | `1` | Set to `0` to stop the runner removing finished task checkouts |
 
----
+**Harness sign-in**
 
-## 🛠️ Production Host Deployment
+- **Codex**: device-code sign-in from the browser, with an OpenAI API key as a fallback.
+- **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
+- **Cursor**: set a `CURSOR_API_KEY`.
+- **OpenCode**: uses a stored or host `auth.json`.
+- **Devin**: runs over ACP using `credentials.toml`, set up by browser sign-in, host import, or API key.
 
-Deploy AiSevak directly to an Ubuntu 22.04+ VM or AWS EC2 instance:
+**GitHub.** Connect under **Settings → Connectors** with a classic personal access token (`repo`, `read:org`, `gist`). The runner signs in `gh` and shares the credential helper with agents.
+
+**Skills.** Installed skills live in `${MANAGED_ROOT}/skills` and are mounted into each thread as `$AISEVAK_SKILLS_DIR`. Separately, capabilities control which CLI actions each agent is allowed to take.
+
+**Archiving and cleanup.** Archiving a chat stops its active turns and hides it, but keeps the timeline and provider history; turn on **Show archived chats** to see it again. The runner removes clean, idle checkouts of finished tasks and keeps branches, uncommitted or untracked files, and anything a live process is using.
+
+## Deploying to a server
+
+On a fresh Ubuntu 22.04+ machine:
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-The host installer:
-- Deploys directory structure under `/opt/aisevak` and persistent workspaces at `/srv/aisevak`.
-- Configures Docker Compose for PostgreSQL 18 and Caddy zero-downtime TLS reverse proxy.
-- Installs and activates the host-native systemd daemon (`aisevak-runner.service`).
+The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, starts PostgreSQL and Caddy (with automatic TLS) through Docker Compose, and installs the runner as a systemd service (`aisevak-runner.service`). See [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) for an EC2 walkthrough.
 
-For sanitized AWS EC2 and Systems Manager runbooks, see [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md).
+> [!WARNING]
+> Harnesses run with approvals off and full access to the host. Aisevak is built for small, trusted teams. Run it on a dedicated machine or VM.
+> Harness credentials (Cursor and Devin keys, the Claude Code token) sit in each harness's environment, so an agent's own shell commands can read them. Run logs redact them.
 
----
+## Development
 
-## ☁️ AiSevak Cloud (Founding Member Launch)
+```bash
+pnpm test        # unit tests
+pnpm typecheck   # type-check every package
+pnpm build       # build everything
+```
 
-Prefer zero-maintenance infrastructure? Reserve a dedicated, single-tenant 4 vCPU / 8GB NVMe VM with automated rolling upgrades and encrypted S3 backups at **[aisevak.com](https://aisevak.com)** ($79/mo locked for life).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for conventions.
 
----
+## License
 
-## 🏛️ Brand Lineage & License
-
-AiSevak was created by **[PromptLabs Pvt Ltd](https://promptlabs.link)** (Directors: Rishabh Sinha & Amit Kumar Modi) to orchestrate agents developing **[Embedr](https://embedr.app)**, the AI-powered IDE for embedded systems and hardware firmware.
-
-Licensed under the **[MIT License](LICENSE)**.
-
-Chat archiving retains the Aisevak timeline and provider history. Archived chats
-are hidden unless **Show archived chats** is enabled (API: `includeArchived=true`).
-Archive stops queued/active turns, archives Codex through its app-server protocol,
-and asks the runner to remove clean, idle, managed linked checkouts. Restore waits
-for provider unarchive before accepting another turn. ACP providers retain their
-session history and close their idle process because ACP has no archive method.
-
-The runner also cleans completed/cancelled task checkouts and expired tool tokens.
-It keeps branches, primary repositories, dirty/untracked/unknown ignored files,
-shared checkouts and live processes. Only ignored root `node_modules` and generated
-skill copies are disposable. Deferred cleanup records its reason and retries after
-five minutes, including after a restart. `AISEVAK_AUTO_WORKTREE_CLEANUP=0` disables
-automatic cleanup. Recreated checkouts retain existing branch commits.
+[MIT](LICENSE)
