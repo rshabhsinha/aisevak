@@ -37,7 +37,7 @@ Both themes use the same semantic roles with refined low-contrast surfaces.
 | --- | --- | --- | --- |
 | Canvas Background | `#FAF9F7` (warm porcelain) | `#0A0A0C` (deep obsidian void) | app canvas |
 | Card / Panel | `#FFFFFF` | `#121215` (raised carbon) | panels, cards, inputs |
-| Hover / Muted | `#F5F4F0` | `#17171B` | secondary surfaces, row hover |
+| Hover / Muted | `#F4F3F0` | `#16161A` | secondary surfaces, row hover |
 | Primary | `#5B4DE3` (soft violet) | `#7C72FF` (luminous indigo) | primary action, focus, selection |
 | Success | `#16A34A` (forest) | `#34D399` (mint) | completed and active-positive states |
 | Warning | `#D97706` (amber) | `#FBBF24` (soft amber) | running and attention states |
@@ -111,7 +111,7 @@ User messages use a compact muted bubble. Assistant content remains unboxed for 
 
 ### Workspace frame
 
-Desktop uses a 232px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
+Desktop uses a 242px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
 
 ### Board
 

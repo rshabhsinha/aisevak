@@ -12,7 +12,7 @@ apps/
 packages/
   cli/       The `aisevak` CLI that agents use inside their runs
   core/      Shared types, migrations, harness adapters, and runtime events
-scripts/     install.sh, update.sh, and release helpers
+scripts/     install.sh, update.sh, and the Codex runtime publisher the installer uses
 tests/       Cross-package tests and fixtures
 docs/        Design language, provider event notes, and UI QA checklists
 ```

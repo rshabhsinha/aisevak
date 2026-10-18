@@ -28,7 +28,7 @@ You give Aisevak a task. An **Orchestrator** agent breaks it down, hands pieces 
 
 ## Quick start
 
-You need Node.js 20+, pnpm 9+, Docker, and at least one harness installed (`codex`, `claude-agent-acp` for Claude Code, `cursor-agent`, `opencode`, or `devin`).
+You need Node.js 20+ (22+ for Claude Code), pnpm 9+, Docker, Git 2.36+, and at least one harness installed (`codex`, `claude-agent-acp` for Claude Code, `cursor-agent`, `opencode`, or `devin`).
 
 ```bash
 git clone https://github.com/rshabhsinha/aisevak.git
@@ -120,7 +120,7 @@ Defaults below are the values the code uses when a variable is unset.
 **Harness sign-in**
 
 - **Codex**: device-code sign-in from the browser, with an OpenAI API key as a fallback.
-- **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
+- **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh` on Node.js 22+), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
 - **Cursor**: save a `CURSOR_API_KEY` under **Settings → Cursor**. Subscriptions tied to the macOS keychain never reach agent worktrees.
 - **OpenCode**: uses a stored or host `auth.json`.
 - **Devin**: runs over ACP using `credentials.toml`, set up by browser sign-in, host import, or API key.
@@ -133,7 +133,12 @@ Defaults below are the values the code uses when a variable is unset.
 
 ## Deploying to a server
 
-On an Ubuntu 22.04+ machine with Docker Engine, the Docker Compose plugin, Node.js, and rsync installed (the installer adds Git and the GitHub CLI if they are missing):
+Before running the installer on Ubuntu 22.04+, install Docker Engine, the Docker Compose plugin, Node.js, and rsync. The installer adds Git and the GitHub CLI if they are missing. Two version requirements to watch:
+
+- **Git 2.36 or newer.** The runner's checkout cleanup uses `git worktree list -z`. Ubuntu 22.04 ships Git 2.34, so install a newer Git first (for example from the `git-core` PPA) or use Ubuntu 24.04.
+- **Node.js 22 or newer for Claude Code.** On older Node.js the installer skips the `claude-agent-acp` adapter.
+
+Then run:
 
 ```bash
 sudo ./scripts/install.sh
