@@ -453,6 +453,9 @@ export function App() {
   // Bumped by every board reload so slower, superseded responses (an older
   // search, or a load-more page from before the reload) are dropped.
   const tasksRequestRef = useRef(0);
+  // Latest load-more request per column, so only that request clears its
+  // column's loading flag.
+  const loadMoreRequestRef = useRef<Partial<Record<BoardColumnId, number>>>({});
   const [taskRefs, setTaskRefs] = useState<TaskRef[]>([]);
   const [activityReports, setActivityReports] = useState<ActivityReport[]>([]);
   const [activityNextCursor, setActivityNextCursor] = useState<string | null>(null);
@@ -789,12 +792,21 @@ export function App() {
     const column = boardRef.current[bucket];
     if (!column.nextCursor || column.loadingMore) return;
     const request = tasksRequestRef.current;
+    const loadRequest = (loadMoreRequestRef.current[bucket] ?? 0) + 1;
+    loadMoreRequestRef.current[bucket] = loadRequest;
+    const clearLoading = () => {
+      if (loadMoreRequestRef.current[bucket] !== loadRequest) return;
+      setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: false } }));
+    };
     setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: true } }));
     try {
       const page = await api<TaskPage>(taskPageUrl(bucket, TASK_COLUMN_PAGE_SIZE, column.nextCursor));
-      // A reload replaced the board (and cleared loadingMore) while this page
-      // was in flight; its cursor belongs to the old list.
-      if (request !== tasksRequestRef.current) return;
+      // A reload replaced this column while the page was in flight, so its
+      // cursor belongs to the old list.
+      if (request !== tasksRequestRef.current || boardRef.current[bucket].nextCursor !== column.nextCursor) {
+        clearLoading();
+        return;
+      }
       setBoard((board) => {
         const seen = new Set(board[bucket].tasks.map((task) => task.id));
         return {
@@ -808,9 +820,7 @@ export function App() {
         };
       });
     } catch (error) {
-      if (request === tasksRequestRef.current) {
-        setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: false } }));
-      }
+      clearLoading();
       throw error;
     }
   }
