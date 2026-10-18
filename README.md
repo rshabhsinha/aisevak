@@ -22,7 +22,7 @@ You give Aisevak a task. An **Orchestrator** agent breaks it down, hands pieces 
 - **Use the harnesses you already have.** Codex, Claude Code, Cursor, OpenCode, and Devin, each signed in with your own account or API key. Mix them freely: one agent can run on Codex while another runs on Claude Code.
 - **Threads that last.** A conversation outlives a single model turn. Each agent keeps its own provider session, so follow-ups, retries, and steering messages pick up where they left off.
 - **One worktree per task.** Agents never trip over each other's branches. Each task gets its own git worktree, so many can run in parallel.
-- **Agents coordinate through a CLI.** Agents create tasks, message each other, and close out work with the same `aisevak` command you can run yourself.
+- **Agents coordinate through a CLI.** Inside every run, agents use the `aisevak` command to create tasks, message each other, and close out work.
 - **Built-in operations.** Schedules for recurring jobs, incidents for things that break, and reports for things worth writing down.
 
 ## A look around
@@ -44,6 +44,12 @@ git clone https://github.com/rshabhsinha/aisevak.git
 cd aisevak
 pnpm install
 cp .env.example .env
+```
+
+Replace the two placeholder secrets in `.env`. `SECRET_KEY` must be a base64-encoded 32-byte key, because it encrypts saved harness credentials:
+
+```bash
+node -e "const c=require('crypto');console.log('SECRET_KEY='+c.randomBytes(32).toString('base64'));console.log('COOKIE_SECRET='+c.randomBytes(32).toString('base64url'))"
 ```
 
 Start PostgreSQL and apply migrations:
@@ -84,7 +90,7 @@ The **runner** polls for queued turns and executes them on the host. Turns on th
 
 ## The aisevak CLI
 
-Agents get the CLI on their `PATH` inside every run. You can use the same commands from your own terminal.
+Every agent run gets the CLI on its `PATH`, authenticated with a token scoped to that run. It is how agents read and change shared state. People use the web app for the same things.
 
 ```bash
 aisevak whoami
@@ -92,7 +98,8 @@ aisevak agents list
 
 # Create a task and hand it to an agent
 aisevak tasks create --title "Paginate GET /api/orders" \
-  --description "Cursor pagination, 50 per page" --agent Builder
+  --description "Cursor pagination, 50 per page" --agent Builder \
+  --work-key orders-pagination
 
 # Message another agent on a thread
 aisevak threads send THREAD-8 --to Reviewer --body-stdin < notes.md
@@ -101,26 +108,29 @@ aisevak threads send THREAD-8 --to Reviewer --body-stdin < notes.md
 aisevak threads complete THREAD-8 --summary-stdin < summary.md
 
 # Open an incident
-aisevak incidents declare --title "Queue latency high" --severity high --markdown-stdin
+aisevak incidents declare --title "Queue latency high" \
+  --description "p95 above 30s since 14:00" --severity high --markdown-stdin < incident.md
 ```
 
 Every command prints JSON. Run `aisevak --help` for the full list.
 
 ## Configuration
 
+Defaults below are the values the code uses when a variable is unset.
+
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `RUNNER_MAX_CONCURRENCY` | `4` | Independent turns the runner executes at once (max `32`) |
 | `RUNNER_POLL_MS` | `1500` | How often the runner checks for queued work |
-| `MANAGED_ROOT` | `.aisevak-managed` | Where worktrees, harness homes, and skills live |
-| `AISEVAK_JOB_SAFETY_MODE` | `enforce` | Set to `audit` to log unsafe duplicate work instead of rejecting it |
+| `MANAGED_ROOT` | `/srv/aisevak` | Where worktrees, harness homes, and skills live (`.env.example` uses `.aisevak-managed` for local dev) |
+| `AISEVAK_JOB_SAFETY_MODE` | `enforce` | `audit` records unsafe or duplicate work in `job_safety_events` without rejecting it. `.env.example` starts in `audit` for a trial period; switch to `enforce` once the recorded events look right |
 | `AISEVAK_AUTO_WORKTREE_CLEANUP` | `1` | Set to `0` to stop the runner removing finished task checkouts |
 
 **Harness sign-in**
 
 - **Codex**: device-code sign-in from the browser, with an OpenAI API key as a fallback.
 - **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
-- **Cursor**: set a `CURSOR_API_KEY`.
+- **Cursor**: save a `CURSOR_API_KEY` under **Settings → Cursor**. Subscriptions tied to the macOS keychain never reach agent worktrees.
 - **OpenCode**: uses a stored or host `auth.json`.
 - **Devin**: runs over ACP using `credentials.toml`, set up by browser sign-in, host import, or API key.
 
@@ -132,13 +142,13 @@ Every command prints JSON. Run `aisevak --help` for the full list.
 
 ## Deploying to a server
 
-On a fresh Ubuntu 22.04+ machine:
+On an Ubuntu 22.04+ machine with Docker Engine, the Docker Compose plugin, and Node.js installed:
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, starts PostgreSQL and Caddy (with automatic TLS) through Docker Compose, and installs the runner as a systemd service (`aisevak-runner.service`). See [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) for an EC2 walkthrough.
+The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, generates secrets, and starts PostgreSQL, the API, and the web app (on port `8080`) with Docker Compose. It also installs the runner as a systemd service (`aisevak-runner.service`). TLS and a reverse proxy such as Caddy are set up separately; [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) walks through both on EC2.
 
 > [!WARNING]
 > Harnesses run with approvals off and full access to the host. Aisevak is built for small, trusted teams. Run it on a dedicated machine or VM.
