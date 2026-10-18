@@ -142,7 +142,7 @@ Defaults below are the values the code uses when a variable is unset.
 
 ## Deploying to a server
 
-On an Ubuntu 22.04+ machine with Docker Engine, the Docker Compose plugin, and Node.js installed:
+On an Ubuntu 22.04+ machine with Docker Engine, the Docker Compose plugin, Node.js, and rsync installed (the installer adds Git and the GitHub CLI if they are missing):
 
 ```bash
 sudo ./scripts/install.sh
