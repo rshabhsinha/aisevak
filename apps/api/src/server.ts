@@ -1114,7 +1114,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/tasks", async (request) => {
     requireUser(request);
-    const query = tasksQuerySchema.parse(request.query);
+    const parsedQuery = tasksQuerySchema.safeParse(request.query);
+    if (!parsedQuery.success) throwBadRequest("Invalid task list query");
+    const query = parsedQuery.data;
     // Without paging parameters the endpoint keeps returning every task, for
     // API clients that predate the bounded board.
     if (!query.bucket && query.limit === undefined && !query.cursor && !query.query) {
@@ -1149,7 +1151,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     values.push(limit + 1);
     const [result, count] = await Promise.all([
       pool.query(
-        `${TASK_LIST_SELECT}
+        `${TASK_LIST_SELECT.replace("SELECT tasks.*,", `SELECT tasks.*, ${TASK_CURSOR_COLUMN},`)}
        ${conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : ""}
        ORDER BY tasks.created_at DESC, tasks.id DESC
        LIMIT $${values.length}`,
@@ -1171,9 +1173,15 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       )
     ]);
     const hasMore = result.rows.length > limit;
-    const tasks = result.rows.slice(0, limit);
-    const last = tasks.at(-1) as { created_at?: string; id?: string } | undefined;
-    const nextCursor = hasMore && last?.created_at && last?.id ? encodeResourceCursor(last.created_at, last.id) : null;
+    const page = (result.rows as Array<Record<string, unknown>>).slice(0, limit);
+    const last = page.at(-1);
+    // created_at reaches JS as a millisecond Date; the cursor uses the exact
+    // microsecond text so rows sharing a millisecond are never skipped.
+    const nextCursor =
+      hasMore && typeof last?.cursor_created_at === "string" && typeof last.id === "string"
+        ? encodeTaskCursor(last.cursor_created_at, last.id)
+        : null;
+    const tasks = page.map(({ cursor_created_at: _cursor, ...task }) => task);
     return { tasks, nextCursor, hasMore, total: count.rows[0]?.total ?? tasks.length };
   });
 
@@ -2188,6 +2196,7 @@ function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
   }
   return `${status} IN (${list(TASK_BUCKET_STATUSES[bucket])})`;
 }
+const TASK_CURSOR_COLUMN = `to_char(tasks.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at`;
 const TASK_LIST_SELECT = `SELECT tasks.*,
               projects.name AS project_name,
               CASE WHEN agents.kind = 'dispatcher' THEN 'Auto-route' ELSE agents.name END AS agent_name,
@@ -3898,6 +3907,10 @@ function decodeThreadCursor(value: string): { lastActivityAt: string; id: string
 
 function encodeResourceCursor(value: string | Date, id: string): string {
   return Buffer.from(`${dateString(value)}|${id}`, "utf8").toString("base64url");
+}
+
+function encodeTaskCursor(createdAt: string, id: string): string {
+  return Buffer.from(`${createdAt}|${id}`, "utf8").toString("base64url");
 }
 
 function decodeResourceCursor(value: string): { updatedAt: string; id: string } {

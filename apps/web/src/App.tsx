@@ -450,6 +450,9 @@ export function App() {
   const [board, setBoard] = useState<BoardState>(emptyBoard);
   const boardRef = useRef(board);
   boardRef.current = board;
+  // Bumped by every board reload so slower, superseded responses (an older
+  // search, or a load-more page from before the reload) are dropped.
+  const tasksRequestRef = useRef(0);
   const [taskRefs, setTaskRefs] = useState<TaskRef[]>([]);
   const [activityReports, setActivityReports] = useState<ActivityReport[]>([]);
   const [activityNextCursor, setActivityNextCursor] = useState<string | null>(null);
@@ -485,6 +488,8 @@ export function App() {
   const [scheduleComposerDate, setScheduleComposerDate] = useState<Date | null>(null);
   const [scheduleToEdit, setScheduleToEdit] = useState<Schedule | null>(null);
   const [query, setQuery] = useState("");
+  const queryRef = useRef(query);
+  queryRef.current = query;
   const [loadingOlderThreads, setLoadingOlderThreads] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
@@ -751,12 +756,14 @@ export function App() {
   function taskPageUrl(bucket: BoardColumnId, limit: number, cursor?: string | null) {
     const params = new URLSearchParams({ bucket, limit: String(limit) });
     if (cursor) params.set("cursor", cursor);
-    if (query.trim()) params.set("query", query.trim());
+    const search = queryRef.current.trim();
+    if (search) params.set("query", search);
     return `/api/tasks?${params.toString()}`;
   }
 
   async function reloadTasks() {
     // Refresh every column, keeping as many cards as are already loaded.
+    const request = ++tasksRequestRef.current;
     const current = boardRef.current;
     const [pages, refs] = await Promise.all([
       Promise.all(
@@ -766,6 +773,7 @@ export function App() {
       ),
       api<{ tasks: TaskRef[] }>("/api/tasks/references")
     ]);
+    if (request !== tasksRequestRef.current) return;
     setBoard(
       Object.fromEntries(
         BOARD_COLUMNS.map((column, index) => [
@@ -780,9 +788,13 @@ export function App() {
   async function loadMoreTasks(bucket: BoardColumnId) {
     const column = boardRef.current[bucket];
     if (!column.nextCursor || column.loadingMore) return;
+    const request = tasksRequestRef.current;
     setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: true } }));
     try {
       const page = await api<TaskPage>(taskPageUrl(bucket, TASK_COLUMN_PAGE_SIZE, column.nextCursor));
+      // A reload replaced the board (and cleared loadingMore) while this page
+      // was in flight; its cursor belongs to the old list.
+      if (request !== tasksRequestRef.current) return;
       setBoard((board) => {
         const seen = new Set(board[bucket].tasks.map((task) => task.id));
         return {
@@ -796,7 +808,9 @@ export function App() {
         };
       });
     } catch (error) {
-      setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: false } }));
+      if (request === tasksRequestRef.current) {
+        setBoard((board) => ({ ...board, [bucket]: { ...board[bucket], loadingMore: false } }));
+      }
       throw error;
     }
   }

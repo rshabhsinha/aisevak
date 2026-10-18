@@ -15,6 +15,11 @@ const task = (number: number, createdAt: string) => ({
   title: `Task ${number}`,
   created_at: createdAt
 });
+// Paged queries also select the exact microsecond timestamp for the cursor.
+const pagedTask = (number: number, createdAt: string, cursorCreatedAt: string) => ({
+  ...task(number, createdAt),
+  cursor_created_at: cursorCreatedAt
+});
 
 async function taskServer(rows: unknown[], total = rows.length) {
   const calls: Array<{ sql: string; params: unknown[] }> = [];
@@ -38,7 +43,11 @@ async function taskServer(rows: unknown[], total = rows.length) {
 
 describe("task board routes", () => {
   it("pages one column with a keyset cursor and a column total", async () => {
-    const { get, calls } = await taskServer([task(3, "2026-10-03T00:00:00.000Z"), task(2, "2026-10-02T00:00:00.000Z"), task(1, "2026-10-01T00:00:00.000Z")], 40);
+    const { get, calls } = await taskServer([
+      pagedTask(3, "2026-10-03T00:00:00.000Z", "2026-10-03T00:00:00.000000Z"),
+      pagedTask(2, "2026-10-02T00:00:00.000Z", "2026-10-02T00:00:00.000000Z"),
+      pagedTask(1, "2026-10-01T00:00:00.000Z", "2026-10-01T00:00:00.000000Z")
+    ], 40);
     const response = await get("/api/tasks?bucket=completed&limit=2");
     expect(response.statusCode).toBe(200);
     const body = response.json();
@@ -53,7 +62,7 @@ describe("task board routes", () => {
     await get(`/api/tasks?bucket=completed&limit=2&cursor=${body.nextCursor}`);
     const next = calls.find((call) => call.sql.includes("LIMIT $"))!;
     expect(next.sql).toContain("(tasks.created_at, tasks.id) < (");
-    expect(next.params).toEqual(["2026-10-02T00:00:00.000Z", task(2, "").id, 3]);
+    expect(next.params).toEqual(["2026-10-02T00:00:00.000000Z", task(2, "").id, 3]);
     // The total ignores the cursor so the column badge stays stable while paging.
     expect(calls.find((call) => call.sql.includes("count(*)::int AS total"))!.sql).not.toContain("tasks.created_at, tasks.id");
   });
@@ -79,8 +88,36 @@ describe("task board routes", () => {
     expect(calls.some((call) => call.sql.includes("LIMIT $"))).toBe(false);
   });
 
-  it("rejects unknown buckets", async () => {
+  it("builds the cursor from the exact microsecond timestamp, not the millisecond Date", async () => {
+    // Two tasks inserted in one transaction share a millisecond; a millisecond
+    // cursor would skip the second one on the next page.
+    const { get, calls } = await taskServer([
+      pagedTask(5, "2026-10-05T00:00:00.123Z", "2026-10-05T00:00:00.123456Z"),
+      pagedTask(4, "2026-10-05T00:00:00.123Z", "2026-10-05T00:00:00.123100Z")
+    ]);
+    const body = (await get("/api/tasks?bucket=open&limit=1")).json();
+    expect(body.tasks).toEqual([task(5, "2026-10-05T00:00:00.123Z")]);
+    expect(calls.find((call) => call.sql.includes("LIMIT $"))!.sql).toContain("AS cursor_created_at");
+
+    calls.length = 0;
+    await get(`/api/tasks?bucket=open&limit=1&cursor=${body.nextCursor}`);
+    const next = calls.find((call) => call.sql.includes("LIMIT $"))!;
+    expect(next.params.slice(0, 2)).toEqual(["2026-10-05T00:00:00.123456Z", task(5, "").id]);
+  });
+
+  it("rejects invalid query parameters with 400", async () => {
     const { get } = await taskServer([]);
-    expect((await get("/api/tasks?bucket=archived")).statusCode).toBeGreaterThanOrEqual(400);
+    expect((await get("/api/tasks?bucket=archived")).statusCode).toBe(400);
+    expect((await get("/api/tasks?bucket=open&limit=0")).statusCode).toBe(400);
+    expect((await get("/api/tasks?bucket=open&limit=500")).statusCode).toBe(400);
+    expect((await get("/api/tasks?bucket=open&cursor=not-a-cursor")).statusCode).toBe(400);
+  });
+
+  it("serves bounded task references without matching the task detail route", async () => {
+    const { get, calls } = await taskServer([{ id: task(1, "").id, number: 1, title: "Task 1" }]);
+    const response = await get("/api/tasks/references");
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toEqual({ tasks: [{ id: task(1, "").id, number: 1, title: "Task 1" }] });
+    expect(calls.find((call) => call.sql.includes("FROM tasks"))!.sql).toContain("LIMIT 500");
   });
 });
