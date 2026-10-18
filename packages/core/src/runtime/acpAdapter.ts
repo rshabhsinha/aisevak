@@ -141,6 +141,9 @@ export function createAcpAdapter(options: { provider: RuntimeProvider; sessionId
 
   const response = (record: JsonRecord): EventBody => {
     const error = objectValue(record.error);
+    // Requests the runner recovers from (model or option fallbacks, a failed
+    // session/load that starts a fresh session) are kept raw, not shown.
+    if (error && record.aisevakRecovered === true) return { type: "provider.event" };
     if (error) {
       const data = objectValue(error.data);
       const detail = stringValue(data?.message) ?? stringValue(data?.details) ?? stringValue(error.data);

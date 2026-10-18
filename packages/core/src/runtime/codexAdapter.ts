@@ -56,6 +56,10 @@ function codexBody(record: JsonRecord, method: string | undefined, params: JsonR
   if (!method) {
     // A JSON-RPC response to one of our requests.
     const error = objectValue(record.error);
+    // The runner marks failed requests it recovers from (a resume that falls
+    // back to a fresh thread, a rejected steer reported on its input), so they
+    // are kept raw rather than shown as provider errors.
+    if (error && record.aisevakRecovered === true) return { type: "provider.event" };
     if (error) {
       const message = stringValue(error.message) ?? "Codex request failed";
       return { type: "runtime.error", text: message, error: compact({ message, code: codeString(error.code) }) };

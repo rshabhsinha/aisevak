@@ -33,7 +33,19 @@ export function createRuntimeNormalizer(
           raw: { source: provider === "codex" ? "codex.app-server" : "acp.jsonrpc", payload: line }
         };
       }
-      return acp ? acp.normalize(message) : normalizeCodexMessage(message);
+      try {
+        return acp ? acp.normalize(message) : normalizeCodexMessage(message);
+      } catch {
+        // Normalization only feeds the timeline. An adapter bug must never
+        // reject the runner's line handler, which would fail the live turn,
+        // so keep the raw line as an opaque provider event instead.
+        return {
+          v: RUNTIME_EVENT_VERSION,
+          type: "provider.event",
+          provider,
+          raw: { source: provider === "codex" ? "codex.app-server" : "acp.jsonrpc", payload: message }
+        };
+      }
     }
   };
 }

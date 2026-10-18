@@ -2,7 +2,7 @@
   {
     "kind": "error",
     "label": "Provider error",
-    "detail": "no rollout found for thread id thr_x"
+    "detail": "model gpt-x is not available"
   },
   {
     "kind": "tools",

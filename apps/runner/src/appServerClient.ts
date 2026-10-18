@@ -12,6 +12,7 @@ interface JsonRpcMessage {
 }
 
 interface PendingRequest {
+  method: string;
   resolve: (value: Record<string, unknown>) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
@@ -502,7 +503,9 @@ class PersistentAppServer {
 
     const messageTurnId = extractTurnId(message);
     const state = (messageTurnId ? this.turnStates.get(messageTurnId) : null) ?? this.activeTurn;
-    if (state) this.captureLine(state, trimmed);
+    if (state) {
+      this.captureLine(state, this.isRecoveredError(message) ? JSON.stringify({ ...message, aisevakRecovered: true }) : trimmed);
+    }
 
     const maybeThreadId = extractThreadId(message);
     if (state && maybeThreadId && maybeThreadId !== state.threadId) {
@@ -539,6 +542,18 @@ class PersistentAppServer {
       completedState.finalError = extractTurnError(message);
       completedState.resolveCompleted();
     }
+  }
+
+  /**
+   * Failed requests the client recovers from: a resume of a thread with no
+   * rollout falls back to thread/start, and a rejected steer is reported on
+   * its input instead of failing the turn.
+   */
+  private isRecoveredError(message: JsonRpcMessage): boolean {
+    if (message.method || message.id === undefined || !message.error) return false;
+    const method = this.pending.get(String(message.id))?.method;
+    if (method === "turn/steer") return true;
+    return method === "thread/resume" && isMissingRolloutError(message.error.message ?? "");
   }
 
   private captureLine(state: TurnState, line: string): void {
@@ -634,7 +649,7 @@ class PersistentAppServer {
       this.rejectOne(id, new Error(`Timed out waiting for app-server response to ${method}`));
     }, 30_000);
     const promise = new Promise<Record<string, unknown>>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, timeout });
+      this.pending.set(id, { method, resolve, reject, timeout });
     });
     try {
       this.send({ id, method, params });

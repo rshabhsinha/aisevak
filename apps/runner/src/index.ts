@@ -2567,7 +2567,9 @@ export async function persistCodexLine(
   job: Pick<RunJob, "id" | "task_session_id" | "agent_thread_id"> & Partial<Pick<RunJob, "provider_driver" | "codex_thread_id">>,
   line: string,
   seq: number,
-  normalizer: RuntimeNormalizer = createRuntimeNormalizer(harnessDriver(job.provider_driver), { sessionId: job.codex_thread_id })
+  // Required: ACP adapters carry per-run state, so every line of a run must
+  // go through that run's one normalizer.
+  normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
   if (!normalized) return;
@@ -2594,7 +2596,9 @@ export async function persistDispatcherCodexLine(
   job: Pick<DispatcherJob, "id"> & Partial<Pick<DispatcherJob, "provider_driver" | "codex_thread_id">>,
   line: string,
   seq: number,
-  normalizer: RuntimeNormalizer = createRuntimeNormalizer(harnessDriver(job.provider_driver), { sessionId: job.codex_thread_id })
+  // Required: ACP adapters carry per-run state, so every line of a run must
+  // go through that run's one normalizer.
+  normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
   if (!normalized) return;

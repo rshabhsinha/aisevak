@@ -43,15 +43,20 @@ export function contentItemsText(value: unknown): string | undefined {
 }
 
 const MAX_DIFF_CELLS = 4_000_000;
+// Above this many lines on either side the diff is skipped entirely: the
+// stored payload already carries the full texts, and a giant listing helps
+// nobody in the timeline.
+export const MAX_DIFF_LINES = 20_000;
 const CONTEXT_LINES = 3;
 
 /**
  * Build a unified diff for one file from its before/after text. ACP harnesses
  * report edits as {oldText, newText}; the UI renders unified diffs.
  */
-export function unifiedDiff(path: string, oldText: string | null | undefined, newText: string): string {
+export function unifiedDiff(path: string, oldText: string | null | undefined, newText: string): string | undefined {
   const before = oldText ? splitLines(oldText) : [];
   const after = splitLines(newText);
+  if (before.length > MAX_DIFF_LINES || after.length > MAX_DIFF_LINES) return undefined;
   const relative = path.replace(/^\/+/, "");
   const header = [`--- ${oldText == null ? "/dev/null" : `a/${relative}`}`, `+++ b/${relative}`];
   const ops = diffLines(before, after);
@@ -75,13 +80,12 @@ export function unifiedDiff(path: string, oldText: string | null | undefined, ne
     const newStart = slice[0]!.newLine;
     const oldCount = slice.filter((op) => op.kind !== "+").length;
     const newCount = slice.filter((op) => op.kind !== "-").length;
-    hunks.push(
-      `@@ -${oldCount === 0 ? oldStart : oldStart + 1},${oldCount} +${newCount === 0 ? newStart : newStart + 1},${newCount} @@`,
-      ...slice.map((op) => `${op.kind}${op.text}`)
-    );
+    // Push line by line: spreading a large slice into push() overflows the stack.
+    hunks.push(`@@ -${oldCount === 0 ? oldStart : oldStart + 1},${oldCount} +${newCount === 0 ? newStart : newStart + 1},${newCount} @@`);
+    for (const op of slice) hunks.push(`${op.kind}${op.text}`);
     index = end;
   }
-  return [...header, ...hunks].join("\n");
+  return header.concat(hunks).join("\n");
 }
 
 interface DiffOp {

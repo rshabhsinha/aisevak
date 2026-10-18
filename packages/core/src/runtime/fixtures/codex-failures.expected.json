@@ -2,10 +2,18 @@
   {
     "v": 2,
     "provider": "codex",
+    "type": "provider.event",
+    "raw": {
+      "source": "codex.app-server"
+    }
+  },
+  {
+    "v": 2,
+    "provider": "codex",
     "type": "runtime.error",
-    "text": "no rollout found for thread id thr_x",
+    "text": "model gpt-x is not available",
     "error": {
-      "message": "no rollout found for thread id thr_x",
+      "message": "model gpt-x is not available",
       "code": "-32600"
     },
     "raw": {
