@@ -1,6 +1,6 @@
-# Aisevak Design Language: Frontier SF Startup System
+# Design language
 
-Aisevak is a calm, minimal control room for agent work. The interface embodies the **Frontier SF Startup** aesthetic: quiet surfaces, hairline micro-borders, crystalline typography, clear agent state, compact controls, and motion that explains what changed without decorative excess.
+Aisevak is a calm, minimal control room for agent work: quiet surfaces, hairline borders, clear agent state, compact controls, and motion that explains what changed without decoration. Follow this guide when changing the web app in `apps/web`.
 
 ## Design principles
 
@@ -18,9 +18,9 @@ Controls use the shadcn composition model paired with AICSS agentic primitives: 
 
 ### Motion confirms change
 
-Animation is functional and brief (150–200ms). AICSS quantum lattice orbs pulse and wave to reflect live agent thinking and working states. Thinking disclosures smoothly expand to reveal chain-of-thought streams. Motion respects `prefers-reduced-motion`.
+Animation is functional and brief (150–200ms). AICSS agent orbs pulse to reflect live agent thinking and working states. Thinking disclosures smoothly expand to reveal chain-of-thought streams. Motion respects `prefers-reduced-motion`.
 
-### Anti-patterns & Strict "Do Nots"
+### Things to avoid
 
 - ❌ **NO decorative status dots**: Do not place green/amber/red indicator dots beside ordinary labels (e.g. no `● Live catalog`, `● Default`, etc.).
 - ❌ **NO noisy tag / pill badge designs**: Avoid bulky colored badges (e.g. no chunky `DEFAULT` purple pill tags).
@@ -37,7 +37,7 @@ Both themes use the same semantic roles with refined low-contrast surfaces.
 | --- | --- | --- | --- |
 | Canvas Background | `#FAF9F7` (warm porcelain) | `#0A0A0C` (deep obsidian void) | app canvas |
 | Card / Panel | `#FFFFFF` | `#121215` (raised carbon) | panels, cards, inputs |
-| Hover / Muted | `#F5F4F0` | `#17171B` | secondary surfaces, row hover |
+| Hover / Muted | `#F4F3F0` | `#16161A` | secondary surfaces, row hover |
 | Primary | `#5B4DE3` (soft violet) | `#7C72FF` (luminous indigo) | primary action, focus, selection |
 | Success | `#16A34A` (forest) | `#34D399` (mint) | completed and active-positive states |
 | Warning | `#D97706` (amber) | `#FBBF24` (soft amber) | running and attention states |
@@ -63,7 +63,7 @@ All product code consumes semantic CSS tokens such as `--background`, `--card`, 
 ### AICSS Agentic Components
 
 1. **Thinking & Reasoning (`ThinkingReasoning`)**: Shimmering label state with collapsible chain-of-thought and latency/token counters.
-2. **Quantum Lattice Orbs (`AgentOrb`)**: 3x3 dot matrix micro-animations displaying live agent status (*Thinking*, *Working*, *Searching*, *Finalizing*).
+2. **Agent orbs (`AgentOrb`)**: 3x3 dot matrix micro-animations displaying live agent status (*Thinking*, *Working*, *Searching*, *Finalizing*).
 3. **File Diffs (`FileDiff`)**: Word/line level additions (`+`) and deletions (`-`) with one-click copy and clean monospace layout.
 4. **Approval Cards (`ApprovalCard`)**: Understated human-in-the-loop action confirmation cards with keyboard accelerators (`⌘↵` / `Esc`).
 5. **Task Progress (`TaskList`)**: Step-by-step checklists with live status indicators.
@@ -111,7 +111,7 @@ User messages use a compact muted bubble. Assistant content remains unboxed for 
 
 ### Workspace frame
 
-Desktop uses a 232px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
+Desktop uses a 240px navigation rail and a 64px top bar. The rail groups daily workspace views separately from system management. At medium widths it collapses to icons; on mobile it becomes a horizontally scrollable bottom navigation bar.
 
 ### Board
 

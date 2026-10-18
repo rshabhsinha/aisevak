@@ -1,6 +1,6 @@
 # Provider event normalization: gap analysis and proposal
 
-Status: **approved 2026-10-17**, see "Decisions" at the end.
+Status: **implemented** in [#35](https://github.com/rshabhsinha/aisevak/pull/35) (approved 2026-10-17; see "Decisions" at the end). Sections 1 and 2 describe the code as it was before that change and are kept as background for the design.
 
 Scope: the code that turns each harness's raw stdout into what aisevak stores in
 `run_events` / `dispatcher_run_events` and renders in the thread view. That is:

@@ -1,103 +1,60 @@
-# Contributing to AiSevak
+# Contributing
 
-Thank you for contributing to AiSevak! AiSevak is the open-source host-native operating system and multi-agent coordination layer for software engineers.
+Thanks for helping improve Aisevak.
 
----
-
-## Code of Conduct & Principles
-
-1. **Host-Native Determinism**: AI agents coordinate as real Linux/macOS processes via durable threads and dedicated Git worktrees.
-2. **Zero Token Markup**: Users always connect their own model credentials directly; no middleman fee or telemetry proxies.
-3. **No Fluff**: Keep tools, CLI arguments, and docs concise, typed, and well-tested.
-
----
-
-## Monorepo Architecture
-
-AiSevak is organized as a pnpm workspace:
+## Repository layout
 
 ```
-aisevak/
-├── apps/
-│   ├── api/        # Fastify + PostgreSQL coordination backend & SSE dispatcher
-│   ├── runner/     # Host-native turn delivery & isolated execution supervisor
-│   ├── web/        # React 19 control room client (local dev port 5173)
-│   └── site/       # React 19 marketing site & waitlist app (local dev port 5174)
-├── packages/
-│   ├── cli/        # `aisevak` CLI socket interface used by agents and developers
-│   └── core/       # Shared TypeScript types, migrations, and database schema
-└── scripts/
-    └── install.sh  # Host-native Linux systemd daemon installer
+apps/
+  api/       Fastify API, PostgreSQL state, and the coordination layer
+  runner/    Picks up queued turns and runs harnesses in isolated worktrees
+  web/       React control room (http://localhost:5173 in development)
+packages/
+  cli/       The `aisevak` CLI that agents use inside their runs
+  core/      Shared types, migrations, harness adapters, and runtime events
+scripts/     install.sh, update.sh, and the Codex runtime publisher the installer uses
+tests/       Cross-package tests and fixtures
+docs/        Design language, provider event notes, and UI QA checklists
 ```
 
----
+## Setup
 
-## Development Setup
-
-### Prerequisites
-- Node.js >= 20.0.0
-- pnpm >= 9.0.0
-- Docker & Docker Compose (for local PostgreSQL 18)
-- Git >= 2.38 (supporting worktrees)
-
-### Getting Started
-
-1. **Clone the repository**:
-   ```bash
-   git clone https://github.com/rshabhsinha/aisevak.git
-   cd aisevak
-   ```
-
-2. **Install dependencies**:
-   ```bash
-   pnpm install
-   ```
-
-3. **Configure environment & database**:
-   ```bash
-   cp .env.example .env
-   docker compose up -d postgres
-   pnpm db:migrate
-   ```
-
-4. **Start the full local development stack**:
-   ```bash
-   pnpm dev
-   ```
-   Or run specific services:
-   - Web Control Room: `pnpm dev:web` (`http://localhost:5173`)
-   - Marketing Site: `pnpm dev:site` (`http://localhost:5174`)
-   - Coordination API: `pnpm dev:api` (`http://localhost:8787`)
-   - Host Runner: `pnpm dev:runner`
-
----
-
-## Testing & Type Checking
-
-Run all test suites across packages before opening a pull request:
+You need Node.js 20+, pnpm 9+, Docker, and Git 2.36+ (the runner uses `git worktree list -z`).
 
 ```bash
-# Type check all packages
-pnpm typecheck
-
-# Run Vitest test suites
-pnpm test
-
-# Build marketing site
-pnpm build:site
+git clone https://github.com/rshabhsinha/aisevak.git
+cd aisevak
+pnpm install
+cp .env.example .env
 ```
 
----
+Set `SECRET_KEY` (a base64-encoded 32-byte key) and `COOKIE_SECRET` in `.env`; the [README](README.md#quick-start) has a one-line generator. Then start PostgreSQL and run migrations:
 
-## Pull Request Guidelines
+```bash
+docker compose up -d postgres
+pnpm db:migrate
+```
 
-- **Atomic Commits**: Keep Git commits focused on single concerns.
-- **Git Worktree Compatibility**: Ensure tools never assume working inside the root repo checkout when executing inside runner-managed worktrees.
-- **Durable State Serialization**: Any new coordination entity must be versioned in `@aisevak/core` database migrations.
+Run the API, runner, and web app together with `pnpm dev`, or one at a time with `pnpm dev:api`, `pnpm dev:runner`, and `pnpm dev:web`.
 
----
+## Before opening a pull request
+
+```bash
+pnpm typecheck
+pnpm test
+```
+
+Some runner tests spawn real processes and can time out on a busy machine. If they do, rerun with a longer timeout, for example `pnpm exec vitest run --testTimeout=60000`.
+
+UI changes should follow [docs/design-language.md](docs/design-language.md) and be checked in light and dark mode at desktop and narrow widths. [docs/MOBILE_UI_QA.md](docs/MOBILE_UI_QA.md) lists the mobile checks.
+
+## Guidelines
+
+- Keep commits focused on one change.
+- Code that runs inside agent runs must not assume it is in the root checkout; runs execute in runner-managed worktrees.
+- New or changed persistent state needs a migration in `packages/core`.
+- Provider output goes through the runtime event adapters in `packages/core/src/runtime`; add a fixture when you change how a provider's events are mapped.
 
 ## License
 
-AiSevak is open-source software licensed under the [MIT License](LICENSE).
-Created by [PromptLabs Pvt Ltd](https://promptlabs.link).
+By contributing, you agree that your contributions are licensed under the [MIT License](LICENSE).

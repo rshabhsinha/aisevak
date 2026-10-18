@@ -1,19 +1,10 @@
-<div align="center">
-  <img src="apps/web/public/favicon.svg" width="56" height="56" alt="" />
-  <h1>Aisevak</h1>
-  <p>A self-hosted workspace where coding agents take tasks, work in their own git worktrees, and coordinate with each other through durable threads.</p>
-  <p>
-    <a href="#quick-start">Quick start</a> ·
-    <a href="#how-it-works">How it works</a> ·
-    <a href="#the-aisevak-cli">CLI</a> ·
-    <a href="#deploying-to-a-server">Deploy</a> ·
-    <a href="CONTRIBUTING.md">Contributing</a>
-  </p>
-</div>
+# Aisevak
 
-<p align="center">
-  <img src="docs/images/thread.png" alt="An Orchestrator thread: the agent plans the work, delegates to Builder and Reviewer through the aisevak CLI, and reports the result" width="100%" />
-</p>
+A self-hosted workspace where coding agents take tasks, work in their own git worktrees, and coordinate with each other through durable threads.
+
+[Quick start](#quick-start) · [How it works](#how-it-works) · [CLI](#the-aisevak-cli) · [Deploy](#deploying-to-a-server) · [Contributing](CONTRIBUTING.md)
+
+![An Orchestrator thread: the agent plans the work, delegates to Builder and Reviewer through the aisevak CLI, and reports the result](docs/images/thread.png)
 
 ## What it does
 
@@ -29,15 +20,15 @@ You give Aisevak a task. An **Orchestrator** agent breaks it down, hands pieces 
 
 **Tasks.** Every piece of work is a task, tracked from open to done. Tasks can be routed by the Orchestrator or assigned straight to an agent.
 
-<img src="docs/images/tasks.png" alt="Task board with Todo, Running, Completed, and Needs attention columns" width="100%" />
+![Task board with Todo, Running, Completed, and Needs attention columns](docs/images/tasks.png)
 
 **Agents.** Define as many agents as you like. Each one has a harness, a model, a reasoning level, and a prompt describing its job.
 
-<img src="docs/images/agents.png" alt="Agent setup showing Builder, Reviewer, Orchestrator, Frontend, Triage, and Docs agents across Codex, Cursor, Devin, and OpenCode" width="100%" />
+![Agent setup showing Builder, Reviewer, Orchestrator, Frontend, Triage, and Docs agents across Codex, Cursor, Devin, and OpenCode](docs/images/agents.png)
 
 ## Quick start
 
-You need Node.js 20+, pnpm 9+, Docker, and at least one harness installed (`codex`, `claude-agent-acp` for Claude Code, `cursor-agent`, `opencode`, or `devin`).
+You need Node.js 20+ (22+ for Claude Code), pnpm 9+, Docker, Git 2.36+, and at least one harness installed (`codex`, `claude-agent-acp` for Claude Code, `cursor-agent`, `opencode`, or `devin`).
 
 ```bash
 git clone https://github.com/rshabhsinha/aisevak.git
@@ -129,7 +120,7 @@ Defaults below are the values the code uses when a variable is unset.
 **Harness sign-in**
 
 - **Codex**: device-code sign-in from the browser, with an OpenAI API key as a fallback.
-- **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh`), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
+- **Claude Code**: runs over ACP through `claude-agent-acp` (installed by `scripts/install.sh` on Node.js 22+), using a `claude setup-token` subscription token or an Anthropic API key saved under **Settings → Claude Code**.
 - **Cursor**: save a `CURSOR_API_KEY` under **Settings → Cursor**. Subscriptions tied to the macOS keychain never reach agent worktrees.
 - **OpenCode**: uses a stored or host `auth.json`.
 - **Devin**: runs over ACP using `credentials.toml`, set up by browser sign-in, host import, or API key.
@@ -142,13 +133,18 @@ Defaults below are the values the code uses when a variable is unset.
 
 ## Deploying to a server
 
-On an Ubuntu 22.04+ machine with Docker Engine, the Docker Compose plugin, Node.js, and rsync installed (the installer adds Git and the GitHub CLI if they are missing):
+Before running the installer on Ubuntu 22.04+, install Docker Engine, the Docker Compose plugin, Node.js, and rsync. The installer adds Git and the GitHub CLI if they are missing. Two version requirements to watch:
+
+- **Git 2.36 or newer.** The runner's checkout cleanup uses `git worktree list -z`. Ubuntu 22.04 ships Git 2.34, so install a newer Git first (for example from the `git-core` PPA) or use Ubuntu 24.04.
+- **Node.js 22 or newer for Claude Code.** On older Node.js the installer skips the `claude-agent-acp` adapter.
+
+Then run:
 
 ```bash
 sudo ./scripts/install.sh
 ```
 
-The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, generates secrets, and starts PostgreSQL, the API, and the web app (on port `8080`) with Docker Compose. It also installs the runner as a systemd service (`aisevak-runner.service`). TLS and a reverse proxy such as Caddy are set up separately; [docs/AWS_DEPLOYMENT.md](docs/AWS_DEPLOYMENT.md) walks through both on EC2.
+The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, generates secrets, and starts PostgreSQL, the API, and the web app (on port `8080`) with Docker Compose. It also installs the runner as a systemd service (`aisevak-runner.service`). Put a reverse proxy with TLS, such as Caddy or nginx, in front of port `8080`; the installer doesn't set one up.
 
 > [!WARNING]
 > Harnesses run with approvals off and full access to the host. Aisevak is built for small, trusted teams. Run it on a dedicated machine or VM.
