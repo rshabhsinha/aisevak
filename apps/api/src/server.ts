@@ -2201,11 +2201,11 @@ function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
 // occurrences and orchestrated tasks execute as dispatcher runs rather than
 // worker task_runs, so:
 // 1. any active worker or dispatcher run puts the task in Running;
-// 2. otherwise the latest worker run decides, as before;
-// 3. a task still 'open' with no worker run takes its latest dispatcher run's
-//    outcome, unless assignments or child tasks are still in flight;
-// 4. otherwise the task's own status.
-const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
+// 2. otherwise the most recent run of either kind decides: a worker run's
+//    status always counts, while a dispatcher run's counts only for a task
+//    still 'open' with no assignments or child tasks in flight;
+// 3. otherwise the task's own status.
+export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
          SELECT id, status
          FROM task_runs
          WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
@@ -2224,18 +2224,23 @@ const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
          LIMIT 1
        ) active_run ON true
        LEFT JOIN LATERAL (
-         SELECT status
-         FROM dispatcher_runs
-         WHERE dispatcher_runs.task_id = tasks.id
-         ORDER BY created_at DESC
+         SELECT recent.kind, recent.status FROM (
+           SELECT 'worker' AS kind, status, created_at FROM task_runs
+           WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+           UNION ALL
+           SELECT 'dispatcher' AS kind, status, created_at FROM dispatcher_runs
+           WHERE dispatcher_runs.task_id = tasks.id
+         ) recent
+         ORDER BY recent.created_at DESC
          LIMIT 1
-       ) latest_dispatch ON true
+       ) latest_any ON true
        CROSS JOIN LATERAL (
          SELECT COALESCE(
            active_run.status::text,
-           latest.status::text,
+           CASE WHEN latest_any.kind = 'worker' THEN latest_any.status::text END,
            CASE
-             WHEN tasks.status = 'open'
+             WHEN latest_any.kind = 'dispatcher'
+               AND tasks.status = 'open'
                AND NOT EXISTS (
                  SELECT 1 FROM task_assignments assignment
                  WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')
@@ -2244,7 +2249,7 @@ const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
                  SELECT 1 FROM tasks child
                  WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')
                )
-             THEN latest_dispatch.status::text
+             THEN latest_any.status::text
            END,
            tasks.status::text
          ) AS status
@@ -5012,19 +5017,12 @@ async function getDispatcherContext(pool: DbPool): Promise<{
      LEFT JOIN projects ON projects.id = tasks.project_id
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
-     LEFT JOIN LATERAL (
-       SELECT id, status
-       FROM task_runs
-       WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
-       ORDER BY created_at DESC
-       LIMIT 1
-     ) latest ON true
-     WHERE latest.status IN ('queued', 'running', 'cancel_requested', 'failed')
+     ${TASK_STATUS_JOINS}
+     -- Same status the board shows, so finished scheduled occurrences and
+     -- tasks with an active dispatcher run are treated like worker runs.
+     WHERE board.status IN ('queued', 'running', 'cancel_requested', 'failed')
         OR tasks.status IN ('needs_attention', 'blocked')
-        OR (
-          tasks.status = 'open'
-          AND COALESCE(latest.status::text, '') NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
-        )
+        OR (tasks.status = 'open' AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded'))
      ORDER BY tasks.created_at ASC`
   );
   const agents = await pool.query(

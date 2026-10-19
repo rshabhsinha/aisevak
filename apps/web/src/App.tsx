@@ -1358,7 +1358,7 @@ export function App() {
           {view === "tasks" ? (
             <TasksView
               board={board}
-              onLoadMore={(bucket) => void loadMoreTasks(bucket)}
+              onLoadMore={loadMoreTasks}
               onSelect={(task) => void openTaskThread(task)}
             />
           ) : null}
@@ -1884,7 +1884,7 @@ function incidentSeverityVariant(severity: Incident["severity"]): "secondary" | 
 
 function TasksView(props: {
   board: BoardState;
-  onLoadMore: (bucket: BoardColumnId) => void;
+  onLoadMore: (bucket: BoardColumnId) => Promise<void>;
   onSelect: (task: Task) => void;
 }) {
   const [mobileColumn, setMobileColumn] = useState<BoardColumnId>("open");
@@ -2012,26 +2012,32 @@ function TasksView(props: {
 }
 
 // Loads the next page when the button scrolls into its column's view, so long
-// columns page in as they are scrolled; clicking still works.
-function KanbanLoadMore(props: { loading: boolean; onLoadMore: () => void; children: ReactNode }) {
+// columns page in as they are scrolled; clicking still works. A failed load
+// stops auto-loading until the button is clicked, so an API error cannot turn
+// into a request loop.
+function KanbanLoadMore(props: { loading: boolean; onLoadMore: () => Promise<void>; children: ReactNode }) {
   const ref = useRef<HTMLButtonElement>(null);
-  const onLoadMoreRef = useRef(props.onLoadMore);
-  onLoadMoreRef.current = props.onLoadMore;
+  const [failed, setFailed] = useState(false);
+  const loadRef = useRef(() => {});
+  loadRef.current = () => {
+    setFailed(false);
+    props.onLoadMore().catch(() => setFailed(true));
+  };
   useEffect(() => {
     const el = ref.current;
-    if (!el || props.loading) return;
+    if (!el || props.loading || failed) return;
     const observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0]?.isIntersecting) onLoadMoreRef.current();
+        if (entries[0]?.isIntersecting) loadRef.current();
       },
       { root: el.closest(".kanban-cards"), rootMargin: "200px" }
     );
     observer.observe(el);
     return () => observer.disconnect();
-  }, [props.loading]);
+  }, [props.loading, failed]);
   return (
-    <button type="button" ref={ref} className="kanban-load-more" disabled={props.loading} onClick={props.onLoadMore}>
-      {props.children}
+    <button type="button" ref={ref} className="kanban-load-more" disabled={props.loading} onClick={() => loadRef.current()}>
+      {failed && !props.loading ? "Couldn’t load more · Retry" : props.children}
     </button>
   );
 }
