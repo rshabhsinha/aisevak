@@ -110,3 +110,15 @@ it("never throws when the attachments root is missing", async () => {
   await expect(promptImages(prompt, { managedRoot: "/definitely/not/here" })).resolves.toEqual([]);
   await expect(codexUserInput(prompt, { managedRoot: "/definitely/not/here" })).resolves.toEqual([{ type: "text", text: prompt, text_elements: [] }]);
 });
+
+it("accepts images when MANAGED_ROOT itself is reached through a symlink", async () => {
+  const real = await realpath(await mkdtemp(join(tmpdir(), "aisevak-real-root-")));
+  const parent = await realpath(await mkdtemp(join(tmpdir(), "aisevak-link-parent-")));
+  roots.push(real, parent);
+  const linkedRoot = join(parent, "managed");
+  await symlink(real, linkedRoot);
+  const png = await stored(linkedRoot, "shot.png", PNG, "image/png");
+  expect(await promptImages(appendAttachmentBlock("x", [png]), { managedRoot: linkedRoot })).toEqual([
+    { path: join(real, "attachments", png.id, "shot.png"), mimeType: "image/png", size: PNG.length }
+  ]);
+});

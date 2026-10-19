@@ -1,7 +1,7 @@
 import { findMessageAttachments, isImageAttachment } from "@aisevak/core";
 import { constants } from "node:fs";
 import { open, realpath } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 
 // Image attachments referenced in a prompt's <attachments> block, handed to
 // harnesses as native image input alongside the text (which keeps the paths,
@@ -54,9 +54,13 @@ export async function promptImages(text: string, options: PromptImageOptions = {
   const maxBytes = options.maxBytes ?? MAX_PROMPT_IMAGE_BYTES;
   const maxImages = options.maxImages ?? MAX_PROMPT_IMAGES;
   const maxTotalBytes = options.maxTotalBytes ?? MAX_PROMPT_IMAGE_TOTAL_BYTES;
-  let attachmentsRoot: string;
+  // The API writes paths under resolve(MANAGED_ROOT), which may itself sit
+  // behind a symlink (/srv → /data/srv, macOS /var → /private/var). Allow
+  // symlinks above the attachments root, never below it.
+  const literalRoot = join(resolve(options.managedRoot ?? defaultManagedRoot()), "attachments");
+  let realRoot: string;
   try {
-    attachmentsRoot = await realpath(join(options.managedRoot ?? defaultManagedRoot(), "attachments"));
+    realRoot = await realpath(literalRoot);
   } catch {
     return [];
   }
@@ -69,9 +73,11 @@ export async function promptImages(text: string, options: PromptImageOptions = {
     if (!isImageAttachment(file) || !UUID.test(file.id) || seen.has(file.path)) continue;
     seen.add(file.path);
     try {
-      // realpath equal to the given path means no symlink or `..` anywhere on it.
+      if (resolve(file.path) !== file.path || dirname(file.path) !== join(literalRoot, file.id)) continue;
+      // Resolving must not leave <root>/attachments/<id>/<name>: no symlinked
+      // id folder or file.
       const real = await realpath(file.path);
-      if (real !== file.path || dirname(real) !== join(attachmentsRoot, file.id)) continue;
+      if (real !== join(realRoot, file.id, basename(file.path))) continue;
       const handle = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
       try {
         const stats = await handle.stat();
