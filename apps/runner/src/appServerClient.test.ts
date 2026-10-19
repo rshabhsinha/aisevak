@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
 import {
   closeAllCodexAppServers,
   runCodexAppServerTurn,
@@ -448,6 +448,12 @@ describe("Codex archive protocol",()=>{
 
   it("passes stored image attachments as localImage input on turn/start and turn/steer", async () => {
     const fixture = await fakeAppServerFixture();
+    const previousManagedRoot = process.env.MANAGED_ROOT;
+    process.env.MANAGED_ROOT = fixture.directory;
+    onTestFinished(() => {
+      if (previousManagedRoot === undefined) delete process.env.MANAGED_ROOT;
+      else process.env.MANAGED_ROOT = previousManagedRoot;
+    });
     const inputLog = join(fixture.directory, "inputs");
     const image = await storedAttachment(fixture.directory, "shot.png", PNG_BYTES);
     const notes = await storedAttachment(fixture.directory, "notes.txt", Buffer.from("hello"));
@@ -501,7 +507,7 @@ async function storedAttachment(root: string, name: string, bytes: Buffer): Prom
 }
 
 async function fakeAppServerFixture(): Promise<FakeFixture> {
-  const directory = await mkdtemp(join(tmpdir(), "aisevak-app-server-test-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "aisevak-app-server-test-")));
   cleanup.push(directory);
   const binary = join(directory, "fake-codex");
   const startsFile = join(directory, "starts");

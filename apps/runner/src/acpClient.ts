@@ -224,6 +224,9 @@ class PersistentAcpSession {
       await options.onThreadId(this.sessionId);
       await this.applyModel(options);
 
+      // Read image attachments before taking the launch fence, which holds row
+      // locks until the prompt is sent. acpPromptContent never throws.
+      const prompt = await acpPromptContent(options.prompt, this.supportsImages);
       const release = await options.onBeforeTurnStart?.();
       if (options.onBeforeTurnStart && !release) {
         return {
@@ -238,7 +241,6 @@ class PersistentAcpSession {
         };
       }
 
-      const prompt = await acpPromptContent(options.prompt, this.supportsImages);
       const promptRequest = this.request("session/prompt", {
         sessionId: this.sessionId,
         prompt

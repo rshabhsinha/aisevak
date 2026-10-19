@@ -281,6 +281,9 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
+      // Read image attachments before taking the launch fence, which holds row
+      // locks until turn/start is sent. codexUserInput never throws.
+      const input = await codexUserInput(options.prompt);
       const releaseTurnStartFence = await options.onBeforeTurnStart?.();
       if (options.onBeforeTurnStart && !releaseTurnStartFence) {
         return {
@@ -296,7 +299,6 @@ class PersistentAppServer {
       }
 
       let turnRequest: Promise<Record<string, unknown>>;
-      const input = await codexUserInput(options.prompt);
       try {
         turnRequest = this.request("turn/start", {
           threadId: state.threadId,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
@@ -152,7 +152,10 @@ readline.createInterface({input:process.stdin}).on('line', line => {
 });
 
 it("sends stored image attachments as ACP image blocks only when the agent advertises image support", async () => {
-  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  // Real path: image attachments must not sit behind a symlink (macOS /var → /private/var).
+  const home = await realpath(await mkdtemp(join(tmpdir(), "aisevak-acp-test-")));
+  const previousManagedRoot = process.env.MANAGED_ROOT;
+  process.env.MANAGED_ROOT = home;
   const script = join(home, "fake.cjs");
   const log = join(home, "prompts");
   await writeFile(script, `const fs = require('node:fs');
@@ -193,5 +196,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
       [{ type: "text", text: message }, imageBlock],
       [{ type: "text", text: message }]
     ]);
-  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+  } finally {
+    if (previousManagedRoot === undefined) delete process.env.MANAGED_ROOT;
+    else process.env.MANAGED_ROOT = previousManagedRoot; await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });

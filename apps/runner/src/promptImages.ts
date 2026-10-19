@@ -1,27 +1,37 @@
 import { findMessageAttachments, isImageAttachment } from "@aisevak/core";
-import { open, readFile } from "node:fs/promises";
-import { basename, dirname, isAbsolute, normalize } from "node:path";
+import { constants } from "node:fs";
+import { open, realpath } from "node:fs/promises";
+import { dirname, join, resolve } from "node:path";
 
 // Image attachments referenced in a prompt's <attachments> block, handed to
 // harnesses as native image input alongside the text (which keeps the paths,
 // so agents can still open the files themselves).
 
 export const MAX_PROMPT_IMAGE_BYTES = 5 * 1024 * 1024;
+export const MAX_PROMPT_IMAGES = 8;
+export const MAX_PROMPT_IMAGE_TOTAL_BYTES = 20 * 1024 * 1024;
 
 export interface PromptImage {
   path: string;
   mimeType: string;
   size: number;
+  /** File bytes, read from the same handle that was checked (only when requested). */
+  data?: Buffer;
+}
+
+export interface PromptImageOptions {
+  /** MANAGED_ROOT; images must live in <root>/attachments/<id>/. Defaults to the runner's. */
+  managedRoot?: string;
+  maxBytes?: number;
+  maxImages?: number;
+  maxTotalBytes?: number;
+  withData?: boolean;
 }
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-// Only files the attachments API stored (<root>/attachments/<id>/<name>) are
-// eligible, so a hand-typed block cannot turn an arbitrary file into model input.
-function isStoredAttachmentPath(path: string, id: string): boolean {
-  if (!isAbsolute(path) || normalize(path) !== path) return false;
-  const directory = dirname(path);
-  return UUID.test(id) && basename(directory) === id && basename(dirname(directory)) === "attachments";
+function defaultManagedRoot(): string {
+  return resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak");
 }
 
 /** Detect the real image type from magic bytes; the block's mime type is only a hint. */
@@ -34,31 +44,60 @@ export function sniffImageMimeType(head: Uint8Array): string | null {
   return null;
 }
 
-export async function promptImages(text: string, maxBytes = MAX_PROMPT_IMAGE_BYTES): Promise<PromptImage[]> {
-  const candidates = findMessageAttachments(text).filter(
-    (file) => isImageAttachment(file) && isStoredAttachmentPath(file.path, file.id)
-  );
+/**
+ * The stored images a prompt references. Only regular files the attachments
+ * API wrote (<root>/attachments/<id>/<name>, no symlinks anywhere on the path)
+ * qualify, so a hand-typed block cannot turn an arbitrary file into model
+ * input. Never throws: an unreadable image is skipped and the text still goes.
+ */
+export async function promptImages(text: string, options: PromptImageOptions = {}): Promise<PromptImage[]> {
+  const maxBytes = options.maxBytes ?? MAX_PROMPT_IMAGE_BYTES;
+  const maxImages = options.maxImages ?? MAX_PROMPT_IMAGES;
+  const maxTotalBytes = options.maxTotalBytes ?? MAX_PROMPT_IMAGE_TOTAL_BYTES;
+  let attachmentsRoot: string;
+  try {
+    attachmentsRoot = await realpath(join(options.managedRoot ?? defaultManagedRoot(), "attachments"));
+  } catch {
+    return [];
+  }
+
   const images: PromptImage[] = [];
-  for (const file of candidates) {
-    const handle = await open(file.path, "r").catch(() => null);
-    if (!handle) continue; // Deleted since the message was sent.
+  let totalBytes = 0;
+  const seen = new Set<string>();
+  for (const file of findMessageAttachments(text)) {
+    if (images.length >= maxImages) break;
+    if (!isImageAttachment(file) || !UUID.test(file.id) || seen.has(file.path)) continue;
+    seen.add(file.path);
     try {
-      const stats = await handle.stat();
-      if (!stats.isFile() || stats.size === 0 || stats.size > maxBytes) continue;
-      const head = new Uint8Array(16);
-      await handle.read(head, 0, head.length, 0);
-      const mimeType = sniffImageMimeType(head);
-      if (mimeType) images.push({ path: file.path, mimeType, size: stats.size });
-    } finally {
-      await handle.close();
+      // realpath equal to the given path means no symlink or `..` anywhere on it.
+      const real = await realpath(file.path);
+      if (real !== file.path || dirname(real) !== join(attachmentsRoot, file.id)) continue;
+      const handle = await open(real, constants.O_RDONLY | constants.O_NOFOLLOW);
+      try {
+        const stats = await handle.stat();
+        if (!stats.isFile() || stats.size === 0 || stats.size > maxBytes) continue;
+        if (totalBytes + stats.size > maxTotalBytes) continue;
+        const head = new Uint8Array(16);
+        await handle.read(head, 0, head.length, 0);
+        const mimeType = sniffImageMimeType(head);
+        if (!mimeType) continue;
+        const data = options.withData ? await handle.readFile() : undefined;
+        if (data && data.length !== stats.size) continue;
+        totalBytes += stats.size;
+        images.push({ path: real, mimeType, size: stats.size, ...(data ? { data } : {}) });
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    } catch {
+      // Deleted, unreadable, or a symlink: send the text without it.
     }
   }
   return images;
 }
 
 /** Codex app-server v2 `UserInput` items for a prompt. */
-export async function codexUserInput(text: string): Promise<Array<Record<string, unknown>>> {
-  const images = await promptImages(text);
+export async function codexUserInput(text: string, options: PromptImageOptions = {}): Promise<Array<Record<string, unknown>>> {
+  const images = await promptImages(text, options);
   return [
     { type: "text", text, text_elements: [] },
     ...images.map((image) => ({ type: "localImage", path: image.path }))
@@ -68,13 +107,13 @@ export async function codexUserInput(text: string): Promise<Array<Record<string,
 /** ACP `ContentBlock`s for a prompt; images only when the agent advertised support. */
 export async function acpPromptContent(
   text: string,
-  supportsImages: boolean
+  supportsImages: boolean,
+  options: PromptImageOptions = {}
 ): Promise<Array<Record<string, unknown>>> {
   const blocks: Array<Record<string, unknown>> = [{ type: "text", text }];
   if (!supportsImages) return blocks;
-  for (const image of await promptImages(text)) {
-    const data = await readFile(image.path).catch(() => null);
-    if (data) blocks.push({ type: "image", mimeType: image.mimeType, data: data.toString("base64") });
+  for (const image of await promptImages(text, { ...options, withData: true })) {
+    if (image.data) blocks.push({ type: "image", mimeType: image.mimeType, data: image.data.toString("base64") });
   }
   return blocks;
 }
