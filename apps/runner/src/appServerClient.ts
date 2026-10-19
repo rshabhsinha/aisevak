@@ -1,5 +1,6 @@
 import { buildCodexAppServerArgs } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { codexUserInput } from "./promptImages.js";
 
 type JsonRpcId = string | number;
 
@@ -295,10 +296,11 @@ class PersistentAppServer {
       }
 
       let turnRequest: Promise<Record<string, unknown>>;
+      const input = await codexUserInput(options.prompt);
       try {
         turnRequest = this.request("turn/start", {
           threadId: state.threadId,
-          input: [{ type: "text", text: options.prompt, text_elements: [] }],
+          input,
           cwd: options.cwd,
           model: explicitModel(options.model),
           ...(stringModelOption(options.modelOptions, "reasoningEffort")
@@ -476,7 +478,7 @@ class PersistentAppServer {
       const response = await this.request("turn/steer", {
         threadId: state.threadId,
         expectedTurnId: state.turnId,
-        input: [{ type: "text", text: input.message, text_elements: [] }]
+        input: await codexUserInput(input.message)
       });
       this.bindTurnId(state, extractTurnId({ result: response }));
       await state.options.onInputHandled?.(input);

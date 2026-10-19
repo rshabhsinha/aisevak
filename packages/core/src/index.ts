@@ -13,6 +13,7 @@ export * from "./crypto.js";
 export * from "./db.js";
 export * from "./github.js";
 export * from "./installedSkills.js";
+export * from "./messageAttachments.js";
 export * from "./migrations.js";
 export * from "./models.js";
 export * from "./resources.js";

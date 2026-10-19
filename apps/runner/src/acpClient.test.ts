@@ -1,6 +1,7 @@
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, expect, it, vi } from "vitest";
 import { closeAllAcpSessions, closeIdleAcpSessions, runAcpTurn } from "./acpClient.js";
 
@@ -147,5 +148,50 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     const promptError = lines.map((line) => JSON.parse(line)).find((message) => message.error?.message === "Prompt failed");
     expect(promptError).toBeDefined();
     expect(promptError.aisevakRecovered).toBeUndefined();
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});
+
+it("sends stored image attachments as ACP image blocks only when the agent advertises image support", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  const log = join(home, "prompts");
+  await writeFile(script, `const fs = require('node:fs');
+const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'initialize') { console.log(JSON.stringify({id:m.id,result:{protocolVersion:1,agentCapabilities:{promptCapabilities:{image:process.env.FAKE_IMAGE === '1'}}}})); return; }
+ if(m.method === 'session/prompt') fs.appendFileSync(${JSON.stringify(log)}, JSON.stringify(m.params.prompt) + '\\n');
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'hold') { setTimeout(() => console.log(JSON.stringify({id:m.id,result:{}})), 1500); return; }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const id = randomUUID();
+  const imagePath = join(home, "attachments", id, "shot.png");
+  await mkdir(dirname(imagePath), { recursive: true });
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]);
+  await writeFile(imagePath, png);
+  const message = `see attached\n\n<attachments>\n- ${imagePath} (image/png, ${png.length} bytes, id ${id})\n</attachments>`;
+  const run = (runtimeHome: string, image: boolean, prompt: string, nextInput?: () => Promise<{ id: string; message: string } | null>) =>
+    runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome,
+      model: "auto", prompt, threadId: null, env: { ...process.env, FAKE_IMAGE: image ? "1" : "0" }, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {}, shouldCancel: async () => false,
+      nextInput, onInputHandled: async () => {}
+    });
+  try {
+    let offered = false;
+    const injected = async () => (offered ? null : ((offered = true), { id: "input-1", message }));
+    expect((await run(join(home, "with-image"), true, message)).status).toBe("completed");
+    expect((await run(join(home, "with-image"), true, "hold", injected)).status).toBe("completed");
+    await closeAllAcpSessions();
+    expect((await run(join(home, "text-only"), false, message)).status).toBe("completed");
+
+    const prompts = (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    const imageBlock = { type: "image", mimeType: "image/png", data: png.toString("base64") };
+    expect(prompts).toEqual([
+      [{ type: "text", text: message }, imageBlock],
+      [{ type: "text", text: "hold" }],
+      [{ type: "text", text: message }, imageBlock],
+      [{ type: "text", text: message }]
+    ]);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
