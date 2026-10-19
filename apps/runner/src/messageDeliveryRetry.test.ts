@@ -92,7 +92,7 @@ describe("message delivery retry", () => {
     expect(queries.map((query) => query.sql.trim())).toEqual([
       "BEGIN",
       expect.stringContaining("FOR UPDATE OF delivery"),
-      expect.stringContaining("JOIN task_assignments ON task_assignments.id = message_deliveries.assignment_id"),
+      expect.stringContaining("JOIN task_assignments ON task_assignments.id = delivery.assignment_id"),
       expect.stringContaining("INSERT INTO dispatcher_runs"),
       expect.stringContaining("SET status = 'retrying'"),
       "COMMIT"

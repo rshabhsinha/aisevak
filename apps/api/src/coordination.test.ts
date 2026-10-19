@@ -214,7 +214,9 @@ describe("coordination prompt de-duplication", () => {
     expect(count(prompt, "Individual component result.")).toBe(1);
     expect(count(prompt, "Immutable job_id: c90c20c4051e4ae8bfd0044cbdebf5cc")).toBe(1);
     expect(count(prompt, '"workItemId": "addition:usblc6-2sc6"')).toBe(1);
-    expect(prompt).toContain("Purpose: same as the thread's opening message (see thread history below).");
+    // The purpose (the opening task body) is printed once, in full.
+    expect(prompt).toContain("Purpose: Task TASK-1004: Populate ST USBLC6-2SC6");
+    expect(count(prompt, "You own this component task.")).toBe(1);
     expect(prompt).not.toContain("#4481");
   });
 
@@ -235,8 +237,9 @@ describe("coordination prompt de-duplication", () => {
     expect(prompt).toContain("#4464 Populator -> Reviewer [assignment.created]: ASSIGNMENT-59 (review:job:2:4) for TASK-1004: / Review exact revision 1.1.1:review-4. Use controller review-start.");
     expect(prompt).toContain("#4469 Reviewer -> Populator [assignment.completed]: ASSIGNMENT-59 completed: / changes_requested");
     expect(prompt).not.toContain("Reviewer requested corrections");
-    // The recipient's own message keeps its distinct content.
-    expect(prompt).toContain("#4420 Orchestrator -> Populator [task.created]: Task TASK-1004: Populate ST USBLC6-2SC6");
+    // The recipient's own message stays listed even though the purpose
+    // already showed all of its lines.
+    expect(prompt).toContain("#4420 Orchestrator -> Populator [task.created]:");
     expect(prompt).toContain("aisevak threads messages THREAD-954");
   });
 
@@ -281,3 +284,33 @@ describe("assignment delivery cancellation", () => {
     expect(inputs?.params?.[2]).toEqual(["queued", "delivering"]);
   });
 });
+
+describe("coordination prompt keeps information it has not shown", () => {
+  const orch = { id: "orch", name: "Orch", description: "Coordinates." };
+  const builder = { id: "builder", name: "Builder", description: "Builds." };
+  const reviewerAgent = { id: "rev", name: "Reviewer", description: "Reviews." };
+  const opening = "Ship the OAuth login flow for the web app.";
+  const item = (id: string, number: number, from: any, to: any, type: string, body: string) => ({
+    id, number, message_type: type, body,
+    sender_agent_id: from.id, sender_agent_name: from.name,
+    recipient_agent_id: to?.id ?? null, recipient_agent_name: to?.name ?? null
+  });
+  const history = [
+    item("1", 1, orch, builder, "task.created", opening),
+    item("2", 2, builder, orch, "message", "Status: blocked on missing CLIENT_ID env var\nchanges_requested"),
+    item("3", 3, orch, null, "message", "Status: blocked on missing CLIENT_ID env var\nchanges_requested")
+  ];
+  const trigger = item("4", 4, builder, reviewerAgent, "handoff", "Please review PR #12");
+
+  it("prints the purpose and the first occurrence of every line", () => {
+    const prompt = coordinationPrompt({ ...thread, purpose: opening }, reviewerAgent, trigger, [...history, trigger]);
+
+    expect(prompt).toContain(`Purpose: ${opening}`);
+    expect(prompt).toContain("#2 Builder -> Orch [message]: Status: blocked on missing CLIENT_ID env var / changes_requested");
+    // A thread-wide message is addressed to everyone and is kept in full.
+    expect(prompt).toContain("#3 Orch -> thread [message]: Status: blocked on missing CLIENT_ID env var\nchanges_requested");
+    // The opening message's only line is already in the purpose above.
+    expect(prompt).toContain("#1 Orch -> Builder [task.created]: (no new content)");
+  });
+});
+

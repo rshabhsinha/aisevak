@@ -369,9 +369,10 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       );
       await appendRunCancelEvent(client, "dispatcher", run.id, error);
       const deliveryId = current.message_delivery_id ?? run.message_delivery_id;
+      const settled = Boolean(deliveryId && await settleDeliveryByAssignment(client, deliveryId, error));
       // A delivery the provider never acknowledged was not seen by the
       // recipient, so a runner restart retries it rather than dropping it.
-      const requeued = Boolean(
+      const requeued = settled || Boolean(
         deliveryId &&
           finalStatus === "failed" &&
           await requeueUnpresentedRunDelivery(client, run.id, deliveryId, error)
@@ -408,6 +409,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       const error = delivery.run_status === "succeeded"
         ? null
         : "The coordination delivery was interrupted when the runner stopped";
+      if (error && await settleDeliveryByAssignment(client, delivery.message_delivery_id, error)) return;
       await client.query(
         `UPDATE message_deliveries
          SET status = $2, completed_at = now(), error = $3, updated_at = now()
@@ -456,6 +458,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       );
       const deliveryId = updated.rows[0]?.message_delivery_id ?? input.message_delivery_id;
       if (!deliveryId) return;
+      if (inputError && await settleDeliveryByAssignment(client, deliveryId, inputError)) return;
       await client.query(
         `UPDATE message_deliveries
          SET status = $2, completed_at = now(), error = $3, updated_at = now()
@@ -2617,18 +2620,29 @@ export async function persistDispatcherCodexLine(
   );
 }
 
+// A delivery is superseded once its assignment has a newer delivery (an
+// owner retry or follow-up). Its outcome must then not change the assignment,
+// which belongs to the newer delivery.
+const NEWER_ASSIGNMENT_DELIVERY = `EXISTS (
+  SELECT 1 FROM message_deliveries newer
+  WHERE newer.assignment_id = delivery.assignment_id
+    AND newer.id <> delivery.id
+    AND newer.created_at > delivery.created_at
+)`;
+
 async function markAssignmentDeliveryTerminal(
   queryable: Pick<DbPool, "query">,
   messageDeliveryId: string,
   error: string,
   status: "blocked" | "cancelled"
 ): Promise<void> {
-  const assignment = await queryable.query<{ assignment_id: string | null }>(
-    "SELECT assignment_id FROM message_deliveries WHERE id = $1",
+  const assignment = await queryable.query<{ assignment_id: string | null; superseded: boolean }>(
+    `SELECT delivery.assignment_id, ${NEWER_ASSIGNMENT_DELIVERY} AS superseded
+     FROM message_deliveries delivery WHERE delivery.id = $1`,
     [messageDeliveryId]
   );
   const assignmentId = assignment.rows[0]?.assignment_id;
-  if (!assignmentId) return;
+  if (!assignmentId || assignment.rows[0]?.superseded) return;
   await queryable.query(
     `UPDATE task_assignments
      SET status = $2,
@@ -2638,6 +2652,49 @@ async function markAssignmentDeliveryTerminal(
      WHERE id = $1 AND status IN ('queued', 'running')`,
     [assignmentId, status, error]
   );
+}
+
+// Settles a delivery from its assignment instead of from the turn that
+// carried it, when the assignment already decided the outcome:
+// - the assignee completed/blocked it (or it was cancelled), possibly from
+//   inside the turn that later failed or was stopped: never retry finished
+//   work, and record a completed assignment's delivery as completed;
+// - a newer delivery superseded it: fail it quietly, without a retry and
+//   without touching the assignment the newer delivery now drives.
+// Returns true when the delivery was settled here.
+export async function settleDeliveryByAssignment(
+  queryable: Pick<DbPool, "query">,
+  messageDeliveryId: string,
+  error: string
+): Promise<boolean> {
+  const state = await queryable.query<{ assignment_status: string | null; superseded: boolean }>(
+    `SELECT task_assignments.status AS assignment_status, ${NEWER_ASSIGNMENT_DELIVERY} AS superseded
+     FROM message_deliveries delivery
+     JOIN task_assignments ON task_assignments.id = delivery.assignment_id
+     WHERE delivery.id = $1`,
+    [messageDeliveryId]
+  );
+  const row = state.rows[0];
+  if (!row) return false;
+  const terminal = row.assignment_status !== null && ["completed", "blocked", "cancelled"].includes(row.assignment_status);
+  if (!terminal && !row.superseded) return false;
+  const settledError = row.superseded
+    ? `Superseded by a newer delivery for this assignment${error ? `; turn ended with: ${error}` : ""}`
+    : row.assignment_status === "completed"
+      ? null
+      : `Assignment was ${row.assignment_status}${error ? `; turn ended with: ${error}` : ""}`;
+  await queryable.query(
+    `UPDATE message_deliveries
+     SET status = $2, completed_at = now(), error = $3, updated_at = now()
+     WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
+    [messageDeliveryId, settledError === null ? "completed" : "failed", settledError === null ? null : encodePostgresText(settledError)]
+  );
+  await queryable.query(
+    "UPDATE task_assignments SET active_delivery_id = NULL, updated_at = now() WHERE active_delivery_id = $1",
+    [messageDeliveryId]
+  );
+  await cancelQueuedDeliveryRuns(queryable, messageDeliveryId, settledError ?? "Assignment completed");
+  return true;
 }
 
 export async function finishMessageDelivery(
@@ -2696,34 +2753,9 @@ export async function finishMessageDelivery(
       if (!delivery || delivery.status !== "running") return;
 
       // The assignee may complete or block its assignment and then have the
-      // turn fail or be stopped. The assignment's outcome is already recorded,
-      // so the delivery is settled by it and never retried (a retry would
-      // redo finished work).
-      const assignment = await client.query<{ status: string }>(
-        `SELECT task_assignments.status
-         FROM message_deliveries
-         JOIN task_assignments ON task_assignments.id = message_deliveries.assignment_id
-         WHERE message_deliveries.id = $1`,
-        [messageDeliveryId]
-      );
-      const assignmentStatus = assignment.rows[0]?.status;
-      if (assignmentStatus && ["completed", "blocked", "cancelled"].includes(assignmentStatus)) {
-        const settledError = assignmentStatus === "completed"
-          ? null
-          : `Assignment was ${assignmentStatus}${error ? `; turn ended with: ${error}` : ""}`;
-        await client.query(
-          `UPDATE message_deliveries
-           SET status = $2, completed_at = now(), error = $3, updated_at = now()
-           WHERE id = $1 AND status = 'running'`,
-          [messageDeliveryId, settledError ? "failed" : "completed", settledError === null ? null : encodePostgresText(settledError)]
-        );
-        await client.query(
-          "UPDATE task_assignments SET active_delivery_id = NULL, updated_at = now() WHERE active_delivery_id = $1",
-          [messageDeliveryId]
-        );
-        await cancelQueuedDeliveryRuns(client, messageDeliveryId, `Assignment ${assignmentStatus}`);
-        return;
-      }
+      // turn fail or be stopped, or an owner retry may have superseded this
+      // delivery; either way it must not be retried.
+      if (await settleDeliveryByAssignment(client, messageDeliveryId, error)) return;
 
       if (delivery.agent_thread_id) {
         const ownership = await client.query<{
@@ -3108,6 +3140,7 @@ export async function finishAgentTurnInput(
     const deliveryId = result.rows[0]?.message_delivery_id ?? input.messageDeliveryId;
     if (!deliveryId) return;
     if (error) {
+      if (await settleDeliveryByAssignment(client, deliveryId, error)) return;
       await client.query(
         `UPDATE message_deliveries
          SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
@@ -3198,14 +3231,17 @@ async function failPendingAgentTurnInputsInTransaction(
           : "The turn finished before this message could be delivered"
       ]
     );
-    const deliveryIds = result.rows
-      .map((row) => row.message_delivery_id)
-      .filter((id): id is string => Boolean(id));
-  if (deliveryIds.length === 0) return;
   const deliveryError =
     finalStatus === "cancelled"
       ? "The turn was stopped before this message could be delivered"
       : "The turn finished before this message could be delivered";
+  const deliveryIds: string[] = [];
+  for (const row of result.rows) {
+    if (!row.message_delivery_id) continue;
+    if (await settleDeliveryByAssignment(client, row.message_delivery_id, deliveryError)) continue;
+    deliveryIds.push(row.message_delivery_id);
+  }
+  if (deliveryIds.length === 0) return;
   await client.query(
       `UPDATE message_deliveries
        SET status = 'failed', completed_at = now(), error = $2, updated_at = now()

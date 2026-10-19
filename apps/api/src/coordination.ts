@@ -2507,8 +2507,9 @@ export interface JobEnvelope {
 
 const HISTORY_BODY_LIMIT = 1200;
 const HISTORY_SUMMARY_LIMIT = 200;
-// Lines shorter than this (headings, "changes_requested", blank-ish lines)
-// carry meaning in context and are never treated as repeated boilerplate.
+// Lines shorter than this (headings, "changes_requested") carry meaning in
+// context, so they are never dropped from a full body as repeated
+// boilerplate. A one-line summary only skips them once they were displayed.
 const REPEATED_LINE_MIN_LENGTH = 40;
 
 function sameText(a: unknown, b: unknown): boolean {
@@ -2537,10 +2538,14 @@ function withoutRepeatedLines(body: string, seen: Set<string>): { text: string; 
   return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), omitted };
 }
 
-function rememberLines(text: unknown, seen: Set<string>): void {
+// `seen` holds lines long enough to drop from later full bodies; `shown`
+// holds every displayed line, for picking a summary's new lines.
+function rememberLines(text: unknown, seen: Set<string>, shown: Set<string>): void {
   if (typeof text !== "string") return;
   for (const line of text.split("\n")) {
     const key = line.trim();
+    if (!key) continue;
+    shown.add(key);
     if (key.length >= REPEATED_LINE_MIN_LENGTH) seen.add(key);
   }
 }
@@ -2550,50 +2555,47 @@ function truncate(text: string, limit: number): string {
 }
 
 // Earlier messages are context, not instructions. Messages the recipient
-// sent or received keep their (de-duplicated) body; exchanges between other
-// agents are reduced to one line, because their bodies are role instructions
-// addressed to someone else.
-function coordinationHistoryLines(thread: any, recipient: any, message: any, history: any[], seen: Set<string>): string[] {
-  // How many of the thread's texts contain each line; a one-line summary
-  // skips lines shared with other messages (labels, job headers).
-  const lineCounts = new Map<string, number>();
-  for (const text of [thread.purpose, message.body, ...history.map((item) => item.body)]) {
-    if (typeof text !== "string") continue;
-    for (const key of new Set(text.split("\n").map((line) => line.trim()).filter(Boolean))) {
-      lineCounts.set(key, (lineCounts.get(key) ?? 0) + 1);
-    }
-  }
+// sent or received, and thread-wide messages, keep their (de-duplicated)
+// body; exchanges between other agents are reduced to one line, because
+// their bodies are role instructions addressed to someone else.
+function coordinationHistoryLines(recipient: any, message: any, history: any[], seen: Set<string>, shown: Set<string>): string[] {
   return history
     .filter((item) => !isSameMessage(item, message))
     .map((item) => {
       const label = `- ${item.number ? `#${item.number} ` : ""}${item.sender_agent_name ?? "System"} -> ${item.recipient_agent_name ?? "thread"} [${item.message_type}]`;
-      const involvesRecipient = Boolean(recipient.id) &&
-        (item.sender_agent_id === recipient.id || item.recipient_agent_id === recipient.id);
-      const { text, omitted } = withoutRepeatedLines(String(item.body ?? ""), seen);
-      if (!involvesRecipient && recipient.id) {
-        const summary = text.split("\n").map((line) => line.trim())
-          .filter((line) => line && (lineCounts.get(line) ?? 0) <= 1)
-          .slice(0, 2).join(" / ");
-        return `${label}: ${truncate(summary || "(no new content)", HISTORY_SUMMARY_LIMIT)}`;
+      const involvesRecipient = !recipient.id || !item.recipient_agent_id ||
+        item.sender_agent_id === recipient.id || item.recipient_agent_id === recipient.id;
+      if (!involvesRecipient) {
+        // The first lines not yet shown anywhere in this prompt, so repeated
+        // labels and headers are skipped but nothing new is lost.
+        const fresh = String(item.body ?? "").split("\n").map((line) => line.trim())
+          .filter((line) => line && !shown.has(line))
+          .slice(0, 2);
+        for (const line of fresh) shown.add(line);
+        return `${label}: ${truncate(fresh.join(" / ") || "(no new content)", HISTORY_SUMMARY_LIMIT)}`;
       }
+      const { text, omitted } = withoutRepeatedLines(String(item.body ?? ""), seen);
+      const visible = truncate(text, HISTORY_BODY_LIMIT);
       // Only text actually shown counts as seen by later entries.
-      rememberLines(truncate(text, HISTORY_BODY_LIMIT), seen);
+      rememberLines(visible, seen, shown);
       const note = omitted > 0 ? `\n  (${omitted} line${omitted === 1 ? "" : "s"} already shown above omitted)` : "";
-      return `${label}: ${truncate(text || "(no new content)", HISTORY_BODY_LIMIT)}${note}`;
+      return `${label}: ${visible || "(no new content)"}${note}`;
     });
 }
 
 export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[], envelope?: JobEnvelope | null): string {
-  // The triggering message is shown in full as "Why you were triggered"; the
-  // thread purpose is often the same text as that message or as the first
-  // history entry, so it is only shown when it adds something.
+  // The triggering message is shown in full as "Why you were triggered", so a
+  // purpose that is the same text is not printed twice. Any other purpose is
+  // printed in full and later history entries omit the lines it repeats.
   const purposeIsTrigger = sameText(thread.purpose, message.body);
-  const purposeRepeats =
-    purposeIsTrigger || history.some((item) => !isSameMessage(item, message) && sameText(thread.purpose, item.body));
   const seen = new Set<string>();
-  if (!purposeRepeats) rememberLines(thread.purpose, seen);
-  rememberLines(message.body, seen);
-  const lines = coordinationHistoryLines(thread, recipient, message, history, seen);
+  const shown = new Set<string>();
+  // The trigger is printed verbatim, so the purpose leaves out the long
+  // lines (job headers, source data) the trigger already carries.
+  rememberLines(message.body, seen, shown);
+  const purpose = purposeIsTrigger ? null : withoutRepeatedLines(String(thread.purpose ?? ""), seen);
+  if (purpose) rememberLines(purpose.text, seen, shown);
+  const lines = coordinationHistoryLines(recipient, message, history, seen, shown);
   const context = [
     `You are ${recipient.name}: ${recipient.description}`,
     "You have received an Aisevak coordination message. Use the aisevak CLI based on your judgment; inspect resources lazily instead of loading everything.",
@@ -2602,9 +2604,7 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
     `Description: ${thread.description}`,
     purposeIsTrigger
       ? "Purpose: same as the message that triggered you (below)."
-      : purposeRepeats
-        ? "Purpose: same as the thread's opening message (see thread history below)."
-        : `Purpose: ${thread.purpose}`,
+      : `Purpose: ${purpose?.text ?? ""}${purpose?.omitted ? `\n  (${purpose.omitted} line${purpose.omitted === 1 ? "" : "s"} repeated in the triggering message omitted)` : ""}`,
     `Thread started by: ${thread.created_by_agent_name ?? "platform"}`,
     `Message from: ${message.sender_agent_name ?? "platform"}`,
     `Message type: ${message.message_type ?? "message"}`,
