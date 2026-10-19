@@ -2695,6 +2695,36 @@ export async function finishMessageDelivery(
       const delivery = result.rows[0];
       if (!delivery || delivery.status !== "running") return;
 
+      // The assignee may complete or block its assignment and then have the
+      // turn fail or be stopped. The assignment's outcome is already recorded,
+      // so the delivery is settled by it and never retried (a retry would
+      // redo finished work).
+      const assignment = await client.query<{ status: string }>(
+        `SELECT task_assignments.status
+         FROM message_deliveries
+         JOIN task_assignments ON task_assignments.id = message_deliveries.assignment_id
+         WHERE message_deliveries.id = $1`,
+        [messageDeliveryId]
+      );
+      const assignmentStatus = assignment.rows[0]?.status;
+      if (assignmentStatus && ["completed", "blocked", "cancelled"].includes(assignmentStatus)) {
+        const settledError = assignmentStatus === "completed"
+          ? null
+          : `Assignment was ${assignmentStatus}${error ? `; turn ended with: ${error}` : ""}`;
+        await client.query(
+          `UPDATE message_deliveries
+           SET status = $2, completed_at = now(), error = $3, updated_at = now()
+           WHERE id = $1 AND status = 'running'`,
+          [messageDeliveryId, settledError ? "failed" : "completed", settledError === null ? null : encodePostgresText(settledError)]
+        );
+        await client.query(
+          "UPDATE task_assignments SET active_delivery_id = NULL, updated_at = now() WHERE active_delivery_id = $1",
+          [messageDeliveryId]
+        );
+        await cancelQueuedDeliveryRuns(client, messageDeliveryId, `Assignment ${assignmentStatus}`);
+        return;
+      }
+
       if (delivery.agent_thread_id) {
         const ownership = await client.query<{
           ownership_generation: number;

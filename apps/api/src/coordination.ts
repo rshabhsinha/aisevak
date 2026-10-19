@@ -949,7 +949,7 @@ export async function registerCoordinationRoutes(
       const retryIdempotencyKey = body.idempotencyKey || `assignment:${id}:attempt:${nextAttempt}`;
       const duplicate = await existingIdempotentMessage(client, context.agentId, retryIdempotencyKey);
       if (duplicate) return;
-      if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Retrying ASSIGNMENT-${assignment.assignment_number}`);
+      if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Retrying ASSIGNMENT-${assignment.assignment_number}`, { stopRunningTurn: true });
       await client.query("UPDATE task_assignments SET attempt_count = $2, status = 'queued', result = NULL, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, nextAttempt]);
       const message = await insertMessage(client, {
         threadId: assignment.coordination_thread_id,
@@ -990,7 +990,7 @@ export async function registerCoordinationRoutes(
         const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
         if (duplicate) return;
         await client.query("UPDATE task_assignments SET status = $2, result = $3, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, action === "complete" ? "completed" : "blocked", body.result]);
-        if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`);
+        if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`, { stopRunningTurn: false });
         if (assignment.task_agent_id !== context.agentId) {
           const message = await insertMessage(client, {
             threadId: assignment.coordination_thread_id,
@@ -1506,15 +1506,19 @@ async function recordSafetyEvent(
   if (jobSafetyMode() === "enforce") throw safetyConflict(input.message);
 }
 
-async function cancelPendingAssignmentDelivery(
+export async function cancelPendingAssignmentDelivery(
   client: PoolClient,
   deliveryId: string,
-  reason: string
+  reason: string,
+  options: { stopRunningTurn: boolean }
 ): Promise<void> {
   // Completing/blocking an assignment must make an already-queued delivery
-  // inert. A running provider turn is allowed to finish its current turn;
-  // its terminalizer observes the failed delivery and will not enqueue a
-  // duplicate retry.
+  // inert. When the assignee completes or blocks its own assignment, the
+  // running turn for this delivery is normally the very turn making the call:
+  // cancelling it would kill the agent mid tool call and record finished work
+  // as a cancelled run and failed delivery. That turn is left to finish and
+  // its terminalizer settles the still-running delivery. A retry requested by
+  // the task owner does stop the running turn.
   await client.query(
     `UPDATE message_deliveries
      SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
@@ -1528,17 +1532,21 @@ async function cancelPendingAssignmentDelivery(
      WHERE message_delivery_id = $1 AND status IN ('queued', 'cancel_requested')`,
     [deliveryId, reason]
   );
-  await client.query(
-    `UPDATE dispatcher_runs
-     SET status = 'cancel_requested', error = COALESCE(error, $2), updated_at = now()
-     WHERE message_delivery_id = $1 AND status = 'running'`,
-    [deliveryId, reason]
-  );
+  if (options.stopRunningTurn) {
+    await client.query(
+      `UPDATE dispatcher_runs
+       SET status = 'cancel_requested', error = COALESCE(error, $2), updated_at = now()
+       WHERE message_delivery_id = $1 AND status = 'running'`,
+      [deliveryId, reason]
+    );
+  }
+  // A 'delivering' input is the injected turn currently running; like a
+  // running dispatcher turn it is only stopped for a retry.
   await client.query(
     `UPDATE agent_turn_inputs
      SET status = 'failed', error = $2, updated_at = now()
-     WHERE message_delivery_id = $1 AND status IN ('queued', 'delivering')`,
-    [deliveryId, reason]
+     WHERE message_delivery_id = $1 AND status = ANY($3::text[])`,
+    [deliveryId, reason, options.stopRunningTurn ? ["queued", "delivering"] : ["queued"]]
   );
 }
 
@@ -2237,7 +2245,8 @@ export async function queueDelivery(
   }
 
   const history = await client.query(
-    `SELECT thread_messages.message_type, thread_messages.body, thread_messages.created_at,
+    `SELECT thread_messages.id, thread_messages.number, thread_messages.message_type, thread_messages.body, thread_messages.created_at,
+            thread_messages.sender_agent_id, thread_messages.recipient_agent_id,
             sender.name AS sender_agent_name, recipient.name AS recipient_agent_name
      FROM thread_messages LEFT JOIN agents sender ON sender.id = thread_messages.sender_agent_id
      LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
@@ -2496,15 +2505,106 @@ export interface JobEnvelope {
   providerThreadId: string | null;
 }
 
+const HISTORY_BODY_LIMIT = 1200;
+const HISTORY_SUMMARY_LIMIT = 200;
+// Lines shorter than this (headings, "changes_requested", blank-ish lines)
+// carry meaning in context and are never treated as repeated boilerplate.
+const REPEATED_LINE_MIN_LENGTH = 40;
+
+function sameText(a: unknown, b: unknown): boolean {
+  return typeof a === "string" && typeof b === "string" && a.trim() !== "" && a.trim() === b.trim();
+}
+
+function isSameMessage(item: any, message: any): boolean {
+  if (item.id && message.id) return item.id === message.id;
+  return item.message_type === message.message_type && sameText(item.body, message.body);
+}
+
+// Drops lines the agent has already been shown in this prompt. Coordination
+// bodies often restate the same job header and source data, so without this
+// the history repeats it once per message.
+function withoutRepeatedLines(body: string, seen: Set<string>): { text: string; omitted: number } {
+  let omitted = 0;
+  const kept: string[] = [];
+  for (const line of body.split("\n")) {
+    const key = line.trim();
+    if (key.length >= REPEATED_LINE_MIN_LENGTH && seen.has(key)) {
+      omitted += 1;
+      continue;
+    }
+    kept.push(line);
+  }
+  return { text: kept.join("\n").replace(/\n{3,}/g, "\n\n").trim(), omitted };
+}
+
+function rememberLines(text: unknown, seen: Set<string>): void {
+  if (typeof text !== "string") return;
+  for (const line of text.split("\n")) {
+    const key = line.trim();
+    if (key.length >= REPEATED_LINE_MIN_LENGTH) seen.add(key);
+  }
+}
+
+function truncate(text: string, limit: number): string {
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+// Earlier messages are context, not instructions. Messages the recipient
+// sent or received keep their (de-duplicated) body; exchanges between other
+// agents are reduced to one line, because their bodies are role instructions
+// addressed to someone else.
+function coordinationHistoryLines(thread: any, recipient: any, message: any, history: any[], seen: Set<string>): string[] {
+  // How many of the thread's texts contain each line; a one-line summary
+  // skips lines shared with other messages (labels, job headers).
+  const lineCounts = new Map<string, number>();
+  for (const text of [thread.purpose, message.body, ...history.map((item) => item.body)]) {
+    if (typeof text !== "string") continue;
+    for (const key of new Set(text.split("\n").map((line) => line.trim()).filter(Boolean))) {
+      lineCounts.set(key, (lineCounts.get(key) ?? 0) + 1);
+    }
+  }
+  return history
+    .filter((item) => !isSameMessage(item, message))
+    .map((item) => {
+      const label = `- ${item.number ? `#${item.number} ` : ""}${item.sender_agent_name ?? "System"} -> ${item.recipient_agent_name ?? "thread"} [${item.message_type}]`;
+      const involvesRecipient = Boolean(recipient.id) &&
+        (item.sender_agent_id === recipient.id || item.recipient_agent_id === recipient.id);
+      const { text, omitted } = withoutRepeatedLines(String(item.body ?? ""), seen);
+      if (!involvesRecipient && recipient.id) {
+        const summary = text.split("\n").map((line) => line.trim())
+          .filter((line) => line && (lineCounts.get(line) ?? 0) <= 1)
+          .slice(0, 2).join(" / ");
+        return `${label}: ${truncate(summary || "(no new content)", HISTORY_SUMMARY_LIMIT)}`;
+      }
+      // Only text actually shown counts as seen by later entries.
+      rememberLines(truncate(text, HISTORY_BODY_LIMIT), seen);
+      const note = omitted > 0 ? `\n  (${omitted} line${omitted === 1 ? "" : "s"} already shown above omitted)` : "";
+      return `${label}: ${truncate(text || "(no new content)", HISTORY_BODY_LIMIT)}${note}`;
+    });
+}
+
 export function coordinationPrompt(thread: any, recipient: any, message: any, history: any[], envelope?: JobEnvelope | null): string {
-  const lines = history.map((item) => `- ${item.sender_agent_name ?? "System"} -> ${item.recipient_agent_name ?? "thread"} [${item.message_type}]: ${String(item.body).slice(0, 1200)}`);
+  // The triggering message is shown in full as "Why you were triggered"; the
+  // thread purpose is often the same text as that message or as the first
+  // history entry, so it is only shown when it adds something.
+  const purposeIsTrigger = sameText(thread.purpose, message.body);
+  const purposeRepeats =
+    purposeIsTrigger || history.some((item) => !isSameMessage(item, message) && sameText(thread.purpose, item.body));
+  const seen = new Set<string>();
+  if (!purposeRepeats) rememberLines(thread.purpose, seen);
+  rememberLines(message.body, seen);
+  const lines = coordinationHistoryLines(thread, recipient, message, history, seen);
   const context = [
     `You are ${recipient.name}: ${recipient.description}`,
     "You have received an Aisevak coordination message. Use the aisevak CLI based on your judgment; inspect resources lazily instead of loading everything.",
     "",
     `Thread: THREAD-${thread.number} — ${thread.title}`,
     `Description: ${thread.description}`,
-    `Purpose: ${thread.purpose}`,
+    purposeIsTrigger
+      ? "Purpose: same as the message that triggered you (below)."
+      : purposeRepeats
+        ? "Purpose: same as the thread's opening message (see thread history below)."
+        : `Purpose: ${thread.purpose}`,
     `Thread started by: ${thread.created_by_agent_name ?? "platform"}`,
     `Message from: ${message.sender_agent_name ?? "platform"}`,
     `Message type: ${message.message_type ?? "message"}`,
@@ -2514,7 +2614,7 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
     `Result recipient: ${thread.callback_agent_name ?? "none"}`,
     ...formatJobEnvelope(envelope),
     "",
-    "Recent thread history:",
+    `Recent thread history (earlier messages; full bodies via aisevak threads messages THREAD-${thread.number}):`,
     ...(lines.length ? lines : ["- No earlier messages."]),
     ""
   ];
