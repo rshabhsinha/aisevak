@@ -7092,7 +7092,10 @@ label {
 
 .thread-list-archived {
   display: inline-flex;
+  /* The global label rule stacks label content in a column. */
+  flex-direction: row;
   align-items: center;
+  font-weight: 500;
   gap: 8px;
   min-width: 0;
   color: var(--muted-foreground);
