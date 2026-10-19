@@ -85,4 +85,21 @@ describe("delivery settled by its assignment", () => {
     expect(deliveryUpdate(queries)?.params).toEqual(["delivery", "completed", null]);
     expect(assignmentChanged(queries)).toBe(false);
   });
+
+  it("blocks the assignment when an older turn fails after a newer delivery already finished", async () => {
+    // superseded=false models: the newer delivery exists but is completed.
+    const { pool: db, queries } = pool({ status: "running", superseded: false });
+
+    await finishMessageDelivery(db, job, "cancelled", "old turn stopped");
+
+    expect(retried(queries)).toBe(false);
+    expect(assignmentChanged(queries)).toBe(true);
+  });
+
+  it("only treats a newer pending delivery as superseding", async () => {
+    const { pool: db, queries } = pool({ status: "running", superseded: false });
+    await finishMessageDelivery(db, job, "failed", "x");
+    const check = queries.find((q) => q.sql.includes("newer.assignment_id = delivery.assignment_id"));
+    expect(check?.sql).toContain("newer.status IN ('queued', 'retrying', 'running')");
+  });
 });

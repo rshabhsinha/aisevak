@@ -458,7 +458,9 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       );
       const deliveryId = updated.rows[0]?.message_delivery_id ?? input.message_delivery_id;
       if (!deliveryId) return;
-      if (inputError && await settleDeliveryByAssignment(client, deliveryId, inputError)) return;
+      if (inputError && await settleDeliveryByAssignment(client, deliveryId, inputError, {
+        presented: input.input_status === "delivering"
+      })) return;
       await client.query(
         `UPDATE message_deliveries
          SET status = $2, completed_at = now(), error = $3, updated_at = now()
@@ -2620,14 +2622,17 @@ export async function persistDispatcherCodexLine(
   );
 }
 
-// A delivery is superseded once its assignment has a newer delivery (an
-// owner retry or follow-up). Its outcome must then not change the assignment,
-// which belongs to the newer delivery.
+// A delivery is superseded while its assignment has a newer, still pending
+// delivery (an owner retry or follow-up): the assignment's outcome then
+// belongs to that newer delivery. Once the newer one has finished, an older
+// turn failing still settles the assignment as before, so it cannot be left
+// running with nothing active.
 const NEWER_ASSIGNMENT_DELIVERY = `EXISTS (
   SELECT 1 FROM message_deliveries newer
   WHERE newer.assignment_id = delivery.assignment_id
     AND newer.id <> delivery.id
     AND newer.created_at > delivery.created_at
+    AND newer.status IN ('queued', 'retrying', 'running')
 )`;
 
 async function markAssignmentDeliveryTerminal(
@@ -2665,7 +2670,8 @@ async function markAssignmentDeliveryTerminal(
 export async function settleDeliveryByAssignment(
   queryable: Pick<DbPool, "query">,
   messageDeliveryId: string,
-  error: string
+  error: string,
+  options: { presented?: boolean } = {}
 ): Promise<boolean> {
   const state = await queryable.query<{ assignment_status: string | null; superseded: boolean }>(
     `SELECT task_assignments.status AS assignment_status, ${NEWER_ASSIGNMENT_DELIVERY} AS superseded
@@ -2680,7 +2686,7 @@ export async function settleDeliveryByAssignment(
   if (!terminal && !row.superseded) return false;
   const settledError = row.superseded
     ? `Superseded by a newer delivery for this assignment${error ? `; turn ended with: ${error}` : ""}`
-    : row.assignment_status === "completed"
+    : row.assignment_status === "completed" && options.presented !== false
       ? null
       : `Assignment was ${row.assignment_status}${error ? `; turn ended with: ${error}` : ""}`;
   await queryable.query(
@@ -3217,13 +3223,15 @@ async function failPendingAgentTurnInputsInTransaction(
       await requeueUnpresentedAgentTurnInput(client, input.id, { requeueCancelled: options.requeueCancelled });
     }
   }
-  const result = await client.query<{ message_delivery_id: string | null }>(
+  const result = await client.query<{ message_delivery_id: string | null; previous_status: string }>(
       `UPDATE agent_turn_inputs
        SET status = 'failed',
            error = $2,
            updated_at = now()
-       WHERE ${runColumn} = $1 AND status IN ('queued', 'delivering')
-       RETURNING message_delivery_id`,
+       FROM agent_turn_inputs previous
+       WHERE previous.id = agent_turn_inputs.id
+         AND agent_turn_inputs.${runColumn} = $1 AND agent_turn_inputs.status IN ('queued', 'delivering')
+       RETURNING agent_turn_inputs.message_delivery_id, previous.status AS previous_status`,
       [
         runId,
         finalStatus === "cancelled"
@@ -3238,7 +3246,9 @@ async function failPendingAgentTurnInputsInTransaction(
   const deliveryIds: string[] = [];
   for (const row of result.rows) {
     if (!row.message_delivery_id) continue;
-    if (await settleDeliveryByAssignment(client, row.message_delivery_id, deliveryError)) continue;
+    if (await settleDeliveryByAssignment(client, row.message_delivery_id, deliveryError, {
+      presented: row.previous_status === "delivering"
+    })) continue;
     deliveryIds.push(row.message_delivery_id);
   }
   if (deliveryIds.length === 0) return;

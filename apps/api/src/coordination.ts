@@ -1518,7 +1518,10 @@ export async function cancelPendingAssignmentDelivery(
   // cancelling it would kill the agent mid tool call and record finished work
   // as a cancelled run and failed delivery. That turn is left to finish and
   // its terminalizer settles the still-running delivery. A retry requested by
-  // the task owner does stop the running turn.
+  // the task owner stops a running turn that still holds the active delivery;
+  // after a block the active delivery is already cleared, so the retry's new
+  // delivery reaches the assignee's still-running turn as a mid-turn input
+  // and the runner treats the old delivery as superseded.
   await client.query(
     `UPDATE message_deliveries
      SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
