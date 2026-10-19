@@ -55,7 +55,7 @@ describe("task board routes", () => {
     expect(body).toMatchObject({ hasMore: true, total: 40 });
 
     const list = calls.find((call) => call.sql.includes("LIMIT $"))!;
-    expect(list.sql).toContain("COALESCE(latest.status::text, tasks.status::text) IN ('succeeded'");
+    expect(list.sql).toContain("board.status IN ('succeeded'");
     expect(list.params.at(-1)).toBe(3);
 
     calls.length = 0;
@@ -70,7 +70,19 @@ describe("task board routes", () => {
   it("puts tasks with an unknown or missing status in the Todo column", async () => {
     const { get, calls } = await taskServer([]);
     await get("/api/tasks?bucket=open");
-    expect(calls.find((call) => call.sql.includes("LIMIT $"))!.sql).toMatch(/IS NULL OR COALESCE\(latest\.status::text, tasks\.status::text\) NOT IN \('queued'/);
+    expect(calls.find((call) => call.sql.includes("LIMIT $"))!.sql).toMatch(/board\.status IS NULL OR board\.status NOT IN \('queued'/);
+  });
+
+  it("buckets by active and dispatcher runs, not only worker runs", async () => {
+    const { get, calls } = await taskServer([]);
+    await get("/api/tasks?bucket=running");
+    const list = calls.find((call) => call.sql.includes("LIMIT $"))!.sql;
+    const count = calls.find((call) => call.sql.includes("count(*)::int AS total"))!.sql;
+    for (const sql of [list, count]) {
+      expect(sql).toContain("FROM dispatcher_runs");
+      expect(sql).toContain("active_run.status::text");
+      expect(sql).toContain("board.status IN ('queued', 'running', 'cancel_requested')");
+    }
   });
 
   it("searches on the server", async () => {

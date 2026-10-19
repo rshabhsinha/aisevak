@@ -2381,21 +2381,24 @@ select:disabled {
   font-weight: 500;
 }
 
+/* Each column scrolls on its own so the headers stay in view and a long
+   column never stretches the whole board. */
 .board-columns {
   min-height: 0;
   display: flex;
   flex: 1;
   gap: 12px;
-  overflow: auto;
-  padding: 16px 18px 28px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 16px 18px 0;
   background: var(--background);
 }
 
 .kanban-col {
-  width: 280px;
-  min-width: 250px;
+  min-width: 260px;
+  min-height: 0;
   display: flex;
-  flex: 1 0 250px;
+  flex: 1 1 0;
   flex-direction: column;
   gap: 10px;
 }
@@ -2438,13 +2441,23 @@ select:disabled {
 }
 
 .kanban-cards {
+  min-height: 0;
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   gap: 8px;
+  margin: 0 -4px;
+  padding: 2px 4px 28px;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
 }
 
 .kanban-card {
   width: 100%;
+  min-width: 0;
+  flex-shrink: 0;
+  overflow: hidden;
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 12px 14px 11px;
@@ -2495,6 +2508,17 @@ select:disabled {
   justify-content: space-between;
 }
 
+.card-top {
+  gap: 8px;
+  min-width: 0;
+}
+
+.card-top > .status {
+  flex-shrink: 0;
+  white-space: nowrap;
+  text-transform: capitalize;
+}
+
 .task-key,
 .meta-badge {
   color: var(--muted-foreground);
@@ -2529,8 +2553,17 @@ select:disabled {
   color: var(--accent-foreground);
   font-family: var(--font-code);
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.task-work-identity > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.task-work-identity > svg {
+  flex-shrink: 0;
 }
 
 .task-orchestration-summary {
@@ -2547,6 +2580,9 @@ select:disabled {
 .task-assignment-more {
   border-radius: 999px;
   padding: 2px 6px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
   background: var(--muted);
   color: var(--muted-foreground);
   white-space: nowrap;
@@ -2582,6 +2618,7 @@ select:disabled {
 }
 
 .card-footer {
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -2630,6 +2667,7 @@ select:disabled {
   background: color-mix(in srgb, var(--secondary) 80%, transparent);
   padding: 1px 5px;
   border-radius: 4px;
+  min-width: 0;
   max-width: 130px;
 }
 
@@ -2645,6 +2683,7 @@ select:disabled {
 
 .kanban-load-more {
   width: 100%;
+  flex-shrink: 0;
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 8px 10px;
@@ -5434,8 +5473,7 @@ label {
     display: none;
     flex: 1 1 0;
     flex-direction: column;
-    overflow-y: auto;
-    overscroll-behavior-y: contain;
+    overflow: hidden;
     background: var(--card);
     border-radius: 10px;
     padding: 10px;
@@ -5443,6 +5481,10 @@ label {
   }
 
   .kanban-col.mobile-current-column { display: flex; }
+
+  .kanban-cards {
+    padding-bottom: 4px;
+  }
 
   .kanban-card {
     padding: 12px 14px 11px;

@@ -1296,6 +1296,11 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL D
 -- get now() so they are treated as possibly launched; new rows start NULL.
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS launch_attempted_at timestamptz DEFAULT now();
 ALTER TABLE dispatcher_runs ALTER COLUMN launch_attempted_at DROP DEFAULT;
+
+-- The task board resolves each task's column from its latest runs.
+CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx
+ON dispatcher_runs(task_id, created_at DESC) WHERE task_id IS NOT NULL;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
