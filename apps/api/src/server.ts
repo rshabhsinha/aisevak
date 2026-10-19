@@ -1169,12 +1169,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
          FROM tasks
          LEFT JOIN projects ON projects.id = tasks.project_id
          JOIN agents ON agents.id = tasks.agent_id
-         LEFT JOIN LATERAL (
-           SELECT status FROM task_runs
-           WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
-           ORDER BY created_at DESC
-           LIMIT 1
-         ) latest ON true
+         ${TASK_STATUS_JOINS}
          ${filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : ""}`,
         filterValues
       )
@@ -2188,21 +2183,77 @@ const tasksQuerySchema = z.object({
   cursor: z.string().trim().min(1).optional(),
   query: z.string().trim().max(200).optional()
 });
-// Mirrors the board's runBucket(): a task sits in the column of its latest
-// worker run's status, or its own status when it has never run.
+// Mirrors the board's runBucket() over board.status (see TASK_STATUS_JOINS).
 const TASK_BUCKET_STATUSES = {
   running: ["queued", "running", "cancel_requested"],
   completed: ["succeeded", "done", "completed", "active", "enabled", "published", "resolved"],
   failed: ["failed", "cancelled", "canceled", "needs_attention", "blocked", "expired", "revoked", "disabled"]
 } as const;
 function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
-  const status = "COALESCE(latest.status::text, tasks.status::text)";
+  const status = "board.status";
   const list = (statuses: readonly string[]) => statuses.map((value) => `'${value}'`).join(", ");
   if (bucket === "open") {
     return `(${status} IS NULL OR ${status} NOT IN (${list(Object.values(TASK_BUCKET_STATUSES).flat())}))`;
   }
   return `${status} IN (${list(TASK_BUCKET_STATUSES[bucket])})`;
 }
+// board.status is the status that picks a task's board column. Scheduled
+// occurrences and orchestrated tasks execute as dispatcher runs rather than
+// worker task_runs, so:
+// 1. any active worker or dispatcher run puts the task in Running;
+// 2. otherwise the most recent run of either kind decides: a worker run's
+//    status always counts, while a dispatcher run's counts only for a task
+//    still 'open' with no assignments or child tasks in flight;
+// 3. otherwise the task's own status.
+export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
+         SELECT id, status
+         FROM task_runs
+         WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+         ORDER BY created_at DESC
+         LIMIT 1
+       ) latest ON true
+       LEFT JOIN LATERAL (
+         SELECT active.status FROM (
+           SELECT status, created_at FROM task_runs
+           WHERE task_runs.task_id = tasks.id AND task_runs.status IN ('queued', 'running', 'cancel_requested')
+           UNION ALL
+           SELECT status, created_at FROM dispatcher_runs
+           WHERE dispatcher_runs.task_id = tasks.id AND dispatcher_runs.status IN ('queued', 'running', 'cancel_requested')
+         ) active
+         ORDER BY (active.status = 'running') DESC, active.created_at DESC
+         LIMIT 1
+       ) active_run ON true
+       LEFT JOIN LATERAL (
+         SELECT recent.kind, recent.status FROM (
+           SELECT 'worker' AS kind, status, created_at FROM task_runs
+           WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
+           UNION ALL
+           SELECT 'dispatcher' AS kind, status, created_at FROM dispatcher_runs
+           WHERE dispatcher_runs.task_id = tasks.id
+         ) recent
+         ORDER BY recent.created_at DESC
+         LIMIT 1
+       ) latest_any ON true
+       CROSS JOIN LATERAL (
+         SELECT COALESCE(
+           active_run.status::text,
+           CASE WHEN latest_any.kind = 'worker' THEN latest_any.status::text END,
+           CASE
+             WHEN latest_any.kind = 'dispatcher'
+               AND tasks.status = 'open'
+               AND NOT EXISTS (
+                 SELECT 1 FROM task_assignments assignment
+                 WHERE assignment.task_id = tasks.id AND assignment.status IN ('queued', 'running')
+               )
+               AND NOT EXISTS (
+                 SELECT 1 FROM tasks child
+                 WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')
+               )
+             THEN latest_any.status::text
+           END,
+           tasks.status::text
+         ) AS status
+       ) board`;
 const TASK_CURSOR_COLUMN = `to_char(tasks.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at`;
 const TASK_LIST_SELECT = `SELECT tasks.*,
               projects.name AS project_name,
@@ -2245,6 +2296,7 @@ const TASK_LIST_SELECT = `SELECT tasks.*,
                  ORDER BY safety_event.created_at DESC, safety_event.id DESC LIMIT 1) AS latest_safety_event,
               latest.status AS latest_run_status,
               latest.id AS latest_run_id,
+              board.status AS board_status,
               EXISTS (
                 SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id
                 UNION ALL
@@ -2254,13 +2306,7 @@ const TASK_LIST_SELECT = `SELECT tasks.*,
        LEFT JOIN projects ON projects.id = tasks.project_id
        LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
        JOIN agents ON agents.id = tasks.agent_id
-       LEFT JOIN LATERAL (
-         SELECT id, status
-         FROM task_runs
-         WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
-         ORDER BY created_at DESC
-         LIMIT 1
-       ) latest ON true`;
+       ${TASK_STATUS_JOINS}`;
 const agentThreadsQuerySchema = z.object({
   includeArchived: z.enum(["true", "false"]).default("false").transform(value => value === "true"),
   limit: z.coerce.number().int().min(1).max(50).default(10),
@@ -4971,19 +5017,12 @@ async function getDispatcherContext(pool: DbPool): Promise<{
      LEFT JOIN projects ON projects.id = tasks.project_id
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
-     LEFT JOIN LATERAL (
-       SELECT id, status
-       FROM task_runs
-       WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
-       ORDER BY created_at DESC
-       LIMIT 1
-     ) latest ON true
-     WHERE latest.status IN ('queued', 'running', 'cancel_requested', 'failed')
+     ${TASK_STATUS_JOINS}
+     -- Same status the board shows, so finished scheduled occurrences and
+     -- tasks with an active dispatcher run are treated like worker runs.
+     WHERE board.status IN ('queued', 'running', 'cancel_requested', 'failed')
         OR tasks.status IN ('needs_attention', 'blocked')
-        OR (
-          tasks.status = 'open'
-          AND COALESCE(latest.status::text, '') NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
-        )
+        OR (tasks.status = 'open' AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded'))
      ORDER BY tasks.created_at ASC`
   );
   const agents = await pool.query(

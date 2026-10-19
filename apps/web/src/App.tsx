@@ -207,6 +207,9 @@ interface Task {
   agent_kind: "worker" | "dispatcher";
   latest_run_status?: string | null;
   latest_run_id?: string | null;
+  // Status that picks the board column, including dispatcher (scheduled and
+  // orchestrated) runs; older APIs omit it.
+  board_status?: string | null;
   has_runs?: boolean;
   open_pr_on_success: boolean;
   work_scope?: string | null;
@@ -1355,7 +1358,7 @@ export function App() {
           {view === "tasks" ? (
             <TasksView
               board={board}
-              onLoadMore={(bucket) => void loadMoreTasks(bucket)}
+              onLoadMore={loadMoreTasks}
               onSelect={(task) => void openTaskThread(task)}
             />
           ) : null}
@@ -1881,7 +1884,7 @@ function incidentSeverityVariant(severity: Incident["severity"]): "secondary" | 
 
 function TasksView(props: {
   board: BoardState;
-  onLoadMore: (bucket: BoardColumnId) => void;
+  onLoadMore: (bucket: BoardColumnId) => Promise<void>;
   onSelect: (task: Task) => void;
 }) {
   const [mobileColumn, setMobileColumn] = useState<BoardColumnId>("open");
@@ -1904,7 +1907,7 @@ function TasksView(props: {
               <div className={`kanban-col col-${column.id} ${mobileColumn === column.id ? "mobile-current-column" : ""}`} key={column.id}>
                 <div className="kanban-head">
                   <span className="kanban-head-title">
-                    {column.id === "running" ? (
+                    {column.id === "running" && columnState.total > 0 ? (
                       <AgentOrb variant="working" size={12} color="var(--primary)" />
                     ) : (
                       column.icon
@@ -1915,7 +1918,7 @@ function TasksView(props: {
                 </div>
                 <div className="kanban-cards">
                   {tasks.map((task) => {
-                    const status = task.latest_run_status ?? task.status;
+                    const status = task.board_status ?? task.latest_run_status ?? task.status;
                     const isBlocked = status === "blocked";
                     const isRunning = isActiveRun(status);
                     return (
@@ -1989,16 +1992,14 @@ function TasksView(props: {
                     </div>
                   ) : null}
                   {columnState.nextCursor ? (
-                    <button
-                      type="button"
-                      className="kanban-load-more"
-                      disabled={columnState.loadingMore}
-                      onClick={() => props.onLoadMore(column.id)}
+                    <KanbanLoadMore
+                      loading={columnState.loadingMore}
+                      onLoadMore={() => props.onLoadMore(column.id)}
                     >
                       {columnState.loadingMore
                         ? "Loading…"
                         : `Show ${Math.min(TASK_COLUMN_PAGE_SIZE, columnState.total - tasks.length)} more · ${tasks.length} of ${columnState.total}`}
-                    </button>
+                    </KanbanLoadMore>
                   ) : null}
                 </div>
               </div>
@@ -2007,6 +2008,37 @@ function TasksView(props: {
         </div>
       </div>
     </div>
+  );
+}
+
+// Loads the next page when the button scrolls into its column's view, so long
+// columns page in as they are scrolled; clicking still works. A failed load
+// stops auto-loading until the button is clicked, so an API error cannot turn
+// into a request loop.
+function KanbanLoadMore(props: { loading: boolean; onLoadMore: () => Promise<void>; children: ReactNode }) {
+  const ref = useRef<HTMLButtonElement>(null);
+  const [failed, setFailed] = useState(false);
+  const loadRef = useRef(() => {});
+  loadRef.current = () => {
+    setFailed(false);
+    props.onLoadMore().catch(() => setFailed(true));
+  };
+  useEffect(() => {
+    const el = ref.current;
+    if (!el || props.loading || failed) return;
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) loadRef.current();
+      },
+      { root: el.closest(".kanban-cards"), rootMargin: "200px" }
+    );
+    observer.observe(el);
+    return () => observer.disconnect();
+  }, [props.loading, failed]);
+  return (
+    <button type="button" ref={ref} className="kanban-load-more" disabled={props.loading} onClick={() => loadRef.current()}>
+      {failed && !props.loading ? "Couldn’t load more · Retry" : props.children}
+    </button>
   );
 }
 
