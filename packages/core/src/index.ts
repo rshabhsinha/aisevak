@@ -9,6 +9,7 @@ export * from "./cursor.js";
 export * from "./devin.js";
 export * from "./harnessBinary.js";
 export * from "./opencode.js";
+export * from "./providerAccounts.js";
 export * from "./crypto.js";
 export * from "./db.js";
 export * from "./github.js";

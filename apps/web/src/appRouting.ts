@@ -15,6 +15,9 @@ export type AppView =
   | "opencode"
   | "devin"
   | "claude"
+  | "harnesses"
+  | "usage"
+  | "limits"
   | "settings";
 
 export interface AppRoute {
@@ -39,6 +42,9 @@ const VIEW_PATHS: Record<Exclude<AppView, "runs">, string> = {
   opencode: "/settings/opencode",
   devin: "/settings/devin",
   claude: "/settings/claude-code",
+  harnesses: "/settings/harnesses",
+  usage: "/settings/usage",
+  limits: "/settings/limits",
   settings: "/settings"
 };
 
@@ -48,7 +54,7 @@ for (const [view, path] of Object.entries(VIEW_PATHS)) {
 }
 PATH_VIEWS.set("/projects", "projects");
 PATH_VIEWS.set("/connectors", "connectors");
-PATH_VIEWS.set("/settings", "codex");
+PATH_VIEWS.set("/settings", "harnesses");
 
 export function appPath(view: AppView, threadId: string | null = null): string {
   if (view === "runs") {

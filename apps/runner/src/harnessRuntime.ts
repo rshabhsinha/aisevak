@@ -21,6 +21,8 @@ import {
   materializeOpenCodeAuthFile,
   OPENCODE_AUTH_SECRET_NAME,
   parseOpenCodeAuthFile,
+  isDefaultProviderInstance,
+  providerInstanceSecretName,
   type DbPool,
   type ProviderDriver
 } from "@aisevak/core";
@@ -47,13 +49,16 @@ export async function materializeHarnessAuth(
   runtimeHome: string,
   secretKey: string,
   baseEnv: NodeJS.ProcessEnv,
-  model?: string | null
+  model?: string | null,
+  providerInstanceId?: string | null
 ): Promise<HarnessLaunchEnv> {
+  // Credentials of the thread's account; the default account uses the unscoped names.
+  const secretName = (baseName: string) => providerInstanceSecretName(baseName, providerInstanceId);
   if (driver === "claude") {
     if (model && !isClaudeModelId(model)) {
       throw new Error(`Claude Code cannot run ${model}. Give this agent a Claude model such as claude-opus-5-5.`);
     }
-    const credential = (await readInternalSecret(pool, CLAUDE_CODE_TOKEN_SECRET_NAME, secretKey))?.trim();
+    const credential = (await readInternalSecret(pool, secretName(CLAUDE_CODE_TOKEN_SECRET_NAME), secretKey))?.trim();
     if (!credential) {
       throw new Error("Claude Code is not authenticated. An admin must connect Claude Code from Settings > Claude Code.");
     }
@@ -68,8 +73,8 @@ export async function materializeHarnessAuth(
   }
 
   if (driver === "cursor") {
-    const apiKey = await readSecret(pool, CURSOR_API_KEY_SECRET_NAME, secretKey);
-    const bundle = await readSecret(pool, CURSOR_AUTH_SECRET_NAME, secretKey);
+    const apiKey = await readSecret(pool, secretName(CURSOR_API_KEY_SECRET_NAME), secretKey);
+    const bundle = await readSecret(pool, secretName(CURSOR_AUTH_SECRET_NAME), secretKey);
     if (isCursorHostAuthBundle(bundle) && !apiKey) {
       throw new Error(
         "Cursor subscription tokens are not portable into VM worker homes. Save a CURSOR_API_KEY in Settings > Cursor."
@@ -96,8 +101,8 @@ export async function materializeHarnessAuth(
   }
 
   if (driver === "opencode") {
-    const stored = await readSecret(pool, OPENCODE_AUTH_SECRET_NAME, secretKey);
-    const auth = stored ?? (await readHostOpenCodeAuth());
+    const stored = await readSecret(pool, secretName(OPENCODE_AUTH_SECRET_NAME), secretKey);
+    const auth = stored ?? (isDefaultProviderInstance(providerInstanceId) ? await readHostOpenCodeAuth() : undefined);
     if (!auth) {
       throw new Error("OpenCode is not authenticated. An admin must connect OpenCode from Settings > OpenCode.");
     }
@@ -115,8 +120,8 @@ export async function materializeHarnessAuth(
   }
 
   if (driver === "devin") {
-    const apiKey = await readSecret(pool, DEVIN_API_KEY_SECRET_NAME, secretKey);
-    const bundle = await readSecret(pool, DEVIN_AUTH_SECRET_NAME, secretKey);
+    const apiKey = await readSecret(pool, secretName(DEVIN_API_KEY_SECRET_NAME), secretKey);
+    const bundle = await readSecret(pool, secretName(DEVIN_AUTH_SECRET_NAME), secretKey);
     if (bundle) {
       await materializeDevinAuthBundle(runtimeHome, bundle);
     }

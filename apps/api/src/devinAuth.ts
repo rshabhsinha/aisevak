@@ -1,4 +1,5 @@
 import {
+  providerInstanceSecretName,
   DEVIN_API_KEY_SECRET_NAME,
   DEVIN_AUTH_SECRET_NAME,
   decryptSecret,
@@ -58,11 +59,16 @@ export class DevinAuthManager {
     private readonly secretKey: string,
     private readonly devinBinary: string,
     private readonly authHomeRoot: string,
-    private readonly hostHome = homedir()
+    private readonly hostHome = homedir(),
+    private readonly instanceId?: string
   ) {}
 
+  private secret(baseName: string): string {
+    return providerInstanceSecretName(baseName, this.instanceId);
+  }
+
   async getStatus(): Promise<DevinAuthStatusResponse> {
-    const apiKey = await this.readSecret(DEVIN_API_KEY_SECRET_NAME);
+    const apiKey = await this.readSecret(this.secret(DEVIN_API_KEY_SECRET_NAME));
     if (apiKey) {
       const probe = await this.probeHome(this.hostHome);
       return {
@@ -77,7 +83,7 @@ export class DevinAuthManager {
       };
     }
 
-    const stored = await this.readSecret(DEVIN_AUTH_SECRET_NAME);
+    const stored = await this.readSecret(this.secret(DEVIN_AUTH_SECRET_NAME));
     if (stored) {
       const home = join(this.authHomeRoot, "connected");
       await materializeDevinAuthBundle(home, stored);
@@ -244,7 +250,7 @@ export class DevinAuthManager {
   async disconnect(): Promise<DevinAuthStatusResponse> {
     await this.dispose();
     await this.pool.query("DELETE FROM secrets WHERE name = ANY($1::text[])", [
-      [DEVIN_API_KEY_SECRET_NAME, DEVIN_AUTH_SECRET_NAME]
+      [this.secret(DEVIN_API_KEY_SECRET_NAME), this.secret(DEVIN_AUTH_SECRET_NAME)]
     ]);
     await rm(this.authHomeRoot, { recursive: true, force: true });
     return this.getStatus();

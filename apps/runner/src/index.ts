@@ -4,6 +4,8 @@ import {
   buildScheduledAgentPrompt,
   codexChatGptAuthSecrets,
   CODEX_CHATGPT_AUTH_SECRET_NAME,
+  isDefaultProviderInstance,
+  providerInstanceSecretName,
   createPool,
   decryptSecret,
   encryptSecret,
@@ -130,6 +132,7 @@ interface RunJob {
   agent_id: string;
   coordination_thread_id: string | null;
   provider_driver: ProviderDriver;
+  provider_instance_id: string | null;
 }
 
 interface DispatcherJob {
@@ -171,6 +174,7 @@ interface DispatcherJob {
   assignment_status: string | null;
   assignment_attempt: number | null;
   provider_driver: ProviderDriver;
+  provider_instance_id: string | null;
 }
 
 async function main(): Promise<void> {
@@ -1569,7 +1573,8 @@ export async function processOneDispatcherRun(
             coordination_threads.work_key AS thread_work_key,
             agent_threads.ownership_generation,
             agent_threads.coordination_thread_id,
-            COALESCE(provider_instances.driver, 'codex') AS provider_driver
+            COALESCE(provider_instances.driver, 'codex') AS provider_driver,
+            provider_instances.id AS provider_instance_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
      LEFT JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
@@ -1625,7 +1630,7 @@ export async function processOneDispatcherRun(
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth =
       driver === "codex"
-        ? await materializeCodexAuth(pool, job.codex_home)
+        ? await materializeCodexAuth(pool, job.codex_home, job.provider_instance_id)
         : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
     const harnessAuth =
       driver === "codex"
@@ -1633,7 +1638,7 @@ export async function processOneDispatcherRun(
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          }, job.model);
+          }, job.model, job.provider_instance_id);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await dispatcherRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -1821,7 +1826,8 @@ export async function processOneDispatcherRun(
           pool,
           job.codex_home,
           codexAuth.chatGptAuth,
-          codexAuth.chatGptAuthRevision
+          codexAuth.chatGptAuthRevision,
+          job.provider_instance_id
         );
       } catch (error) {
         stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
@@ -1930,7 +1936,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
                WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_children,
             agent_threads.ownership_generation,
             agent_threads.coordination_thread_id,
-            COALESCE(provider_instances.driver, 'codex') AS provider_driver
+            COALESCE(provider_instances.driver, 'codex') AS provider_driver,
+            provider_instances.id AS provider_instance_id
      FROM task_runs
      JOIN task_sessions ON task_sessions.id = task_runs.task_session_id
      LEFT JOIN agent_threads ON agent_threads.id = task_runs.agent_thread_id
@@ -1968,7 +1975,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     await materializeSkills(job.codex_home, normalizeCodexSkillSnapshots(job.skills_snapshot));
     const codexAuth =
       driver === "codex"
-        ? await materializeCodexAuth(pool, job.codex_home)
+        ? await materializeCodexAuth(pool, job.codex_home, job.provider_instance_id)
         : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
     const harnessAuth =
       driver === "codex"
@@ -1976,7 +1983,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          }, job.model);
+          }, job.model, job.provider_instance_id);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await workerRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -2116,7 +2123,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
           pool,
           job.codex_home,
           codexAuth.chatGptAuth,
-          codexAuth.chatGptAuthRevision
+          codexAuth.chatGptAuthRevision,
+          job.provider_instance_id
         );
       } catch (error) {
         stderr += `\nCould not persist refreshed ChatGPT authentication: ${String(
@@ -2412,9 +2420,16 @@ interface MaterializedCodexAuth {
   redactionSecrets: string[];
 }
 
-async function materializeCodexAuth(pool: DbPool, codexHome: string): Promise<MaterializedCodexAuth> {
+async function materializeCodexAuth(
+  pool: DbPool,
+  codexHome: string,
+  providerInstanceId?: string | null
+): Promise<MaterializedCodexAuth> {
   const authPath = join(codexHome, "auth.json");
-  const storedChatGptAuth = await readSecretSnapshot(pool, CODEX_CHATGPT_AUTH_SECRET_NAME);
+  const storedChatGptAuth = await readSecretSnapshot(
+    pool,
+    providerInstanceSecretName(CODEX_CHATGPT_AUTH_SECRET_NAME, providerInstanceId)
+  );
   if (storedChatGptAuth) {
     const auth = parseCodexChatGptAuthFile(storedChatGptAuth.value);
     await writeFile(authPath, serializeCodexChatGptAuthFile(auth), { encoding: "utf8", mode: 0o600 });
@@ -2426,13 +2441,14 @@ async function materializeCodexAuth(pool: DbPool, codexHome: string): Promise<Ma
     };
   }
 
-  const apiKey = await readSecret(pool, "openai_api_key");
+  const apiKey = await readSecret(pool, providerInstanceSecretName("openai_api_key", providerInstanceId));
   if (apiKey) {
     await rm(authPath, { force: true });
     return { apiKey, redactionSecrets: [apiKey] };
   }
 
-  if (existsSync(env.codexHostAuthJson)) {
+  // Only the default account falls back to the host's own Codex login.
+  if (isDefaultProviderInstance(providerInstanceId) && existsSync(env.codexHostAuthJson)) {
     await copyFile(env.codexHostAuthJson, authPath);
     await chmod(authPath, 0o600);
     return { redactionSecrets: authFileRedactionSecrets(await readFile(authPath, "utf8")) };
@@ -2447,7 +2463,8 @@ export async function persistRefreshedCodexAuth(
   pool: DbPool,
   codexHome: string,
   original: CodexChatGptAuthFile,
-  originalEncryptedValue: string
+  originalEncryptedValue: string,
+  providerInstanceId?: string | null
 ): Promise<boolean> {
   const refreshed = parseCodexChatGptAuthFile(await readFile(join(codexHome, "auth.json"), "utf8"));
   if (refreshed.tokens.account_id !== original.tokens.account_id) {
@@ -2463,7 +2480,7 @@ export async function persistRefreshedCodexAuth(
      WHERE name = $1 AND encrypted_value = $4
      RETURNING id`,
     [
-      CODEX_CHATGPT_AUTH_SECRET_NAME,
+      providerInstanceSecretName(CODEX_CHATGPT_AUTH_SECRET_NAME, providerInstanceId),
       "Internal ChatGPT authentication used by the Codex runner",
       encrypted,
       originalEncryptedValue

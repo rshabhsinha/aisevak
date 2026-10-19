@@ -367,6 +367,19 @@
   font-weight: 400;
 }
 
+.cmp-model-account {
+  flex: none;
+  max-width: 96px;
+  overflow: hidden;
+  border-radius: 5px;
+  padding: 0 5px;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  font-size: 0.85em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .cmp-model-caret {
   flex: none;
   color: var(--muted-foreground);

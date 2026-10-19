@@ -29,6 +29,11 @@ import {
   defaultCodexModelOptions,
   defaultHarnessModelOptions,
   defaultModelForDriver,
+  defaultProviderInstanceId,
+  isDefaultProviderInstance,
+  newProviderInstanceId,
+  PROVIDER_DRIVER_LABELS,
+  PROVIDER_DRIVERS,
   isClaudeModelId,
   fetchZenModelCatalog,
   materializeDevinAuthBundle,
@@ -52,6 +57,7 @@ import {
   type CodexHarnessModel,
   type CodexSkillSnapshot,
   type DbPool,
+  type ProviderDriver,
   type UserRole
 } from "@aisevak/core";
 import Fastify, {
@@ -73,6 +79,8 @@ import { CursorAuthManager } from "./cursorAuth.js";
 import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
 import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
 import { runHarnessCommand } from "./harnessCommand.js";
+import { loadUsageAnalytics } from "./usageAnalytics.js";
+import { loadAccountLimits } from "./usageLimits.js";
 import {
   cancelStaleQueuedAgentThreadRuns,
   registerCoordinationRoutes,
@@ -137,27 +145,36 @@ let devinModelCache:
 
 export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   const app = Fastify({ logger: true });
-  const codexAuth = new CodexAuthManager(pool, env.secretKey);
-  const cursorAuth = new CursorAuthManager(
-    pool,
-    env.secretKey,
-    env.cursorBinary,
-    resolve(env.managedRoot, "harness-auth", "cursor-auth")
+  // One auth manager per harness account (provider instance). Managers keep
+  // in-flight device logins in memory, so they are cached for the process.
+  const authHome = (name: string, instanceId: string) =>
+    resolve(env.managedRoot, "harness-auth", isDefaultProviderInstance(instanceId) ? name : `${name}-${instanceId}`);
+  const codexAuths = accountManagers((id) => new CodexAuthManager(pool, env.secretKey, {}, id));
+  const cursorAuths = accountManagers(
+    (id) => new CursorAuthManager(pool, env.secretKey, env.cursorBinary, authHome("cursor-auth", id), id)
   );
-  const openCodeAuth = new OpenCodeAuthManager(
-    pool,
-    env.secretKey,
-    env.openCodeBinary,
-    resolve(env.managedRoot, "harness-auth", "opencode-auth")
+  const openCodeAuths = accountManagers(
+    (id) => new OpenCodeAuthManager(pool, env.secretKey, env.openCodeBinary, authHome("opencode-auth", id), undefined, id)
   );
-  const devinAuth = new DevinAuthManager(
-    pool,
-    env.secretKey,
-    env.devinBinary,
-    resolve(env.managedRoot, "harness-auth", "devin-auth")
+  const devinAuths = accountManagers(
+    (id) => new DevinAuthManager(pool, env.secretKey, env.devinBinary, authHome("devin-auth", id), undefined, id)
   );
-  const claudeCodeAuth = new ClaudeCodeAuthManager(pool, env.secretKey);
-  app.addHook("onClose", async () => devinAuth.dispose());
+  const claudeCodeAuths = accountManagers((id) => new ClaudeCodeAuthManager(pool, env.secretKey, undefined, id));
+  const accountFor = async (request: FastifyRequest, driver: ProviderDriver): Promise<string> => {
+    const { instance } = z.object({ instance: z.string().trim().min(1).max(120).optional() }).parse(request.query);
+    const id = instance ?? defaultProviderInstanceId(driver);
+    const found = await pool.query("SELECT 1 FROM provider_instances WHERE id = $1 AND driver = $2", [id, driver]);
+    if (!found.rows[0]) throw app.httpErrors.notFound(`No ${PROVIDER_DRIVER_LABELS[driver]} account ${id}`);
+    return id;
+  };
+  const codexAuthFor = async (request: FastifyRequest) => codexAuths.get(await accountFor(request, "codex"));
+  const cursorAuthFor = async (request: FastifyRequest) => cursorAuths.get(await accountFor(request, "cursor"));
+  const openCodeAuthFor = async (request: FastifyRequest) => openCodeAuths.get(await accountFor(request, "opencode"));
+  const devinAuthFor = async (request: FastifyRequest) => devinAuths.get(await accountFor(request, "devin"));
+  const claudeCodeAuthFor = async (request: FastifyRequest) => claudeCodeAuths.get(await accountFor(request, "claude"));
+  app.addHook("onClose", async () => {
+    await Promise.all(devinAuths.all().map((manager) => manager.dispose()));
+  });
   await app.register(sensible);
   await app.register(cookie, { secret: env.cookieSecret });
   await app.register(cors, {
@@ -298,13 +315,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/codex-auth", async (request) => {
     requireAdmin(request);
-    return codexAuth.getStatus();
+    return (await codexAuthFor(request)).getStatus();
   });
 
   app.post("/api/codex-auth/login", async (request) => {
     const user = requireAdmin(request);
     try {
-      return await codexAuth.startDeviceLogin(user.id);
+      return await (await codexAuthFor(request)).startDeviceLogin(user.id);
     } catch (error) {
       throw app.httpErrors.badGateway(sanitizeCodexAuthError(error));
     }
@@ -314,7 +331,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     const user = requireAdmin(request);
     const { id } = codexLoginParams.parse(request.params);
     try {
-      return await codexAuth.pollDeviceLogin(id, user.id);
+      return await (await codexAuthFor(request)).pollDeviceLogin(id, user.id);
     } catch (error) {
       throw app.httpErrors.badRequest(sanitizeCodexAuthError(error));
     }
@@ -322,24 +339,24 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.delete("/api/codex-auth", async (request) => {
     requireAdmin(request);
-    return codexAuth.disconnect();
+    return (await codexAuthFor(request)).disconnect();
   });
 
   app.get("/api/cursor-auth", async (request) => {
     requireAdmin(request);
-    return cursorAuth.getStatus();
+    return (await cursorAuthFor(request)).getStatus();
   });
 
   app.post("/api/cursor-auth/api-key", async (request) => {
     requireAdmin(request);
     const body = z.object({ apiKey: z.string().trim().min(1) }).parse(request.body);
-    return cursorAuth.saveApiKey(body.apiKey);
+    return (await cursorAuthFor(request)).saveApiKey(body.apiKey);
   });
 
   app.post("/api/cursor-auth/import-host", async (request) => {
     requireAdmin(request);
     try {
-      return await cursorAuth.importHostAuth();
+      return await (await cursorAuthFor(request)).importHostAuth();
     } catch (error) {
       throw app.httpErrors.badRequest(error instanceof Error ? error.message : String(error));
     }
@@ -347,56 +364,56 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.post("/api/cursor-auth/login", async (request) => {
     const user = requireAdmin(request);
-    return cursorAuth.startLogin(user.id);
+    return (await cursorAuthFor(request)).startLogin(user.id);
   });
 
   app.get("/api/cursor-auth/login/:id", async (request) => {
     const user = requireAdmin(request);
     const { id } = codexLoginParams.parse(request.params);
-    return cursorAuth.pollLogin(id, user.id);
+    return (await cursorAuthFor(request)).pollLogin(id, user.id);
   });
 
   app.delete("/api/cursor-auth", async (request) => {
     requireAdmin(request);
-    return cursorAuth.disconnect();
+    return (await cursorAuthFor(request)).disconnect();
   });
 
   app.get("/api/opencode-auth", async (request) => {
     requireAdmin(request);
-    return openCodeAuth.getStatus();
+    return (await openCodeAuthFor(request)).getStatus();
   });
 
   app.post("/api/opencode-auth/import-host", async (request) => {
     requireAdmin(request);
-    return openCodeAuth.importHostAuth();
+    return (await openCodeAuthFor(request)).importHostAuth();
   });
 
   app.post("/api/opencode-auth/login", async (request) => {
     const user = requireAdmin(request);
-    return openCodeAuth.startLogin(user.id);
+    return (await openCodeAuthFor(request)).startLogin(user.id);
   });
 
   app.get("/api/opencode-auth/login/:id", async (request) => {
     const user = requireAdmin(request);
     const { id } = codexLoginParams.parse(request.params);
-    return openCodeAuth.pollLogin(id, user.id);
+    return (await openCodeAuthFor(request)).pollLogin(id, user.id);
   });
 
   app.delete("/api/opencode-auth", async (request) => {
     requireAdmin(request);
-    return openCodeAuth.disconnect();
+    return (await openCodeAuthFor(request)).disconnect();
   });
 
   app.get("/api/claude-code-auth", async (request) => {
     requireAdmin(request);
-    return claudeCodeAuth.getStatus();
+    return (await claudeCodeAuthFor(request)).getStatus();
   });
 
   app.post("/api/claude-code-auth/token", async (request) => {
     requireAdmin(request);
     const body = z.object({ token: z.string().trim().min(1) }).parse(request.body);
     try {
-      return await claudeCodeAuth.saveCredential(body.token);
+      return await (await claudeCodeAuthFor(request)).saveCredential(body.token);
     } catch (error) {
       throw app.httpErrors.badRequest(error instanceof Error ? error.message : "Could not save the Claude credential.");
     }
@@ -404,24 +421,24 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.delete("/api/claude-code-auth", async (request) => {
     requireAdmin(request);
-    return claudeCodeAuth.disconnect();
+    return (await claudeCodeAuthFor(request)).disconnect();
   });
 
   app.get("/api/devin-auth", async (request) => {
     requireAdmin(request);
-    return devinAuth.getStatus();
+    return (await devinAuthFor(request)).getStatus();
   });
 
   app.post("/api/devin-auth/api-key", async (request) => {
     requireAdmin(request);
     const body = z.object({ apiKey: z.string().trim().min(1) }).parse(request.body);
-    return devinAuth.saveApiKey(body.apiKey);
+    return (await devinAuthFor(request)).saveApiKey(body.apiKey);
   });
 
   app.post("/api/devin-auth/import-host", async (request) => {
     requireAdmin(request);
     try {
-      return await devinAuth.importHostAuth();
+      return await (await devinAuthFor(request)).importHostAuth();
     } catch (error) {
       throw app.httpErrors.badRequest(error instanceof Error ? error.message : String(error));
     }
@@ -429,25 +446,136 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.post("/api/devin-auth/login", async (request) => {
     const user = requireAdmin(request);
-    return devinAuth.startLogin(user.id);
+    return (await devinAuthFor(request)).startLogin(user.id);
   });
 
   app.post("/api/devin-auth/login/:id/code", async (request) => {
     const user = requireAdmin(request);
     const { id } = codexLoginParams.parse(request.params);
     const body = z.object({ code: z.string().trim().min(1) }).parse(request.body);
-    return devinAuth.submitLoginCode(id, user.id, body.code);
+    return (await devinAuthFor(request)).submitLoginCode(id, user.id, body.code);
   });
 
   app.get("/api/devin-auth/login/:id", async (request) => {
     const user = requireAdmin(request);
     const { id } = codexLoginParams.parse(request.params);
-    return devinAuth.pollLogin(id, user.id);
+    return (await devinAuthFor(request)).pollLogin(id, user.id);
   });
 
   app.delete("/api/devin-auth", async (request) => {
     requireAdmin(request);
-    return devinAuth.disconnect();
+    return (await devinAuthFor(request)).disconnect();
+  });
+
+  app.get("/api/harness-accounts", async (request) => {
+    requireAdmin(request);
+    const result = await pool.query<{
+      id: string;
+      driver: ProviderDriver;
+      label: string | null;
+      created_at: Date;
+      agents: number;
+      threads: number;
+    }>(
+      `SELECT provider_instances.id, provider_instances.driver, NULLIF(provider_instances.config->>'label', '') AS label,
+              provider_instances.created_at,
+              (SELECT count(*)::int FROM agents WHERE agents.provider_instance_id = provider_instances.id) AS agents,
+              (SELECT count(*)::int FROM agent_threads WHERE agent_threads.provider_instance_id = provider_instances.id
+                 AND agent_threads.archived_at IS NULL) AS threads
+       FROM provider_instances
+       WHERE enabled = true AND driver = ANY($1::text[])
+       ORDER BY created_at ASC, id ASC`,
+      [PROVIDER_DRIVERS]
+    );
+    return {
+      accounts: result.rows.map((row) => ({
+        id: row.id,
+        driver: row.driver,
+        label: row.label,
+        isDefault: isDefaultProviderInstance(row.id),
+        createdAt: row.created_at,
+        agents: row.agents,
+        threads: row.threads
+      }))
+    };
+  });
+
+  app.post("/api/harness-accounts", async (request) => {
+    requireAdmin(request);
+    const body = z
+      .object({ driver: z.enum(PROVIDER_DRIVERS as [ProviderDriver, ...ProviderDriver[]]), label: z.string().trim().min(1).max(60) })
+      .parse(request.body);
+    const existing = await pool.query<{ id: string }>("SELECT id FROM provider_instances");
+    const id = newProviderInstanceId(body.driver, body.label, existing.rows.map((row) => row.id));
+    await pool.query(
+      `INSERT INTO provider_instances (id, driver, display_name, enabled, config)
+       VALUES ($1, $2, $3, true, jsonb_build_object('label', $4::text))`,
+      [id, body.driver, PROVIDER_DRIVER_LABELS[body.driver], body.label]
+    );
+    return { account: { id, driver: body.driver, label: body.label, isDefault: false, agents: 0, threads: 0 } };
+  });
+
+  app.patch("/api/harness-accounts/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = z.object({ id: z.string().min(1).max(120) }).parse(request.params);
+    const body = z.object({ label: z.string().trim().max(60) }).parse(request.body);
+    const result = await pool.query(
+      `UPDATE provider_instances
+       SET config = jsonb_set(config, '{label}', to_jsonb($2::text)), updated_at = now()
+       WHERE id = $1
+       RETURNING id`,
+      [id, body.label]
+    );
+    if (!result.rows[0]) throw app.httpErrors.notFound("Account not found");
+    return { ok: true };
+  });
+
+  app.delete("/api/harness-accounts/:id", async (request) => {
+    requireAdmin(request);
+    const { id } = z.object({ id: z.string().min(1).max(120) }).parse(request.params);
+    if (isDefaultProviderInstance(id)) {
+      throw app.httpErrors.badRequest("The default account cannot be removed. Disconnect it instead.");
+    }
+    const usage = await pool.query<{ agents: number; threads: number }>(
+      `SELECT (SELECT count(*)::int FROM agents WHERE provider_instance_id = $1) AS agents,
+              (SELECT count(*)::int FROM agent_threads WHERE provider_instance_id = $1) AS threads`,
+      [id]
+    );
+    const { agents = 0, threads = 0 } = usage.rows[0] ?? {};
+    if (agents > 0 || threads > 0) {
+      throw app.httpErrors.conflict(
+        `This account is used by ${agents} agent${agents === 1 ? "" : "s"} and ${threads} thread${threads === 1 ? "" : "s"}. Move them to another account first.`
+      );
+    }
+    await withTransaction(pool, async (client) => {
+      // Account-scoped credentials are stored as `<secret>@<instance id>`.
+      await client.query("DELETE FROM secrets WHERE agent_accessible = false AND name LIKE '%@' || $1", [id]);
+      await client.query("DELETE FROM provider_instances WHERE id = $1", [id]);
+    });
+    return { ok: true };
+  });
+
+  app.get("/api/usage/limits", async (request) => {
+    requireAdmin(request);
+    const query = z.object({ refresh: z.enum(["0", "1"]).optional() }).parse(request.query);
+    const accounts = await pool.query<{ id: string; driver: ProviderDriver }>(
+      `SELECT id, driver FROM provider_instances
+       WHERE enabled = true AND driver = ANY($1::text[])
+       ORDER BY created_at ASC, id ASC`,
+      [PROVIDER_DRIVERS]
+    );
+    return { limits: await loadAccountLimits(pool, env.secretKey, accounts.rows, { refresh: query.refresh === "1" }) };
+  });
+
+  app.get("/api/usage/analytics", async (request) => {
+    requireAdmin(request);
+    const query = z
+      .object({
+        days: z.coerce.number().min(1).max(365).default(30),
+        tzOffset: z.coerce.number().int().min(-900).max(900).default(0)
+      })
+      .parse(request.query);
+    return loadUsageAnalytics(pool, { days: query.days, tzOffsetMinutes: query.tzOffset });
   });
 
   app.get("/api/codex/models", async (request) => {
@@ -462,9 +590,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         id: string;
         driver: string;
         display_name: string;
+        account_label: string | null;
         enabled: boolean;
       }>(
-        `SELECT id, driver, display_name, enabled
+        `SELECT id, driver,
+                CASE WHEN COALESCE(config->>'label', '') <> '' THEN display_name || ' · ' || (config->>'label') ELSE display_name END AS display_name,
+                NULLIF(config->>'label', '') AS account_label,
+                enabled
          FROM provider_instances
          WHERE enabled = true
          ORDER BY created_at ASC`
@@ -5142,4 +5274,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.error(error);
     process.exit(1);
   });
+}
+
+function accountManagers<T>(create: (instanceId: string) => T): { get(instanceId: string): T; all(): T[] } {
+  const managers = new Map<string, T>();
+  return {
+    get(instanceId) {
+      let manager = managers.get(instanceId);
+      if (!manager) {
+        manager = create(instanceId);
+        managers.set(instanceId, manager);
+      }
+      return manager;
+    },
+    all: () => [...managers.values()]
+  };
 }
