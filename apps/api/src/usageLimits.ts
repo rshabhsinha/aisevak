@@ -73,13 +73,14 @@ export async function loadAccountLimits(
   pool: DbPool,
   secretKey: string,
   accounts: { id: string; driver: ProviderDriver }[],
-  options: { refresh?: boolean; fetchImpl?: typeof fetch } = {}
+  options: { refresh?: boolean | string[]; fetchImpl?: typeof fetch } = {}
 ): Promise<AccountLimits[]> {
   const context: LimitsContext = { pool, secretKey, fetchImpl: options.fetchImpl ?? fetch, now: new Date() };
   return Promise.all(
     accounts.map(async (account) => {
       const cached = cache.get(account.id);
-      if (!options.refresh && cached && Date.now() - cached.at < CACHE_TTL_MS && cached.value.driver === account.driver) {
+      const refresh = Array.isArray(options.refresh) ? options.refresh.includes(account.id) : Boolean(options.refresh);
+      if (!refresh && cached && Date.now() - cached.at < CACHE_TTL_MS && cached.value.driver === account.driver) {
         return cached.value;
       }
       let value: AccountLimits;
@@ -95,6 +96,11 @@ export async function loadAccountLimits(
       return value;
     })
   );
+}
+
+/** Forget an account's cached limits, e.g. after it is removed. */
+export function forgetAccountLimits(accountId: string): void {
+  cache.delete(accountId);
 }
 
 async function fetchLimits(context: LimitsContext, accountId: string, driver: ProviderDriver): Promise<AccountLimits> {

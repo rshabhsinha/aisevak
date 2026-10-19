@@ -1,6 +1,6 @@
 import { encryptSecret, providerInstanceSecretName, type DbPool } from "@aisevak/core";
 import { describe, expect, it, vi } from "vitest";
-import { loadAccountLimits, parseClaudeUsage, parseCursorUsage, parseWhamUsage, type AccountLimits } from "./usageLimits.js";
+import { forgetAccountLimits, loadAccountLimits, parseClaudeUsage, parseCursorUsage, parseWhamUsage, type AccountLimits } from "./usageLimits.js";
 
 const key = Buffer.alloc(32, 7).toString("base64");
 
@@ -124,5 +124,26 @@ describe("account limits", () => {
       ["codex-local", "snapshot", 55]
     ]);
     expect(limits[2]!.error).toContain("expired");
+  });
+
+  it("re-checks only the accounts named in a targeted refresh", async () => {
+    let utilization = 10;
+    const fetchImpl = vi.fn(async () => new Response(JSON.stringify({ five_hour: { utilization } })));
+    const pool = poolWith({
+      claude_code_token: "sk-ant-oat01-personal-token-HOME",
+      [providerInstanceSecretName("claude_code_token", "claude-ops")]: "sk-ant-oat01-ops-token-OPS"
+    });
+    const accounts = [
+      { id: "claude-local", driver: "claude" as const },
+      { id: "claude-ops", driver: "claude" as const }
+    ];
+    const options = { fetchImpl: fetchImpl as unknown as typeof fetch };
+    await loadAccountLimits(pool, key, accounts, { ...options, refresh: true });
+    utilization = 70;
+    const targeted = await loadAccountLimits(pool, key, accounts, { ...options, refresh: ["claude-ops"] });
+    expect(targeted.map((entry) => entry.windows[0]?.usedPercent)).toEqual([10, 70]);
+    forgetAccountLimits("claude-local");
+    const afterForget = await loadAccountLimits(pool, key, accounts, options);
+    expect(afterForget.map((entry) => entry.windows[0]?.usedPercent)).toEqual([70, 70]);
   });
 });

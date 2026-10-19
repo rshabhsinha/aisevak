@@ -3918,9 +3918,12 @@ function CodexConnectionView({ instanceId, onStatus }: HarnessAccountViewProps =
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
   useEffect(() => {
+    if (status === placeholderStatus.current) return;
     onStatus?.({ connected: status.connected, lastError: status.lastError });
-  }, [status.connected, status.lastError]);
+  }, [status]);
 
   useEffect(() => {
     if (!login) return;
@@ -4116,9 +4119,12 @@ function CursorConnectionView({ instanceId, onStatus }: HarnessAccountViewProps 
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
   useEffect(() => {
+    if (status === placeholderStatus.current) return;
     onStatus?.({ connected: status.connected, lastError: status.lastError });
-  }, [status.connected, status.lastError]);
+  }, [status]);
 
   useEffect(() => {
     if (!login) return;
@@ -4342,9 +4348,12 @@ function OpenCodeConnectionView({ instanceId, onStatus }: HarnessAccountViewProp
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
   useEffect(() => {
+    if (status === placeholderStatus.current) return;
     onStatus?.({ connected: status.connected, lastError: status.lastError });
-  }, [status.connected, status.lastError]);
+  }, [status]);
 
   useEffect(() => {
     if (!login) return;
@@ -4529,9 +4538,12 @@ function DevinConnectionView({ instanceId, onStatus }: HarnessAccountViewProps =
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
   useEffect(() => {
+    if (status === placeholderStatus.current) return;
     onStatus?.({ connected: status.connected, lastError: status.lastError });
-  }, [status.connected, status.lastError]);
+  }, [status]);
 
   async function loadStatus() {
     setBusy(true);
@@ -4683,9 +4695,12 @@ function ClaudeCodeConnectionView({ instanceId, onStatus }: HarnessAccountViewPr
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
   useEffect(() => {
+    if (status === placeholderStatus.current) return;
     onStatus?.({ connected: status.connected, lastError: status.lastError });
-  }, [status.connected, status.lastError]);
+  }, [status]);
 
   async function loadStatus() {
     setBusy(true);
@@ -5806,7 +5821,16 @@ function HarnessesView(props: {
             account={selected}
             accounts={props.accounts}
             limits={limits[selected.id]}
-            onStatus={(status) => setStatuses((current) => ({ ...current, [selected.id]: status }))}
+            onStatus={(status) => {
+              const previous = statuses[selected.id];
+              setStatuses((current) => ({ ...current, [selected.id]: status }));
+              // A new or removed credential changes the limits; re-check just this account.
+              if (previous && previous.connected !== status.connected) {
+                void api<{ limits: AccountLimits[] }>(`/api/usage/limits?refresh=${encodeURIComponent(selected.id)}`)
+                  .then((result) => setLimits(Object.fromEntries(result.limits.map((entry) => [entry.accountId, entry]))))
+                  .catch(() => undefined);
+              }
+            }}
             onAccountsChanged={props.onAccountsChanged}
             onRemoved={() => setSelectedId(null)}
           />
@@ -5931,7 +5955,18 @@ function HarnessAccountDetail(props: {
             </p>
           </div>
           {!account.isDefault ? (
-            <Button variant="outline" disabled={busy || account.agents > 0} title={account.agents > 0 ? "Move its agents to another account first" : undefined} onClick={() => void remove()}>
+            <Button
+              variant="outline"
+              disabled={busy || !account.removable}
+              title={
+                account.removable
+                  ? undefined
+                  : account.agents > 0
+                    ? "Move its agents to another account first"
+                    : "This account ran threads, so it is kept for their history. Disconnect it instead."
+              }
+              onClick={() => void remove()}
+            >
               <Trash2 size={14} /> Remove account
             </Button>
           ) : null}

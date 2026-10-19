@@ -1,5 +1,5 @@
 import { ChevronRight, Gauge, RefreshCw, TrendingDown, TrendingUp } from "./icons";
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Badge } from "./ui/badge";
 import { Button } from "./ui/button";
 import { HarnessMark } from "./harness-logos";
@@ -27,6 +27,8 @@ export interface HarnessAccount {
   isDefault: boolean;
   agents: number;
   threads: number;
+  /** False for the default account and for accounts that agents or threads (archived included) use. */
+  removable: boolean;
 }
 
 export function accountName(account: Pick<HarnessAccount, "label" | "isDefault"> | undefined): string {
@@ -389,15 +391,21 @@ export function CostAnalyticsView({ accounts }: { accounts: HarnessAccount[] }) 
   const [expanded, setExpanded] = useState<Set<HarnessDriver>>(new Set());
   const [chartAsTable, setChartAsTable] = useState(false);
 
+  // Only the latest request may update the view, so a slow earlier range
+  // cannot overwrite a newer one.
+  const requestRef = useRef(0);
+
   async function load(range = days) {
+    const request = ++requestRef.current;
     setBusy(true);
     setError(null);
     try {
-      setData(await getJson<UsageAnalytics>(`/api/usage/analytics?days=${range}&tzOffset=${new Date().getTimezoneOffset()}`));
+      const result = await getJson<UsageAnalytics>(`/api/usage/analytics?days=${range}&tzOffset=${new Date().getTimezoneOffset()}`);
+      if (request === requestRef.current) setData(result);
     } catch (loadError) {
-      setError(loadError instanceof Error ? loadError.message : "Could not load usage analytics.");
+      if (request === requestRef.current) setError(loadError instanceof Error ? loadError.message : "Could not load usage analytics.");
     } finally {
-      setBusy(false);
+      if (request === requestRef.current) setBusy(false);
     }
   }
 

@@ -1,4 +1,5 @@
 import {
+  isDefaultProviderInstance,
   providerInstanceSecretName,
   OPENCODE_AUTH_SECRET_NAME,
   decryptSecret,
@@ -79,7 +80,10 @@ export class OpenCodeAuthManager {
       }
     }
 
+    // Only the default account may fall back to the host login; the runner
+    // never gives added accounts the host credentials.
     try {
+      if (!isDefaultProviderInstance(this.instanceId)) throw new Error("No stored credentials for this account");
       const host = await readFile(this.hostAuthPath, "utf8");
       const providerIds = openCodeAuthProviderIds(parseOpenCodeAuthFile(host));
       // Read-only: never persist host credentials from a status check.

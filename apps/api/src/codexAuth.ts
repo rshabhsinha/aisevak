@@ -241,7 +241,7 @@ export class CodexAuthManager {
            agent_accessible = false,
            updated_at = now()`,
       [
-        CODEX_CHATGPT_AUTH_SECRET_NAME,
+        this.secret(CODEX_CHATGPT_AUTH_SECRET_NAME),
         "Internal ChatGPT authentication used by the Codex runner",
         encrypted,
         requestedBy

@@ -67,7 +67,7 @@ import Fastify, {
 } from "fastify";
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
+import { mkdir, rm } from "node:fs/promises";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { PoolClient } from "pg";
@@ -80,7 +80,7 @@ import { DevinAuthManager, devinHomeEnv } from "./devinAuth.js";
 import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
 import { runHarnessCommand } from "./harnessCommand.js";
 import { loadUsageAnalytics } from "./usageAnalytics.js";
-import { loadAccountLimits } from "./usageLimits.js";
+import { forgetAccountLimits, loadAccountLimits } from "./usageLimits.js";
 import {
   cancelStaleQueuedAgentThreadRuns,
   registerCoordinationRoutes,
@@ -476,12 +476,14 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       created_at: Date;
       agents: number;
       threads: number;
+      all_threads: number;
     }>(
       `SELECT provider_instances.id, provider_instances.driver, NULLIF(provider_instances.config->>'label', '') AS label,
               provider_instances.created_at,
               (SELECT count(*)::int FROM agents WHERE agents.provider_instance_id = provider_instances.id) AS agents,
               (SELECT count(*)::int FROM agent_threads WHERE agent_threads.provider_instance_id = provider_instances.id
-                 AND agent_threads.archived_at IS NULL) AS threads
+                 AND agent_threads.archived_at IS NULL) AS threads,
+              (SELECT count(*)::int FROM agent_threads WHERE agent_threads.provider_instance_id = provider_instances.id) AS all_threads
        FROM provider_instances
        WHERE enabled = true AND driver = ANY($1::text[])
        ORDER BY created_at ASC, id ASC`,
@@ -495,7 +497,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         isDefault: isDefaultProviderInstance(row.id),
         createdAt: row.created_at,
         agents: row.agents,
-        threads: row.threads
+        threads: row.threads,
+        removable: !isDefaultProviderInstance(row.id) && row.agents === 0 && row.all_threads === 0
       }))
     };
   });
@@ -512,7 +515,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
        VALUES ($1, $2, $3, true, jsonb_build_object('label', $4::text))`,
       [id, body.driver, PROVIDER_DRIVER_LABELS[body.driver], body.label]
     );
-    return { account: { id, driver: body.driver, label: body.label, isDefault: false, agents: 0, threads: 0 } };
+    return { account: { id, driver: body.driver, label: body.label, isDefault: false, agents: 0, threads: 0, removable: true } };
   });
 
   app.patch("/api/harness-accounts/:id", async (request) => {
@@ -543,8 +546,12 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     );
     const { agents = 0, threads = 0 } = usage.rows[0] ?? {};
     if (agents > 0 || threads > 0) {
+      // Threads keep their account for good (archived ones included), so an
+      // account that ever ran a thread stays.
       throw app.httpErrors.conflict(
-        `This account is used by ${agents} agent${agents === 1 ? "" : "s"} and ${threads} thread${threads === 1 ? "" : "s"}. Move them to another account first.`
+        agents > 0
+          ? `This account is used by ${agents} agent${agents === 1 ? "" : "s"}. Move them to another account first.`
+          : `This account ran ${threads} thread${threads === 1 ? "" : "s"} (archived ones included), so it is kept for their history. Disconnect it instead.`
       );
     }
     await withTransaction(pool, async (client) => {
@@ -552,19 +559,30 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       await client.query("DELETE FROM secrets WHERE agent_accessible = false AND name LIKE '%@' || $1", [id]);
       await client.query("DELETE FROM provider_instances WHERE id = $1", [id]);
     });
+    // Drop in-flight logins, cached managers and login homes, so a later account
+    // that reuses this id starts clean.
+    await devinAuths.take(id)?.dispose();
+    for (const managers of [codexAuths, cursorAuths, openCodeAuths, claudeCodeAuths]) managers.take(id);
+    await Promise.all(
+      ["cursor-auth", "opencode-auth", "devin-auth"].map((name) => rm(authHome(name, id), { recursive: true, force: true }))
+    );
+    forgetAccountLimits(id);
     return { ok: true };
   });
 
   app.get("/api/usage/limits", async (request) => {
     requireAdmin(request);
-    const query = z.object({ refresh: z.enum(["0", "1"]).optional() }).parse(request.query);
+    // refresh=1 re-checks every account; refresh=<account id> just that one.
+    const query = z.object({ refresh: z.string().trim().max(120).optional() }).parse(request.query);
     const accounts = await pool.query<{ id: string; driver: ProviderDriver }>(
       `SELECT id, driver FROM provider_instances
        WHERE enabled = true AND driver = ANY($1::text[])
        ORDER BY created_at ASC, id ASC`,
       [PROVIDER_DRIVERS]
     );
-    return { limits: await loadAccountLimits(pool, env.secretKey, accounts.rows, { refresh: query.refresh === "1" }) };
+    return { limits: await loadAccountLimits(pool, env.secretKey, accounts.rows, {
+      refresh: query.refresh === "1" ? true : query.refresh && query.refresh !== "0" ? [query.refresh] : false
+    }) };
   });
 
   app.get("/api/usage/analytics", async (request) => {
@@ -5276,7 +5294,11 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   });
 }
 
-function accountManagers<T>(create: (instanceId: string) => T): { get(instanceId: string): T; all(): T[] } {
+function accountManagers<T>(create: (instanceId: string) => T): {
+  get(instanceId: string): T;
+  all(): T[];
+  take(instanceId: string): T | undefined;
+} {
   const managers = new Map<string, T>();
   return {
     get(instanceId) {
@@ -5287,6 +5309,11 @@ function accountManagers<T>(create: (instanceId: string) => T): { get(instanceId
       }
       return manager;
     },
-    all: () => [...managers.values()]
+    all: () => [...managers.values()],
+    take(instanceId) {
+      const manager = managers.get(instanceId);
+      managers.delete(instanceId);
+      return manager;
+    }
   };
 }

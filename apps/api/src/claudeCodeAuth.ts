@@ -75,7 +75,7 @@ export class ClaudeCodeAuthManager {
        SET description = excluded.description, encrypted_value = excluded.encrypted_value,
            agent_accessible = false, updated_at = now()`,
       [
-        CLAUDE_CODE_TOKEN_SECRET_NAME,
+        this.secret(CLAUDE_CODE_TOKEN_SECRET_NAME),
         kind === "oauth_token"
           ? "Claude subscription token used by the Claude Code harness"
           : "Anthropic API key used by the Claude Code harness",
