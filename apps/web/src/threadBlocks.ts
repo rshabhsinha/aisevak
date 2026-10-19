@@ -69,6 +69,8 @@ export interface ThreadUsage {
   cost?: { amount: number; currency: string };
 }
 
+export type TurnEndState = "completed" | "failed" | "cancelled" | "interrupted";
+
 export type ThreadBlock =
   | { kind: "user"; id: string; text: string; createdAt: string }
   | {
@@ -80,11 +82,21 @@ export type ThreadBlock =
       completedAt?: string;
       streaming: boolean;
     }
-  | { kind: "thinking"; id: string; text: string; createdAt: string; streaming: boolean }
+  | { kind: "thinking"; id: string; text: string; createdAt: string; completedAt?: string; streaming: boolean }
   | { kind: "tools"; id: string; entries: ThreadToolCall[]; createdAt: string }
   | { kind: "plan"; id: string; items: ThreadPlanItem[]; createdAt: string }
   | { kind: "diff"; id: string; diffs: ThreadFileDiff[]; createdAt: string }
-  | { kind: "usage"; id: string; usage: ThreadUsage; createdAt: string }
+  | {
+      kind: "turn-end";
+      id: string;
+      state: TurnEndState;
+      createdAt: string;
+      completedAt: string;
+      usage?: ThreadUsage;
+      detail?: string;
+      /** No provider completion was seen; the run simply stopped producing events. */
+      implicit?: boolean;
+    }
   | { kind: "comment"; id: string; text: string; createdAt: string }
   | { kind: "error"; id: string; label: string; detail?: string; createdAt: string }
   | { kind: "notice"; id: string; level: "info" | "warning"; text: string; detail?: string; createdAt: string }
@@ -188,6 +200,13 @@ export function deriveThreadBlocks(input: {
   // An interrupted run leaves open streaming markers; only keep them when the
   // run is actually still active.
   const runActive = input.run ? isActiveRunStatus(input.run.status) : false;
+  // The active run's last turn is still going, so it has no ending yet.
+  if (runActive) {
+    const lastEnd = lastIndexOf(blocks, (block) => block.kind === "turn-end");
+    const lastUser = lastIndexOf(blocks, (block) => block.kind === "user");
+    const last = blocks[lastEnd];
+    if (last?.kind === "turn-end" && last.implicit && lastEnd > lastUser) blocks.splice(lastEnd, 1);
+  }
   if (!runActive) {
     for (const block of blocks) {
       if ((block.kind === "assistant" || block.kind === "thinking") && block.streaming) {
@@ -209,6 +228,11 @@ export function deriveThreadBlocks(input: {
   return blocks;
 }
 
+function lastIndexOf<T>(items: T[], predicate: (item: T) => boolean): number {
+  for (let index = items.length - 1; index >= 0; index -= 1) if (predicate(items[index]!)) return index;
+  return -1;
+}
+
 function isSteeringEvent(event: ThreadEvent): boolean {
   return event.event_type === "thread.message-sent" && rawRecord(event.payload)?.steer === true;
 }
@@ -228,18 +252,83 @@ function processRunGroup(
   const { blocks, blockIndex, push, replace } = ctx;
   const assistantByItemId = new Map<string, BlockOf<"assistant">>();
   const toolByItemId = new Map<string, { blockId: string; entryIndex: number }>();
-  const reasoningByItemId = new Map<string, string>();
-  let thinkingBlock: BlockOf<"thinking"> | null = null;
+  // Each burst of reasoning between other steps gets its own block.
+  const thinkingByItemId = new Map<string, string>();
+  const reasoningText = new Map<string, Map<string, string>>();
+  let openThinkingId: string | null = null;
   let planBlockId: string | null = null;
   // Shown once at the end of the run, holding the latest values.
   const summary: {
     turnDiff: { diffs: ThreadFileDiff[]; createdAt: string } | null;
     usage: { usage: ThreadUsage; createdAt: string } | null;
-  } = { turnDiff: null, usage: null };
+    firstAt: string | null;
+    lastAt: string | null;
+  } = { turnDiff: null, usage: null, firstAt: null, lastAt: null };
   const groupStartIndex = blocks.length;
+  let segmentStart = groupStartIndex;
+
+  // Close the current turn: changed files, then one ending with its status,
+  // duration and usage. A run can hold several turns (ACP steering prompts).
+  const endTurn = (state: TurnEndState, detail: string | undefined, createdAt: string, implicit = false) => {
+    if (!summary.firstAt) {
+      // Nothing happened since the last ending: a runner-inserted failure
+      // right after a provider ending amends it instead of adding another.
+      const previous = blocks[blocks.length - 1];
+      if (previous?.kind === "turn-end" && blocks.length - 1 >= groupStartIndex) {
+        if (state === "failed") replace({ ...previous, state, detail: detail ?? previous.detail, implicit: false });
+        return;
+      }
+      if (implicit) return;
+      summary.firstAt = createdAt;
+    }
+    if (summary.turnDiff && summary.turnDiff.diffs.length > 0) {
+      push({ kind: "diff", id: `diff:${blocks.length}:${summary.turnDiff.createdAt}`, diffs: summary.turnDiff.diffs, createdAt: summary.turnDiff.createdAt });
+    }
+    // Providers often report a fatal error and then fail the turn with the
+    // same message; the ending carries it, so drop the duplicate step.
+    if (detail) {
+      for (let index = blocks.length - 1; index >= segmentStart; index -= 1) {
+        const block = blocks[index]!;
+        if (block.kind === "error" && block.detail === detail) {
+          blocks.splice(index, 1);
+          blockIndex.clear();
+          blocks.forEach((entry, position) => blockIndex.set(entry.id, position));
+          break;
+        }
+      }
+    }
+    const usage = summary.usage && hasUsage(summary.usage.usage) ? summary.usage.usage : undefined;
+    push({
+      kind: "turn-end",
+      id: `turn-end:${blocks.length}:${summary.firstAt}`,
+      state,
+      detail,
+      createdAt: summary.firstAt,
+      completedAt: [summary.lastAt ?? summary.firstAt, implicit ? "" : createdAt].sort().at(-1)!,
+      usage,
+      implicit: implicit || undefined
+    });
+    summary.firstAt = null;
+    summary.lastAt = null;
+    summary.usage = null;
+    summary.turnDiff = null;
+    segmentStart = blocks.length;
+  };
+
+  const thinkingAt = (blockId: string) => {
+    const block = blocks[blockIndex.get(blockId) ?? -1];
+    return block?.kind === "thinking" ? block : null;
+  };
+  const closeThinking = (createdAt: string) => {
+    if (!openThinkingId) return;
+    const block = thinkingAt(openThinkingId);
+    if (block?.streaming) replace({ ...block, streaming: false, completedAt: block.completedAt ?? createdAt });
+    openThinkingId = null;
+  };
 
   // Text from a message is final once anything else happens in the run.
   const settleStreams = (createdAt: string) => {
+    closeThinking(createdAt);
     for (const block of assistantByItemId.values()) {
       if (block.streaming) {
         const next = { ...block, streaming: false, completedAt: block.completedAt ?? createdAt };
@@ -263,13 +352,23 @@ function processRunGroup(
   };
 
   const updateThinking = (itemId: string, createdAt: string, text: string, mode: "append" | "replace") => {
-    if (!thinkingBlock) {
-      thinkingBlock = { kind: "thinking", id: `thinking:${createdAt}:${blocks.length}`, text: "", createdAt, streaming: true };
-      push(thinkingBlock);
+    let blockId = thinkingByItemId.get(itemId) ?? openThinkingId;
+    if (!blockId || !thinkingAt(blockId)) {
+      blockId = `thinking:${createdAt}:${blocks.length}`;
+      push({ kind: "thinking", id: blockId, text: "", createdAt, streaming: true });
     }
-    reasoningByItemId.set(itemId, mode === "append" ? (reasoningByItemId.get(itemId) ?? "") + text : text);
-    thinkingBlock = { ...thinkingBlock, text: [...reasoningByItemId.values()].filter((part) => part.trim()).join("\n\n") };
-    replace(thinkingBlock);
+    thinkingByItemId.set(itemId, blockId);
+    openThinkingId = blockId;
+    const parts = reasoningText.get(blockId) ?? new Map<string, string>();
+    parts.set(itemId, mode === "append" ? (parts.get(itemId) ?? "") + text : text);
+    reasoningText.set(blockId, parts);
+    const current = thinkingAt(blockId)!;
+    replace({
+      ...current,
+      text: [...parts.values()].filter((part) => part.trim()).join("\n\n"),
+      streaming: true,
+      completedAt: createdAt
+    });
   };
 
   const upsertTool = (itemId: string, createdAt: string, mutate: (entry: ThreadToolCall) => void) => {
@@ -338,15 +437,17 @@ function processRunGroup(
         replace(next);
       }
     }
-    if (thinkingBlock?.streaming) {
-      thinkingBlock = { ...thinkingBlock, streaming: false };
-      replace(thinkingBlock);
-    }
+    closeThinking(createdAt);
   };
 
   for (const event of sortedEvents) {
     const createdAt = event.created_at ?? fallbackCreatedAt;
     const payload = rawRecord(event.payload);
+    // Turn timing comes from provider output only.
+    if (!["thread.message-sent", "task.comment", "turn.failed"].includes(event.event_type)) {
+      summary.firstAt ??= createdAt;
+      if (!summary.lastAt || createdAt > summary.lastAt) summary.lastAt = createdAt;
+    }
 
     // Rows aisevak writes itself (not provider output).
     if (event.event_type === "thread.message-sent") {
@@ -360,8 +461,8 @@ function processRunGroup(
       continue;
     }
     if (event.event_type === "turn.failed") {
-      push({ kind: "error", id: `error:${event.id}`, label: "Turn failed", detail: event.text ?? undefined, createdAt });
       closeTurn(createdAt);
+      endTurn("failed", event.text ?? undefined, createdAt);
       continue;
     }
 
@@ -443,18 +544,9 @@ function processRunGroup(
         closeTurn(createdAt);
         if (runtime.usage) mergeUsage(runtime.usage, createdAt);
         const turn = runtime.turn;
-        if (turn?.state === "failed") {
-          const detail = turnFailureDetail(turn);
-          const previous = blocks[blocks.length - 1];
-          // Codex reports a fatal error and then fails the turn with the same message.
-          if (previous?.kind === "error" && blocks.length > groupStartIndex && previous.detail === detail) {
-            replace({ ...previous, label: "Turn failed" });
-          } else {
-            push({ kind: "error", id: `error:${event.id}`, label: "Turn failed", detail, createdAt });
-          }
-        } else if (turn?.state === "cancelled" || turn?.state === "interrupted") {
-          push({ kind: "system", id: `system:${event.id}`, text: turn.state === "cancelled" ? "Turn cancelled" : "Turn interrupted", createdAt });
-        }
+        const state: TurnEndState =
+          turn?.state === "failed" || turn?.state === "cancelled" || turn?.state === "interrupted" ? turn.state : "completed";
+        endTurn(state, turn?.state === "failed" ? turnFailureDetail(turn) : undefined, createdAt);
         break;
       }
       case "runtime.error":
@@ -479,29 +571,21 @@ function processRunGroup(
       case "parse.error":
         push({ kind: "error", id: `error:${event.id}`, label: "Malformed provider output", detail: runtime.text, createdAt });
         break;
-      case "thread.started":
-        if (runtime.threadId) push({ kind: "system", id: `system:${event.id}`, text: `Session ${runtime.threadId}`, createdAt });
-        break;
       default:
-        // session.configured, request.opened (auto-approved), user.message
+        // thread.started (provider session ids are noise), session.configured, request.opened (auto-approved), user.message
         // (aisevak records prompts itself), turn.started, provider.event.
         break;
     }
   }
 
-  const { turnDiff, usage } = summary;
-  if (turnDiff && turnDiff.diffs.length > 0) {
-    push({ kind: "diff", id: `diff:${groupStartIndex}:${turnDiff.createdAt}`, diffs: turnDiff.diffs, createdAt: turnDiff.createdAt });
-  }
-  if (usage && hasUsage(usage.usage)) {
-    push({ kind: "usage", id: `usage:${groupStartIndex}:${usage.createdAt}`, usage: usage.usage, createdAt: usage.createdAt });
-  }
+  const lastAt = summary.lastAt ?? fallbackCreatedAt;
+  endTurn("completed", undefined, lastAt, true);
 }
 
 function applyToolItem(entry: ThreadToolCall, item: RuntimeItem): void {
-  if (item.title) entry.title = item.title;
+  if (item.title) entry.title = unwrapShellCommand(item.title);
   else if (!entry.title) entry.title = item.toolName ?? TOOL_LABELS[item.itemType];
-  if (item.command) entry.command = item.command;
+  if (item.command) entry.command = unwrapShellCommand(item.command);
   if (item.output) entry.output = item.output;
   if (item.exitCode !== undefined) entry.exitCode = item.exitCode;
   if (item.changes?.length) entry.diffs = item.changes.flatMap(fileDiff);
@@ -509,6 +593,14 @@ function applyToolItem(entry: ThreadToolCall, item: RuntimeItem): void {
   const status: ToolStatus = item.status === "in_progress" ? "running" : item.status === "completed" ? "completed" : "failed";
   // A late progress update never reopens a finished tool.
   if (!(status === "running" && entry.status !== "running")) entry.status = status;
+}
+
+/** `/bin/zsh -lc "pnpm test"` → `pnpm test`: the shell wrapper is harness plumbing. */
+export function unwrapShellCommand(command: string): string {
+  const match = /^(?:\/(?:usr\/)?bin\/)?(?:ba|z)?sh\s+-l?c\s+(['"])([\s\S]*)\1\s*$/.exec(command.trim());
+  if (!match) return command;
+  const inner = match[2]!;
+  return match[1] === "'" ? inner.replace(/'\\''/g, "'") : inner.replace(/\\(["\\$`])/g, "$1");
 }
 
 const TOOL_LABELS: Record<RuntimeItemType, string> = {

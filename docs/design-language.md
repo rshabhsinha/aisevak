@@ -105,7 +105,9 @@ Task cards are the main raised surface. Other collections prefer flat rows insid
 
 ### Conversation
 
-User messages use a compact muted bubble. Assistant content remains unboxed for readability. Tool work is grouped into a bordered, collapsible log. Code always uses the dark technical surface in both themes so syntax and copy behavior remain predictable.
+Every harness renders through one linear timeline (`chat-timeline.tsx`, styled in `timeline.css`). User messages use a compact muted bubble with attachment chips. An agent turn runs on a hairline rail with one marker per step: thinking, tool runs ("Ran 3 commands, edited 2 files"), plans, commentary, notices. While a turn is live the rail stays open and ends in a shimmering activity row. Once it finishes, the work folds into a single "Worked for 1m 4s" row, and the closing answer, changed files and any failure stay visible below it. Assistant content remains unboxed for readability. Code always uses the dark technical surface in both themes so syntax and copy behavior remain predictable.
+
+The composer (`agent-composer.tsx`, `composer.css`) is one rounded surface: an auto-growing input, an attachment tray (button, paste, or drop anywhere on the chat pane), and a toolbar with the model picker. The picker lists models grouped by harness with search and keyboard navigation, and a details pane shows the highlighted model's description and its options. Reasoning effort uses the AICSS Reasoning Effort slider.
 
 ## Layout patterns
 

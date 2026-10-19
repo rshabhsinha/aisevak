@@ -29,8 +29,9 @@
     ]
   },
   {
-    "kind": "error",
-    "label": "Turn failed",
-    "detail": "The agent hit its per-turn request limit"
+    "kind": "turn-end",
+    "state": "failed",
+    "detail": "The agent hit its per-turn request limit",
+    "completedAt": "2026-01-01T00:00:07Z"
   }
 ]

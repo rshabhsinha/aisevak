@@ -55,6 +55,9 @@ services:
       # devin-auth) — the API container runs as the runner UID and cannot create
       # siblings of the bind-mounted dirs above.
       - /srv/aisevak/harness-auth:/srv/aisevak/harness-auth
+      # Files attached to chat messages. The API writes them; the host runner
+      # hands agents the same absolute paths.
+      - /srv/aisevak/attachments:/srv/aisevak/attachments
       # Host-published harness CLIs (read-only) so status probes and model
       # discovery inside the container see the same binaries as the runner.
       - /opt/aisevak/harness-bin:/opt/aisevak/harness-bin:ro

@@ -1,6 +1,7 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
+import { registerAttachmentRoutes } from "./attachments.js";
 import {
   buildCodexPrompt,
   buildDispatcherPrompt,
@@ -169,6 +170,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   app.get("/api/health", async () => ({ ok: true }));
+
+  registerAttachmentRoutes(app, { managedRoot: env.managedRoot, requireUser });
 
   app.get("/api/onboarding/status", async () => {
     const users = await pool.query<{ count: string }>("SELECT count(*) FROM users");
