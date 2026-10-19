@@ -5,6 +5,7 @@ import {
   redactSecrets
 } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { acpPromptContent } from "./promptImages.js";
 import type { AppServerTurnInput, AppServerTurnOptions, AppServerTurnResult } from "./appServerClient.js";
 
 export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary" | "codexHome"> {
@@ -98,6 +99,12 @@ interface PendingRequest {
 // session/load starts a fresh session.
 const RECOVERABLE_ACP_METHODS = new Set(["authenticate", "session/set_model", "session/set_config_option", "session/load"]);
 
+export function acpSupportsImages(initializeResult: unknown): boolean {
+  const capabilities = (initializeResult as { agentCapabilities?: { promptCapabilities?: { image?: unknown } } } | null)
+    ?.agentCapabilities;
+  return capabilities?.promptCapabilities?.image === true;
+}
+
 class PersistentAcpSession {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingRequest>();
@@ -107,6 +114,8 @@ class PersistentAcpSession {
   private nextId = 1;
   private closed = false;
   private initializePromise: Promise<void> | null = null;
+  // From the `initialize` result: whether `session/prompt` accepts image blocks.
+  private supportsImages = false;
   private sessionId: string | null = null;
   lastUsedAt = Date.now();
   isRunning = false;
@@ -215,6 +224,9 @@ class PersistentAcpSession {
       await options.onThreadId(this.sessionId);
       await this.applyModel(options);
 
+      // Read image attachments before taking the launch fence, which holds row
+      // locks until the prompt is sent. acpPromptContent never throws.
+      const prompt = await acpPromptContent(options.prompt, this.supportsImages);
       const release = await options.onBeforeTurnStart?.();
       if (options.onBeforeTurnStart && !release) {
         return {
@@ -231,7 +243,7 @@ class PersistentAcpSession {
 
       const promptRequest = this.request("session/prompt", {
         sessionId: this.sessionId,
-        prompt: [{ type: "text", text: options.prompt }]
+        prompt
       }, true);
       void promptRequest.catch(() => undefined);
       promptMayHaveBeenPresented = true;
@@ -281,7 +293,7 @@ class PersistentAcpSession {
           try {
             await this.request("session/prompt", {
               sessionId: this.sessionId,
-              prompt: [{ type: "text", text: input.message }]
+              prompt: await acpPromptContent(input.message, this.supportsImages)
             }, true);
             await options.onInputHandled?.(input);
           } catch (error) {
@@ -354,6 +366,7 @@ class PersistentAcpSession {
     if (!this.initializePromise) {
       this.initializePromise = (async () => {
         const result = await this.request("initialize", buildAcpInitializeParams());
+        this.supportsImages = acpSupportsImages(result);
         const methods = Array.isArray((result as { authMethods?: unknown }).authMethods)
           ? ((result as { authMethods: Array<{ id?: string }> }).authMethods ?? [])
           : [];

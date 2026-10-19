@@ -1,5 +1,6 @@
 import { buildCodexAppServerArgs } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { codexUserInput } from "./promptImages.js";
 
 type JsonRpcId = string | number;
 
@@ -280,6 +281,9 @@ class PersistentAppServer {
       this.loadedThreads.add(state.threadId);
       await options.onThreadId(state.threadId);
 
+      // Read image attachments before taking the launch fence, which holds row
+      // locks until turn/start is sent. codexUserInput never throws.
+      const input = await codexUserInput(options.prompt);
       const releaseTurnStartFence = await options.onBeforeTurnStart?.();
       if (options.onBeforeTurnStart && !releaseTurnStartFence) {
         return {
@@ -298,7 +302,7 @@ class PersistentAppServer {
       try {
         turnRequest = this.request("turn/start", {
           threadId: state.threadId,
-          input: [{ type: "text", text: options.prompt, text_elements: [] }],
+          input,
           cwd: options.cwd,
           model: explicitModel(options.model),
           ...(stringModelOption(options.modelOptions, "reasoningEffort")
@@ -476,7 +480,7 @@ class PersistentAppServer {
       const response = await this.request("turn/steer", {
         threadId: state.threadId,
         expectedTurnId: state.turnId,
-        input: [{ type: "text", text: input.message, text_elements: [] }]
+        input: await codexUserInput(input.message)
       });
       this.bindTurnId(state, extractTurnId({ result: response }));
       await state.options.onInputHandled?.(input);

@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, onTestFinished } from "vitest";
 import {
   closeAllCodexAppServers,
   runCodexAppServerTurn,
@@ -444,10 +445,69 @@ describe("Codex archive protocol",()=>{
     expect((await readFile(fixture.startsFile+".rpc","utf8")).trim().split("\n")).toEqual(["thread/archive","thread/unarchive"]);
     for(const pid of (await readFile(fixture.startsFile,"utf8")).trim().split("\n")) expect(()=>process.kill(Number(pid),0)).toThrow();
   });
+
+  it("passes stored image attachments as localImage input on turn/start and turn/steer", async () => {
+    const fixture = await fakeAppServerFixture();
+    const previousManagedRoot = process.env.MANAGED_ROOT;
+    process.env.MANAGED_ROOT = fixture.directory;
+    onTestFinished(() => {
+      if (previousManagedRoot === undefined) delete process.env.MANAGED_ROOT;
+      else process.env.MANAGED_ROOT = previousManagedRoot;
+    });
+    const inputLog = join(fixture.directory, "inputs");
+    const image = await storedAttachment(fixture.directory, "shot.png", PNG_BYTES);
+    const notes = await storedAttachment(fixture.directory, "notes.txt", Buffer.from("hello"));
+    const missing = join(fixture.directory, "attachments", "00000000-0000-4000-8000-000000000000", "gone.png");
+    const block = (lines: string[]) => `<attachments>\n${lines.join("\n")}\n</attachments>`;
+    const prompt = `look at this\n\n${block([
+      `- ${image.path} (image/png, ${PNG_BYTES.length} bytes, id ${image.id})`,
+      `- ${notes.path} (text/plain, 5 bytes, id ${notes.id})`,
+      `- ${missing} (image/png, 10 bytes, id 00000000-0000-4000-8000-000000000000)`
+    ])}`;
+    const env = { ...turnOptions(fixture, "").env, FAKE_INPUT_LOG: inputLog };
+
+    expect((await runCodexAppServerTurn({ ...turnOptions(fixture, prompt), env })).status).toBe("completed");
+    const steer = `and this\n\n${block([`- ${image.path} (image/png, ${PNG_BYTES.length} bytes, id ${image.id})`])}`;
+    let offered = false;
+    const steered = await runCodexAppServerTurn({
+      ...turnOptions(fixture, "wait-for-steer"),
+      env,
+      nextInput: async () => (offered ? null : ((offered = true), { id: "input-1", message: steer }))
+    });
+    expect(steered.status).toBe("completed");
+
+    const calls = (await readFile(inputLog, "utf8")).trim().split("\n").map((line) => JSON.parse(line));
+    expect(calls[0]).toEqual({
+      method: "turn/start",
+      input: [
+        { type: "text", text: prompt, text_elements: [] },
+        { type: "localImage", path: image.path }
+      ]
+    });
+    expect(calls[1].input).toEqual([{ type: "text", text: "wait-for-steer", text_elements: [] }]);
+    expect(calls[2]).toEqual({
+      method: "turn/steer",
+      input: [
+        { type: "text", text: steer, text_elements: [] },
+        { type: "localImage", path: image.path }
+      ]
+    });
+  });
 });
 
+const PNG_BYTES = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d]);
+
+async function storedAttachment(root: string, name: string, bytes: Buffer): Promise<{ id: string; path: string }> {
+  const id = randomUUID();
+  const directory = join(root, "attachments", id);
+  await mkdir(directory, { recursive: true });
+  const path = join(directory, name);
+  await writeFile(path, bytes);
+  return { id, path };
+}
+
 async function fakeAppServerFixture(): Promise<FakeFixture> {
-  const directory = await mkdtemp(join(tmpdir(), "aisevak-app-server-test-"));
+  const directory = await realpath(await mkdtemp(join(tmpdir(), "aisevak-app-server-test-")));
   cleanup.push(directory);
   const binary = join(directory, "fake-codex");
   const startsFile = join(directory, "starts");
@@ -495,6 +555,9 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
       setTimeout(() => fs.closeSync(0), 10);
     }
     return;
+  }
+  if ((message.method === "turn/start" || message.method === "turn/steer") && process.env.FAKE_INPUT_LOG) {
+    fs.appendFileSync(process.env.FAKE_INPUT_LOG, JSON.stringify({ method: message.method, input: message.params.input }) + "\\n");
   }
   if (message.method === "turn/start") {
     const turnId = "turn-" + (++turn);
