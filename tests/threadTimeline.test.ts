@@ -166,12 +166,13 @@ describe("deriveThreadBlocks", () => {
         { jsonrpc: "2.0", id: 5, result: { stopReason: "cancelled" } }
       ])
     });
-    // Each prompt result closes its own turn.
+    // The refusal closes the turn; the later cancellation produced nothing new,
+    // so it folds into that ending and the more serious state wins.
     expect(blocks).toMatchObject([
       { kind: "error", label: "Provider error", detail: "Failed to initialize session services" },
-      { kind: "turn-end", state: "failed", detail: "The model refused to continue" },
-      { kind: "turn-end", state: "cancelled" }
+      { kind: "turn-end", state: "failed", detail: "The model refused to continue" }
     ]);
+    expect(blocks).toHaveLength(2);
   });
 
   it("renders runner-inserted turn failures", () => {
@@ -201,6 +202,30 @@ describe("deriveThreadBlocks", () => {
       events: providerEvents("codex", [codex("error", { error: { message: "Rate limited", codexErrorInfo: "rateLimitExceeded" }, willRetry: true })])
     });
     expect(steps(blocks)).toMatchObject([{ kind: "notice", level: "warning", text: "Rate limited", detail: "rateLimitExceeded" }]);
+  });
+
+  it("folds output after a turn's completion into that ending instead of adding an empty turn", () => {
+    const blocks = deriveThreadBlocks({
+      run: { id: "run-1", status: "succeeded" },
+      events: providerEvents("codex", [
+        codex("item/completed", { item: { id: "m", type: "agentMessage", text: "Done." } }),
+        codex("turn/completed", { turn: { id: "t1", status: "completed" } }),
+        codex("thread/tokenUsage/updated", { tokenUsage: { last: { inputTokens: 10, outputTokens: 2 } } }),
+        codex("turn/completed", { turn: { id: "t1", status: "interrupted" } }),
+        { method: "some/unknown/notification", params: {} }
+      ])
+    });
+    expect(kinds(blocks)).toEqual(["assistant", "turn-end"]);
+    expect(blocks[1]).toMatchObject({ state: "interrupted" });
+  });
+
+  it("keeps the live turn open when a steering message is pending", () => {
+    const blocks = deriveThreadBlocks({
+      run: { id: "run-1", status: "running", started_at: "2026-01-01T00:00:00Z" },
+      events: providerEvents("codex", [codex("item/started", { item: { id: "c1", type: "commandExecution", command: "pnpm test", status: "inProgress" } })]),
+      pendingMessages: [{ id: "p1", text: "also lint", createdAt: "2026-01-01T00:00:05Z" }]
+    });
+    expect(kinds(blocks)).toEqual(["tools", "user", "working"]);
   });
 
   it("summarizes usage on the turn's ending", () => {

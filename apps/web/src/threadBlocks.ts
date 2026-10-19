@@ -188,15 +188,6 @@ export function deriveThreadBlocks(input: {
     processRunGroup(chronologicalEvents, fallbackCreatedAt, { push, replace, blockIndex, blocks });
   }
 
-  for (const message of input.pendingMessages ?? []) {
-    push({
-      kind: "user",
-      id: `pending:${message.id}`,
-      text: message.text,
-      createdAt: message.createdAt
-    });
-  }
-
   // An interrupted run leaves open streaming markers; only keep them when the
   // run is actually still active.
   const runActive = input.run ? isActiveRunStatus(input.run.status) : false;
@@ -207,6 +198,16 @@ export function deriveThreadBlocks(input: {
     const last = blocks[lastEnd];
     if (last?.kind === "turn-end" && last.implicit && lastEnd > lastUser) blocks.splice(lastEnd, 1);
   }
+  // Optimistic messages go after that cleanup so they never hide the live turn.
+  for (const message of input.pendingMessages ?? []) {
+    push({
+      kind: "user",
+      id: `pending:${message.id}`,
+      text: message.text,
+      createdAt: message.createdAt
+    });
+  }
+
   if (!runActive) {
     for (const block of blocks) {
       if ((block.kind === "assistant" || block.kind === "thinking") && block.streaming) {
@@ -227,6 +228,8 @@ export function deriveThreadBlocks(input: {
 
   return blocks;
 }
+
+const TURN_SEVERITY: Record<TurnEndState, number> = { completed: 0, interrupted: 1, cancelled: 1, failed: 2 };
 
 function lastIndexOf<T>(items: T[], predicate: (item: T) => boolean): number {
   for (let index = items.length - 1; index >= 0; index -= 1) if (predicate(items[index]!)) return index;
@@ -269,18 +272,41 @@ function processRunGroup(
 
   // Close the current turn: changed files, then one ending with its status,
   // duration and usage. A run can hold several turns (ACP steering prompts).
+  const resetSegment = () => {
+    summary.firstAt = null;
+    summary.lastAt = null;
+    summary.usage = null;
+    summary.turnDiff = null;
+    segmentStart = blocks.length;
+  };
   const endTurn = (state: TurnEndState, detail: string | undefined, createdAt: string, implicit = false) => {
-    if (!summary.firstAt) {
-      // Nothing happened since the last ending: a runner-inserted failure
-      // right after a provider ending amends it instead of adding another.
+    // Nothing visible happened since the last ending (trailing usage, config
+    // noise, a repeated completion, the runner's own failure row): fold it into
+    // that ending instead of drawing an empty turn.
+    const empty =
+      !blocks.slice(segmentStart).some((block) => block.kind !== "user" && block.kind !== "comment") &&
+      !summary.turnDiff?.diffs.length;
+    if (empty) {
       const previous = blocks[blocks.length - 1];
       if (previous?.kind === "turn-end" && blocks.length - 1 >= groupStartIndex) {
-        if (state === "failed") replace({ ...previous, state, detail: detail ?? previous.detail, implicit: false });
+        const escalate = !implicit && TURN_SEVERITY[state] > TURN_SEVERITY[previous.state];
+        const usage = summary.usage && hasUsage(summary.usage.usage) ? { ...previous.usage, ...summary.usage.usage } : previous.usage;
+        replace({
+          ...previous,
+          state: escalate ? state : previous.state,
+          detail: state === "failed" && !implicit ? (detail ?? previous.detail) : previous.detail,
+          completedAt: implicit ? previous.completedAt : [previous.completedAt, createdAt].sort().at(-1)!,
+          usage
+        });
+        resetSegment();
         return;
       }
-      if (implicit) return;
-      summary.firstAt = createdAt;
+      if (implicit) {
+        resetSegment();
+        return;
+      }
     }
+    summary.firstAt ??= createdAt;
     if (summary.turnDiff && summary.turnDiff.diffs.length > 0) {
       push({ kind: "diff", id: `diff:${blocks.length}:${summary.turnDiff.createdAt}`, diffs: summary.turnDiff.diffs, createdAt: summary.turnDiff.createdAt });
     }
@@ -308,11 +334,7 @@ function processRunGroup(
       usage,
       implicit: implicit || undefined
     });
-    summary.firstAt = null;
-    summary.lastAt = null;
-    summary.usage = null;
-    summary.turnDiff = null;
-    segmentStart = blocks.length;
+    resetSegment();
   };
 
   const thinkingAt = (blockId: string) => {

@@ -1,7 +1,7 @@
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import sensible from "@fastify/sensible";
-import { registerAttachmentRoutes } from "./attachments.js";
+import { registerAttachmentRoutes, stripAttachmentBlock } from "./attachments.js";
 import {
   buildCodexPrompt,
   buildDispatcherPrompt,
@@ -171,7 +171,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
 
   app.get("/api/health", async () => ({ ok: true }));
 
-  registerAttachmentRoutes(app, { managedRoot: env.managedRoot, requireUser });
+  registerAttachmentRoutes(app, {
+    managedRoot: env.managedRoot,
+    requireUser,
+    authenticate: (request) => getUserFromRequest(pool, request)
+  });
 
   app.get("/api/onboarding/status", async () => {
     const users = await pool.query<{ count: string }>("SELECT count(*) FROM users");
@@ -3885,7 +3889,8 @@ function modelOptionsFor(model: string | null | undefined, value: unknown): Mode
 }
 
 function threadTitleFromMessage(message: string): string {
-  const firstLine = message.trim().split(/\r?\n/, 1)[0]?.trim() || "New thread";
+  const { text, fileNames } = stripAttachmentBlock(message);
+  const firstLine = text.trim().split(/\r?\n/, 1)[0]?.trim() || fileNames[0] || "New thread";
   return firstLine.length <= 80 ? firstLine : `${firstLine.slice(0, 79).trimEnd()}…`;
 }
 

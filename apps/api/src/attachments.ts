@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
-import type { FastifyInstance, FastifyRequest } from "fastify";
+import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import { z } from "zod";
 
 // Files people attach to chat messages. They are written under
@@ -20,12 +20,26 @@ export interface StoredAttachment {
 }
 
 const uploadSchema = z.object({
-  name: z.string().trim().min(1).max(200),
+  // Long names are shortened on disk (safeAttachmentName), never rejected.
+  name: z.string().trim().min(1).transform((name) => name.slice(0, 500)),
   mimeType: z.string().trim().max(120).default("application/octet-stream"),
   data: z.string().min(1)
 });
 
 const fileParams = z.object({ id: z.string().uuid(), name: z.string().min(1) });
+
+const ATTACHMENT_BLOCK = /\n*<attachments>\n([\s\S]*?)\n<\/attachments>\s*$/;
+
+/** The message without its trailing attachment block, plus the attached file names. */
+export function stripAttachmentBlock(message: string): { text: string; fileNames: string[] } {
+  const match = ATTACHMENT_BLOCK.exec(message);
+  if (!match) return { text: message, fileNames: [] };
+  const fileNames = match[1]!
+    .split("\n")
+    .map((line) => /^- (.+?) \(/.exec(line.trim())?.[1]?.split("/").pop())
+    .filter((name): name is string => Boolean(name));
+  return { text: message.slice(0, match.index), fileNames };
+}
 
 export function attachmentsRoot(managedRoot: string): string {
   return resolve(managedRoot, "attachments");
@@ -93,12 +107,23 @@ export async function readAttachment(managedRoot: string, id: string): Promise<S
 
 export function registerAttachmentRoutes(
   app: FastifyInstance,
-  options: { managedRoot: string; requireUser: (request: FastifyRequest) => unknown }
+  options: {
+    managedRoot: string;
+    requireUser: (request: FastifyRequest) => unknown;
+    /** Resolves the signed-in user straight from the request (cookie or API key). */
+    authenticate: (request: FastifyRequest) => Promise<unknown>;
+  }
 ): void {
   // Base64 inflates the body by a third, plus JSON framing.
   const bodyLimit = Math.ceil(MAX_ATTACHMENT_BYTES * 1.4) + 4096;
 
-  app.post("/api/attachments", { bodyLimit }, async (request, reply) => {
+  // The global preHandler that sets request.user runs after the body is parsed,
+  // so reject anonymous uploads before reading up to ~28 MB of JSON.
+  const onRequest = async (request: FastifyRequest, reply: FastifyReply) => {
+    if (!(await options.authenticate(request))) return reply.unauthorized();
+  };
+
+  app.post("/api/attachments", { bodyLimit, onRequest }, async (request, reply) => {
     options.requireUser(request);
     const body = uploadSchema.parse(request.body);
     const bytes = Buffer.from(body.data.replace(/^data:[^,]*,/, ""), "base64");

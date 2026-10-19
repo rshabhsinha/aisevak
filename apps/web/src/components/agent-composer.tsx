@@ -136,6 +136,7 @@ async function uploadAttachment(file: File): Promise<MessageAttachment> {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name: file.name || "pasted-image.png", mimeType: blob.type || file.type, data: await readAsBase64(blob) })
   });
+  if (response.status === 413) throw new Error("Too large to upload (20 MB max).");
   if (!response.ok) {
     const text = await response.text();
     let message = text;
@@ -180,6 +181,8 @@ export function AgentComposer(props: {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const attachmentsRef = useRef(attachments);
   attachmentsRef.current = attachments;
+  const messageRef = useRef(message);
+  messageRef.current = message;
 
   useAutoGrow(textareaRef, message);
 
@@ -277,14 +280,22 @@ export function AgentComposer(props: {
 
   async function submit() {
     if (!canSend || !props.selection) return;
+    const sentText = message;
+    const sentKeys = new Set(ready.map((item) => item.key));
     const text = appendAttachmentBlock(message.trim(), ready.map((item) => item.attachment!));
     setSending(true);
     setError(null);
     try {
       await props.onSend(text, props.selection);
-      setMessage("");
-      attachments.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
-      setAttachments([]);
+      // Keep anything typed or attached while the send was in flight.
+      if (messageRef.current === sentText) setMessage("");
+      setAttachments((current) =>
+        current.filter((item) => {
+          if (!sentKeys.has(item.key)) return true;
+          if (item.previewUrl) URL.revokeObjectURL(item.previewUrl);
+          return false;
+        })
+      );
     } catch (sendError) {
       const raw = sendError instanceof Error ? sendError.message : "Failed to send message.";
       setError(props.formatError ? props.formatError(raw) : raw);

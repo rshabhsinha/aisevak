@@ -71,7 +71,9 @@ function buildTurn(
   live: BlockOf<"working"> | null
 ): AgentTurn {
   const startedAt = blocks[0]?.createdAt ?? end?.createdAt ?? live?.createdAt ?? new Date(0).toISOString();
-  if (live) return { type: "turn", id, steps: blocks, answer: null, outcomes: [], end, live, startedAt };
+  // Live turns, and work cut off by a steering message (it has no ending of
+  // its own), stay open on the rail.
+  if (live || !end) return { type: "turn", id, steps: blocks, answer: null, outcomes: [], end, live, startedAt };
 
   let answerIndex = -1;
   for (let index = blocks.length - 1; index >= 0; index -= 1) {

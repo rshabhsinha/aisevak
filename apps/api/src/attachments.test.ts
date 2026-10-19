@@ -1,8 +1,10 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import sensible from "@fastify/sensible";
+import Fastify from "fastify";
 import { afterEach, describe, expect, it } from "vitest";
-import { normalizeMimeType, readAttachment, safeAttachmentName, storeAttachment } from "./attachments.js";
+import { normalizeMimeType, readAttachment, registerAttachmentRoutes, safeAttachmentName, storeAttachment, stripAttachmentBlock } from "./attachments.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -30,5 +32,39 @@ describe("chat attachments", () => {
     expect(normalizeMimeType("", "report.PDF")).toBe("application/pdf");
     expect(normalizeMimeType("application/octet-stream", "shot.png")).toBe("image/png");
     expect(normalizeMimeType("text/x-log", "a.log")).toBe("text/x-log");
+  });
+
+  it("strips the attachment block for thread titles", () => {
+    expect(stripAttachmentBlock("<attachments>\n- /srv/aisevak/attachments/1/shot.png (image/png, 3 bytes, id 1)\n</attachments>")).toEqual({
+      text: "",
+      fileNames: ["shot.png"]
+    });
+    expect(stripAttachmentBlock("Fix this")).toEqual({ text: "Fix this", fileNames: [] });
+  });
+
+  it("rejects anonymous uploads and stores signed-in ones", async () => {
+    const root = await mkdtemp(join(tmpdir(), "aisevak-attachments-"));
+    roots.push(root);
+    let signedIn = false;
+    const app = Fastify();
+    await app.register(sensible);
+    registerAttachmentRoutes(app, {
+      managedRoot: root,
+      requireUser: () => {
+        if (!signedIn) throw app.httpErrors.unauthorized();
+        return {};
+      },
+      authenticate: async () => (signedIn ? {} : undefined)
+    });
+    const upload = { name: "a.txt", mimeType: "text/plain", data: Buffer.from("hello").toString("base64") };
+    expect((await app.inject({ method: "POST", url: "/api/attachments", payload: upload })).statusCode).toBe(401);
+    signedIn = true;
+    const response = await app.inject({ method: "POST", url: "/api/attachments", payload: upload });
+    expect(response.statusCode).toBe(200);
+    const { attachment } = response.json() as { attachment: { id: string; name: string } };
+    const download = await app.inject({ method: "GET", url: `/api/attachments/${attachment.id}/${attachment.name}` });
+    expect(download.body).toBe("hello");
+    expect(download.headers["content-disposition"]).toContain("attachment;");
+    await app.close();
   });
 });

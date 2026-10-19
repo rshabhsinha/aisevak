@@ -105,11 +105,11 @@ function TaskComment({ block }: { block: BlockOf<"comment"> }) {
 }
 
 const Turn = memo(function Turn({ turn, latest }: { turn: AgentTurn; latest: boolean }) {
-  if (turn.live) {
+  if (turn.live || !turn.end) {
     return (
-      <section className="tl-turn is-live" aria-label="Agent turn in progress">
-        <Rail steps={turn.steps} live />
-        <LiveRow turn={turn} />
+      <section className={`tl-turn ${turn.live ? "is-live" : ""}`} aria-label={turn.live ? "Agent turn in progress" : "Agent work"}>
+        <Rail steps={turn.steps} live={Boolean(turn.live)} />
+        {turn.live ? <LiveRow turn={turn} /> : null}
       </section>
     );
   }

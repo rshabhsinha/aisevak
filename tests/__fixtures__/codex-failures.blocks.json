@@ -20,11 +20,6 @@
     "kind": "turn-end",
     "state": "failed",
     "detail": "Context window exceeded",
-    "completedAt": "2026-01-01T00:00:05Z"
-  },
-  {
-    "kind": "turn-end",
-    "state": "interrupted",
     "completedAt": "2026-01-01T00:00:06Z"
   },
   {

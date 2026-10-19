@@ -61,6 +61,8 @@ describe("groupTimeline", () => {
       { kind: "turn-end", id: "e", state: "completed", createdAt: at, completedAt: at }
     ]);
     expect(items.map((item) => item.type)).toEqual(["turn", "user", "turn"]);
+    // The work before the steer has no ending yet, so it stays open on the rail.
+    expect(items[0]).toMatchObject({ type: "turn", end: null, answer: null, steps: [{ id: "a" }] });
   });
 });
 
