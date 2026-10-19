@@ -7074,3 +7074,48 @@ label {
 .notice-row small { color: var(--muted-foreground); font-size: 11px; }
 .notice-warning { background: var(--warning-soft); color: var(--warning); }
 .notice-info { background: var(--muted); color: var(--muted-foreground); }
+
+/* Thread list controls: archived switch + refresh, one quiet row under search. */
+.thread-list-controls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+  margin: 2px 0 4px;
+  padding: 0 2px 0 4px;
+}
+
+.thread-list-controls.is-mobile {
+  padding: 4px 16px;
+}
+
+.thread-list-archived {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--muted-foreground);
+  font-size: 11.5px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.thread-list-archived:hover {
+  color: var(--foreground);
+}
+
+.thread-list-controls .thread-list-refresh {
+  width: 26px;
+  height: 26px;
+  flex: none;
+  color: var(--muted-foreground);
+}
+
+.thread-list-controls .thread-list-refresh:hover:not(:disabled) {
+  color: var(--foreground);
+}
+
+.thread-list-controls .switch { width: 26px; height: 16px; flex: none; }
+.thread-list-controls .switch-thumb { width: 12px; height: 12px; }
+.thread-list-controls .switch[data-state="checked"] .switch-thumb { transform: translateX(10px); }

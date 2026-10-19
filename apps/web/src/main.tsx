@@ -4,6 +4,8 @@ import { App } from "./App.js";
 import { ThemeProvider } from "./components/theme-provider.js";
 import "blobatar/motion.css";
 import "./styles.css";
+import "./timeline.css";
+import "./composer.css";
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

@@ -6,7 +6,6 @@ import {
   Bot,
   Calendar,
   ChatsIcon,
-  Check,
   CheckCircle2,
   ChevronDown,
   ChevronLeft,
@@ -47,20 +46,12 @@ import { AgentAvatar } from "./components/agent-avatar";
 import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
-import { ClaudeCodeLogo, CursorLogo, DevinLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
+import { ClaudeCodeLogo, CursorLogo, DevinLogo, OpenCodeLogo } from "./components/harness-logos";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { cn } from "./lib/utils";
 import { Badge } from "./components/ui/badge";
 import { Button } from "./components/ui/button";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList
-} from "./components/ui/command";
 import { Input } from "./components/ui/input";
 import { NativeSelect } from "./components/ui/native-select";
 import { Popover, PopoverContent, PopoverTrigger } from "./components/ui/popover";
@@ -74,6 +65,7 @@ import {
   type AgentRunTimelineRun
 } from "./agentRunTimeline";
 import { ChatTimeline, CollapsibleText, CopyButton } from "./components/chat-timeline";
+import { AgentComposer, optionsForModel, selectionForModel } from "./components/agent-composer";
 import { mergeRefreshedAgentThreads, updateAgentThreadInPlace } from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
@@ -473,6 +465,7 @@ export function App() {
   const [githubHostname, setGithubHostname] = useState("github.com");
   const threadsRequestRef = useRef(0);
   const [includeArchivedThreads, setIncludeArchivedThreads] = useState(false);
+  const [refreshingThreads, setRefreshingThreads] = useState(false);
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(initialRoute.threadId);
@@ -881,6 +874,28 @@ export function App() {
     if (user) void reloadAgentThreads().catch(error => setMessage(error instanceof Error ? error.message : "Could not load chats"));
   }, [includeArchivedThreads]);
 
+  function toggleArchivedThreads(include: boolean) {
+    threadsRequestRef.current += 1;
+    setAgentThreads(current => selectedThread ? current.filter(thread => thread.id === selectedThread.id) : []);
+    setNextThreadCursor(null);
+    setIncludeArchivedThreads(include);
+  }
+
+  async function refreshThreads() {
+    if (refreshingThreads) return;
+    setRefreshingThreads(true);
+    try {
+      await Promise.all([
+        reloadAgentThreads(),
+        selectedThreadId && !draftThread ? loadAgentThread(selectedThreadId) : Promise.resolve()
+      ]);
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Could not refresh chats");
+    } finally {
+      setRefreshingThreads(false);
+    }
+  }
+
   async function reloadAgentThreads(cursor?: string): Promise<AgentThread[]> {
     const requestId = ++threadsRequestRef.current;
     const suffix = `?limit=${SIDEBAR_THREAD_PAGE_SIZE}&includeArchived=${includeArchivedThreads}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`;
@@ -1134,14 +1149,14 @@ export function App() {
               </div>
             ) : null}
 
-            {view === "runs" ? <label className="text-muted" style={{padding:"6px 12px", fontSize:12}}>
-              <input type="checkbox" checked={includeArchivedThreads} onChange={event => {
-                threadsRequestRef.current += 1;
-                setAgentThreads(current => selectedThread ? current.filter(thread => thread.id === selectedThread.id) : []);
-                setNextThreadCursor(null);
-                setIncludeArchivedThreads(event.target.checked);
-              }} /> Show archived chats
-            </label> : null}
+            {view === "runs" ? (
+              <ThreadListControls
+                includeArchived={includeArchivedThreads}
+                onIncludeArchivedChange={toggleArchivedThreads}
+                refreshing={refreshingThreads}
+                onRefresh={() => void refreshThreads()}
+              />
+            ) : null}
 
             {draftThread && view === "runs" ? (
               <button
@@ -1383,7 +1398,9 @@ export function App() {
                 <MobileThreadListView
                   threads={filteredThreads}
                   includeArchived={includeArchivedThreads}
-                  onIncludeArchivedChange={setIncludeArchivedThreads}
+                  onIncludeArchivedChange={toggleArchivedThreads}
+                  refreshing={refreshingThreads}
+                  onRefresh={() => void refreshThreads()}
                   query={query}
                   hasMore={Boolean(nextThreadCursor)}
                   loadingMore={loadingOlderThreads}
@@ -3156,10 +3173,44 @@ function AgentThreadSidebar(props: {
   );
 }
 
+function ThreadListControls(props: {
+  includeArchived: boolean;
+  onIncludeArchivedChange: (value: boolean) => void;
+  refreshing: boolean;
+  onRefresh: () => void;
+  className?: string;
+}) {
+  return (
+    <div className={`thread-list-controls ${props.className ?? ""}`}>
+      <label className="thread-list-archived">
+        <Switch
+          checked={props.includeArchived}
+          onCheckedChange={props.onIncludeArchivedChange}
+          aria-label="Show archived chats"
+        />
+        <span>Show archived</span>
+      </label>
+      <Button
+        variant="ghost"
+        size="icon"
+        className="thread-list-refresh"
+        title="Refresh threads"
+        aria-label="Refresh threads"
+        disabled={props.refreshing}
+        onClick={props.onRefresh}
+      >
+        <RefreshCw size={13} className={props.refreshing ? "spin" : undefined} />
+      </Button>
+    </div>
+  );
+}
+
 function MobileThreadListView(props: {
   threads: AgentThread[];
   includeArchived: boolean;
   onIncludeArchivedChange: (value: boolean) => void;
+  refreshing: boolean;
+  onRefresh: () => void;
   query: string;
   hasMore: boolean;
   loadingMore: boolean;
@@ -3196,10 +3247,13 @@ function MobileThreadListView(props: {
         </div>
       </div>
 
-      <label className="mobile-thread-filter">
-        <input type="checkbox" checked={props.includeArchived} onChange={(event) => props.onIncludeArchivedChange(event.target.checked)} />
-        Show archived chats
-      </label>
+      <ThreadListControls
+        className="is-mobile"
+        includeArchived={props.includeArchived}
+        onIncludeArchivedChange={props.onIncludeArchivedChange}
+        refreshing={props.refreshing}
+        onRefresh={props.onRefresh}
+      />
       <div className="mobile-thread-list-scroll">
         {props.threads.map((thread) => {
           const active = isActiveRun(thread.latest_status);
@@ -3503,7 +3557,7 @@ function AgentChatsView(props: {
           {props.thread?.archived_at || props.thread?.cleanup_state === 'restoring' ? <div className="text-muted" role="status">
             {props.thread.archived_at ? "Chat archived. Restore it to send a message." : "Restoring chat…"}
             {props.thread.cleanup_error ? <p>{props.thread.cleanup_error}</p> : null}
-          </div> : <AgentChatComposer
+          </div> : <AgentComposer
             active={active}
             providers={props.providers}
             selection={props.selection}
@@ -3513,231 +3567,11 @@ function AgentChatsView(props: {
             onSelectionChange={props.onSelectionChange}
             onSend={props.onSendMessage}
             onCancel={props.onCancel}
+            formatError={friendlyError}
           />}
         </div>
       </div>
     </div>
-  );
-}
-
-function AgentChatComposer(props: {
-  active: boolean;
-  providers: ProviderInstance[];
-  selection: ModelSelection | null;
-  harnessLocked?: boolean;
-  message?: string;
-  onMessageChange?: (msg: string) => void;
-  onSelectionChange: (selection: ModelSelection) => Promise<void>;
-  onSend: (message: string, selection: ModelSelection) => Promise<void>;
-  onCancel: () => Promise<void>;
-}) {
-  const [internalMessage, setInternalMessage] = useState("");
-  const message = props.message !== undefined ? props.message : internalMessage;
-  const setMessage = props.onMessageChange ?? setInternalMessage;
-  const [sending, setSending] = useState(false);
-  const [pickerOpen, setPickerOpen] = useState(false);
-  const [modelQuery, setModelQuery] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const selection = props.selection;
-  const provider =
-    props.providers.find((entry) => entry.id === selection?.providerInstanceId) ?? props.providers[0];
-  const model = provider?.models.find((entry) => entry.id === selection?.model) ?? provider?.models[0];
-  const reasoningOption = model?.options?.find((option) => option.id === "reasoningEffort");
-  const reasoningValue =
-    selection?.options.find((option) => option.id === "reasoningEffort")?.value ??
-    reasoningOption?.defaultValue ??
-    "";
-
-  async function submit() {
-    const trimmed = message.trim();
-    if (!trimmed || !selection || sending) return;
-    setSending(true);
-    setError(null);
-    try {
-      await props.onSend(trimmed, selection);
-      setMessage("");
-    } catch (sendError) {
-      setError(sendError instanceof Error ? friendlyError(sendError.message) : "Failed to send message.");
-    } finally {
-      setSending(false);
-    }
-  }
-
-  return (
-    <form
-      className="agent-composer"
-      onSubmit={(event) => {
-        event.preventDefault();
-        void submit();
-      }}
-    >
-      <div className="agent-composer-surface">
-        <Textarea
-          value={message}
-          disabled={sending}
-          rows={2}
-          aria-label="Message the agent"
-          placeholder={props.active ? "Send guidance to the active turn…" : "Ask the agent to build, inspect, or change something"}
-          onChange={(event) => setMessage(event.target.value)}
-          onKeyDown={(event) => {
-            if (!shouldSubmitComposer({ ...event, isComposing: event.nativeEvent.isComposing }, window.matchMedia("(pointer: coarse)").matches)) return;
-            event.preventDefault();
-            void submit();
-          }}
-        />
-        <div className="agent-composer-footer">
-          <div className="agent-composer-controls">
-            <Select
-              value={provider?.id}
-              disabled={!provider || props.harnessLocked}
-              onValueChange={(providerId) => {
-                const nextProvider = props.providers.find((entry) => entry.id === providerId);
-                if (!nextProvider) return;
-                const nextModel =
-                  nextProvider.models.find((entry) => entry.id === selection?.model) ??
-                  nextProvider.models.find((entry) => entry.id === nextProvider.defaultModel) ??
-                  nextProvider.models[0];
-                if (!nextModel) return;
-                void props.onSelectionChange(selectionForModel(nextProvider, nextModel, selection));
-              }}
-            >
-              <SelectTrigger className="agent-harness-trigger" aria-label="Choose a harness" title={props.harnessLocked ? "Harness is locked for this thread" : "Choose a harness"}>
-                <SelectValue placeholder="Harness" />
-                {props.harnessLocked ? <LockKeyhole size={11} /> : null}
-              </SelectTrigger>
-              <SelectContent side="top" align="start">
-                <SelectGroup>
-                  <SelectLabel>Harness</SelectLabel>
-                  {props.providers.map((entry) => (
-                    <SelectItem key={entry.id} value={entry.id}>
-                      <span className="agent-harness-option">
-                        <HarnessMark driver={entry.driver} size={13} />
-                        {entry.display_name}
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectGroup>
-              </SelectContent>
-            </Select>
-
-            <Popover
-              open={pickerOpen}
-              onOpenChange={(open) => {
-                setPickerOpen(open);
-                if (!open) setModelQuery("");
-              }}
-            >
-              <PopoverTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="agent-model-trigger"
-                  aria-label="Choose a model"
-                  type="button"
-                  disabled={!provider}
-                >
-                  <span>{model?.label ?? selection?.model ?? "Choose model"}</span>
-                  <ChevronDown size={11} />
-                </Button>
-              </PopoverTrigger>
-              <PopoverContent
-                className="agent-model-popover"
-                side="top"
-                align="start"
-                sideOffset={8}
-                aria-label="Choose a model"
-              >
-                <Command>
-                  <CommandInput
-                    value={modelQuery}
-                    placeholder="Search models…"
-                    onValueChange={setModelQuery}
-                  />
-                  <CommandList>
-                    <CommandEmpty>No matching models.</CommandEmpty>
-                    <CommandGroup heading={provider?.display_name ?? "Models"}>
-                      {(provider?.models ?? []).map((modelEntry) => {
-                        const isSelected = modelEntry.id === selection?.model;
-                        return (
-                          <CommandItem
-                            value={`${modelEntry.label} ${modelEntry.id} ${modelEntry.description}`}
-                            className={isSelected ? "is-selected" : ""}
-                            key={modelEntry.id}
-                            onSelect={() => {
-                              if (!provider) return;
-                              void props.onSelectionChange(selectionForModel(provider, modelEntry, selection));
-                              setPickerOpen(false);
-                              setModelQuery("");
-                            }}
-                          >
-                            <div className="model-row-copy">
-                              <span className="model-row-label">
-                                {modelEntry.label}
-                                {modelEntry.badge && modelEntry.badge !== "Default" ? (
-                                  <span className="model-row-badge">{modelEntry.badge}</span>
-                                ) : null}
-                              </span>
-                              {modelEntry.description ? (
-                                <span className="model-row-desc">{modelEntry.description}</span>
-                              ) : null}
-                            </div>
-                            {isSelected ? <Check size={14} className="text-primary shrink-0 ml-2" /> : null}
-                          </CommandItem>
-                        );
-                      })}
-                    </CommandGroup>
-                  </CommandList>
-                </Command>
-              </PopoverContent>
-            </Popover>
-
-            {reasoningOption && selection ? (
-              <Select
-                value={String(reasoningValue)}
-                onValueChange={(value) => {
-                    const options = [
-                      ...selection.options.filter((option) => option.id !== reasoningOption.id),
-                      { id: reasoningOption.id, value }
-                    ];
-                    void props.onSelectionChange({ ...selection, options });
-                }}
-              >
-                <SelectTrigger className="reasoning-control" aria-label={reasoningOption.label}>
-                  <span className="reasoning-label">Reasoning</span>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent side="top" align="start">
-                  <SelectGroup>
-                    <SelectLabel>{reasoningOption.label}</SelectLabel>
-                    {reasoningOption.values.map((value) => (
-                      <SelectItem key={value.id} value={value.id}>{value.label}</SelectItem>
-                    ))}
-                  </SelectGroup>
-                </SelectContent>
-              </Select>
-            ) : null}
-          </div>
-
-          <div className="agent-composer-actions">
-            <span>{props.active ? "Message the active turn" : "Enter to send"} · Shift Enter for newline</span>
-            {props.active ? (
-              <button className="agent-send-button stop" type="button" onClick={() => void props.onCancel()} aria-label="Stop Codex">
-                <Square size={15} weight="fill" />
-              </button>
-            ) : null}
-            <button
-              className="agent-send-button"
-              type="submit"
-              disabled={!message.trim() || !selection || sending}
-              aria-label={sending ? "Sending" : props.active ? "Send guidance" : "Send message"}
-            >
-              {sending ? <Loader2 className="spin" size={15} /> : <ArrowUp size={16} weight="bold" />}
-            </button>
-          </div>
-        </div>
-      </div>
-      {error ? <div className="composer-error">{error}</div> : null}
-    </form>
   );
 }
 
@@ -6052,30 +5886,6 @@ function formatSidebarRunTime(value: string): string {
     return `${diffHours}h ago`;
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
-}
-
-function selectionForModel(
-  provider: ProviderInstance,
-  model: CodexModel,
-  previous?: ModelSelection | null
-): ModelSelection {
-  return {
-    providerInstanceId: provider.id,
-    model: model.id,
-    options: optionsForModel(model, previous?.options)
-  };
-}
-
-function optionsForModel(
-  model: CodexModel,
-  previous: ModelOptionSelection[] = []
-): ModelOptionSelection[] {
-  return (model.options ?? []).flatMap((option): ModelOptionSelection[] => {
-      const previousValue = previous.find((entry) => entry.id === option.id)?.value;
-      const canReusePrevious = option.values.some((value) => value.id === String(previousValue));
-      const value = canReusePrevious ? previousValue : (option.defaultValue ?? option.values[0]?.id);
-      return value ? [{ id: option.id, value }] : [];
-  });
 }
 
 function agentSummary(agent: Agent, providers: ProviderInstance[]): string {

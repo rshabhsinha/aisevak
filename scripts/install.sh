@@ -68,6 +68,7 @@ install -d -o "${RUNNER_USER}" -g "${RUNNER_USER}" \
   "${WORKSPACE_DIR}/skills" \
   "${WORKSPACE_DIR}/probe-schema" \
   "${WORKSPACE_DIR}/harness-auth" \
+  "${WORKSPACE_DIR}/attachments" \
   "${WORKSPACE_DIR}/worktrees"
 chmod 0700 "${WORKSPACE_DIR}/aws"
 # Older API releases created Codex homes as root from inside the container.

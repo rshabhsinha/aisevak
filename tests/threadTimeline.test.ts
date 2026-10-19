@@ -55,6 +55,8 @@ const thought = (text: string) => update("agent_thought_chunk", { content: { typ
 const codex = (method: string, params: Record<string, unknown>) => ({ method, params: { threadId: "thr", turnId: "t1", ...params } });
 
 const kinds = (blocks: ThreadBlock[]) => blocks.map((block) => block.kind);
+/** The blocks inside turns, without the per-turn endings. */
+const steps = (blocks: ThreadBlock[]) => blocks.filter((block) => block.kind !== "turn-end");
 
 describe("deriveThreadBlocks", () => {
   it("orders streamed deltas by seq even when created_at is not monotonic", () => {
@@ -66,7 +68,7 @@ describe("deriveThreadBlocks", () => {
       ],
       { createdAt: (index) => (index === 0 ? "2026-01-01T00:00:09Z" : "2026-01-01T00:00:01Z") }
     );
-    expect(deriveThreadBlocks({ run: null, events: events.reverse() })).toMatchObject([{ kind: "assistant", text: "Hello world" }]);
+    expect(steps(deriveThreadBlocks({ run: null, events: events.reverse() }))).toMatchObject([{ kind: "assistant", text: "Hello world" }]);
   });
 
   it("uses the run prompt only when no user message event exists", () => {
@@ -86,7 +88,7 @@ describe("deriveThreadBlocks", () => {
         chunk("Done.")
       ])
     });
-    expect(blocks).toMatchObject([
+    expect(steps(blocks)).toMatchObject([
       { kind: "assistant", text: "Checking.", streaming: false },
       { kind: "tools", entries: [{ title: "ls", status: "completed", icon: "terminal" }] },
       { kind: "assistant", text: "Done." }
@@ -99,24 +101,24 @@ describe("deriveThreadBlocks", () => {
       update("tool_call_update", { toolCallId: "t1", status: "in_progress" })
     ];
     const running = deriveThreadBlocks({ run: null, events: providerEvents("opencode", lines) });
-    expect(running).toMatchObject([{ kind: "tools", entries: [{ status: "running" }] }]);
+    expect(steps(running)).toMatchObject([{ kind: "tools", entries: [{ status: "running" }] }]);
     const done = deriveThreadBlocks({
       run: null,
       events: providerEvents("opencode", [...lines, update("tool_call_update", { toolCallId: "t1", status: "failed" })])
     });
-    expect(done).toMatchObject([{ kind: "tools", entries: [{ status: "failed" }] }]);
+    expect(steps(done)).toMatchObject([{ kind: "tools", entries: [{ status: "failed" }] }]);
   });
 
   it("streams Codex command output, then keeps the final aggregated output and exit code", () => {
     const started = codex("item/started", { item: { id: "c1", type: "commandExecution", command: "pnpm test", status: "inProgress" } });
     const delta = codex("item/commandExecution/outputDelta", { itemId: "c1", delta: "running…\n" });
     const live = deriveThreadBlocks({ run: null, events: providerEvents("codex", [started, delta]) });
-    expect(live).toMatchObject([{ kind: "tools", entries: [{ status: "running", output: "running…\n", command: "pnpm test" }] }]);
+    expect(steps(live)).toMatchObject([{ kind: "tools", entries: [{ status: "running", output: "running…\n", command: "pnpm test" }] }]);
     const completed = codex("item/completed", {
       item: { id: "c1", type: "commandExecution", command: "pnpm test", status: "completed", exitCode: 2, aggregatedOutput: "FAIL\n" }
     });
     const done = deriveThreadBlocks({ run: null, events: providerEvents("codex", [started, delta, completed]) });
-    expect(done).toMatchObject([{ kind: "tools", entries: [{ status: "failed", output: "FAIL\n", exitCode: 2 }] }]);
+    expect(steps(done)).toMatchObject([{ kind: "tools", entries: [{ status: "failed", output: "FAIL\n", exitCode: 2 }] }]);
   });
 
   it("streams Codex reasoning summaries and renders Codex plans", () => {
@@ -128,7 +130,7 @@ describe("deriveThreadBlocks", () => {
         codex("turn/plan/updated", { plan: [{ step: "A", status: "completed" }, { step: "B", status: "inProgress" }] })
       ])
     });
-    expect(blocks).toMatchObject([
+    expect(steps(blocks)).toMatchObject([
       { kind: "thinking", text: "Step one" },
       { kind: "plan", items: [{ title: "A", status: "completed" }, { title: "B", status: "running" }] }
     ]);
@@ -141,7 +143,7 @@ describe("deriveThreadBlocks", () => {
         codex("item/completed", { item: { id: "f1", type: "fileChange", status: "completed", changes: [{ path: "a.ts", kind: { type: "update" }, diff: "@@ -1 +1 @@\n-x\n+y\n" }] } })
       ])
     });
-    expect(codexBlocks).toMatchObject([
+    expect(steps(codexBlocks)).toMatchObject([
       { kind: "tools", entries: [{ icon: "edit", diffs: [{ path: "a.ts", diff: "--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-x\n+y\n" }] }] }
     ]);
     const acpBlocks = deriveThreadBlocks({
@@ -150,7 +152,7 @@ describe("deriveThreadBlocks", () => {
         update("tool_call", { toolCallId: "e1", title: "Edit `a.ts`", kind: "edit", status: "completed", content: [{ type: "diff", path: "a.ts", oldText: "x\n", newText: "y\n" }] })
       ])
     });
-    expect(acpBlocks).toMatchObject([
+    expect(steps(acpBlocks)).toMatchObject([
       { kind: "tools", entries: [{ title: "Edit a.ts", diffs: [{ path: "a.ts", diff: "--- a/a.ts\n+++ b/a.ts\n@@ -1,1 +1,1 @@\n-x\n+y" }] }] }
     ]);
   });
@@ -164,17 +166,34 @@ describe("deriveThreadBlocks", () => {
         { jsonrpc: "2.0", id: 5, result: { stopReason: "cancelled" } }
       ])
     });
+    // The refusal closes the turn; the later cancellation produced nothing new,
+    // so it folds into that ending and the more serious state wins.
     expect(blocks).toMatchObject([
       { kind: "error", label: "Provider error", detail: "Failed to initialize session services" },
-      { kind: "error", label: "Turn failed", detail: "The model refused to continue" },
-      { kind: "system", text: "Turn cancelled" }
+      { kind: "turn-end", state: "failed", detail: "The model refused to continue" }
     ]);
+    expect(blocks).toHaveLength(2);
   });
 
   it("renders runner-inserted turn failures", () => {
     expect(deriveThreadBlocks({ run: null, events: [aisevakEvent("turn.failed", { text: "Ownership changed" }, { seq: 4 })] })).toMatchObject([
-      { kind: "error", label: "Turn failed", detail: "Ownership changed" }
+      { kind: "turn-end", state: "failed", detail: "Ownership changed" }
     ]);
+  });
+
+  it("folds a runner failure into the provider's own failed ending", () => {
+    const blocks = deriveThreadBlocks({
+      run: null,
+      events: [
+        ...providerEvents("codex", [
+          codex("error", { error: { message: "Context window exceeded" }, willRetry: false }),
+          codex("turn/completed", { turn: { id: "t1", status: "failed", error: { message: "Context window exceeded" } } })
+        ]),
+        aisevakEvent("turn.failed", { text: "Run failed" }, { seq: 9, createdAt: "2026-01-01T00:00:05Z" })
+      ]
+    });
+    expect(kinds(blocks)).toEqual(["turn-end"]);
+    expect(blocks[0]).toMatchObject({ state: "failed", detail: "Run failed" });
   });
 
   it("shows retryable errors as warnings, not failures", () => {
@@ -182,10 +201,34 @@ describe("deriveThreadBlocks", () => {
       run: null,
       events: providerEvents("codex", [codex("error", { error: { message: "Rate limited", codexErrorInfo: "rateLimitExceeded" }, willRetry: true })])
     });
-    expect(blocks).toMatchObject([{ kind: "notice", level: "warning", text: "Rate limited", detail: "rateLimitExceeded" }]);
+    expect(steps(blocks)).toMatchObject([{ kind: "notice", level: "warning", text: "Rate limited", detail: "rateLimitExceeded" }]);
   });
 
-  it("summarizes usage once at the end of the run", () => {
+  it("folds output after a turn's completion into that ending instead of adding an empty turn", () => {
+    const blocks = deriveThreadBlocks({
+      run: { id: "run-1", status: "succeeded" },
+      events: providerEvents("codex", [
+        codex("item/completed", { item: { id: "m", type: "agentMessage", text: "Done." } }),
+        codex("turn/completed", { turn: { id: "t1", status: "completed" } }),
+        codex("thread/tokenUsage/updated", { tokenUsage: { last: { inputTokens: 10, outputTokens: 2 } } }),
+        codex("turn/completed", { turn: { id: "t1", status: "interrupted" } }),
+        { method: "some/unknown/notification", params: {} }
+      ])
+    });
+    expect(kinds(blocks)).toEqual(["assistant", "turn-end"]);
+    expect(blocks[1]).toMatchObject({ state: "interrupted" });
+  });
+
+  it("keeps the live turn open when a steering message is pending", () => {
+    const blocks = deriveThreadBlocks({
+      run: { id: "run-1", status: "running", started_at: "2026-01-01T00:00:00Z" },
+      events: providerEvents("codex", [codex("item/started", { item: { id: "c1", type: "commandExecution", command: "pnpm test", status: "inProgress" } })]),
+      pendingMessages: [{ id: "p1", text: "also lint", createdAt: "2026-01-01T00:00:05Z" }]
+    });
+    expect(kinds(blocks)).toEqual(["tools", "user", "working"]);
+  });
+
+  it("summarizes usage on the turn's ending", () => {
     const blocks = deriveThreadBlocks({
       run: null,
       events: providerEvents("opencode", [
@@ -196,7 +239,7 @@ describe("deriveThreadBlocks", () => {
     });
     expect(blocks).toMatchObject([
       { kind: "assistant", text: "pong", streaming: false },
-      { kind: "usage", usage: { contextUsedTokens: 50_000, contextMaxTokens: 200_000, inputTokens: 6675, outputTokens: 21 } }
+      { kind: "turn-end", state: "completed", usage: { contextUsedTokens: 50_000, contextMaxTokens: 200_000, inputTokens: 6675, outputTokens: 21 } }
     ]);
   });
 
@@ -214,8 +257,8 @@ describe("deriveThreadBlocks", () => {
         { id: "legacy", seq: 99, event_type: "item/agentMessage/delta", text: "legacy", payload: { type: "item/agentMessage/delta", raw: {} }, run_id: "run-1" }
       ]
     });
-    expect(blocks).toMatchObject([{ kind: "assistant", text: "new reply" }]);
-    expect(blocks).toHaveLength(1);
+    expect(steps(blocks)).toMatchObject([{ kind: "assistant", text: "new reply" }]);
+    expect(steps(blocks)).toHaveLength(1);
   });
 
   it("keeps each run's messages separate even when ACP item ids repeat", () => {
@@ -226,20 +269,21 @@ describe("deriveThreadBlocks", () => {
         ...providerEvents("devin", [chunk("second")], { runId: "run-b", createdAt: () => "2026-01-01T00:00:05Z" })
       ]
     });
-    expect(blocks).toMatchObject([
+    expect(steps(blocks)).toMatchObject([
       { kind: "assistant", text: "first" },
       { kind: "assistant", text: "second" }
     ]);
   });
 
-  it("merges a run's reasoning into one thinking block", () => {
+  it("keeps each burst of reasoning in its own thinking block", () => {
     const blocks = deriveThreadBlocks({
       run: null,
       events: providerEvents("opencode", [thought("First"), thought(" thought"), update("tool_call", { toolCallId: "t", title: "x", kind: "read", status: "completed" }), thought("Second")])
     });
-    expect(blocks).toMatchObject([
-      { kind: "thinking", text: "First thought\n\nSecond" },
-      { kind: "tools", entries: [{ icon: "read" }] }
+    expect(steps(blocks)).toMatchObject([
+      { kind: "thinking", text: "First thought", streaming: false },
+      { kind: "tools", entries: [{ icon: "read" }] },
+      { kind: "thinking", text: "Second" }
     ]);
   });
 
@@ -262,7 +306,7 @@ describe("deriveThreadBlocks", () => {
         steer("second steer", "2026-01-01T00:00:03Z")
       ]
     });
-    expect(blocks).toMatchObject([
+    expect(steps(blocks)).toMatchObject([
       { kind: "assistant", text: "earlier" },
       { kind: "user", text: "first steer" },
       { kind: "user", text: "second steer" }

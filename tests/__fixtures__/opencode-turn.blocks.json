@@ -1,12 +1,9 @@
 [
   {
-    "kind": "system",
-    "text": "Session ses_oc1"
-  },
-  {
     "kind": "thinking",
     "text": "The user wants a listing.",
-    "streaming": false
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:06Z"
   },
   {
     "kind": "tools",
@@ -29,7 +26,9 @@
     "completedAt": "2026-01-01T00:00:13Z"
   },
   {
-    "kind": "usage",
+    "kind": "turn-end",
+    "state": "completed",
+    "completedAt": "2026-01-01T00:00:13Z",
     "usage": {
       "contextUsedTokens": 8467,
       "contextMaxTokens": 200000,

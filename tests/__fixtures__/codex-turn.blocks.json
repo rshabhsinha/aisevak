@@ -1,12 +1,9 @@
 [
   {
-    "kind": "system",
-    "text": "Session thr_1"
-  },
-  {
     "kind": "thinking",
     "text": "Looking at the test output first.",
-    "streaming": false
+    "streaming": false,
+    "completedAt": "2026-01-01T00:00:09Z"
   },
   {
     "kind": "plan",
@@ -90,7 +87,9 @@
     ]
   },
   {
-    "kind": "usage",
+    "kind": "turn-end",
+    "state": "completed",
+    "completedAt": "2026-01-01T00:00:27Z",
     "usage": {
       "contextUsedTokens": 18655,
       "contextMaxTokens": 258400,

@@ -1,13 +1,19 @@
-import { useEffect, useMemo, useState, type ReactElement } from "react";
+import { memo, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   CheckCircle2,
   ChevronDown,
+  ChevronRight,
   CircleAlert,
   Copy,
-  Gauge,
-  Info
+  FileIcon,
+  GitDiff,
+  Info,
+  ListChecks,
+  Sparkle,
+  StopCircle
 } from "./icons";
-import { FileDiff, TaskList, ThinkingReasoning, ToolCall } from "./aicss";
+import { AgentOrb, FileDiff, TaskList, ThinkingReasoning, ToolCall } from "./aicss";
+import { ThinkingState } from "./aicss/thinking-state";
 import { MarkdownContent } from "./markdown";
 import { Button } from "./ui/button";
 import {
@@ -18,11 +24,15 @@ import {
   type ThreadRunRef,
   type ThreadUsage
 } from "../threadBlocks";
-import { formatElapsed } from "../agentRunTimeline";
+import { currentActivity, groupTimeline, summarizeSteps, summarizeTools, type AgentTurn, type TurnStep } from "../threadTurns";
+import { formatDuration, formatElapsed } from "../agentRunTimeline";
+import { attachmentUrl, fileExtensionLabel, formatBytes, isImageAttachment, splitAttachmentBlock, type MessageAttachment } from "../messageAttachments";
 
-// Unified chat renderer: every harness (Codex, Cursor, OpenCode, Devin) is
-// normalized into ThreadBlock[] by deriveThreadBlocks, so this component never
-// needs provider-specific branches.
+type BlockOf<K extends ThreadBlock["kind"]> = Extract<ThreadBlock, { kind: K }>;
+
+// One linear timeline for every harness. deriveThreadBlocks normalizes provider
+// events into blocks and groupTimeline folds them into user messages and agent
+// turns, so nothing here branches on the provider.
 export function ChatTimeline({
   run,
   events,
@@ -32,218 +42,340 @@ export function ChatTimeline({
   events: ThreadEvent[];
   pendingMessages?: PendingUserMessage[];
 }) {
-  const blocks = useMemo(
-    () => deriveThreadBlocks({ run, events, pendingMessages }),
+  const items = useMemo(
+    () => groupTimeline(deriveThreadBlocks({ run, events, pendingMessages })),
     [events, pendingMessages, run]
   );
 
   return (
-    <div className="chat-timeline">
-      {blocks.length === 0 ? <span className="text-muted">No run events yet.</span> : null}
-      {blocks.map((block) => (
-        <ThreadBlockView block={block} key={block.id} />
-      ))}
+    <div className="chat-timeline tl">
+      {items.length === 0 ? <span className="tl-empty">No messages yet.</span> : null}
+      {items.map((item, index) => {
+        if (item.type === "user") return <UserMessage key={item.block.id} block={item.block} />;
+        if (item.type === "comment") return <TaskComment key={item.block.id} block={item.block} />;
+        return <Turn key={item.id} turn={item} latest={index === items.length - 1} />;
+      })}
     </div>
   );
 }
 
-function ThreadBlockView({ block }: { block: ThreadBlock }) {
-  switch (block.kind) {
-    case "user":
-      return <UserBlock block={block} />;
-    case "assistant":
-      return <AssistantBlock block={block} />;
+const UserMessage = memo(function UserMessage({ block }: { block: BlockOf<"user"> }) {
+  const { text, attachments } = useMemo(() => splitAttachmentBlock(block.text), [block.text]);
+  return (
+    <div className="tl-user" title={formatTimestamp(block.createdAt)}>
+      {attachments.length ? <AttachmentStrip attachments={attachments} /> : null}
+      {text ? (
+        <div className="tl-user-bubble">
+          <CollapsibleText text={text} />
+        </div>
+      ) : null}
+    </div>
+  );
+});
+
+function AttachmentStrip({ attachments }: { attachments: MessageAttachment[] }) {
+  return (
+    <div className="tl-attachments">
+      {attachments.map((file) =>
+        isImageAttachment(file) && file.id ? (
+          <a key={file.path} className="tl-attachment-image" href={attachmentUrl(file)} target="_blank" rel="noreferrer" title={file.name}>
+            <img src={attachmentUrl(file)} alt={file.name} loading="lazy" />
+          </a>
+        ) : (
+          <span key={file.path} className="tl-attachment-file" title={file.path}>
+            <FileIcon size={14} />
+            <span className="tl-attachment-name">{file.name}</span>
+            <span className="tl-attachment-meta">
+              {fileExtensionLabel(file.name)} · {formatBytes(file.size)}
+            </span>
+          </span>
+        )
+      )}
+    </div>
+  );
+}
+
+function TaskComment({ block }: { block: BlockOf<"comment"> }) {
+  return (
+    <div className="tl-comment" title={formatTimestamp(block.createdAt)}>
+      <span className="tl-comment-label">Task comment</span>
+      <MarkdownContent text={block.text} plain />
+    </div>
+  );
+}
+
+const Turn = memo(function Turn({ turn, latest }: { turn: AgentTurn; latest: boolean }) {
+  if (turn.live || !turn.end) {
+    return (
+      <section className={`tl-turn ${turn.live ? "is-live" : ""}`} aria-label={turn.live ? "Agent turn in progress" : "Agent work"}>
+        <Rail steps={turn.steps} live={Boolean(turn.live)} />
+        {turn.live ? <LiveRow turn={turn} /> : null}
+      </section>
+    );
+  }
+
+  const failed = turn.end?.state === "failed";
+  const stopped = turn.end?.state === "cancelled" || turn.end?.state === "interrupted";
+  return (
+    <section className="tl-turn" aria-label="Agent turn">
+      {turn.steps.length > 0 ? <WorkSummary turn={turn} defaultOpen={latest && !turn.answer} /> : null}
+      {turn.answer ? <Answer block={turn.answer} turn={turn} showMeta={turn.steps.length === 0} /> : null}
+      {turn.outcomes.map((step) => (
+        <div className="tl-outcome" key={step.id}>
+          <StepBody step={step} />
+        </div>
+      ))}
+      {failed || stopped || (!turn.answer && turn.steps.length === 0 && turn.outcomes.length === 0) ? (
+        <EndRow turn={turn} />
+      ) : null}
+    </section>
+  );
+});
+
+/** The collapsed "Worked for 1m 4s · Ran 3 commands" row over a finished turn's work. */
+function WorkSummary({ turn, defaultOpen }: { turn: AgentTurn; defaultOpen: boolean }) {
+  const [open, setOpen] = useState(defaultOpen);
+  const state = turn.end?.state ?? "completed";
+  const duration = turn.end ? formatElapsed(turn.end.createdAt, turn.end.completedAt) : null;
+  const verb = state === "failed" ? "Failed after" : state === "completed" ? "Worked for" : "Stopped after";
+  const digest = summarizeSteps(turn.steps);
+  return (
+    <div className={`tl-work ${open ? "is-open" : ""}`}>
+      <button type="button" className="tl-work-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <span className={`tl-work-icon is-${state}`}>
+          {state === "failed" ? <CircleAlert size={14} weight="fill" /> : state === "completed" ? <CheckCircle2 size={14} /> : <StopCircle size={14} />}
+        </span>
+        <span className="tl-work-label">
+          {duration ? `${verb} ${duration}` : verb === "Worked for" ? "Worked" : state === "failed" ? "Failed" : "Stopped"}
+        </span>
+        {digest ? <span className="tl-work-digest">{digest}</span> : null}
+        <ChevronRight size={12} className="tl-chevron" />
+        {turn.end?.usage ? <UsageMeta usage={turn.end.usage} /> : null}
+      </button>
+      {open ? <Rail steps={turn.steps} /> : null}
+    </div>
+  );
+}
+
+function Answer({ block, turn, showMeta }: { block: BlockOf<"assistant">; turn: AgentTurn; showMeta: boolean }) {
+  const duration = turn.end ? formatElapsed(turn.end.createdAt, turn.end.completedAt) : null;
+  return (
+    <div className="tl-answer">
+      <MarkdownContent text={block.text || "(empty response)"} />
+      <div className="tl-answer-actions">
+        {block.text.trim() ? <CopyButton text={block.text} label="Copy message" /> : null}
+        {showMeta && duration ? <span className="tl-meta">{duration}</span> : null}
+        {showMeta && turn.end?.usage ? <UsageMeta usage={turn.end.usage} /> : null}
+        <span className="tl-meta tl-answer-time">{formatTime(block.createdAt)}</span>
+      </div>
+    </div>
+  );
+}
+
+function EndRow({ turn }: { turn: AgentTurn }) {
+  const end = turn.end;
+  const state = end?.state ?? "completed";
+  const duration = end ? formatElapsed(end.createdAt, end.completedAt) : null;
+  const label =
+    state === "failed"
+      ? "Turn failed"
+      : state === "cancelled"
+        ? "Cancelled"
+        : state === "interrupted"
+          ? "Interrupted"
+          : "Finished without a reply";
+  return (
+    <div className={`tl-end is-${state}`} role={state === "failed" ? "alert" : undefined}>
+      <span className="tl-end-icon">
+        {state === "failed" ? <CircleAlert size={14} weight="fill" /> : state === "completed" ? <CheckCircle2 size={14} /> : <StopCircle size={14} />}
+      </span>
+      <span className="tl-end-text">
+        <strong>{label}</strong>
+        {duration ? <span className="tl-meta"> · {duration}</span> : null}
+        {end?.detail ? <span className="tl-end-detail">{end.detail}</span> : null}
+      </span>
+    </div>
+  );
+}
+
+function LiveRow({ turn }: { turn: AgentTurn }) {
+  const activity = currentActivity(turn.steps);
+  return (
+    <div className="tl-live" role="status">
+      <span className="tl-marker">
+        <AgentOrb variant="working" size={13} color="var(--primary)" />
+      </span>
+      <ThinkingState className="tl-live-label">{activity}</ThinkingState>
+      {turn.live?.createdAt ? <LiveElapsed createdAt={turn.live.createdAt} /> : null}
+    </div>
+  );
+}
+
+/** The vertical line through a turn's steps, one marker per step. */
+function Rail({ steps, live = false }: { steps: TurnStep[]; live?: boolean }) {
+  if (steps.length === 0) return null;
+  return (
+    <ol className={`tl-rail ${live ? "is-live" : ""}`}>
+      {steps.map((step) => (
+        <li className={`tl-step is-${step.kind}`} key={step.id}>
+          <span className="tl-marker" aria-hidden="true">
+            <StepMarker step={step} />
+          </span>
+          <div className="tl-step-body">
+            <StepBody step={step} />
+          </div>
+        </li>
+      ))}
+    </ol>
+  );
+}
+
+function StepMarker({ step }: { step: TurnStep }) {
+  switch (step.kind) {
     case "thinking":
-      return <ThinkingBlock block={block} />;
-    case "tools":
-      return <ToolsBlock block={block} />;
+      return step.streaming ? <AgentOrb variant="thinking" size={12} color="var(--primary)" /> : <Sparkle size={13} />;
+    case "tools": {
+      const running = step.entries.some((entry) => entry.status === "running");
+      if (running) return <AgentOrb variant="working" size={12} color="var(--primary)" />;
+      return step.entries.some((entry) => entry.status === "failed") ? (
+        <CircleAlert size={13} className="tl-tone-danger" />
+      ) : (
+        <CheckCircle2 size={13} />
+      );
+    }
     case "plan":
-      return <PlanBlock block={block} />;
+      return <ListChecks size={13} />;
     case "diff":
-      return <DiffBlock block={block} />;
-    case "usage":
-      return <UsageBlock block={block} />;
-    case "notice":
-      return <NoticeBlock block={block} />;
-    case "comment":
-      return <CommentBlock block={block} />;
+      return <GitDiff size={13} />;
     case "error":
-      return <ErrorBlock block={block} />;
-    case "system":
-      return <SystemBlock block={block} />;
-    case "working":
-      return <WorkingBlock block={block} />;
+      return <CircleAlert size={13} weight="fill" className="tl-tone-danger" />;
+    case "notice":
+      return <Info size={13} className="tl-tone-warning" />;
+    default:
+      return <span className="tl-dot" />;
   }
 }
 
-function UserBlock({ block }: { block: Extract<ThreadBlock, { kind: "user" }> }) {
-  return (
-    <div className="timeline-user-row">
-      <div className="user-bubble">
-        <CollapsibleText text={block.text} />
-        <span className="timeline-meta">{formatTime(block.createdAt)}</span>
-      </div>
-    </div>
-  );
-}
-
-function AssistantBlock({ block }: { block: Extract<ThreadBlock, { kind: "assistant" }> }) {
-  return (
-    <div className="timeline-assistant-row">
-      <div className="assistant-message group-assistant">
-        <MarkdownContent text={block.text || (block.streaming ? "" : "(empty response)")} />
-        {block.streaming ? <span className="streaming-caret" aria-hidden="true" /> : null}
-        <div className="assistant-meta-row">
-          <span className="timeline-meta">
-            {formatTime(block.createdAt)}
-            {block.completedAt
-              ? ` · ${formatElapsed(block.createdAt, block.completedAt) ?? ""}`
-              : ""}
-          </span>
-          {!block.streaming && block.text.trim() ? (
-            <CopyButton text={block.text} label="Copy message" />
-          ) : null}
+function StepBody({ step }: { step: TurnStep }): ReactNode {
+  switch (step.kind) {
+    case "assistant":
+      return (
+        <div className="tl-commentary">
+          <MarkdownContent text={step.text} />
+          {step.streaming ? <span className="streaming-caret" aria-hidden="true" /> : null}
         </div>
-      </div>
-    </div>
-  );
-}
-
-function ThinkingBlock({ block }: { block: Extract<ThreadBlock, { kind: "thinking" }> }) {
-  return (
-    <div className="working-row py-1">
-      <ThinkingReasoning
-        label="Thinking"
-        isStreaming={block.streaming}
-        defaultExpanded={false}
-        rawText={block.text}
-      />
-    </div>
-  );
-}
-
-function ToolsBlock({ block }: { block: Extract<ThreadBlock, { kind: "tools" }> }) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const maxVisible = 6;
-  const hasOverflow = block.entries.length > maxVisible;
-  const visibleEntries = hasOverflow && !isExpanded ? block.entries.slice(-maxVisible) : block.entries;
-  const hiddenCount = block.entries.length - visibleEntries.length;
-
-  return (
-    <div className="work-group">
-      {hasOverflow ? (
-        <div className="work-group-head">
-          <span>Tool calls ({block.entries.length})</span>
-          <button type="button" onClick={() => setIsExpanded((value) => !value)}>
-            {isExpanded ? "Show less" : `Show ${hiddenCount} more`}
-          </button>
+      );
+    case "thinking": {
+      const duration = step.completedAt ? formatElapsed(step.createdAt, step.completedAt) : null;
+      return (
+        <ThinkingReasoning
+          className="tl-thinking"
+          label={step.streaming ? "Thinking" : duration && duration !== "0ms" ? `Thought for ${duration}` : "Thought"}
+          isStreaming={step.streaming}
+          rawText={step.text}
+        />
+      );
+    }
+    case "tools":
+      return <ToolGroup step={step} />;
+    case "plan":
+      return <TaskList className="tl-plan" title="Plan" tasks={step.items.map((item) => ({ ...item, detail: undefined }))} />;
+    case "diff":
+      return <Changes step={step} />;
+    case "error":
+      return (
+        <div className="tl-error">
+          <strong>{step.label}</strong>
+          {step.detail ? <span>{step.detail}</span> : null}
         </div>
-      ) : null}
-      <div className="work-group-rows">
-        {visibleEntries.map((entry) => (
-          <ToolCall entry={entry} key={entry.id} />
-        ))}
-      </div>
-    </div>
-  );
+      );
+    case "notice":
+      return (
+        <div className={`tl-notice is-${step.level}`}>
+          {step.text}
+          {step.detail ? <span className="tl-meta"> · {step.detail}</span> : null}
+        </div>
+      );
+    case "system":
+      return <div className="tl-system">{step.text}</div>;
+  }
 }
 
-function PlanBlock({ block }: { block: Extract<ThreadBlock, { kind: "plan" }> }) {
-  return <TaskList title="Plan" tasks={block.items.map((item) => ({ ...item, detail: undefined }))} />;
-}
-
-function DiffBlock({ block }: { block: Extract<ThreadBlock, { kind: "diff" }> }) {
-  const [open, setOpen] = useState(false);
+/** A run of tool calls: one row when alone, a digest that opens into rows otherwise. */
+function ToolGroup({ step }: { step: BlockOf<"tools"> }) {
+  const running = step.entries.some((entry) => entry.status === "running");
+  const [open, setOpen] = useState<boolean | null>(null);
+  if (step.entries.length === 1) return <ToolCall entry={step.entries[0]!} />;
+  const isOpen = open ?? running;
   return (
-    <div className="turn-diff">
-      <button type="button" className="turn-diff-toggle" onClick={() => setOpen((value) => !value)}>
-        <ChevronDown size={12} style={{ transform: open ? "rotate(0deg)" : "rotate(-90deg)", transition: "transform 140ms ease" }} />
-        <span>
-          Changed {block.diffs.length} {block.diffs.length === 1 ? "file" : "files"}
-        </span>
+    <div className={`tl-tools ${isOpen ? "is-open" : ""}`}>
+      <button type="button" className="tl-tools-toggle" aria-expanded={isOpen} onClick={() => setOpen(!isOpen)}>
+        <span>{summarizeTools(step.entries)}</span>
+        <ChevronRight size={12} className="tl-chevron" />
       </button>
-      {open ? block.diffs.map((diff) => <FileDiff key={diff.path} filename={diff.path} diff={diff.diff} defaultExpanded={false} />) : null}
+      {isOpen ? (
+        <div className="tl-tools-rows">
+          {step.entries.map((entry) => (
+            <ToolCall entry={entry} key={entry.id} />
+          ))}
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function UsageBlock({ block }: { block: Extract<ThreadBlock, { kind: "usage" }> }) {
-  const parts = usageParts(block.usage);
-  const percent = contextPercent(block.usage);
+function Changes({ step }: { step: BlockOf<"diff"> }) {
+  const [open, setOpen] = useState(false);
+  const totals = useMemo(() => {
+    let additions = 0;
+    let deletions = 0;
+    for (const diff of step.diffs) {
+      for (const line of diff.diff.split("\n")) {
+        if (line.startsWith("+") && !line.startsWith("+++")) additions += 1;
+        else if (line.startsWith("-") && !line.startsWith("---")) deletions += 1;
+      }
+    }
+    return { additions, deletions };
+  }, [step.diffs]);
   return (
-    <div className="usage-row" title={usageTitle(block.usage)}>
-      <Gauge size={12} />
+    <div className={`tl-changes ${open ? "is-open" : ""}`}>
+      <button type="button" className="tl-tools-toggle" aria-expanded={open} onClick={() => setOpen((value) => !value)}>
+        <GitDiff size={13} />
+        <span>
+          Changed {step.diffs.length} {step.diffs.length === 1 ? "file" : "files"}
+        </span>
+        <span className="tl-diffstat">
+          <span className="is-add">+{totals.additions}</span> <span className="is-del">−{totals.deletions}</span>
+        </span>
+        <ChevronRight size={12} className="tl-chevron" />
+      </button>
+      {open ? (
+        <div className="tl-changes-files">
+          {step.diffs.map((diff) => (
+            <FileDiff key={diff.path} filename={diff.path} diff={diff.diff} defaultExpanded={step.diffs.length === 1} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function UsageMeta({ usage }: { usage: ThreadUsage }) {
+  const percent = contextPercent(usage);
+  const tokens = (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
+  const parts: string[] = [];
+  if (tokens > 0) parts.push(`${formatTokens(tokens)} tokens`);
+  if (usage.cost && usage.cost.amount > 0) parts.push(`${usage.cost.currency === "USD" ? "$" : `${usage.cost.currency} `}${usage.cost.amount.toFixed(2)}`);
+  if (parts.length === 0 && percent === null) return null;
+  return (
+    <span className="tl-usage" title={usageTitle(usage)}>
+      {parts.join(" · ")}
       {percent !== null ? (
-        <span className="usage-meter" aria-label={`Context ${percent}% full`}>
-          <span className="usage-meter-fill" style={{ width: `${Math.min(100, percent)}%` }} />
+        <span className="tl-usage-ring" style={{ ["--pct" as string]: `${Math.min(100, percent)}` }} aria-label={`Context ${percent}% full`}>
+          {percent}%
         </span>
       ) : null}
-      <span>{parts.join(" · ")}</span>
-    </div>
-  );
-}
-
-function NoticeBlock({ block }: { block: Extract<ThreadBlock, { kind: "notice" }> }) {
-  return (
-    <div className={`notice-row notice-${block.level}`} role="status">
-      <Info size={13} />
-      <span>
-        {block.text}
-        {block.detail ? <small> · {block.detail}</small> : null}
-      </span>
-    </div>
-  );
-}
-
-function CommentBlock({ block }: { block: Extract<ThreadBlock, { kind: "comment" }> }) {
-  return (
-    <div className="task-comment-row">
-      <div className="task-comment-bubble">
-        <div className="task-comment-label">Task comment</div>
-        <MarkdownContent text={block.text} plain />
-        <span className="timeline-meta">{formatTime(block.createdAt)}</span>
-      </div>
-    </div>
-  );
-}
-
-function ErrorBlock({ block }: { block: Extract<ThreadBlock, { kind: "error" }> }) {
-  return (
-    <div className="agent-run-failure" role="alert">
-      <span className="agent-run-failure-icon">
-        <CircleAlert size={15} weight="fill" />
-      </span>
-      <span>
-        <strong>{block.label}</strong>
-        {block.detail ? <small>{block.detail}</small> : null}
-      </span>
-    </div>
-  );
-}
-
-function SystemBlock({ block }: { block: Extract<ThreadBlock, { kind: "system" }> }) {
-  return (
-    <div className="system-row">
-      <span>{block.text}</span>
-    </div>
-  );
-}
-
-function WorkingBlock({ block }: { block: Extract<ThreadBlock, { kind: "working" }> }) {
-  return (
-    <div className="working-row py-1 max-w-fit">
-      <ThinkingReasoning
-        label="Agent active"
-        isStreaming={true}
-        defaultExpanded={false}
-        liveElapsed={block.createdAt ? <LiveElapsed createdAt={block.createdAt} /> : undefined}
-        rawText={
-          block.createdAt
-            ? `Run in progress · Started at ${new Date(block.createdAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}`
-            : undefined
-        }
-      />
-    </div>
+    </span>
   );
 }
 
@@ -258,18 +390,11 @@ export function CollapsibleText({ text }: { text: string }) {
         <MarkdownContent text={text} plain />
       </div>
       {shouldCollapse ? (
-        <button
-          className="collapsible-toggle-btn"
-          type="button"
-          onClick={() => setExpanded((value) => !value)}
-        >
-          <span>{expanded ? "Show less" : "Show full report"}</span>
+        <button className="collapsible-toggle-btn" type="button" onClick={() => setExpanded((value) => !value)}>
+          <span>{expanded ? "Show less" : "Show more"}</span>
           <ChevronDown
             size={12}
-            style={{
-              transform: expanded ? "rotate(180deg)" : "rotate(0deg)",
-              transition: "transform 140ms ease"
-            }}
+            style={{ transform: expanded ? "rotate(180deg)" : "rotate(0deg)", transition: "transform 140ms ease" }}
           />
         </button>
       ) : null}
@@ -286,6 +411,7 @@ export function CopyButton({ text, label }: { text: string; label: string }) {
       size="icon"
       type="button"
       title={copied ? "Copied" : label}
+      aria-label={copied ? "Copied" : label}
       onClick={async () => {
         await navigator.clipboard?.writeText(text);
         setCopied(true);
@@ -298,31 +424,18 @@ export function CopyButton({ text, label }: { text: string; label: string }) {
 }
 
 function LiveElapsed({ createdAt }: { createdAt: string }) {
-  const [now, setNow] = useState(() => new Date().toISOString());
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    const id = window.setInterval(() => setNow(new Date().toISOString()), 1000);
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(id);
   }, []);
-  return (
-    <span className="font-mono text-[10.5px] text-muted-foreground/75 tabular-nums">
-      {formatElapsed(createdAt, now) ?? "0s"}
-    </span>
-  );
+  const elapsed = Math.max(0, now - Date.parse(createdAt));
+  return <span className="tl-meta tl-live-elapsed">{Number.isFinite(elapsed) ? formatDuration(Math.floor(elapsed / 1000) * 1000 || 1000) : ""}</span>;
 }
 
 function contextPercent(usage: ThreadUsage): number | null {
   if (!usage.contextUsedTokens || !usage.contextMaxTokens) return null;
   return Math.round((usage.contextUsedTokens / usage.contextMaxTokens) * 100);
-}
-
-function usageParts(usage: ThreadUsage): string[] {
-  const parts: string[] = [];
-  const percent = contextPercent(usage);
-  if (percent !== null) parts.push(`${percent}% context`);
-  if (usage.inputTokens !== undefined) parts.push(`${formatTokens(usage.inputTokens)} in`);
-  if (usage.outputTokens !== undefined) parts.push(`${formatTokens(usage.outputTokens)} out`);
-  if (usage.cost && usage.cost.amount > 0) parts.push(`${usage.cost.currency === "USD" ? "$" : `${usage.cost.currency} `}${usage.cost.amount.toFixed(2)}`);
-  return parts;
 }
 
 function usageTitle(usage: ThreadUsage): string {
@@ -348,5 +461,10 @@ function formatTokens(value: number): string {
 function formatTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
 }

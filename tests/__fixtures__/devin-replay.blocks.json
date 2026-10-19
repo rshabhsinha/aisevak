@@ -22,8 +22,9 @@
     "detail": "Model unavailable"
   },
   {
-    "kind": "error",
-    "label": "Turn failed",
-    "detail": "The model hit its output token limit"
+    "kind": "turn-end",
+    "state": "failed",
+    "detail": "The model hit its output token limit",
+    "completedAt": "2026-01-01T00:00:10Z"
   }
 ]
