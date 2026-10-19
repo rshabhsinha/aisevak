@@ -1,4 +1,5 @@
 import {
+  providerInstanceSecretName,
   CURSOR_API_KEY_SECRET_NAME,
   CURSOR_AUTH_SECRET_NAME,
   decryptSecret,
@@ -56,11 +57,16 @@ export class CursorAuthManager {
     private readonly pool: DbPool,
     private readonly secretKey: string,
     private readonly cursorBinary: string,
-    private readonly authHomeRoot: string
+    private readonly authHomeRoot: string,
+    private readonly instanceId?: string
   ) {}
 
+  private secret(baseName: string): string {
+    return providerInstanceSecretName(baseName, this.instanceId);
+  }
+
   async getStatus(): Promise<CursorAuthStatus> {
-    const apiKey = await this.readSecret(CURSOR_API_KEY_SECRET_NAME);
+    const apiKey = await this.readSecret(this.secret(CURSOR_API_KEY_SECRET_NAME));
     if (apiKey) {
       const probe = await this.probeHome(homedir());
       return {
@@ -75,7 +81,7 @@ export class CursorAuthManager {
       };
     }
 
-    const stored = await this.readSecret(CURSOR_AUTH_SECRET_NAME);
+    const stored = await this.readSecret(this.secret(CURSOR_AUTH_SECRET_NAME));
     if (!stored || isCursorHostAuthBundle(stored)) {
       const probe = await this.probeHome(homedir());
       return {
@@ -102,7 +108,7 @@ export class CursorAuthManager {
   async saveApiKey(apiKey: string): Promise<CursorAuthStatus> {
     const trimmed = apiKey.trim();
     if (!trimmed) throw new Error("Cursor API key is required");
-    await this.upsertSecret(CURSOR_API_KEY_SECRET_NAME, trimmed, "Cursor API key used by the Cursor harness");
+    await this.upsertSecret(this.secret(CURSOR_API_KEY_SECRET_NAME), trimmed, "Cursor API key used by the Cursor harness");
     return this.getStatus();
   }
 
@@ -113,7 +119,7 @@ export class CursorAuthManager {
     if (!probe.connected || !bundleHasFiles(bundle)) {
       throw new Error(PORTABLE_AUTH_ERROR);
     }
-    await this.upsertSecret(CURSOR_AUTH_SECRET_NAME, bundle, "Internal Cursor CLI authentication used by the runner");
+    await this.upsertSecret(this.secret(CURSOR_AUTH_SECRET_NAME), bundle, "Internal Cursor CLI authentication used by the runner");
     return this.getStatus();
   }
 
@@ -170,7 +176,7 @@ export class CursorAuthManager {
     if (!probe.connected || !bundleHasFiles(bundle)) {
       return { status: "pending", auth: await this.getStatus() };
     }
-    await this.upsertSecret(CURSOR_AUTH_SECRET_NAME, bundle, "Internal Cursor CLI authentication used by the runner");
+    await this.upsertSecret(this.secret(CURSOR_AUTH_SECRET_NAME), bundle, "Internal Cursor CLI authentication used by the runner");
     login.child.kill("SIGTERM");
     this.logins.delete(loginId);
     return { status: "connected", auth: await this.getStatus() };
@@ -178,7 +184,7 @@ export class CursorAuthManager {
 
   async disconnect(): Promise<CursorAuthStatus> {
     await this.pool.query("DELETE FROM secrets WHERE name = ANY($1::text[])", [
-      [CURSOR_API_KEY_SECRET_NAME, CURSOR_AUTH_SECRET_NAME]
+      [this.secret(CURSOR_API_KEY_SECRET_NAME), this.secret(CURSOR_AUTH_SECRET_NAME)]
     ]);
     await rm(this.authHomeRoot, { recursive: true, force: true });
     return this.getStatus();

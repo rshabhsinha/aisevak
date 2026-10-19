@@ -47,6 +47,8 @@ export interface ComposerProvider {
   id: string;
   driver: string;
   display_name: string;
+  /** Set for harness accounts added beside the default one. */
+  account_label?: string | null;
   enabled: boolean;
   status: "ready" | "warning" | "error";
   models: ComposerModel[];
@@ -521,6 +523,7 @@ export function ModelPicker(props: {
         <button type="button" className="cmp-model-trigger" aria-label="Choose a model" disabled={!provider}>
           {provider ? <HarnessMark driver={provider.driver} size={13} /> : null}
           <span className="cmp-model-name">{model?.label ?? selection?.model ?? "Choose model"}</span>
+          {provider?.account_label ? <span className="cmp-model-account">{provider.account_label}</span> : null}
           {reasoningLabel ? <span className="cmp-model-effort">{reasoningLabel}</span> : null}
           <CaretUpDown size={11} className="cmp-model-caret" />
         </button>

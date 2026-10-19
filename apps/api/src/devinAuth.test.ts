@@ -22,7 +22,7 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-async function setup() {
+async function setup(instanceId?: string) {
   const root = await mkdtemp(join(tmpdir(), "devin-auth-")); roots.push(root);
   const stored = new Map<string, string>();
   const pool = { async query(sql: string, params: unknown[] = []) {
@@ -32,7 +32,7 @@ async function setup() {
       ? [{ encrypted_value: stored.get(String(params[0])) }] : [] };
   } } as unknown as DbPool;
   mocks.run.mockResolvedValue({ exitCode: 0, stdout: "Not logged in.", stderr: "" });
-  const manager = new DevinAuthManager(pool, key, "/missing/devin", join(root, "auth"), join(root, "host"));
+  const manager = new DevinAuthManager(pool, key, "/missing/devin", join(root, "auth"), join(root, "host"), instanceId);
   managers.push(manager);
   return { root, stored, manager };
 }
@@ -52,6 +52,13 @@ function child(fail = false) {
 }
 
 describe("Devin login lifecycle", () => {
+  it("stores an added account's API key under that account", async () => {
+    const { stored, manager } = await setup("devin-team");
+    await manager.saveApiKey(" team-key ");
+    expect([...stored.keys()]).toEqual(["devin_api_key@devin-team"]);
+    expect(decryptSecret(stored.get("devin_api_key@devin-team")!, key)).toBe("team-key");
+  });
+
   it("returns a controlled failure when the CLI cannot start", async () => {
     const { manager } = await setup(); child(true);
     await expect(manager.startLogin("user")).rejects.toThrow("Unable to start Devin login");

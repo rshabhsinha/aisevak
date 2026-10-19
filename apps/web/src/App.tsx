@@ -5,6 +5,7 @@ import {
   BookOpen,
   Bot,
   Calendar,
+  ChartColumn,
   ChatsIcon,
   CheckCircle2,
   ChevronDown,
@@ -18,6 +19,7 @@ import {
   Copy,
   Eye,
   FolderGit2,
+  Gauge,
   Github,
   Hammer,
   Info,
@@ -46,7 +48,20 @@ import { AgentAvatar } from "./components/agent-avatar";
 import { AgentOrb, ThinkingReasoning, FileDiff, DotMatrixLoader } from "./components/aicss";
 import { MarkdownContent } from "./components/markdown";
 import { OpenAILogo } from "./components/openai-logo";
-import { ClaudeCodeLogo, CursorLogo, DevinLogo, OpenCodeLogo } from "./components/harness-logos";
+import { ClaudeCodeLogo, CodexLogo, CursorLogo, DevinLogo, HarnessMark, OpenCodeLogo } from "./components/harness-logos";
+import {
+  AccountLimitsBody,
+  CostAnalyticsView,
+  HARNESS_LABELS,
+  HARNESS_ORDER,
+  UsageLimitsView,
+  accountName,
+  isWindowStale,
+  type AccountLimits,
+  type HarnessAccount,
+  type HarnessDriver,
+  type LimitWindow as LimitWindowData
+} from "./components/usage-views";
 import { PromptComposer } from "./components/prompt-composer";
 import { ThemeToggle } from "./components/theme-toggle";
 import { cn } from "./lib/utils";
@@ -157,6 +172,7 @@ interface ProviderInstance {
   id: string;
   driver: "codex" | "cursor" | "opencode" | "devin" | "claude";
   display_name: string;
+  account_label?: string | null;
   enabled: boolean;
   status: "ready" | "warning" | "error";
   capabilities: { sessionModelSwitch: "in-session" | "unsupported" };
@@ -1094,7 +1110,7 @@ export function App() {
           <NavButton icon={<Bot />} className="nav-item-secondary" label="Agent setup" active={view === "agents"} onClick={() => { if (window.innerWidth <= MOBILE_BREAKPOINT) setEditingAgent(null); navigateToView("agents"); }} />
           <NavButton icon={<BookOpen />} className="nav-item-secondary" label="Skills" active={view === "skills"} onClick={() => { if (window.innerWidth <= MOBILE_BREAKPOINT) setEditingSkill(null); navigateToView("skills"); }} />
           <NavButton icon={<Calendar />} label="Schedule" active={view === "schedules"} onClick={() => navigateToView("schedules")} />
-          <NavButton className="nav-item-settings nav-item-secondary" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")} />
+          <NavButton className="nav-item-settings nav-item-secondary" icon={<SettingsIcon />} label="Settings" active={isSettingsView(view)} onClick={() => navigateToView(user.role !== "member" ? "harnesses" : "api")} />
 
           <Popover open={mobileMoreOpen} onOpenChange={setMobileMoreOpen}>
             <PopoverTrigger asChild>
@@ -1109,7 +1125,7 @@ export function App() {
                 ["incidents", "Incidents", <CircleAlert size={18} />],
                 ["agents", "Agent setup", <Bot size={18} />],
                 ["skills", "Skills", <BookOpen size={18} />],
-                [user.role !== "member" ? "codex" : "api", "Settings", <SettingsIcon size={18} />]
+                [user.role !== "member" ? "harnesses" : "api", "Settings", <SettingsIcon size={18} />]
               ] as Array<[View, string, ReactNode]>).map(([nextView, label, icon]) => (
                 <Button key={label} variant="ghost" className="mobile-menu-button" onClick={() => {
                   if (nextView === "agents") setEditingAgent(null);
@@ -1249,7 +1265,7 @@ export function App() {
               className="sidebar-footer-btn"
               title="Settings"
               aria-label="Settings"
-              onClick={() => navigateToView(user.role !== "member" ? "codex" : "api")}
+              onClick={() => navigateToView(user.role !== "member" ? "harnesses" : "api")}
             >
               <SettingsIcon size={15} />
             </Button>
@@ -1507,26 +1523,10 @@ export function App() {
 
           {isSettingsView(view) ? (
             <SettingsView
-              activeTab={
-                view === "api"
-                  ? "api"
-                  : view === "credentials"
-                  ? "credentials"
-                  : view === "projects"
-                  ? "projects"
-                  : view === "connectors"
-                  ? "connectors"
-                  : view === "cursor"
-                  ? "cursor"
-                  : view === "opencode"
-                  ? "opencode"
-                  : view === "devin"
-                  ? "devin"
-                  : view === "claude"
-                  ? "claude"
-                  : "codex"
-              }
+              activeTab={settingsTabForView(view)}
+              focusDriver={HARNESS_VIEW_DRIVERS[view as keyof typeof HARNESS_VIEW_DRIVERS]}
               onTabChange={(tab) => navigateToView(tab)}
+              onAccountsChanged={reloadProviderInstances}
               userRole={user.role}
               apiKeys={apiKeys}
               onSavedApiKeys={reloadApiKeys}
@@ -3917,7 +3917,18 @@ function AgentEditor(props: {
   );
 }
 
-function CodexConnectionView() {
+interface HarnessAccountViewProps {
+  /** Provider instance id of the account; omitted for the default account. */
+  instanceId?: string;
+  onStatus?: (status: { connected: boolean; lastError: string | null }) => void;
+}
+
+function accountPath(path: string, instanceId?: string): string {
+  if (!instanceId) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}instance=${encodeURIComponent(instanceId)}`;
+}
+
+function CodexConnectionView({ instanceId, onStatus }: HarnessAccountViewProps = {}) {
   const [status, setStatus] = useState<CodexAuthStatus>({
     connected: false,
     activeMethod: null,
@@ -3939,6 +3950,13 @@ function CodexConnectionView() {
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
+  useEffect(() => {
+    if (status === placeholderStatus.current) return;
+    onStatus?.({ connected: status.connected, lastError: status.lastError });
+  }, [status]);
+
   useEffect(() => {
     if (!login) return;
     let stopped = false;
@@ -3951,7 +3969,7 @@ function CodexConnectionView() {
       }
       try {
         const result = await api<{ status: "pending" | "connected"; auth: CodexAuthStatus }>(
-          `/api/codex-auth/login/${encodeURIComponent(login.loginId)}`
+          accountPath(`/api/codex-auth/login/${encodeURIComponent(login.loginId)}`, instanceId)
         );
         if (stopped) return;
         setStatus(result.auth);
@@ -3978,7 +3996,7 @@ function CodexConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api<CodexAuthStatus>("/api/codex-auth"));
+      setStatus(await api<CodexAuthStatus>(accountPath("/api/codex-auth", instanceId)));
     } catch (statusError) {
       setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read ChatGPT status."));
     } finally {
@@ -3991,7 +4009,7 @@ function CodexConnectionView() {
     setError(null);
     window.open("https://auth.openai.com/codex/device", "_blank", "noopener,noreferrer");
     try {
-      setLogin(await api<CodexDeviceLogin>("/api/codex-auth/login", { method: "POST" }));
+      setLogin(await api<CodexDeviceLogin>(accountPath("/api/codex-auth/login", instanceId), { method: "POST" }));
     } catch (loginError) {
       setError(friendlyError(loginError instanceof Error ? loginError.message : "Could not start ChatGPT login."));
     } finally {
@@ -4003,7 +4021,7 @@ function CodexConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api<CodexAuthStatus>("/api/codex-auth", { method: "DELETE" }));
+      setStatus(await api<CodexAuthStatus>(accountPath("/api/codex-auth", instanceId), { method: "DELETE" }));
       setLogin(null);
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect ChatGPT."));
@@ -4113,7 +4131,7 @@ function CodexConnectionView() {
   );
 }
 
-function CursorConnectionView() {
+function CursorConnectionView({ instanceId, onStatus }: HarnessAccountViewProps = {}) {
   const [status, setStatus] = useState({
     connected: false,
     activeMethod: null as "subscription" | "api_key" | null,
@@ -4133,6 +4151,13 @@ function CursorConnectionView() {
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
+  useEffect(() => {
+    if (status === placeholderStatus.current) return;
+    onStatus?.({ connected: status.connected, lastError: status.lastError });
+  }, [status]);
+
   useEffect(() => {
     if (!login) return;
     let stopped = false;
@@ -4145,7 +4170,7 @@ function CursorConnectionView() {
       }
       try {
         const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
-          `/api/cursor-auth/login/${encodeURIComponent(login.loginId)}`
+          accountPath(`/api/cursor-auth/login/${encodeURIComponent(login.loginId)}`, instanceId)
         );
         if (stopped) return;
         setStatus(result.auth);
@@ -4172,7 +4197,7 @@ function CursorConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/cursor-auth"));
+      setStatus(await api(accountPath("/api/cursor-auth", instanceId)));
     } catch (statusError) {
       setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Cursor status."));
     } finally {
@@ -4184,7 +4209,7 @@ function CursorConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/cursor-auth/import-host", { method: "POST" }));
+      setStatus(await api(accountPath("/api/cursor-auth/import-host", instanceId), { method: "POST" }));
     } catch (importError) {
       setError(
         friendlyError(
@@ -4203,7 +4228,7 @@ function CursorConnectionView() {
     setError(null);
     try {
       const started = await api<{ loginId: string; verificationUrl: string | null; userCode: string | null; intervalSeconds: number; expiresAt: number }>(
-        "/api/cursor-auth/login",
+        accountPath("/api/cursor-auth/login", instanceId),
         { method: "POST" }
       );
       setLogin(started);
@@ -4219,7 +4244,7 @@ function CursorConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/cursor-auth/api-key", { method: "POST", body: JSON.stringify({ apiKey }) }));
+      setStatus(await api(accountPath("/api/cursor-auth/api-key", instanceId), { method: "POST", body: JSON.stringify({ apiKey }) }));
       setApiKey("");
     } catch (saveError) {
       setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save Cursor API key."));
@@ -4232,7 +4257,7 @@ function CursorConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/cursor-auth", { method: "DELETE" }));
+      setStatus(await api(accountPath("/api/cursor-auth", instanceId), { method: "DELETE" }));
       setLogin(null);
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Cursor."));
@@ -4339,7 +4364,7 @@ function CursorConnectionView() {
   );
 }
 
-function OpenCodeConnectionView() {
+function OpenCodeConnectionView({ instanceId, onStatus }: HarnessAccountViewProps = {}) {
   const [status, setStatus] = useState({
     connected: false,
     installed: true,
@@ -4355,6 +4380,13 @@ function OpenCodeConnectionView() {
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
+  useEffect(() => {
+    if (status === placeholderStatus.current) return;
+    onStatus?.({ connected: status.connected, lastError: status.lastError });
+  }, [status]);
+
   useEffect(() => {
     if (!login) return;
     let stopped = false;
@@ -4367,7 +4399,7 @@ function OpenCodeConnectionView() {
       }
       try {
         const result = await api<{ status: "pending" | "connected"; auth: typeof status }>(
-          `/api/opencode-auth/login/${encodeURIComponent(login.loginId)}`
+          accountPath(`/api/opencode-auth/login/${encodeURIComponent(login.loginId)}`, instanceId)
         );
         if (stopped) return;
         setStatus(result.auth);
@@ -4394,7 +4426,7 @@ function OpenCodeConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/opencode-auth"));
+      setStatus(await api(accountPath("/api/opencode-auth", instanceId)));
     } catch (statusError) {
       setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read OpenCode status."));
     } finally {
@@ -4406,7 +4438,7 @@ function OpenCodeConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/opencode-auth/import-host", { method: "POST" }));
+      setStatus(await api(accountPath("/api/opencode-auth/import-host", instanceId), { method: "POST" }));
     } catch (importError) {
       setError(friendlyError(importError instanceof Error ? importError.message : "Could not import host OpenCode credentials."));
     } finally {
@@ -4419,7 +4451,7 @@ function OpenCodeConnectionView() {
     setError(null);
     try {
       const started = await api<{ loginId: string; verificationUrl: string | null; intervalSeconds: number; expiresAt: number }>(
-        "/api/opencode-auth/login",
+        accountPath("/api/opencode-auth/login", instanceId),
         { method: "POST" }
       );
       setLogin(started);
@@ -4435,7 +4467,7 @@ function OpenCodeConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/opencode-auth", { method: "DELETE" }));
+      setStatus(await api(accountPath("/api/opencode-auth", instanceId), { method: "DELETE" }));
       setLogin(null);
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect OpenCode."));
@@ -4519,7 +4551,7 @@ function OpenCodeConnectionView() {
   );
 }
 
-function DevinConnectionView() {
+function DevinConnectionView({ instanceId, onStatus }: HarnessAccountViewProps = {}) {
   const [status, setStatus] = useState({
     connected: false,
     activeMethod: null as "subscription" | "api_key" | null,
@@ -4538,11 +4570,18 @@ function DevinConnectionView() {
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
+  useEffect(() => {
+    if (status === placeholderStatus.current) return;
+    onStatus?.({ connected: status.connected, lastError: status.lastError });
+  }, [status]);
+
   async function loadStatus() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/devin-auth"));
+      setStatus(await api(accountPath("/api/devin-auth", instanceId)));
     } catch (statusError) {
       setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Devin status."));
     } finally {
@@ -4554,7 +4593,7 @@ function DevinConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/devin-auth/import-host", { method: "POST" }));
+      setStatus(await api(accountPath("/api/devin-auth/import-host", instanceId), { method: "POST" }));
     } catch (importError) {
       setError(
         friendlyError(
@@ -4574,7 +4613,7 @@ function DevinConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/devin-auth/api-key", { method: "POST", body: JSON.stringify({ apiKey }) }));
+      setStatus(await api(accountPath("/api/devin-auth/api-key", instanceId), { method: "POST", body: JSON.stringify({ apiKey }) }));
       setApiKey("");
     } catch (saveError) {
       setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save Devin API key."));
@@ -4587,7 +4626,7 @@ function DevinConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/devin-auth", { method: "DELETE" }));
+      setStatus(await api(accountPath("/api/devin-auth", instanceId), { method: "DELETE" }));
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Devin."));
     } finally {
@@ -4672,7 +4711,7 @@ function DevinConnectionView() {
   );
 }
 
-function ClaudeCodeConnectionView() {
+function ClaudeCodeConnectionView({ instanceId, onStatus }: HarnessAccountViewProps = {}) {
   const [status, setStatus] = useState({
     connected: false,
     activeMethod: null as "subscription" | "api_key" | null,
@@ -4688,11 +4727,18 @@ function ClaudeCodeConnectionView() {
     void loadStatus();
   }, []);
 
+  // The initial placeholder status is not a reading; report only fetched ones.
+  const placeholderStatus = useRef(status);
+  useEffect(() => {
+    if (status === placeholderStatus.current) return;
+    onStatus?.({ connected: status.connected, lastError: status.lastError });
+  }, [status]);
+
   async function loadStatus() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/claude-code-auth"));
+      setStatus(await api(accountPath("/api/claude-code-auth", instanceId)));
     } catch (statusError) {
       setError(friendlyError(statusError instanceof Error ? statusError.message : "Could not read Claude Code status."));
     } finally {
@@ -4704,7 +4750,7 @@ function ClaudeCodeConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/claude-code-auth/token", { method: "POST", body: JSON.stringify({ token }) }));
+      setStatus(await api(accountPath("/api/claude-code-auth/token", instanceId), { method: "POST", body: JSON.stringify({ token }) }));
       setToken("");
     } catch (saveError) {
       setError(friendlyError(saveError instanceof Error ? saveError.message : "Could not save the Claude credential."));
@@ -4717,7 +4763,7 @@ function ClaudeCodeConnectionView() {
     setBusy(true);
     setError(null);
     try {
-      setStatus(await api("/api/claude-code-auth", { method: "DELETE" }));
+      setStatus(await api(accountPath("/api/claude-code-auth", instanceId), { method: "DELETE" }));
     } catch (disconnectError) {
       setError(friendlyError(disconnectError instanceof Error ? disconnectError.message : "Could not disconnect Claude Code."));
     } finally {
@@ -5523,11 +5569,13 @@ function githubConnectionStatus(status: GithubConnection["status"]): string {
   }
 }
 
-type SettingsTab = "codex" | "cursor" | "opencode" | "devin" | "claude" | "api" | "credentials" | "projects" | "connectors";
+type SettingsTab = "harnesses" | "usage" | "limits" | "api" | "credentials" | "projects" | "connectors";
 
 function SettingsView(props: {
   activeTab: SettingsTab;
+  focusDriver?: HarnessDriver;
   onTabChange: (tab: SettingsTab) => void;
+  onAccountsChanged: () => Promise<void>;
   userRole: string;
   apiKeys: ExternalApiKey[];
   onSavedApiKeys: () => Promise<void>;
@@ -5544,23 +5592,38 @@ function SettingsView(props: {
   onImportGithub: (repoId: string) => Promise<void>;
 }) {
   const tabs: Array<{ id: SettingsTab; label: string; icon: ReactElement; restricted?: boolean }> = [
-    { id: "codex", label: "ChatGPT", icon: <OpenAILogo size={14} />, restricted: true },
-    { id: "cursor", label: "Cursor", icon: <CursorLogo size={14} />, restricted: true },
-    { id: "opencode", label: "OpenCode", icon: <OpenCodeLogo size={14} />, restricted: true },
-    { id: "devin", label: "Devin", icon: <DevinLogo size={14} />, restricted: true },
-    { id: "claude", label: "Claude Code", icon: <ClaudeCodeLogo size={14} />, restricted: true },
+    { id: "harnesses", label: "Harnesses", icon: <HarnessStackIcon />, restricted: true },
+    { id: "usage", label: "Cost & analytics", icon: <ChartColumn size={14} />, restricted: true },
+    { id: "limits", label: "Usage limits", icon: <Gauge size={14} />, restricted: true },
     { id: "api", label: "API Keys", icon: <KeyRound size={14} /> },
     { id: "credentials", label: "Credentials", icon: <LockKeyhole size={14} />, restricted: true },
     { id: "projects", label: "Projects", icon: <FolderGit2 size={14} /> },
     { id: "connectors", label: "Connectors", icon: <Github size={14} /> }
   ];
+  const isAdmin = props.userRole !== "member";
+  const [accounts, setAccounts] = useState<HarnessAccount[]>([]);
+
+  async function reloadAccounts() {
+    if (!isAdmin) return;
+    try {
+      const result = await api<{ accounts: HarnessAccount[] }>("/api/harness-accounts");
+      setAccounts(result.accounts);
+    } catch {
+      // The tabs that need accounts show their own load errors.
+    }
+  }
+
+  useEffect(() => {
+    void reloadAccounts();
+  }, [isAdmin]);
 
   const tabsRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     tabsRef.current?.querySelector(".active")?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [props.activeTab]);
 
-  const visibleTabs = tabs.filter((t) => !t.restricted || props.userRole !== "member");
+  const visibleTabs = tabs.filter((t) => !t.restricted || isAdmin);
+  const activeTab = visibleTabs.some((tab) => tab.id === props.activeTab) ? props.activeTab : "api";
 
   return (
     <div className="settings-container">
@@ -5569,7 +5632,7 @@ function SettingsView(props: {
           <button
             key={tab.id}
             type="button"
-            className={`settings-tab-btn ${props.activeTab === tab.id ? "active" : ""}`}
+            className={`settings-tab-btn ${activeTab === tab.id ? "active" : ""}`}
             onClick={() => props.onTabChange(tab.id)}
           >
             {tab.icon}
@@ -5578,32 +5641,29 @@ function SettingsView(props: {
         ))}
       </div>
 
-      <div className="settings-content-pane">
-        {props.activeTab === "codex" && props.userRole !== "member" ? (
-          <CodexConnectionView />
+      <div className={`settings-content-pane ${activeTab === "harnesses" ? "settings-content-flush" : ""}`}>
+        {activeTab === "harnesses" && isAdmin ? (
+          <HarnessesView
+            accounts={accounts}
+            focusDriver={props.focusDriver}
+            onAccountsChanged={async () => {
+              await reloadAccounts();
+              await props.onAccountsChanged();
+            }}
+          />
         ) : null}
-        {props.activeTab === "cursor" && props.userRole !== "member" ? (
-          <CursorConnectionView />
-        ) : null}
-        {props.activeTab === "opencode" && props.userRole !== "member" ? (
-          <OpenCodeConnectionView />
-        ) : null}
-        {props.activeTab === "devin" && props.userRole !== "member" ? (
-          <DevinConnectionView />
-        ) : null}
-        {props.activeTab === "claude" && props.userRole !== "member" ? (
-          <ClaudeCodeConnectionView />
-        ) : null}
-        {props.activeTab === "api" ? (
+        {activeTab === "usage" && isAdmin ? <CostAnalyticsView accounts={accounts} /> : null}
+        {activeTab === "limits" && isAdmin ? <UsageLimitsView accounts={accounts} /> : null}
+        {activeTab === "api" ? (
           <ApiView apiKeys={props.apiKeys} onSaved={props.onSavedApiKeys} />
         ) : null}
-        {props.activeTab === "credentials" && props.userRole !== "member" ? (
+        {activeTab === "credentials" && isAdmin ? (
           <CredentialsView credentials={props.credentials} onSaved={props.onSavedCredentials} />
         ) : null}
-        {props.activeTab === "projects" ? (
+        {activeTab === "projects" ? (
           <ProjectsView projects={props.projects} onSaved={props.onSavedProjects} />
         ) : null}
-        {props.activeTab === "connectors" ? (
+        {activeTab === "connectors" ? (
           <ConnectorsView
             repos={props.repos}
             connection={props.connection}
@@ -5615,6 +5675,335 @@ function SettingsView(props: {
           />
         ) : null}
       </div>
+    </div>
+  );
+}
+
+function HarnessStackIcon() {
+  return (
+    <span className="harness-stack-icon" aria-hidden="true">
+      <ClaudeCodeLogo size={11} />
+      <CodexLogo size={11} />
+    </span>
+  );
+}
+
+const HARNESS_TAGLINES: Record<HarnessDriver, string> = {
+  codex: "OpenAI's coding agent, signed in with ChatGPT or an OpenAI API key.",
+  claude: "Anthropic's coding agent, via a `claude setup-token` subscription token or an API key.",
+  cursor: "Cursor's agent CLI, signed in with a Cursor login or API key.",
+  opencode: "Open-source agent that can route to many model providers.",
+  devin: "Cognition's Devin agent, signed in with a Windsurf login or API key."
+};
+
+type AccountStatus = { connected: boolean; lastError: string | null };
+
+function HarnessesView(props: {
+  accounts: HarnessAccount[];
+  focusDriver?: HarnessDriver;
+  onAccountsChanged: () => Promise<void>;
+}) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [statuses, setStatuses] = useState<Record<string, AccountStatus>>({});
+  const [limits, setLimits] = useState<Record<string, AccountLimits>>({});
+  const [adding, setAdding] = useState<HarnessDriver | null>(null);
+  const [newLabel, setNewLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const selected =
+    props.accounts.find((account) => account.id === selectedId) ??
+    props.accounts.find((account) => account.driver === (props.focusDriver ?? "codex") && account.isDefault) ??
+    props.accounts[0];
+
+  // Connection status for the list badges, read once per account.
+  useEffect(() => {
+    let stopped = false;
+    for (const account of props.accounts) {
+      if (statuses[account.id]) continue;
+      void api<AccountStatus>(accountPath(HARNESS_STATUS_PATHS[account.driver], account.isDefault ? undefined : account.id))
+        .then((status) => {
+          if (!stopped) setStatuses((current) => ({ ...current, [account.id]: { connected: status.connected, lastError: status.lastError } }));
+        })
+        .catch(() => undefined);
+    }
+    return () => {
+      stopped = true;
+    };
+  }, [props.accounts]);
+
+  useEffect(() => {
+    void api<{ limits: AccountLimits[] }>("/api/usage/limits")
+      .then((result) => setLimits(Object.fromEntries(result.limits.map((entry) => [entry.accountId, entry]))))
+      .catch(() => undefined);
+  }, [props.accounts.length]);
+
+  async function addAccount(driver: HarnessDriver) {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api<{ account: HarnessAccount }>("/api/harness-accounts", {
+        method: "POST",
+        body: JSON.stringify({ driver, label: newLabel.trim() })
+      });
+      await props.onAccountsChanged();
+      setSelectedId(result.account.id);
+      setAdding(null);
+      setNewLabel("");
+    } catch (addError) {
+      setError(friendlyError(addError instanceof Error ? addError.message : "Could not add the account."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const grouped = HARNESS_ORDER.map((driver) => ({
+    driver,
+    accounts: props.accounts.filter((account) => account.driver === driver)
+  })).filter((group) => group.accounts.length > 0);
+
+  return (
+    <div className="harnesses-view">
+      <aside className="harness-list" aria-label="Harness accounts">
+        <div className="harness-list-head">
+          <h3>Harnesses</h3>
+          <p>Each account is a separate login. Agents pick the account they run on.</p>
+        </div>
+        {grouped.map((group) => (
+          <section className="harness-group" key={group.driver}>
+            <div className="harness-group-head">
+              <span className={`harness-chip driver-${group.driver}`}>
+                <HarnessMark driver={group.driver} size={15} color />
+              </span>
+              <strong>{HARNESS_LABELS[group.driver]}</strong>
+              <button
+                type="button"
+                className="harness-add-btn"
+                aria-label={`Add ${HARNESS_LABELS[group.driver]} account`}
+                title={`Add ${HARNESS_LABELS[group.driver]} account`}
+                onClick={() => {
+                  setAdding(adding === group.driver ? null : group.driver);
+                  setNewLabel("");
+                  setError(null);
+                }}
+              >
+                <Plus size={13} />
+              </button>
+            </div>
+            {group.accounts.map((account) => {
+              const status = statuses[account.id];
+              const accountLimits = limits[account.id];
+              const tightest = accountLimits?.windows
+                .filter((window) => !isWindowStale(window))
+                .reduce<LimitWindowData | null>((worst, window) => (!worst || window.usedPercent > worst.usedPercent ? window : worst), null);
+              return (
+                <button
+                  type="button"
+                  key={account.id}
+                  className={`harness-account-row ${selected?.id === account.id ? "active" : ""}`}
+                  onClick={() => setSelectedId(account.id)}
+                >
+                  <span className={`status-dot ${status ? (status.connected ? "ok" : status.lastError ? "error" : "off") : "pending"}`} />
+                  <span className="harness-account-text">
+                    <span className="harness-account-name">{accountName(account)}</span>
+                    <span className="harness-account-meta">
+                      {status ? (status.connected ? "Connected" : status.lastError ? "Needs attention" : "Not connected") : "Checking…"}
+                      {account.agents ? ` · ${account.agents} agent${account.agents === 1 ? "" : "s"}` : ""}
+                    </span>
+                  </span>
+                  {tightest ? (
+                    <span className={`harness-account-limit ${tightest.usedPercent >= 90 ? "critical" : tightest.usedPercent >= 75 ? "low" : ""}`} title={`${tightest.label}: ${Math.round(100 - tightest.usedPercent)}% left`}>
+                      {Math.round(100 - tightest.usedPercent)}%
+                    </span>
+                  ) : null}
+                </button>
+              );
+            })}
+            {adding === group.driver ? (
+              <form
+                className="harness-add-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (newLabel.trim()) void addAccount(group.driver);
+                }}
+              >
+                <Input
+                  autoFocus
+                  value={newLabel}
+                  maxLength={60}
+                  placeholder="Account name, e.g. Work"
+                  onChange={(event) => setNewLabel(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Escape") setAdding(null);
+                  }}
+                />
+                <Button type="submit" size="sm" disabled={busy || !newLabel.trim()}>
+                  Add
+                </Button>
+              </form>
+            ) : null}
+          </section>
+        ))}
+        {error ? <div className="notice error harness-list-error">{error}</div> : null}
+      </aside>
+      <div className="harness-detail">
+        {selected ? (
+          <HarnessAccountDetail
+            key={selected.id}
+            account={selected}
+            accounts={props.accounts}
+            limits={limits[selected.id]}
+            onStatus={(status) => {
+              const previous = statuses[selected.id];
+              setStatuses((current) => ({ ...current, [selected.id]: status }));
+              // A new or removed credential changes the limits; re-check just this account.
+              if (previous && previous.connected !== status.connected) {
+                void api<{ limits: AccountLimits[] }>(`/api/usage/limits?refresh=${encodeURIComponent(selected.id)}`)
+                  .then((result) => setLimits(Object.fromEntries(result.limits.map((entry) => [entry.accountId, entry]))))
+                  .catch(() => undefined);
+              }
+            }}
+            onAccountsChanged={props.onAccountsChanged}
+            onRemoved={() => setSelectedId(null)}
+          />
+        ) : (
+          <div className="usage-empty">Loading harness accounts…</div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+const HARNESS_STATUS_PATHS: Record<HarnessDriver, string> = {
+  codex: "/api/codex-auth",
+  claude: "/api/claude-code-auth",
+  cursor: "/api/cursor-auth",
+  opencode: "/api/opencode-auth",
+  devin: "/api/devin-auth"
+};
+
+function HarnessAccountDetail(props: {
+  account: HarnessAccount;
+  accounts: HarnessAccount[];
+  limits?: AccountLimits;
+  onStatus: (status: AccountStatus) => void;
+  onAccountsChanged: () => Promise<void>;
+  onRemoved: () => void;
+}) {
+  const { account } = props;
+  const [label, setLabel] = useState(account.label ?? "");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const siblings = props.accounts.filter((entry) => entry.driver === account.driver);
+  const instanceId = account.isDefault ? undefined : account.id;
+  const viewProps: HarnessAccountViewProps = { instanceId, onStatus: props.onStatus };
+
+  async function rename() {
+    if ((account.label ?? "") === label.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/harness-accounts/${encodeURIComponent(account.id)}`, { method: "PATCH", body: JSON.stringify({ label: label.trim() }) });
+      await props.onAccountsChanged();
+    } catch (renameError) {
+      setError(friendlyError(renameError instanceof Error ? renameError.message : "Could not rename the account."));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function remove() {
+    if (!window.confirm(`Remove the ${HARNESS_LABELS[account.driver]} account "${accountName(account)}" and its stored credentials?`)) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await api(`/api/harness-accounts/${encodeURIComponent(account.id)}`, { method: "DELETE" });
+      props.onRemoved();
+      await props.onAccountsChanged();
+    } catch (removeError) {
+      setError(friendlyError(removeError instanceof Error ? removeError.message : "Could not remove the account."));
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="harness-detail-inner">
+      <header className="harness-detail-head">
+        <span className={`harness-chip large driver-${account.driver}`}>
+          <HarnessMark driver={account.driver} size={24} color />
+        </span>
+        <div className="harness-detail-title">
+          <span className="eyebrow">{HARNESS_LABELS[account.driver]}{siblings.length > 1 ? ` · ${siblings.length} accounts` : ""}</span>
+          <input
+            className="harness-account-label-input"
+            value={label}
+            maxLength={60}
+            placeholder={account.isDefault ? "Default account" : "Account name"}
+            aria-label="Account name"
+            disabled={busy}
+            onChange={(event) => setLabel(event.target.value)}
+            onBlur={() => void rename()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") setLabel(account.label ?? "");
+            }}
+          />
+          <p>{HARNESS_TAGLINES[account.driver]}</p>
+        </div>
+        <div className="harness-detail-stats">
+          <span><strong>{account.agents}</strong> agent{account.agents === 1 ? "" : "s"}</span>
+          <span><strong>{account.threads}</strong> active thread{account.threads === 1 ? "" : "s"}</span>
+        </div>
+      </header>
+      {error ? <div className="notice error">{error}</div> : null}
+
+      <div className="harness-embedded">
+        {account.driver === "codex" ? <CodexConnectionView {...viewProps} /> : null}
+        {account.driver === "claude" ? <ClaudeCodeConnectionView {...viewProps} /> : null}
+        {account.driver === "cursor" ? <CursorConnectionView {...viewProps} /> : null}
+        {account.driver === "opencode" ? <OpenCodeConnectionView {...viewProps} /> : null}
+        {account.driver === "devin" ? <DevinConnectionView {...viewProps} /> : null}
+      </div>
+
+      {props.limits && (props.limits.windows.length || props.limits.groups.length) ? (
+        <section className="api-section harness-limits">
+          <div className="section-title-row">
+            <div>
+              <h4>Usage limits</h4>
+              <p>{props.limits.plan ?? "Plan"} · {props.limits.source === "live" ? "checked just now" : "from the last run on this account"}</p>
+            </div>
+          </div>
+          <AccountLimitsBody limits={props.limits} />
+        </section>
+      ) : null}
+
+      <section className="api-section harness-account-footer">
+        <div className="section-title-row">
+          <div>
+            <h4>Using this account</h4>
+            <p>
+              Choose the account per agent in Agent setup: the model picker lists every account as its own entry.
+              {account.isDefault ? " This is the original account and cannot be removed; disconnect it instead." : ""}
+            </p>
+          </div>
+          {!account.isDefault ? (
+            <Button
+              variant="outline"
+              disabled={busy || !account.removable}
+              title={
+                account.removable
+                  ? undefined
+                  : account.agents > 0
+                    ? "Move its agents to another account first"
+                    : "This account ran threads, so it is kept for their history. Disconnect it instead."
+              }
+              onClick={() => void remove()}
+            >
+              <Trash2 size={14} /> Remove account
+            </Button>
+          ) : null}
+        </div>
+      </section>
     </div>
   );
 }
@@ -5879,7 +6268,26 @@ function apiKeyStatus(key: ExternalApiKey): string {
 }
 
 function isSettingsView(view: View): boolean {
-  return ["settings", "codex", "cursor", "opencode", "devin", "claude", "api", "credentials", "projects", "connectors"].includes(view);
+  return [
+    "settings", "codex", "cursor", "opencode", "devin", "claude", "harnesses", "usage", "limits",
+    "api", "credentials", "projects", "connectors"
+  ].includes(view);
+}
+
+// Legacy per-harness settings routes open the Harnesses tab on that harness.
+const HARNESS_VIEW_DRIVERS = {
+  codex: "codex",
+  cursor: "cursor",
+  opencode: "opencode",
+  devin: "devin",
+  claude: "claude"
+} as const satisfies Partial<Record<View, HarnessDriver>>;
+
+function settingsTabForView(view: View): SettingsTab {
+  if (view === "api" || view === "credentials" || view === "projects" || view === "connectors" || view === "usage" || view === "limits") {
+    return view;
+  }
+  return "harnesses";
 }
 
 function viewTitle(view: View): string {
@@ -5898,6 +6306,9 @@ function viewTitle(view: View): string {
     opencode: "Settings",
     devin: "Settings",
     claude: "Settings",
+    harnesses: "Settings",
+    usage: "Settings",
+    limits: "Settings",
     api: "Settings",
     credentials: "Settings",
     projects: "Settings",

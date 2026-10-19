@@ -6,7 +6,7 @@ const key = Buffer.alloc(32, 9).toString("base64");
 const OAUTH = "sk-ant-oat01-example-subscription-token-WXYZ";
 const API_KEY = "sk-ant-api03-example-console-key-ABCD";
 
-function setup(check: (apiKey: string) => Promise<"valid" | "invalid" | "unknown"> = async () => "valid") {
+function setup(check: (apiKey: string) => Promise<"valid" | "invalid" | "unknown"> = async () => "valid", instanceId?: string) {
   const stored = new Map<string, string>();
   const pool = {
     async query(sql: string, params: unknown[] = []) {
@@ -19,10 +19,20 @@ function setup(check: (apiKey: string) => Promise<"valid" | "invalid" | "unknown
     }
   } as unknown as DbPool;
   const checkApiKey = vi.fn(check);
-  return { stored, checkApiKey, manager: new ClaudeCodeAuthManager(pool, key, checkApiKey) };
+  return { stored, checkApiKey, manager: new ClaudeCodeAuthManager(pool, key, checkApiKey, instanceId) };
 }
 
 describe("Claude Code credential management", () => {
+  it("keeps an added account's token separate from the default account", async () => {
+    const { manager, stored } = setup(async () => "valid", "claude-work");
+    expect(await manager.getStatus()).toMatchObject({ connected: false });
+    await manager.saveCredential(OAUTH);
+    expect([...stored.keys()]).toEqual([`${CLAUDE_CODE_TOKEN_SECRET_NAME}@claude-work`]);
+    expect(await manager.getStatus()).toMatchObject({ connected: true, activeMethod: "subscription" });
+    await manager.disconnect();
+    expect(stored.size).toBe(0);
+  });
+
   it("reports a disconnected harness when nothing is stored", async () => {
     const { manager } = setup();
     expect(await manager.getStatus()).toMatchObject({ connected: false, activeMethod: null, credentialHint: null });

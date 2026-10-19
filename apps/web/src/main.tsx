@@ -6,6 +6,7 @@ import "blobatar/motion.css";
 import "./styles.css";
 import "./timeline.css";
 import "./composer.css";
+import "./settings.css";
 
 createRoot(document.getElementById("root")!).render(
   <React.StrictMode>

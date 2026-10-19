@@ -1,4 +1,5 @@
 import {
+  providerInstanceSecretName,
   CLAUDE_CODE_TOKEN_SECRET_NAME,
   classifyClaudeCredential,
   decryptSecret,
@@ -26,8 +27,13 @@ export class ClaudeCodeAuthManager {
   constructor(
     private readonly pool: DbPool,
     private readonly secretKey: string,
-    private readonly checkApiKey: AnthropicKeyCheck = checkAnthropicApiKey
+    private readonly checkApiKey: AnthropicKeyCheck = checkAnthropicApiKey,
+    private readonly instanceId?: string
   ) {}
+
+  private secret(baseName: string): string {
+    return providerInstanceSecretName(baseName, this.instanceId);
+  }
 
   async getStatus(): Promise<ClaudeCodeAuthStatus> {
     const stored = await this.readSecret();
@@ -69,7 +75,7 @@ export class ClaudeCodeAuthManager {
        SET description = excluded.description, encrypted_value = excluded.encrypted_value,
            agent_accessible = false, updated_at = now()`,
       [
-        CLAUDE_CODE_TOKEN_SECRET_NAME,
+        this.secret(CLAUDE_CODE_TOKEN_SECRET_NAME),
         kind === "oauth_token"
           ? "Claude subscription token used by the Claude Code harness"
           : "Anthropic API key used by the Claude Code harness",
@@ -81,7 +87,7 @@ export class ClaudeCodeAuthManager {
 
   async disconnect(): Promise<ClaudeCodeAuthStatus> {
     await this.pool.query("DELETE FROM secrets WHERE name = $1 AND agent_accessible = false", [
-      CLAUDE_CODE_TOKEN_SECRET_NAME
+      this.secret(CLAUDE_CODE_TOKEN_SECRET_NAME)
     ]);
     return this.getStatus();
   }
@@ -91,7 +97,7 @@ export class ClaudeCodeAuthManager {
       // Only the internal (never agent-visible) row counts: an agent credential
       // that happens to share the name must not become the harness credential.
       "SELECT encrypted_value, updated_at FROM secrets WHERE name = $1 AND agent_accessible = false",
-      [CLAUDE_CODE_TOKEN_SECRET_NAME]
+      [this.secret(CLAUDE_CODE_TOKEN_SECRET_NAME)]
     );
     const row = result.rows[0];
     if (!row) return undefined;

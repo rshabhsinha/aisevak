@@ -1,4 +1,6 @@
 import {
+  isDefaultProviderInstance,
+  providerInstanceSecretName,
   OPENCODE_AUTH_SECRET_NAME,
   decryptSecret,
   encryptSecret,
@@ -47,11 +49,16 @@ export class OpenCodeAuthManager {
     private readonly secretKey: string,
     private readonly openCodeBinary: string,
     private readonly authHomeRoot: string,
-    private readonly hostAuthPath = defaultOpenCodeAuthPath()
+    private readonly hostAuthPath = defaultOpenCodeAuthPath(),
+    private readonly instanceId?: string
   ) {}
 
+  private secret(baseName: string): string {
+    return providerInstanceSecretName(baseName, this.instanceId);
+  }
+
   async getStatus(): Promise<OpenCodeAuthStatus> {
-    const stored = await this.readSecret(OPENCODE_AUTH_SECRET_NAME);
+    const stored = await this.readSecret(this.secret(OPENCODE_AUTH_SECRET_NAME));
     if (stored) {
       try {
         const providerIds = openCodeAuthProviderIds(parseOpenCodeAuthFile(stored));
@@ -73,7 +80,10 @@ export class OpenCodeAuthManager {
       }
     }
 
+    // Only the default account may fall back to the host login; the runner
+    // never gives added accounts the host credentials.
     try {
+      if (!isDefaultProviderInstance(this.instanceId)) throw new Error("No stored credentials for this account");
       const host = await readFile(this.hostAuthPath, "utf8");
       const providerIds = openCodeAuthProviderIds(parseOpenCodeAuthFile(host));
       // Read-only: never persist host credentials from a status check.
@@ -183,7 +193,7 @@ export class OpenCodeAuthManager {
   }
 
   async disconnect(): Promise<OpenCodeAuthStatus> {
-    await this.pool.query("DELETE FROM secrets WHERE name = $1", [OPENCODE_AUTH_SECRET_NAME]);
+    await this.pool.query("DELETE FROM secrets WHERE name = $1", [this.secret(OPENCODE_AUTH_SECRET_NAME)]);
     await rm(this.authHomeRoot, { recursive: true, force: true });
     return this.getStatus();
   }
@@ -213,7 +223,7 @@ export class OpenCodeAuthManager {
        VALUES ($1, $2, $3, false)
        ON CONFLICT (name) DO UPDATE
        SET description = excluded.description, encrypted_value = excluded.encrypted_value, updated_at = now()`,
-      [OPENCODE_AUTH_SECRET_NAME, "Internal OpenCode authentication used by the runner", encrypted]
+      [this.secret(OPENCODE_AUTH_SECRET_NAME), "Internal OpenCode authentication used by the runner", encrypted]
     );
   }
 }

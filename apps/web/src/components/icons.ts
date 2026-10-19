@@ -57,3 +57,6 @@ export { File as FileIcon } from "@phosphor-icons/react/dist/icons/File";
 export { StopCircle } from "@phosphor-icons/react/dist/icons/StopCircle";
 export { CaretUpDown } from "@phosphor-icons/react/dist/icons/CaretUpDown";
 export { UploadSimple } from "@phosphor-icons/react/dist/icons/UploadSimple";
+export { ChartBar as ChartColumn } from "@phosphor-icons/react/dist/icons/ChartBar";
+export { TrendUp as TrendingUp } from "@phosphor-icons/react/dist/icons/TrendUp";
+export { TrendDown as TrendingDown } from "@phosphor-icons/react/dist/icons/TrendDown";

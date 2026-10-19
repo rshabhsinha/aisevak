@@ -5,7 +5,10 @@ import { CodexAuthManager } from "./codexAuth.js";
 const secretKey = Buffer.alloc(32, 7).toString("base64");
 
 describe("CodexAuthManager", () => {
-  it("completes device login and stores encrypted Codex authentication", async () => {
+  it.each([
+    [undefined, "openai_codex_auth"],
+    ["codex-work", "openai_codex_auth@codex-work"]
+  ])("completes device login and stores encrypted Codex authentication (account %s)", async (instanceId, secretName) => {
     const stored = new Map<string, string>();
     const pool = {
       async query(sql: string, params: unknown[] = []) {
@@ -51,7 +54,7 @@ describe("CodexAuthManager", () => {
     const manager = new CodexAuthManager(pool, secretKey, {
       authBaseUrl: "https://auth.example.test",
       fetchImpl: fetchImpl as typeof fetch
-    });
+    }, instanceId);
 
     const login = await manager.startDeviceLogin("user-id");
     expect(login.userCode).toBe("ABCD-EFGH");
@@ -66,7 +69,8 @@ describe("CodexAuthManager", () => {
       accountIdSuffix: "123456"
     });
 
-    const encrypted = stored.get("openai_codex_auth");
+    expect([...stored.keys()]).toEqual([secretName]);
+    const encrypted = stored.get(secretName);
     expect(encrypted).toBeTruthy();
     const auth = parseCodexChatGptAuthFile(decryptSecret(encrypted!, secretKey));
     expect(auth.tokens).toMatchObject({

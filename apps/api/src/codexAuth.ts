@@ -1,4 +1,5 @@
 import {
+  providerInstanceSecretName,
   buildCodexChatGptAuthFile,
   CODEX_CHATGPT_AUTH_SECRET_NAME,
   decryptSecret,
@@ -62,7 +63,8 @@ export class CodexAuthManager {
       authBaseUrl?: string;
       fetchImpl?: typeof fetch;
       requestTimeoutMs?: number;
-    } = {}
+    } = {},
+    private readonly instanceId?: string
   ) {
     this.clientId = options.clientId ?? process.env.CODEX_OAUTH_CLIENT_ID ?? DEFAULT_CODEX_CLIENT_ID;
     this.authBaseUrl = options.authBaseUrl ?? DEFAULT_CODEX_AUTH_BASE_URL;
@@ -70,15 +72,19 @@ export class CodexAuthManager {
     this.requestTimeoutMs = Math.max(1, options.requestTimeoutMs ?? AUTH_REQUEST_TIMEOUT_MS);
   }
 
+  private secret(baseName: string): string {
+    return providerInstanceSecretName(baseName, this.instanceId);
+  }
+
   async getStatus(): Promise<CodexAuthStatus> {
     const result = await this.pool.query<{ name: string; encrypted_value: string }>(
       "SELECT name, encrypted_value FROM secrets WHERE name = ANY($1::text[])",
-      [[CODEX_CHATGPT_AUTH_SECRET_NAME, "openai_api_key"]]
+      [[this.secret(CODEX_CHATGPT_AUTH_SECRET_NAME), this.secret("openai_api_key")]]
     );
     const apiKeyConfigured = result.rows.some(
-      (row) => row.name === "openai_api_key" && row.encrypted_value.length > 0
+      (row) => row.name === this.secret("openai_api_key") && row.encrypted_value.length > 0
     );
-    const stored = result.rows.find((row) => row.name === CODEX_CHATGPT_AUTH_SECRET_NAME);
+    const stored = result.rows.find((row) => row.name === this.secret(CODEX_CHATGPT_AUTH_SECRET_NAME));
     if (!stored) {
       return emptyStatus(apiKeyConfigured);
     }
@@ -185,7 +191,7 @@ export class CodexAuthManager {
   }
 
   async disconnect(): Promise<CodexAuthStatus> {
-    await this.pool.query("DELETE FROM secrets WHERE name = $1", [CODEX_CHATGPT_AUTH_SECRET_NAME]);
+    await this.pool.query("DELETE FROM secrets WHERE name = $1", [this.secret(CODEX_CHATGPT_AUTH_SECRET_NAME)]);
     return this.getStatus();
   }
 
@@ -235,7 +241,7 @@ export class CodexAuthManager {
            agent_accessible = false,
            updated_at = now()`,
       [
-        CODEX_CHATGPT_AUTH_SECRET_NAME,
+        this.secret(CODEX_CHATGPT_AUTH_SECRET_NAME),
         "Internal ChatGPT authentication used by the Codex runner",
         encrypted,
         requestedBy
