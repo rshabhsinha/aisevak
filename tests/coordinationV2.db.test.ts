@@ -15,6 +15,7 @@ import {
   recoverInterruptedCoordinationRuns,
   recoverInterruptedWorkerRuns
 } from "../apps/runner/src/index.js";
+import { setThreadArchived } from "../apps/api/src/threadArchive.js";
 import { renewRunLeases } from "../apps/runner/src/runLeases.js";
 
 // Runs the coordination v2 SQL against a real Postgres. Point
@@ -94,6 +95,20 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     expect(notices).toHaveLength(1);
     expect(notices[0]).toMatchObject({ recipient_agent_id: orch.id, parent_message_id: failed.messageId });
     expect(notices[0].body).toContain("Platform notice (not new work, not a reply)");
+  });
+
+  it("sends no notice when a chat is archived mid-assignment", async () => {
+    const { orch, rev, thread, assignment, send } = await scenario();
+    const sent = await send("review it", orch.id, rev.id, assignment.id);
+    const [bound] = await q("SELECT agent_thread_id FROM message_deliveries WHERE id = $1", [sent.deliveryId]);
+    await q("UPDATE task_assignments SET active_delivery_id = $2 WHERE id = $1", [assignment.id, sent.deliveryId]);
+
+    await setThreadArchived(pool, bound.agent_thread_id, true);
+    await notifyFailedDeliveries(pool, managedRoot, 200);
+
+    expect((await q("SELECT status, failure_notified_at IS NOT NULL AS quiet FROM message_deliveries WHERE id = $1", [sent.deliveryId]))[0])
+      .toEqual({ status: "failed", quiet: true });
+    expect(await q("SELECT 1 FROM thread_messages WHERE thread_id = $1 AND message_type = 'delivery.failed'", [thread.id])).toHaveLength(0);
   });
 
   it("leaves live leases alone, redelivers an expired interrupted turn, and fences the old runner", async () => {

@@ -2164,9 +2164,10 @@ async function failStaleQueuedRunInputs(
   );
   if (fallbackDeliveryId) deliveryIds.add(fallbackDeliveryId);
   for (const deliveryId of deliveryIds) {
+    // An ownership change (reassignment) is deliberate: no delivery.failed notice.
     await queryable.query(
       `UPDATE message_deliveries
-       SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+       SET status = 'failed', completed_at = now(), error = $2, failure_notified_at = now(), updated_at = now()
        WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
       [deliveryId, error]
     );
