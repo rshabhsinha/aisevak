@@ -8,6 +8,7 @@ function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?:
   const client = {
     async query(sql: string, params?: unknown[]) {
       queries.push({ sql, params });
+      if (sql.includes("UPDATE tasks")) return { rows: [{ id: params?.[0] }] };
       return { rows: [] };
     },
     release() {}
@@ -107,6 +108,43 @@ describe("worker run finalization", () => {
     const threadUpdate = queries.find((query) => query.sql.includes("UPDATE coordination_threads"));
     expect(taskUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'open'/);
     expect(threadUpdate?.sql).toMatch(/WHERE id = \$1\s+AND status = 'active'/);
+  });
+
+  it("only auto-completes a standalone task, never a coordinated child", async () => {
+    const { pool, queries } = recordingPool();
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id", taskId: "task-id", agentThreadId: null,
+      coordinationThreadId: "coordination-thread-id", finalStatus: "succeeded",
+      stdout: "done", stderr: "", exitCode: 0
+    });
+
+    const taskUpdate = queries.find((query) => query.sql.includes("UPDATE tasks"))!;
+    expect(taskUpdate.sql).toContain("parent_task_id IS NOT NULL");
+    expect(taskUpdate.sql).toContain("FROM task_assignments");
+    expect(taskUpdate.sql).toContain("child.parent_task_id = tasks.id");
+  });
+
+  it("keeps the coordination thread open when a ping turn on a coordinated task succeeds", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const client = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        // The guarded task update matches no row: the task is a child job.
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id", taskId: "child-task-id", agentThreadId: null,
+      coordinationThreadId: "coordination-thread-id", finalStatus: "succeeded",
+      stdout: "resumed", stderr: "", exitCode: 0
+    });
+
+    expect(queries.some((query) => query.sql.includes("UPDATE tasks"))).toBe(true);
+    expect(queries.some((query) => query.sql.includes("UPDATE coordination_threads"))).toBe(false);
   });
 
   it("does not let a stale worker finalize the transferred task", async () => {

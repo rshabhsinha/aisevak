@@ -2374,15 +2374,29 @@ export async function finalizeWorkerRunState(
       [input.runId, input.finalStatus, encodePostgresText(input.stdout), encodePostgresText(input.stderr), input.exitCode]
     );
     if (!ownsCurrentThread) return;
-    await client.query(
+    // A successful turn only closes a standalone task. A child task, or one with
+    // assignments or open children, is part of a coordinated job: one of its
+    // turns ending (for example a ping) does not mean the job is done, and
+    // closing it would refuse the next review assignment. Those tasks close
+    // through `tasks complete` or their coordination thread.
+    const taskUpdate = await client.query(
       `UPDATE tasks
        SET status = $2,
            updated_at = now()
        WHERE id = $1
-         AND status = 'open'`,
+         AND status = 'open'
+         AND NOT ($2 = 'completed' AND (
+           parent_task_id IS NOT NULL
+           OR EXISTS (SELECT 1 FROM task_assignments WHERE task_assignments.task_id = tasks.id)
+           OR EXISTS (SELECT 1 FROM tasks child
+                      WHERE child.parent_task_id = tasks.id
+                        AND child.status NOT IN ('completed', 'blocked', 'cancelled'))
+         ))
+       RETURNING id`,
       [input.taskId, taskStatus]
     );
-    if (input.coordinationThreadId) {
+    const keepsCoordinationOpen = input.finalStatus === "succeeded" && !taskUpdate.rows[0];
+    if (input.coordinationThreadId && !keepsCoordinationOpen) {
       await client.query(
         `UPDATE coordination_threads
          SET status = $2,
