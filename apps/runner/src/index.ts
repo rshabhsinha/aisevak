@@ -616,6 +616,19 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
   }
 }
 
+// systemd stops the whole service process group, so a runner stop or restart
+// (every deploy) also kills the harnesses of in-flight turns. A dispatcher
+// turn that fails while this runner is stopping was most likely killed by
+// that stop: it is left 'running' under this runner's lease instead of
+// finalized, and the next boot of this runner recovers it. A coordination
+// turn's message (and any input it had presented) is redelivered with an
+// "interrupted" note; other dispatcher turns are recovered as failed.
+// Succeeded turns and our own cancellations (Stop, ownership changes)
+// finalize as usual.
+export function deferFinalizationForShutdown(stopping: boolean, finalStatus: "succeeded" | "failed" | "cancelled"): boolean {
+  return stopping && finalStatus === "failed" && !legacyCoordination();
+}
+
 export async function recoverExpiredRunLeases(pool: DbPool, scope: RecoveryScope): Promise<void> {
   await recoverInterruptedCoordinationRuns(pool, scope);
   await recoverInterruptedDispatcherRuns(pool, scope);
@@ -1960,6 +1973,10 @@ export async function processOneDispatcherRun(
     finalStatus = "failed";
   } finally {
     releaseActiveRun();
+    if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
+      console.warn(`Leaving turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
+      return true;
+    }
     // Fenced on ownership: if this runner's lease lapsed and another runner
     // recovered the turn (and possibly redelivered it), the recovery already
     // settled its delivery and inputs, and settling them again here would
@@ -2269,6 +2286,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
+    // Worker turns have no redelivery path, so they finalize even while
+    // stopping and keep their needs_attention signal.
     releaseActiveRun();
     const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,

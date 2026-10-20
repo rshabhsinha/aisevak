@@ -1,5 +1,6 @@
 import type { DbPool } from "@aisevak/core";
 import { afterEach, describe, expect, it } from "vitest";
+import { deferFinalizationForShutdown } from "./index.js";
 import {
   INTERRUPTED_PREAMBLE,
   recoverableRunPredicate,
@@ -10,6 +11,18 @@ import {
 } from "./runLeases.js";
 
 afterEach(() => { delete process.env.AISEVAK_COORDINATION_LEGACY; });
+
+describe("turns ending during a runner stop", () => {
+  it("leaves unsuccessful turns for boot recovery only while stopping", () => {
+    expect(deferFinalizationForShutdown(true, "failed")).toBe(true);
+    // Our own cancellations (Stop, ownership changes) settle as usual.
+    expect(deferFinalizationForShutdown(true, "cancelled")).toBe(false);
+    expect(deferFinalizationForShutdown(true, "succeeded")).toBe(false);
+    expect(deferFinalizationForShutdown(false, "failed")).toBe(false);
+    process.env.AISEVAK_COORDINATION_LEGACY = "1";
+    expect(deferFinalizationForShutdown(true, "failed")).toBe(false);
+  });
+});
 
 describe("run leases", () => {
   it("lets a boot recover its own previous turns, unleased legacy turns, and other runners' leases past the grace period", () => {

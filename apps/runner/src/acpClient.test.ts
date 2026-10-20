@@ -200,3 +200,68 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     if (previousManagedRoot === undefined) delete process.env.MANAGED_ROOT;
     else process.env.MANAGED_ROOT = previousManagedRoot; await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
+
+it("reports a prompt the harness cancelled on its own as failed, and our own cancel as interrupted", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  await writeFile(script, `const readline = require('node:readline');
+const held = [];
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'killed') { console.log(JSON.stringify({id:m.id,result:{stopReason:'cancelled'}})); return; }
+ if(m.method === 'session/prompt') { held.push(m.id); return; }
+ if(m.method === 'session/cancel') { for (const id of held.splice(0)) console.log(JSON.stringify({id,result:{stopReason:'cancelled'}})); }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const options = {
+    binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+    model: "auto", prompt: "killed", threadId: "s1", env: process.env, secrets: [],
+    onLine: async () => {}, onThreadId: async () => {}, shouldCancel: async () => false
+  };
+  try {
+    const killed = await runAcpTurn(options);
+    expect(killed.status).toBe("failed");
+    expect(killed.error).toContain("without a cancel request");
+    let cancel = false;
+    setTimeout(() => { cancel = true; }, 200);
+    const stopped = await runAcpTurn({ ...options, prompt: "hold", shouldCancel: async () => cancel });
+    expect(stopped.status).toBe("interrupted");
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});
+
+it("does not mark a mid-turn input handled when the harness cancels it on its own, and fails the turn", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  // Like claude-agent-acp when killed after a hand-off: the first prompt ends
+  // with end_turn once the injected one arrives, then the injected one is
+  // answered "cancelled".
+  await writeFile(script, `const readline = require('node:readline');
+let first = null;
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && first === null) { first = m.id; return; }
+ if(m.method === 'session/prompt') {
+   console.log(JSON.stringify({id:first,result:{stopReason:'end_turn'}}));
+   setTimeout(() => console.log(JSON.stringify({id:m.id,result:{stopReason:'cancelled'}})), 100);
+   return;
+ }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const handled: Array<{ id: string; error?: string }> = [];
+  let served = false;
+  try {
+    const result = await runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+      model: "auto", prompt: "start", threadId: "s1", env: process.env, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {}, shouldCancel: async () => false,
+      nextInput: async () => {
+        if (served) return null;
+        served = true;
+        return { id: "input-1", message: "also check X", messageDeliveryId: "delivery-1", assignmentId: null };
+      },
+      onInputHandled: async (input, error) => { handled.push({ id: input.id, error }); }
+    });
+    expect(result.status).toBe("failed");
+    expect(handled).toEqual([]);
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});

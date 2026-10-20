@@ -28,6 +28,10 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
 const sessions = new Map<string, PersistentAcpSession>();
 const ACP_SESSION_IDLE_MS = 30 * 60_000;
 
+function stopReasonOf(result: unknown): unknown {
+  return result && typeof result === "object" ? (result as { stopReason?: unknown }).stopReason : undefined;
+}
+
 export async function runAcpTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
   const key = options.runtimeHome;
   await closeIdleAcpSessions(key);
@@ -284,6 +288,7 @@ class PersistentAcpSession {
             cancelBusy = false;
           });
       };
+      let inputKilled = false;
       const pollInput = () => {
         if (injectBusy || turnFinished || cancelRequested || !options.nextInput) return;
         injectBusy = true;
@@ -291,10 +296,18 @@ class PersistentAcpSession {
           const input = await options.nextInput?.();
           if (!input) return;
           try {
-            await this.request("session/prompt", {
+            const injected = await this.request("session/prompt", {
               sessionId: this.sessionId,
               prompt: await acpPromptContent(input.message, this.supportsImages)
             }, true);
+            // A killed harness answers an injected prompt "cancelled" too. That
+            // input was not handled: leave it 'delivering' (boot recovery after
+            // a runner stop redelivers it; otherwise the turn's end fails it)
+            // and fail the turn, whose main prompt may already have ended.
+            if (stopReasonOf(injected) === "cancelled" && !cancelRequested) {
+              inputKilled = true;
+              return;
+            }
             await options.onInputHandled?.(input);
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
@@ -310,8 +323,9 @@ class PersistentAcpSession {
         pollInput();
       }, 750);
 
+      let promptResult: unknown;
       try {
-        await promptRequest;
+        promptResult = await promptRequest;
       } finally {
         turnFinished = true;
       }
@@ -320,6 +334,22 @@ class PersistentAcpSession {
       monitor = null;
       await cancelTask;
       if (this.closed) throw new Error("ACP session closed while handling a mid-turn input");
+      // A harness that is killed (for example when its runner stops) answers
+      // the open prompt with stopReason "cancelled". Unless we asked for the
+      // cancel, that turn did not complete: report it as failed so it is
+      // retried or redelivered instead of recorded as a success.
+      if ((stopReasonOf(promptResult) === "cancelled" || inputKilled) && !cancelRequested) {
+        return {
+          status: "failed",
+          threadId: this.sessionId,
+          turnId: this.sessionId,
+          rawStdout: rawLines.join("\n"),
+          rawStderr: this.rawStderr,
+          exitCode: null,
+          error: "The harness ended the turn as cancelled without a cancel request (it was likely stopped with its runner)",
+          promptMayHaveBeenPresented
+        };
+      }
 
       return {
         status: cancelRequested ? "interrupted" : "completed",
