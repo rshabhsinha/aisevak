@@ -212,12 +212,21 @@ const skillInstallSchema = z.object({
 
 export async function reopenTask(
   pool: DbPool,
-  input: { taskId: string; senderAgentId: string; body?: string; managedRoot: string }
+  input: { taskId: string; senderAgentId: string; capabilities: string[]; body?: string; managedRoot: string }
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
     const task = await showTask(client, input.taskId);
-    if (task.agent_id !== input.senderAgentId) {
+    // The owner reopens with tasks:update. The owner of the parent task may
+    // also reopen a child it created, so an orchestrator can recover a child
+    // task that closed early without taking ownership of it.
+    if (task.agent_id === input.senderAgentId) {
+      if (!input.capabilities.includes("tasks:update")) forbidden("Reopening a task requires tasks:update");
+    } else if (task.parent_task_agent_id && task.parent_task_agent_id === input.senderAgentId) {
+      if (!["tasks:update", "tasks:create-child"].some((capability) => input.capabilities.includes(capability))) {
+        forbidden("Reopening a child task requires tasks:update or tasks:create-child");
+      }
+    } else {
       forbidden(`Task ${task.key ?? input.taskId} is assigned to another agent`);
     }
     await client.query("UPDATE tasks SET status = 'open', updated_at = now() WHERE id = $1", [input.taskId]);
@@ -1037,12 +1046,12 @@ export async function registerCoordinationRoutes(
 
   app.post("/api/agent-tools/v1/tasks/:ref/reopen", async (request) => {
     const context = await requireAgent(pool, request);
-    requireCapability(context, "tasks:update");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = optionalBodySchema.parse(request.body ?? {});
     await reopenTask(pool, {
       taskId: id,
       senderAgentId: context.agentId,
+      capabilities: context.capabilities,
       body: body.body,
       managedRoot: options.managedRoot
     });
@@ -1860,7 +1869,7 @@ async function showMessage(queryable: Queryable, id: string, includeContent = fa
 async function showTask(queryable: Queryable, id: string, includeContent = false): Promise<any> {
   const result = await queryable.query(
     `SELECT tasks.*, agents.name AS agent_name, projects.name AS project_name,
-            parent.number AS parent_task_number,
+            parent.number AS parent_task_number, parent.agent_id AS parent_task_agent_id,
             (SELECT count(*)::int FROM task_assignments WHERE task_assignments.task_id = tasks.id) AS assignment_count,
             (SELECT count(*)::int FROM task_assignments WHERE task_assignments.task_id = tasks.id AND task_assignments.status IN ('queued', 'running')) AS active_assignment_count,
             (SELECT count(*)::int FROM tasks child WHERE child.parent_task_id = tasks.id AND child.status NOT IN ('completed', 'blocked', 'cancelled')) AS active_child_count,

@@ -132,6 +132,7 @@ describe("task reopening ownership", () => {
     await reopenTask(pool, {
       taskId: "task-id",
       senderAgentId: "new-agent",
+      capabilities: ["tasks:update"],
       body: "Please continue after the transfer.",
       managedRoot: "/managed"
     });
@@ -173,7 +174,75 @@ describe("task reopening ownership", () => {
     await expect(reopenTask(pool, {
       taskId: "task-id",
       senderAgentId: "old-agent",
+      capabilities: ["tasks:update"],
       body: "stale reopen",
+      managedRoot: "/managed"
+    })).rejects.toMatchObject({ statusCode: 403 });
+  });
+
+  function childTaskPool(queries: Array<{ sql: string; params?: unknown[] }>) {
+    const task = {
+      id: "task-id",
+      number: 1034,
+      title: "Populate component",
+      agent_id: "populator",
+      parent_task_agent_id: "orchestrator",
+      coordination_thread_id: "thread-id",
+      status: "completed",
+      body: "",
+      content_preview: "",
+      content_total_bytes: 0
+    };
+    const query = async (sql: string, params?: unknown[]) => {
+      queries.push({ sql, params });
+      if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
+      if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      if (sql.includes("INSERT INTO thread_messages")) return { rows: [{ id: "message-id" }] };
+      // A settled delivery row stops queueDelivery before it launches a turn.
+      if (sql.includes("INSERT INTO message_deliveries")) return { rows: [{ id: "delivery-id", status: "completed" }] };
+      return { rows: [] };
+    };
+    const client = { query, release() {} };
+    return { query, async connect() { return client; } } as unknown as DbPool;
+  }
+
+  it("lets the parent task's owner reopen a child it created and wakes the child's owner", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    await reopenTask(childTaskPool(queries), {
+      taskId: "task-id",
+      senderAgentId: "orchestrator",
+      capabilities: ["tasks:create-child"],
+      body: "TASK-1034 closed early; rerun request-review with its original key.",
+      managedRoot: "/managed"
+    });
+
+    const reopen = queries.find(({ sql }) => sql.includes("UPDATE tasks SET status = 'open'"));
+    expect(reopen?.params).toEqual(["task-id"]);
+    const message = queries.find(({ sql }) => sql.includes("INSERT INTO thread_messages"));
+    expect(message?.params?.slice(0, 2)).toEqual(["thread-id", "orchestrator"]);
+    expect(message?.params?.[2]).toBe("populator");
+    const delivery = queries.find(({ sql }) => sql.includes("INSERT INTO message_deliveries"));
+    expect(delivery?.params?.slice(0, 2)).toEqual(["message-id", "populator"]);
+  });
+
+  it("refuses a parent owner without a task capability", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    await expect(reopenTask(childTaskPool(queries), {
+      taskId: "task-id",
+      senderAgentId: "orchestrator",
+      capabilities: ["tasks:read"],
+      managedRoot: "/managed"
+    })).rejects.toMatchObject({ statusCode: 403 });
+    expect(queries.some(({ sql }) => sql.includes("UPDATE tasks SET status = 'open'"))).toBe(false);
+  });
+
+  it("still refuses an unrelated agent", async () => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    await expect(reopenTask(childTaskPool(queries), {
+      taskId: "task-id",
+      senderAgentId: "someone-else",
+      capabilities: ["tasks:update", "tasks:create-child"],
       managedRoot: "/managed"
     })).rejects.toMatchObject({ statusCode: 403 });
   });
