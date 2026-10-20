@@ -249,7 +249,7 @@ async function request(path, options = {}) {
   let payload; try { payload = text ? JSON.parse(text) : {}; } catch { payload = { raw: text }; }
   if (!response.ok) {
     const error = new Error(payload?.error?.message || payload?.message || JSON.stringify(payload));
-    error.code = payload?.error?.code || "HTTP_" + response.status;
+    error.code = payload?.error?.code || (typeof payload?.code === "string" ? payload.code : undefined) || "HTTP_" + response.status;
     throw error;
   }
   return payload;

@@ -117,7 +117,7 @@ aisevak reports revise REPORT --markdown-stdin
 aisevak reports publish REPORT
 ```
 
-Reports keep immutable Markdown revisions. A revision returns the report to draft status until it is published again.
+Reports keep immutable Markdown revisions. A revision returns the report to draft status until it is published again. `create` and `revise` return a non-blocking `writingCheck`; `publish` rejects the current revision with `WRITING_LINT` when it breaks a `report-writing` readability limit.
 
 ## Incidents
 
@@ -130,7 +130,7 @@ aisevak incidents update INC --markdown-stdin
 aisevak incidents resolve INC [--markdown-stdin]
 ```
 
-Declaring an incident creates a linked coordination thread. Without `--to`, the Orchestrator becomes incident commander.
+Declaring an incident creates a linked coordination thread. Without `--to`, the Orchestrator becomes incident commander. `declare`, `update`, and `resolve` reject Markdown that breaks an `incident-writing` readability limit with `WRITING_LINT`, without recording anything.
 
 ## Credentials
 
