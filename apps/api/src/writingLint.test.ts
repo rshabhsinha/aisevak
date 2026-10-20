@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { adviseWritingCheck, assertWritingCheck, lintIncident, lintReport, writingLintMode } from "./writingLint.js";
+import { adviseWritingCheck, lintIncident, lintReport, writingLintMode } from "./writingLint.js";
 
 const goodReport = {
   title: "Cloud health: quiet, four incidents still open",
@@ -131,28 +131,18 @@ describe("incident writing lint", () => {
   });
 });
 
-describe("writing lint enforcement", () => {
+describe("writing lint mode", () => {
   const failing = lintReport({ title: "x".repeat(90), description: "Scope.", markdown: filler(450) });
 
-  it("throws a 422 listing every finding when enforcing", () => {
-    expect(() => assertWritingCheck(failing, "REPORT-9", "enforce")).toThrowError(
-      expect.objectContaining({ statusCode: 422, code: "WRITING_LINT", message: expect.stringContaining("Shorten the title") })
-    );
-  });
-
-  it("returns findings without throwing in warn mode and nothing when off", () => {
-    expect(assertWritingCheck(failing, "REPORT-9", "warn").errors.length).toBe(2);
-    expect(assertWritingCheck(failing, "REPORT-9", "off")).toEqual({ passed: true, errors: [], warnings: [] });
-  });
-
-  it("silences advisory checks only when off", () => {
+  it("returns findings as advice, and nothing when off", () => {
     expect(adviseWritingCheck(failing, "warn")).toBe(failing);
+    expect(failing.errors.map((item) => item.rule)).toEqual(["title-length", "length"]);
     expect(adviseWritingCheck(failing, "off")).toEqual({ passed: true, errors: [], warnings: [] });
   });
 
-  it("defaults to enforce for unknown modes", () => {
-    expect(writingLintMode(undefined)).toBe("enforce");
-    expect(writingLintMode("bogus")).toBe("enforce");
-    expect(writingLintMode("warn")).toBe("warn");
+  it("only turns off when asked; legacy enforce values still just warn", () => {
+    expect(writingLintMode(undefined)).toBe("warn");
+    expect(writingLintMode("enforce")).toBe("warn");
+    expect(writingLintMode("off")).toBe("off");
   });
 });

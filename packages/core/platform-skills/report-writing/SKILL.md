@@ -1,6 +1,6 @@
 ---
 name: report-writing
-description: Read before every `aisevak reports create`, `revise`, or `publish`. Write short, simple reports a busy person understands at a glance; publishing is linted for readability.
+description: Read before every `aisevak reports create`, `revise`, or `publish`. Write short, simple reports a busy person understands at a glance; every report write returns readability findings.
 ---
 
 # Report writing
@@ -12,7 +12,7 @@ A person skimming the Activity feed should understand a report from its title an
 - Lead with the point. Write the conclusion first; supporting detail comes after it, if at all.
 - Make the title something a person would say out loud, and keep it to 80 characters or fewer. Put no timestamps or IDs in it.
 - Use the description (200 characters or fewer) for scope, such as "Three-hour production check, 23:46–02:46 UTC". Do not repeat the title.
-- Aim for under 250 words. More than 400 words is rejected.
+- Aim for under 250 words. More than 400 is flagged as too long.
 - Leave out how you got the answer: the queries you ran, the sources you checked, your methodology. That belongs in the thread or run log. Mention a gap only when it changes the conclusion.
 - Remove every sentence that does not change the reader's understanding or what they do next.
 
@@ -28,6 +28,6 @@ A person skimming the Activity feed should understand a report from its title an
 
 A report is not a database. When you revise a recurring report such as a backlog or a status board, lead with what changed and what is blocked. Show at most 25 table rows, covering the active, blocked, and recently changed items, and link the full list kept in the system that owns it.
 
-## Publishing is linted
+## Readability checks
 
-`create` and `revise` return readability advice under `writingCheck`. `publish` fails with `WRITING_LINT` if the title, description, length, tables, or raw IDs break the limits above. The error message lists each problem. Fix the writing and publish again; do not split or pad the report to get around a limit.
+`create`, `revise`, and `publish` return readability findings under `writingCheck`. They cover the title, description, length, tables, and raw IDs. The write still goes through. When it lists problems, fix them in the next revision. Do not split or pad the report to get around a limit.
