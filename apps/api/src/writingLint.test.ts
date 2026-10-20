@@ -87,10 +87,24 @@ describe("report writing lint", () => {
     expect(rules(lintReport({ ...goodReport, markdown: filler(450) })).errors).toEqual(["length"]);
   });
 
-  it("ignores fenced code when counting prose", () => {
-    const code = Array.from({ length: 500 }, (_, index) => `line ${index}`).join("\n");
-    const check = lintReport({ ...goodReport, markdown: `${goodReport.markdown}\n\n\`\`\`text\n${code}\n\`\`\`` });
-    expect(check.passed).toBe(true);
+  it("counts fenced code toward length but not toward paragraph warnings", () => {
+    const short = lintReport({ ...goodReport, markdown: `${goodReport.markdown}\n\n\`\`\`bash\npnpm test\n\`\`\`` });
+    expect(rules(short)).toEqual({ errors: [], warnings: [] });
+    const logs = Array.from({ length: 250 }, (_, index) => `line ${index}`).join("\n");
+    expect(rules(lintReport({ ...goodReport, markdown: `\`\`\`text\n${logs}\n\`\`\`` }))).toEqual({ errors: ["length"], warnings: [] });
+  });
+
+  it("treats text after an unclosed fence as prose", () => {
+    expect(rules(lintReport({ ...goodReport, markdown: `\`\`\`\n${filler(450)}` })).errors).toEqual(["length"]);
+  });
+
+  it("counts rows in tables with one-dash separators", () => {
+    const rows = Array.from({ length: 40 }, (_, index) => `|${index}|x|`).join("\n");
+    expect(rules(lintReport({ ...goodReport, markdown: `|a|b|\n|-|-|\n${rows}` })).errors).toEqual(["table-rows"]);
+  });
+
+  it("does not mistake slash dates for packed counts", () => {
+    expect(rules(lintReport({ ...goodReport, markdown: "Shipped on 10/20/2026 and 2026/10/21." })).warnings).toEqual([]);
   });
 
   it("flags a heading that repeats the title and a description that repeats it", () => {

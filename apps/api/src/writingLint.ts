@@ -129,7 +129,7 @@ function descriptionFindings(title?: string | null, description?: string | null)
 }
 
 function lengthFindings(markdown: string, warnAt: number, errorAt: number): WritingFinding[] {
-  const words = proseWords(markdown);
+  const words = bodyWords(markdown);
   if (words > errorAt) {
     return [error("length", `Cut the body to ${errorAt} words or fewer (now ${words}); keep audit detail in the thread, not here.`)];
   }
@@ -159,7 +159,7 @@ function bodyStyleFindings(markdown: string): WritingFinding[] {
   if (timestamps > limits.isoTimestampsWarn) {
     findings.push(warning("timestamps", `Use short times such as "02:11 UTC" instead of ${timestamps} full ISO timestamps.`));
   }
-  if (countMatches(markdown, packedCountsPattern) > 0) {
+  if ((markdown.match(packedCountsPattern) ?? []).some((match) => !isSlashDate(match))) {
     findings.push(warning("packed-counts", "Write counts as sentences (\"errors rose from 0 to 5\") instead of slash-packed numbers like 33/5/9/0."));
   }
   const longest = Math.max(0, ...proseBlocks(markdown).map(wordCount));
@@ -177,15 +177,19 @@ function summarize(findings: WritingFinding[]): WritingCheck {
 
 // Splits prose from tables and fenced code. A table is a header line followed by a
 // separator line; its body rows are the following lines that contain a pipe.
-function markdownParts(markdown: string): { prose: string[]; tableRows: number } {
+function markdownParts(markdown: string): { prose: string[]; code: string[]; tableRows: number } {
   const lines = markdown.split(/\r?\n/).map((line) => line.trim());
+  // A fence that never closes is not code; Markdown renders the rest as text.
+  const fences = lines.filter((line) => /^(```|~~~)/.test(line)).length;
+  const lastFence = fences % 2 === 1 ? lines.map((line) => /^(```|~~~)/.test(line)).lastIndexOf(true) : -1;
   const prose: string[] = [];
+  const code: string[] = [];
   let tableRows = 0;
   let inFence = false;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!;
-    if (/^(```|~~~)/.test(line)) { inFence = !inFence; continue; }
-    if (inFence) continue;
+    if (index !== lastFence && /^(```|~~~)/.test(line)) { inFence = !inFence; continue; }
+    if (inFence) { code.push(line); continue; }
     if (line.includes("|") && isTableSeparator(lines[index + 1] ?? "")) {
       index += 2;
       while (index < lines.length && lines[index]!.includes("|")) { tableRows += 1; index += 1; }
@@ -194,16 +198,19 @@ function markdownParts(markdown: string): { prose: string[]; tableRows: number }
     }
     prose.push(line);
   }
-  return { prose, tableRows };
+  return { prose, code, tableRows };
 }
 
 function isTableSeparator(line: string): boolean {
-  return line.includes("-") && /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/.test(line);
+  return line.includes("-") && /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$/.test(line);
 }
 
-function proseWords(markdown: string): number {
-  return wordCount(markdownParts(markdown).prose.join(" "));
+// Code blocks count toward length so pasted logs cannot hide inside a fence.
+function bodyWords(markdown: string): number {
+  const parts = markdownParts(markdown);
+  return wordCount([...parts.prose, ...parts.code].join(" "));
 }
+
 
 function proseBlocks(markdown: string): string[] {
   const blocks: string[] = [];
@@ -221,6 +228,12 @@ function proseBlocks(markdown: string): string[] {
 function wordCount(text: string): number {
   const stripped = text.replace(/\[([^\]]*)\]\([^)]*\)/g, "$1").replace(/[`*_>#|]/g, " ");
   return stripped.split(/\s+/).filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
+}
+
+// 10/20/2026 or 2026/10/20 is a date, not packed counts.
+function isSlashDate(text: string): boolean {
+  const parts = text.split("/");
+  return parts.length === 3 && (parts[0]!.length === 4 || parts[2]!.length === 4);
 }
 
 function countMatches(text: string, pattern: RegExp): number {

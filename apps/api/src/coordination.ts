@@ -1261,15 +1261,19 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
   app.post("/api/agent-tools/v1/reports/:ref/revisions", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const id = await resolveResourceId(pool, "reports", "REPORT", refParams.parse(request.params).ref); const body = markdownSchema.parse(request.body);
-    await withTransaction(pool, async (client) => {
-      const locked = await client.query<{ current_revision: number }>("SELECT current_revision FROM reports WHERE id = $1 FOR UPDATE", [id]);
-      const revision = (locked.rows[0] ?? notFound("Report")).current_revision + 1;
+    const locked = await withTransaction(pool, async (client) => {
+      const locked = await client.query<{ current_revision: number; title: string; description: string }>(
+        "SELECT current_revision, title, description FROM reports WHERE id = $1 FOR UPDATE", [id]
+      );
+      const report = locked.rows[0] ?? notFound("Report");
+      const revision = report.current_revision + 1;
       await client.query("INSERT INTO report_versions (report_id, revision, markdown, created_by_agent_id) VALUES ($1, $2, $3, $4)", [id, revision, body.markdown, context.agentId]);
       await client.query("UPDATE reports SET current_revision = $2, status = 'draft', updated_at = now() WHERE id = $1", [id, revision]);
+      return report;
     });
-    const report = await showReport(pool, id, true);
-    const { markdown, ...rest } = report;
-    return { report: rest, writingCheck: adviseWritingCheck(lintReport({ title: report.title, description: report.description, markdown })) };
+    // Advise on the revision this call wrote, even if another revise has landed since.
+    const writingCheck = adviseWritingCheck(lintReport({ title: locked.title, description: locked.description, markdown: body.markdown }));
+    return { report: await showReport(pool, id), writingCheck };
   });
   app.post("/api/agent-tools/v1/reports/:ref/publish", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
