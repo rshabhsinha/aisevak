@@ -235,8 +235,9 @@ describe.skipIf(!databaseUrl)("coordination v2 phase 3 against Postgres", () => 
     expect(created.status).toBe(200);
     const done = await call(await token(reviewer.id), "POST", `/api/agent-tools/v1/assignments/ASSIGNMENT-${created.body.assignment.number}/complete`, { result: "Approved" });
     expect(done.status).toBe(200);
-    const [result] = await q("SELECT recipient_agent_id FROM thread_messages WHERE thread_id = $1 AND message_type = 'assignment.completed'", [child.threadId]);
-    expect(result.recipient_agent_id).toBe(controller.id);
+    const results = await q("SELECT recipient_agent_id FROM thread_messages WHERE thread_id = $1 AND message_type = 'assignment.completed'", [child.threadId]);
+    // The task owner still gets it (unchanged behaviour), and so does the requester.
+    expect(results.map((row: any) => row.recipient_agent_id).sort()).toEqual([controller.id, populator.id].sort());
   });
 
   it("waits for new inbox items, and keeps a refresh period when refreshing now", async () => {
@@ -244,7 +245,10 @@ describe.skipIf(!databaseUrl)("coordination v2 phase 3 against Postgres", () => 
     const listener = await agent("Listener");
     const work = await task(asker.id, "Inbox wait");
     const listenerToken = await token(listener.id);
-    await call(await token(asker.id, work.id, work.threadId), "POST", "/api/agent-tools/v1/send", { to: listener.name, body: "already pending" });
+    // More pending items than one inbox page: a new one must still be noticed.
+    for (let i = 0; i < 22; i += 1) {
+      await call(await token(asker.id, work.id, work.threadId), "POST", "/api/agent-tools/v1/send", { to: listener.name, body: `already pending ${i}` });
+    }
     const waiting = call(listenerToken, "GET", "/api/agent-tools/v1/inbox?wait=10");
     await new Promise((resolve) => setTimeout(resolve, 1500));
     const started = Date.now();

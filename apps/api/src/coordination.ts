@@ -368,10 +368,11 @@ export async function registerCoordinationRoutes(
     if (!query.wait) return load();
     // Wait for something new: the message that started the caller's own turn
     // is still pending while that turn runs, so "anything pending" would
-    // return at once.
-    const since = Date.now();
-    const result = await waitFor(load, (value) => value.items.some((item: any) => arrivedAfter(item, since)), query.wait);
-    return { ...result, arrived: result.items.filter((item: any) => arrivedAfter(item, since)).length };
+    // return at once. The cutoff and the check both use the database clock and
+    // look past the listing page.
+    const cutoff = (await pool.query<{ at: Date }>("SELECT now() AS at")).rows[0]!.at;
+    const arrived = await waitFor(() => countArrivals(pool, context.agentId, threadId, cutoff), (count) => count > 0, query.wait);
+    return { ...(await load()), arrived };
   });
 
   // Message an agent on a thread (the current task's thread by default),
@@ -1281,26 +1282,28 @@ export async function registerCoordinationRoutes(
           await client.query("UPDATE thread_messages SET request_state = 'replied' WHERE id = $1 AND request_state = 'open'", [assignment.request_message_id]);
         }
         if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`, { stopRunningTurn: false });
-        // The result answers the assignment request, so it goes to whoever
-        // asked (an ancestor task's owner, for example), else the task owner.
+        // The result answers the assignment request: the task owner gets it as
+        // before, and so does whoever asked when that is someone else (an
+        // ancestor task's owner or the orchestrator).
         const requester = assignment.request_message_id
           ? (await client.query<{ sender_agent_id: string | null }>(
               "SELECT sender_agent_id FROM thread_messages WHERE id = $1", [assignment.request_message_id]
             )).rows[0]?.sender_agent_id ?? null
           : null;
-        const resultRecipient = requester ?? assignment.task_agent_id;
-        if (resultRecipient !== context.agentId) {
+        const recipients = [...new Set([assignment.task_agent_id, requester].filter((id): id is string => Boolean(id) && id !== context.agentId))];
+        for (const [index, recipientId] of recipients.entries()) {
           const message = await insertMessage(client, {
             threadId: assignment.coordination_thread_id,
             senderAgentId: context.agentId,
-            recipientAgentId: resultRecipient,
+            recipientAgentId: recipientId,
           body: `ASSIGNMENT-${assignment.assignment_number} ${action === "complete" ? "completed" : "blocked"}:\n\n${body.result}`,
             type: action === "complete" ? "assignment.completed" : "assignment.blocked",
-            idempotencyKey: body.idempotencyKey,
+            // The idempotency key is unique per sender, so it marks the first copy only.
+            idempotencyKey: index === 0 ? body.idempotencyKey : undefined,
             parentMessageId: assignment.request_message_id,
             inReplyToMessageId: assignment.request_message_id
           });
-          await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, resultRecipient);
+          await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, recipientId);
         }
       });
       return { assignment: await showAssignment(pool, id, true) };
@@ -3523,9 +3526,17 @@ export async function expireRequests(pool: DbPool, managedRoot: string, limit = 
   });
 }
 
-function arrivedAfter(item: { created_at?: unknown; delivery?: { state?: string } }, since: number): boolean {
-  const created = item.created_at instanceof Date ? item.created_at.getTime() : Date.parse(String(item.created_at ?? ""));
-  return created >= since && ["queued", "delivering", "presented"].includes(item.delivery?.state ?? "");
+async function countArrivals(queryable: Queryable, agentId: string, threadId: string | null, since: Date): Promise<number> {
+  const result = await queryable.query<{ count: number }>(
+    `SELECT count(*)::int AS count
+     FROM message_deliveries JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+     WHERE message_deliveries.recipient_agent_id = $1
+       AND ($2::uuid IS NULL OR thread_messages.thread_id = $2)
+       AND message_deliveries.status IN ('queued', 'retrying', 'running')
+       AND message_deliveries.created_at >= $3`,
+    [agentId, threadId, since]
+  );
+  return Number(result.rows[0]?.count ?? 0);
 }
 
 export async function requestReply(queryable: Queryable, requestId: string): Promise<any> {

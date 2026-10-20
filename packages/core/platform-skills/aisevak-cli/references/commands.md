@@ -63,10 +63,10 @@ aisevak threads send THREAD [--to AGENT] --body-stdin [--reply-to MESSAGE] [--id
 `threads create` is restricted to explicitly detached, keyed streams. Inside an active task use an assignment or keyed child task.
 aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]
 aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
-aisevak threads refresh THREAD [--every N] [--now]
+aisevak threads refresh THREAD [--every N|none] [--now]
 ```
 
-`threads refresh` sets your own session's conversation refresh on that thread. `--every N` starts a fresh provider conversation after every N successful turns, and `--now` does it once after the current turn without changing the period. The thread, its messages and the task tree stay; the next turn gets the thread's recent history and is told to rebuild context from `threads status` and the task. Use it on long-lived threads such as a campaign task.
+`threads refresh` sets your own session's conversation refresh on that thread. `--every N` starts a fresh provider conversation after every N successful turns, and `--now` does it once after the current turn without changing the period. `--every none` removes the period. The thread, its messages and the task tree stay; the next turn gets the thread's recent history and is told to rebuild context from `threads status` and the task. Use it on long-lived threads such as a campaign task.
 
 `THREAD` accepts `THREAD-n`, `TASK-n` (the task's thread), or a thread id shown in the UI or job envelope.
 

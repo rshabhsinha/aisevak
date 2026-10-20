@@ -324,11 +324,11 @@ Decisions taken with the user before building:
 * `reply`:
   * only the recipient may reply to a request;
   * the reply carries `in_reply_to_message_id`, closes the request, and is delivered to the requester.
-* `wait` is a bounded long poll on the API: it checks once a second, holds no connection between checks, and waits at most 120 s per call. `inbox --wait` works the same way. It waits for a message that arrives after the call started, because the message that started the caller's own turn stays pending while that turn runs. It reports how many arrived.
+* `wait` is a bounded long poll on the API: it checks once a second, holds no connection between checks, and waits at most 120 s per call. `inbox --wait` works the same way. It waits for a message that arrives after the call started, because the message that started the caller's own turn stays pending while that turn runs. Both the cutoff and the check use the database clock, and the check is a separate count, so a long pending list can't hide a new message. It reports how many arrived.
 * `expireRequests` runs with the delivery-failure sweep every 5 s. It marks overdue requests `timed_out` and sends the requester a `request.timed_out` platform notice.
 
 **Assignments as requests.** The `assignment.created` message is a keyed request (`assignment:<id>`), recorded as `task_assignments.request_message_id`.
-* `assignments complete|block` replies to it and closes it. The result goes to whoever sent the request, which may be an ancestor task's owner, or else to the task owner.
+* `assignments complete|block` replies to it and closes it. The result goes to the task owner, as before. It also goes to whoever sent the request (an ancestor task's owner, or the orchestrator) when that is someone else.
 * `assignments retry` reopens the request. The generic `reply` refuses an assignment request and points to `assignments complete|block`, so an assignment can't be closed by accident.
 
 **Task lifecycle.**

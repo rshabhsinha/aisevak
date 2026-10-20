@@ -127,7 +127,7 @@ async function threads() {
   if (command === "show") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref)));
   if (command === "status") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/status"));
   if (command === "refresh") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/refresh", { method: "POST", body: compact({
-    everyTurns: option("--every"), now: args.includes("--now") ? true : undefined
+    everyTurns: option("--every") === "none" ? null : option("--every"), now: args.includes("--now") ? true : undefined
   }) }));
   if (command === "messages") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/messages" + listQuery()));
   if (command === "create") {
@@ -321,7 +321,7 @@ function help() { console.log([
   "aisevak send --to AGENT [--thread THREAD] [--key KEY] [--expect-reply [--timeout SECONDS]] --body-stdin",
   "aisevak reply MESSAGE --body-stdin | wait MESSAGE [--timeout SECONDS]",
   "aisevak skills path | skills install DIRECTORY",
-  "aisevak threads list | show | status | messages | create | send | complete | block | refresh THREAD [--every N] [--now]",
+  "aisevak threads list | show | status | messages | create | send | complete | block | refresh THREAD [--every N|none] [--now]",
   "Thread references accept THREAD-n, TASK-n, or a thread id shown in the UI.",
   "aisevak tasks list | show | create --work-key KEY | update | assign | complete | reopen",
   "aisevak tasks reparent TASK... --parent TASK | policy TASK --max-active-children N",
