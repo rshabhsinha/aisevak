@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+
+// The runner reads MANAGED_ROOT when its module loads; set it before any
+// import so the runner and the API compute the same session homes.
+vi.hoisted(() => { process.env.MANAGED_ROOT = "/tmp/aisevak-coordination-v2-test"; });
 import { createPool, runMigrations, withTransaction, type DbPool } from "../packages/core/src/index.js";
 import {
   agentStatus,
@@ -259,7 +263,6 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
       [orch.id, task.id]
     );
     // Other due schedules may exist in a shared test database; tick until ours ran.
-    const tasksBefore = Number((await q("SELECT count(*)::int AS n FROM tasks"))[0].n);
     for (let i = 0; i < 20; i += 1) {
       await enqueueDueSchedule(pool);
       if ((await q("SELECT 1 FROM schedule_runs WHERE schedule_id = $1", [schedule.id])).length) break;
@@ -277,7 +280,62 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     expect(Number(ticks[0].seq)).toBeGreaterThan(0);
     const created = await q("SELECT count(*)::int AS n FROM tasks WHERE work_scope = $1", [`schedule:${schedule.id}`]);
     expect(created[0].n).toBe(0);
-    expect(Number((await q("SELECT count(*)::int AS n FROM tasks"))[0].n)).toBe(tasksBefore);
     await q("DELETE FROM schedules WHERE id = $1", [schedule.id]);
+  });
+
+  it("ticks into a non-owner agent's existing session without resetting it", async () => {
+    const { rev, task, thread, assignment, send } = await scenario();
+    // The reviewer already has a session on the task thread from a delivery.
+    const owner = (await q("SELECT agent_id FROM tasks WHERE id = $1", [task.id]))[0].agent_id;
+    const first = await send("review it", owner, rev.id, assignment.id);
+    const [before] = await q("SELECT agent_threads.id, ownership_generation FROM agent_threads JOIN message_deliveries md ON md.agent_thread_id = agent_threads.id WHERE md.id = $1", [first.deliveryId]);
+    await q("UPDATE agent_threads SET provider_thread_id = 'reviewer-provider' WHERE id = $1", [before.id]);
+    const [schedule] = await q(
+      `INSERT INTO schedules (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, task_id, overlap_policy)
+       VALUES ('reviewer tick', 'Check reviews', $1, 'interval', now() - interval '2 minutes', 1800, $2, 'allow') RETURNING id`,
+      [rev.id, task.id]
+    );
+    for (let i = 0; i < 20; i += 1) {
+      await enqueueDueSchedule(pool).catch(() => undefined);
+      if ((await q("SELECT 1 FROM schedule_runs WHERE schedule_id = $1", [schedule.id])).length) break;
+    }
+    const [after] = await q("SELECT id, ownership_generation, provider_thread_id FROM agent_threads WHERE id = $1", [before.id]);
+    expect(after).toMatchObject({ ownership_generation: before.ownership_generation, provider_thread_id: "reviewer-provider" });
+    const [run] = await q("SELECT agent_thread_id FROM schedule_runs WHERE schedule_id = $1", [schedule.id]);
+    expect(run.agent_thread_id).toBe(before.id);
+    expect((await q("SELECT count(*)::int AS n FROM thread_messages WHERE thread_id = $1 AND message_type = 'schedule'", [thread.id]))[0].n).toBe(1);
+    await q("DELETE FROM schedules WHERE id = $1", [schedule.id]);
+  });
+
+  it("backs off a schedule whose tick fails and still runs the next one", async () => {
+    const { orch, rev, task } = await scenario();
+    // Another agent's session holds the task's one task-bound slot, so creating
+    // the owner's session for the tick violates agent_threads_task_unique.
+    await q(
+      `INSERT INTO agent_threads (agent_id, task_id, provider_instance_id, model, cwd, runtime_home)
+       VALUES ($1, $2, 'codex-local', 'gpt-test', '/tmp', '/tmp/h')`,
+      [rev.id, task.id]
+    );
+    const [broken] = await q(
+      `INSERT INTO schedules (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, task_id)
+       VALUES ('broken tick', 'x', $1, 'interval', now() - interval '10 years', 1800, $2) RETURNING id`,
+      [orch.id, task.id]
+    );
+    const [healthy] = await q(
+      `INSERT INTO schedules (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds)
+       VALUES ('healthy tick', 'y', $1, 'interval', now() - interval '9 years', 1800) RETURNING id`,
+      [orch.id]
+    );
+    await expect(enqueueDueSchedule(pool)).rejects.toThrow();
+    const [failed] = await q("SELECT next_run_at > now() AS deferred, last_error FROM schedules WHERE id = $1", [broken.id]);
+    expect(failed.deferred).toBe(true);
+    expect(failed.last_error).toContain("agent_threads_task_unique");
+    for (let i = 0; i < 20; i += 1) {
+      await enqueueDueSchedule(pool).catch(() => undefined);
+      if ((await q("SELECT 1 FROM schedule_runs WHERE schedule_id = $1", [healthy.id])).length) break;
+    }
+    expect(await q("SELECT 1 FROM schedule_runs WHERE schedule_id = $1", [healthy.id])).toHaveLength(1);
+    expect((await q("SELECT last_error FROM schedules WHERE id = $1", [healthy.id]))[0].last_error).toBeNull();
+    await q("DELETE FROM schedules WHERE id = ANY($1::uuid[])", [[broken.id, healthy.id]]);
   });
 });

@@ -1401,6 +1401,9 @@ EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS context_policy jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS turns_since_refresh integer NOT NULL DEFAULT 0;
 
+-- The last error of a schedule tick that failed; cleared by the next success.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_error text;
+
 -- The task board resolves each task's column from its latest runs.
 CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx
