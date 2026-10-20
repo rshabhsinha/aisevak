@@ -1,6 +1,6 @@
 # Coordination v2: reliable, harness-agnostic agent messaging
 
-Status: phases 1 and 2 are implemented: phase 1 in rshabhsinha/aisevak#46 (section 8) and phase 2 in rshabhsinha/aisevak#48 (section 9). Phases 3–5 are proposed. Where a section 3 proposal was built differently, section 9 is authoritative.
+Status: phases 1–3 are implemented: phase 1 in rshabhsinha/aisevak#46 (section 8), phase 2 in rshabhsinha/aisevak#48 (section 9), and phase 3 in its follow-up PR (section 10). Phases 4 and 5 are proposed. Where a section 3 proposal was built differently, sections 9 and 10 are authoritative.
 Assumes rshabhsinha/aisevak#45 (successful worker runs only auto-complete standalone tasks; parent-task owners can reopen children) has merged.
 
 ## 1. Why
@@ -183,7 +183,7 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS lease_expires_at timestampt
 
 Backfill: `agent_thread_id` from `agent_turn_inputs`/`dispatcher_runs.message_delivery_id`; `seq` from `created_at` order.
 
-Phase 3 (requests, lifecycle, authority):
+Phase 3 (built; see section 10 for differences, and `packages/core/src/migrations.ts` for the exact statements):
 
 ```sql
 ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS request_key text;
@@ -194,18 +194,14 @@ ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS request_state text CHECK (r
 CREATE UNIQUE INDEX IF NOT EXISTS thread_messages_request_key_unique
 ON thread_messages(thread_id, sender_agent_id, request_key) WHERE request_key IS NOT NULL;
 ALTER TABLE task_assignments ADD COLUMN IF NOT EXISTS request_message_id uuid REFERENCES thread_messages(id) ON DELETE SET NULL;
-ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completion_policy text NOT NULL DEFAULT 'explicit'
-  CHECK (completion_policy IN ('explicit', 'on_first_success'));
--- Backfill once: standalone human-created tasks keep today's behaviour.
-```
-
-Phase 3 also adds the campaign pieces (3.11):
-
-```sql
-ALTER TABLE schedules ADD COLUMN IF NOT EXISTS thread_id uuid REFERENCES coordination_threads(id) ON DELETE SET NULL;
+-- Added without a default, backfilled once (tasks with created_by = a person
+-- become 'on_first_success', the rest 'explicit'), then DEFAULT 'explicit' NOT NULL.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completion_policy text;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS context_policy jsonb NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS turns_since_refresh integer NOT NULL DEFAULT 0;
 ```
+
+`schedules.thread_id` was not needed: `schedules.task_id` already makes a schedule tick into that task's thread (section 10).
 
 Phase 4 (watchdog):
 
@@ -232,10 +228,14 @@ All routes live under `/api/agent-tools/v1` and use the existing bearer token.
 | Thread state | `GET threads/:ref/status` | `aisevak threads status THREAD-n` | `status` | 1 |
 | Failure notices | `delivery.failed` messages | — (arrive as inbox items) | — | 1 |
 | Agent state | `GET agents/:ref/status` | `aisevak agents status AGENT-x` | `status` | 2 |
-| Inbox | `GET inbox[?thread=&recent=true]` (built); `?wait=60s` in phase 3 | `aisevak inbox [--thread THREAD] [--recent]`; `--wait` in phase 3 | `inbox`, `wait` | 2 (wait: 3) |
-| Send (any thread/agent) | `POST send {to, thread?, body, key?, expectReply?, timeout?}` | `aisevak send --to AGENT [--thread THREAD-n] [--key K] [--expect-reply] [--timeout 30m] --body-stdin` | `send` | 3 |
+| Inbox | `GET inbox[?thread=&recent=true&wait=60]` | `aisevak inbox [--thread THREAD] [--recent] [--wait 60]` | `inbox`, `wait` | 2 (wait: 3) |
+| Send (any thread/agent) | `POST send {to, thread?, body, key?, expectReply?, timeoutSeconds?}` | `aisevak send --to AGENT [--thread THREAD-n] [--key K] [--expect-reply [--timeout SECONDS]] --body-stdin` | `send` | 3 |
 | Reply | `POST messages/:ref/reply` | `aisevak reply MESSAGE-n --body-stdin` | `reply` | 3 |
-| Wait for reply | `GET messages/:ref/reply?wait=60s` | `aisevak wait MESSAGE-n [--timeout 60]` | `wait` | 3 |
+| Wait for reply | `GET messages/:ref/reply?wait=60` (at most 120) | `aisevak wait MESSAGE-n [--timeout 60]` | `wait` | 3 |
+| Move tasks | `POST tasks/:ref/reparent {parent}` | `aisevak tasks reparent TASK... --parent TASK` | — | 3 |
+| Task limits | `POST tasks/:ref/policy` | `aisevak tasks policy TASK --max-active-children N` | — | 3 |
+| Retarget schedule | `PATCH schedules/:ref {task, overlapPolicy}` | `aisevak schedules update SCHEDULE --task TASK\|none` | — | 3 |
+| Conversation refresh | `POST threads/:ref/refresh {everyTurns, now}` | `aisevak threads refresh THREAD [--every N] [--now]` | — | 3 |
 | Search threads | `GET threads?query=` (exists) | `aisevak threads list --query` (exists) | `threads_search` | 4 |
 
 Existing commands (`threads send|complete|block`, `assignments *`, `tasks *`) keep their syntax and semantics; new verbs are additive. `aisevak send` is a thin alias over `threads send` plus addressing by agent.
@@ -268,7 +268,7 @@ Each phase is shippable alone and keeps the component-library workflows (orchest
 
 1. **Addressing and visibility (built, #46).** `resolveThreadRef` for every `threads/:ref` route; normalized `delivery` state on messages; `MESSAGE-n` in `show`; `threads status`; `delivery.failed` notices from an API sweeper with quiet settlements marked; prompt framing for notices; skill update. No behaviour change for existing sends.
 2. **Inbox and leases (built, #48).** Bind deliveries to agent threads with `seq`; leases and heartbeat; restart redelivery with an interrupted preamble; recovery of stuck worker turns; ping turns that never change task status; `inbox`/`agents status`; `AISEVAK_COORDINATION_LEGACY` for one release. Deviations are in section 9.
-3. **Requests, lifecycle and campaigns.** `send`/`reply`/`wait`, assignments as requests, `completion_policy`, tree authority (`canActOnTask`). Campaign support (3.11): schedules that tick into a thread, child-task events routed to the parent owner's inbox, conversation refresh that keeps the thread id. Then move the component-library workflow to one campaign task: the orchestrator creates the campaign task once, the 30-minute schedule targets its thread, and new component tasks are created with `--parent-task` set to the campaign task. Existing children stay where they are (ancestor authority covers them) unless the optional re-parenting migration is run. **Needs user decisions before shipping**: (a) whether agent-created tasks default to `explicit` completion (recommended), which changes what a successful worker turn does for tasks created by agents; (b) whether to re-parent existing open component tasks under the campaign task.
+3. **Requests, lifecycle and campaigns (built).** `send`/`reply`/`wait`, assignments as requests, `completion_policy`, tree authority, child-task events, re-parenting, task limits, schedule retargeting, conversation refresh. Decisions taken: agent-created tasks use `explicit` completion, and existing open component tasks are re-parented under the campaign task with `tasks reparent`. Section 10 has details and the campaign runbook.
 4. **MCP and watchdog.** `aisevak mcp`, harness wiring, watchdog nudges/escalations/timeouts; update the `aisevak-cli` skill to prefer `send --expect-reply` + `wait`. The skill already says, as of phase 2, that follow-up pings are safe.
 5. **Cleanup.** Lazily give every agent thread a coordination thread; UI shows `THREAD-n`. Move coordination prompt building into a shared package so the runner can drain an inbox itself (the wake step from 3.2), then remove the dispatcher-run-per-message path, its supersede/migrate machinery, `AISEVAK_COORDINATION_LEGACY`, and legacy routes.
 
@@ -308,3 +308,72 @@ What shipped, and where it deliberately differs from sections 3.2 and 3.6:
 * **Legacy flag.** `AISEVAK_COORDINATION_LEGACY=1` restores the pre-v2 behaviour for one release: recover everything at boot, no lease sweeps, fail and block interrupted deliveries, and finalize ping turns like task runs. Worker turns left `running` are still recovered at boot, because that is a bug fix rather than a behaviour change.
 * **Tests against Postgres.** `tests/coordinationV2.db.test.ts` runs the phase 1 and phase 2 SQL against a real database when `AISEVAK_TEST_DATABASE_URL` is set, and is skipped otherwise.
 * **Deferred:** `consumed_at` (`completed` still means the carrying turn ended successfully), `wait`, and binding inbox items for deliveries that a phase 1 `delivery.failed` sweep cannot queue.
+
+## 10. Phase 3 as built
+
+Decisions taken with the user before building:
+* Agent-created tasks use `explicit` completion.
+* Existing open component tasks are re-parented under the campaign task, rather than relying on ancestor authority alone.
+
+**Requests and replies.**
+* `send --expect-reply` stores the message as a request:
+  * `message_type='request'`, `expects_reply`, `request_state='open'`;
+  * an optional `reply_by` from `--timeout`;
+  * an optional `request_key`, unique per thread and sender, so a resend with the same key returns the first message.
+* The recipient's prompt (cold or incremental) ends with the exact `aisevak reply MESSAGE-n` command.
+* `reply`:
+  * only the recipient may reply to a request;
+  * the reply carries `in_reply_to_message_id`, closes the request, and is delivered to the requester.
+* `wait` is a bounded long poll on the API: it checks once a second, holds no connection between checks, and waits at most 120 s per call. `inbox --wait` works the same way.
+* `expireRequests` runs with the delivery-failure sweep every 5 s. It marks overdue requests `timed_out` and sends the requester a `request.timed_out` platform notice.
+
+**Assignments as requests.** The `assignment.created` message is a keyed request (`assignment:<id>`), recorded as `task_assignments.request_message_id`. `assignments complete|block` replies to it and closes it. The generic `reply` refuses an assignment request and points to `assignments complete|block`, so an assignment can't be closed by accident.
+
+**Task lifecycle.**
+* `tasks.completion_policy`:
+  * The web app's task form sets `on_first_success`, so a person's "run this task" still completes on the first successful standalone run. The #45 guard stays: never a child task, never one with assignments or open children.
+  * Every other task, including agent-created and scheduled-occurrence tasks, is `explicit`. For those, `finalizeWorkerRunState` changes neither task nor thread status, whether the run succeeded or failed.
+* The one-time backfill classifies existing tasks by `created_by`.
+* `AISEVAK_COORDINATION_LEGACY=1` restores the old finalization.
+
+**Authority by task tree.**
+* `taskAuthority()` walks the parent chain, up to 32 levels, and returns `orchestrator`, `owner` or `ancestor`.
+* An ancestor owner can, without holding `tasks:update` globally:
+  * complete the task;
+  * reopen it, with `tasks:update` or `tasks:create-child`;
+  * update it;
+  * create, retry and send on its assignments.
+* Completing a task through ancestor authority goes through `finalizeThread` with the primary-agent check bypassed.
+* `tasks policy` still needs `tasks:update`, so a worker can't raise its own fan-out limits.
+
+**Child events.**
+* `notifyParentOfChildEvent` posts `child.<status>` (completed, blocked, reopened, or any status set by `tasks update`) on the parent task's thread, addressed to the parent's owner.
+* When the child thread's callback agent is the parent's owner, the old completion delivery on the child thread is skipped. The event on the parent thread replaces it, so the controller hears about it in its long-lived session instead of a per-child one.
+
+**Campaigns.**
+* No `schedules.thread_id` was added. A schedule with `task_id` already ticks a `schedule` message into that task's thread, with the `skip` overlap policy dropping a tick while one is still in flight. `schedules update --task` retargets an existing schedule.
+* The runner now binds schedule ticks to the inbox like other deliveries (`agent_thread_id`, `seq`).
+* `tasks reparent` moves a task and its subtree:
+  * it needs authority over both trees;
+  * it rejects cycles;
+  * it records a safety event when the depth limit would be exceeded, and enforce mode rejects the move;
+  * it does not apply the fan-out limit, because it moves existing work.
+* `threads refresh` sets `context_policy.maxTurns` or `refreshNow` on the caller's own session.
+  * After a successful turn, `noteTurnForRefresh` counts the turn. When the policy says so and nothing is queued or running on the thread, it clears `provider_thread_id` (and `task_sessions.codex_thread_id`) and stamps `lastRefreshAt`.
+  * The next delivery then gets the full coordination prompt. It now says the conversation is fresh and that the task tree and thread are the record.
+  * The context-size trigger from 3.11 is deferred: providers don't report context size consistently yet.
+
+**Campaign runbook (component library):**
+1. `aisevak tasks create --title "Component Library campaign …" --work-key campaign-… --agent Orchestrator --description … --body …`
+2. `aisevak tasks policy TASK-c --max-active-children 200` (as the Orchestrator).
+3. `aisevak schedules update SCHEDULE-n --task TASK-c` for the 30-minute check.
+4. `aisevak tasks reparent <open component tasks> --parent TASK-c`. This needs authority over the old parents. The Orchestrator has authority over every task.
+5. Create new component tasks with `--parent-task TASK-c`.
+6. Optionally, `aisevak threads refresh THREAD-c --every 40` from the Orchestrator's session on the campaign thread.
+
+**Not done in phase 3, deferred to phase 4 or 5:**
+* the MCP server;
+* watchdog nudges and escalations;
+* requeueing deliveries cancelled by internal ownership changes onto the new owner;
+* the context-size refresh trigger;
+* splitting `delivered` into consumed and replied for plain messages.

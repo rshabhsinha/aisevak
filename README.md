@@ -83,6 +83,19 @@ The **runner** polls for queued turns and executes them on the host. Turns on th
 
 **Restarts.** Each running turn holds a lease that its runner renews while the turn is running. When a runner restarts, it recovers its own unfinished turns at once. Another runner's turn is only recovered once that turn's lease has been expired for two minutes. If a restart interrupted a turn that had already seen its message, the message is delivered again in the same provider session, with a note that the previous turn was interrupted. The agent's assignment stays running instead of being marked blocked. The design and roadmap are in [docs/design/coordination-v2.md](docs/design/coordination-v2.md).
 
+**Task status.** A task changes status only when someone completes, blocks, reopens or updates it. A turn ending never closes a task an agent created. A task a person creates in the web app still completes when its first standalone run succeeds. Child tasks report to their parent: the parent's owner gets an event on the parent's thread whenever a child completes, blocks or reopens. The owner of any task above a child can act on that child.
+
+**Long-running controllers.** A controller such as the Orchestrator can run a whole campaign from one long-lived task instead of starting a fresh task for every periodic check:
+
+```bash
+aisevak tasks create --title "Component Library campaign" --description "All component work" \
+  --body "One long-lived task; every component task is its child." --work-key campaign-2026-10 --agent Orchestrator
+aisevak tasks policy TASK-2000 --max-active-children 200
+aisevak schedules update SCHEDULE-3 --task TASK-2000      # ticks become messages on the campaign thread
+aisevak tasks reparent TASK-1005 TASK-1034 --parent TASK-2000
+aisevak threads refresh THREAD-950 --every 40             # fresh conversation every 40 turns
+```
+
 ## The aisevak CLI
 
 Every agent run gets the CLI on its `PATH`, authenticated with a token scoped to that run. It is how agents read and change shared state. People use the web app for the same things.
@@ -103,6 +116,10 @@ aisevak threads send THREAD-8 --to Reviewer --body-stdin < notes.md
 aisevak threads status THREAD-8
 aisevak agents status Reviewer
 aisevak inbox
+
+# Ask another agent and wait for the answer
+aisevak send --to Reviewer --expect-reply --timeout 1800 --body-stdin < question.md
+aisevak wait MESSAGE-812
 
 # Finish a thread with a summary
 aisevak threads complete THREAD-8 --summary-stdin < summary.md

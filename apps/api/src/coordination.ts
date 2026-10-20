@@ -113,7 +113,30 @@ const incidentsPageSchema = pageSchema.extend({
   includeResolved: z.enum(["true", "false"]).default("false").transform(value => value === "true")
 });
 const refParams = z.object({ ref: z.string().min(1) });
-const inboxQuerySchema = z.object({ thread: z.string().optional(), limit: z.string().optional(), recent: z.string().optional() });
+const inboxQuerySchema = z.object({ thread: z.string().optional(), limit: z.string().optional(), recent: z.string().optional(), wait: z.coerce.number().int().min(0).max(120).optional() });
+const sendSchema = z.object({
+  to: z.string().min(1),
+  thread: z.string().optional(),
+  body: z.string().min(1),
+  key: z.string().trim().min(1).max(200).optional(),
+  expectReply: z.boolean().default(false),
+  timeoutSeconds: z.coerce.number().int().min(10).max(7 * 24 * 3600).optional(),
+  idempotencyKey: z.string().trim().min(1).max(200).optional()
+});
+const replySchema = z.object({ body: z.string().min(1), idempotencyKey: z.string().trim().min(1).max(200).optional() });
+const waitQuerySchema = z.object({ wait: z.coerce.number().int().min(0).max(120).default(60) });
+const reparentSchema = z.object({ parent: z.string().min(1) });
+const taskPolicySchema = z.object({
+  maxActiveAssignments: z.coerce.number().int().positive().max(100).optional(),
+  maxActiveChildren: z.coerce.number().int().positive().max(1000).optional(),
+  maxChildDepth: z.coerce.number().int().positive().max(100).optional(),
+  maxAssignmentAttempts: z.coerce.number().int().positive().max(100).optional()
+}).refine((value) => Object.keys(value).length > 0, "At least one orchestration limit is required");
+const scheduleUpdateSchema = z.object({
+  task: z.string().nullable().optional(),
+  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional()
+}).refine((value) => value.task !== undefined || value.overlapPolicy !== undefined, "Nothing to update");
+const refreshSchema = z.object({ everyTurns: z.coerce.number().int().min(1).max(10_000).nullable().optional(), now: z.boolean().optional() });
 const threadCreateSchema = z.object({
   title: z.string().trim().min(1),
   description: z.string().trim().min(1),
@@ -214,17 +237,18 @@ const skillInstallSchema = z.object({
 
 export async function reopenTask(
   pool: DbPool,
-  input: { taskId: string; senderAgentId: string; capabilities: string[]; body?: string; managedRoot: string }
+  input: { taskId: string; senderAgentId: string; senderKind?: AgentContext["kind"]; capabilities: string[]; body?: string; managedRoot: string }
 ): Promise<void> {
   await withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
     const task = await showTask(client, input.taskId);
-    // The owner reopens with tasks:update. The owner of the parent task may
-    // also reopen a child it created, so an orchestrator can recover a child
-    // task that closed early without taking ownership of it.
-    if (task.agent_id === input.senderAgentId) {
+    // The owner reopens with tasks:update. The owner of any task above it may
+    // also reopen it, so a controller (for example a campaign task's owner)
+    // can recover a child that closed early without taking ownership of it.
+    const authority = await taskAuthority(client, { agentId: input.senderAgentId, kind: input.senderKind ?? "worker" }, input.taskId);
+    if (authority === "owner" || authority === "orchestrator") {
       if (!input.capabilities.includes("tasks:update")) forbidden("Reopening a task requires tasks:update");
-    } else if (task.parent_task_agent_id && task.parent_task_agent_id === input.senderAgentId) {
+    } else if (authority === "ancestor") {
       if (!["tasks:update", "tasks:create-child"].some((capability) => input.capabilities.includes(capability))) {
         forbidden("Reopening a child task requires tasks:update or tasks:create-child");
       }
@@ -244,6 +268,7 @@ export async function reopenTask(
     if (task.agent_id !== input.senderAgentId) {
       await queueDelivery(client, input.managedRoot, task.coordination_thread_id, message.id, task.agent_id);
     }
+    if (task.status !== "open") await notifyParentOfChildEvent(client, input.managedRoot, input.taskId, "reopened", input.senderAgentId, input.body);
   });
 }
 
@@ -338,7 +363,202 @@ export async function registerCoordinationRoutes(
     requireCapability(context, "threads:read");
     const query = inboxQuerySchema.parse(request.query);
     const threadId = query.thread ? await resolveThreadRef(pool, query.thread) : null;
-    return inbox(pool, context.agentId, { threadId, limit: pageLimit(query.limit, 20, 100), includeRecent: query.recent === "true" });
+    const load = () => inbox(pool, context.agentId, { threadId, limit: pageLimit(query.limit, 20, 100), includeRecent: query.recent === "true" });
+    return query.wait ? waitFor(load, (result) => result.pending > 0, query.wait) : load();
+  });
+
+  // Message an agent on a thread (the current task's thread by default),
+  // optionally as a keyed request that expects one reply.
+  app.post("/api/agent-tools/v1/send", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:send");
+    const body = sendSchema.parse(request.body);
+    if (body.expectReply === false && body.timeoutSeconds) badRequest("--timeout needs --expect-reply");
+    const threadId = body.thread
+      ? await resolveThreadRef(pool, body.thread)
+      : context.coordinationThreadId ?? badRequest("No current thread; pass --thread THREAD-n");
+    const recipient = await getAgent(pool, body.to);
+    if (recipient.id === context.agentId) badRequest("Send to another agent");
+    if (!recipient.enabled) badRequest(`Agent ${recipient.name} is disabled`);
+    const output = await withTransaction(pool, async (client) => {
+      await lockThread(client, threadId);
+      if (body.key) {
+        const keyed = await client.query<{ id: string }>(
+          "SELECT id FROM thread_messages WHERE thread_id = $1 AND sender_agent_id = $2 AND request_key = $3",
+          [threadId, context.agentId, body.key]
+        );
+        if (keyed.rows[0]) return { messageId: keyed.rows[0].id, duplicate: true };
+      }
+      const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
+      if (duplicate) return { messageId: duplicate.id, duplicate: true };
+      const message = await insertMessage(client, {
+        threadId,
+        senderAgentId: context.agentId,
+        recipientAgentId: recipient.id,
+        body: body.body,
+        type: body.expectReply ? "request" : "message",
+        idempotencyKey: body.idempotencyKey,
+        request: body.expectReply ? { key: body.key ?? null, replyBySeconds: body.timeoutSeconds ?? null } : undefined
+      });
+      if (!body.expectReply && body.key) {
+        // A plain message can still carry a key for idempotent resends.
+        await client.query("UPDATE thread_messages SET request_key = $2 WHERE id = $1", [message.id, body.key]);
+      }
+      await client.query(
+        "UPDATE coordination_threads SET status = 'active', last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [threadId]
+      );
+      await addParticipants(client, threadId, [[recipient.id, "participant"]]);
+      await queueDelivery(client, options.managedRoot, threadId, message.id, recipient.id);
+      return { messageId: message.id, duplicate: false };
+    });
+    return { message: await showMessage(pool, output.messageId), duplicate: output.duplicate };
+  });
+
+  app.post("/api/agent-tools/v1/messages/:ref/reply", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:send");
+    const requestId = await resolveResourceId(pool, "thread_messages", "MESSAGE", refParams.parse(request.params).ref);
+    const body = replySchema.parse(request.body);
+    const output = await withTransaction(pool, async (client) => {
+      const original = await client.query<{
+        id: string; number: number; thread_id: string; sender_agent_id: string | null; recipient_agent_id: string | null;
+        expects_reply: boolean; request_state: string | null; assignment_number: number | null;
+      }>(
+        `SELECT thread_messages.id, thread_messages.number, thread_messages.thread_id, thread_messages.sender_agent_id,
+                thread_messages.recipient_agent_id, thread_messages.expects_reply, thread_messages.request_state,
+                task_assignments.number AS assignment_number
+         FROM thread_messages
+         LEFT JOIN task_assignments ON task_assignments.request_message_id = thread_messages.id
+         WHERE thread_messages.id = $1
+         FOR UPDATE OF thread_messages`,
+        [requestId]
+      );
+      const row = original.rows[0] ?? notFound("Message");
+      if (row.assignment_number) {
+        badRequest(`MESSAGE-${row.number} is ASSIGNMENT-${row.assignment_number}; answer it with aisevak assignments complete|block ASSIGNMENT-${row.assignment_number}`);
+      }
+      if (!row.sender_agent_id) badRequest(`MESSAGE-${row.number} came from the platform or a person; reply on its thread instead`);
+      if (row.sender_agent_id === context.agentId) badRequest("You cannot reply to your own message");
+      if (row.expects_reply && row.recipient_agent_id !== context.agentId) {
+        forbidden(`Only the recipient of MESSAGE-${row.number} may reply to it`);
+      }
+      const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
+      if (duplicate) return { messageId: duplicate.id, duplicate: true };
+      const reply = await insertMessage(client, {
+        threadId: row.thread_id,
+        senderAgentId: context.agentId,
+        recipientAgentId: row.sender_agent_id,
+        body: body.body,
+        type: "reply",
+        idempotencyKey: body.idempotencyKey,
+        parentMessageId: row.id,
+        inReplyToMessageId: row.id
+      });
+      if (row.request_state === "open") {
+        await client.query("UPDATE thread_messages SET request_state = 'replied' WHERE id = $1", [row.id]);
+      }
+      await client.query(
+        "UPDATE coordination_threads SET status = 'active', last_activity_at = now(), updated_at = now() WHERE id = $1",
+        [row.thread_id]
+      );
+      await queueDelivery(client, options.managedRoot, row.thread_id, reply.id, row.sender_agent_id);
+      return { messageId: reply.id, duplicate: false };
+    });
+    return { message: await showMessage(pool, output.messageId), request: await requestReply(pool, requestId), duplicate: output.duplicate };
+  });
+
+  // Wait (bounded long poll) for the reply to a request.
+  app.get("/api/agent-tools/v1/messages/:ref/reply", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:read");
+    const requestId = await resolveResourceId(pool, "thread_messages", "MESSAGE", refParams.parse(request.params).ref);
+    const query = waitQuerySchema.parse(request.query);
+    return waitFor(() => requestReply(pool, requestId), (result) => result.state !== "open", query.wait);
+  });
+
+  // Move a task (and its subtree) under another parent, for example under a
+  // long-lived campaign task. The fan-out limit is not applied: this moves
+  // existing work rather than creating it.
+  app.post("/api/agent-tools/v1/tasks/:ref/reparent", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireAnyCapability(context, ["tasks:update", "tasks:create-child"]);
+    const taskId = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
+    const body = reparentSchema.parse(request.body);
+    const parentId = await resolveResourceId(pool, "tasks", "TASK", body.parent);
+    if (parentId === taskId) badRequest("A task cannot be its own parent");
+    await withTransaction(pool, async (client) => {
+      await client.query("SELECT id FROM tasks WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE", [[taskId, parentId]]);
+      await requireTaskAuthority(client, context, taskId, "move this task");
+      await requireTaskAuthority(client, context, parentId, "add children to the new parent");
+      const parentChain = await client.query<{ id: string; depth: number; orchestration_policy: unknown }>(
+        `WITH RECURSIVE chain AS (
+           SELECT id, parent_task_id, orchestration_policy, 0::int AS depth FROM tasks WHERE id = $1
+           UNION ALL
+           SELECT parent.id, parent.parent_task_id, parent.orchestration_policy, chain.depth + 1
+           FROM tasks parent JOIN chain ON parent.id = chain.parent_task_id
+           WHERE chain.depth < 32
+         ) SELECT id, depth, orchestration_policy FROM chain ORDER BY depth ASC`,
+        [parentId]
+      );
+      if (parentChain.rows.some((row) => row.id === taskId)) badRequest("The new parent is inside this task's subtree");
+      const subtree = await client.query<{ height: number }>(
+        `WITH RECURSIVE below AS (
+           SELECT id, 0::int AS height FROM tasks WHERE id = $1
+           UNION ALL
+           SELECT child.id, below.height + 1 FROM tasks child JOIN below ON child.parent_task_id = below.id
+           WHERE below.height < 32
+         ) SELECT COALESCE(max(height), 0)::int AS height FROM below`,
+        [taskId]
+      );
+      const policy = orchestrationPolicy(parentChain.rows[0]?.orchestration_policy);
+      const depth = Number(parentChain.rows.at(-1)?.depth ?? 0) + 1 + Number(subtree.rows[0]?.height ?? 0);
+      if (depth > policy.maxChildDepth) {
+        await recordSafetyEvent(client, {
+          operation: "task.reparent.depth-limit",
+          context,
+          taskId,
+          details: { depth, limit: policy.maxChildDepth, parentTaskId: parentId },
+          message: `Moving this task would make the tree ${depth} levels deep (limit ${policy.maxChildDepth})`
+        });
+      }
+      await client.query("UPDATE tasks SET parent_task_id = $2, updated_at = now() WHERE id = $1", [taskId, parentId]);
+    });
+    return { task: await showTask(pool, taskId) };
+  });
+
+  app.post("/api/agent-tools/v1/tasks/:ref/policy", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "tasks:update");
+    const taskId = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
+    const body = taskPolicySchema.parse(request.body);
+    await requireTaskAuthority(pool, context, taskId, "change this task's limits");
+    const current = await pool.query<{ orchestration_policy: unknown }>("SELECT orchestration_policy FROM tasks WHERE id = $1", [taskId]);
+    const policy = { ...orchestrationPolicy(current.rows[0]?.orchestration_policy), ...body };
+    await pool.query("UPDATE tasks SET orchestration_policy = $2, updated_at = now() WHERE id = $1", [taskId, JSON.stringify(policy)]);
+    return { task: await showTask(pool, taskId), orchestrationPolicy: policy };
+  });
+
+  // Refresh policy for the caller's own session on a thread: start a fresh
+  // provider conversation every N successful turns, or after the current turn.
+  app.post("/api/agent-tools/v1/threads/:ref/refresh", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:read");
+    const threadId = await resolveThreadRef(pool, refParams.parse(request.params).ref);
+    const body = refreshSchema.parse(request.body ?? {});
+    const updated = await pool.query<{ id: string; context_policy: unknown }>(
+      `UPDATE agent_threads
+       SET context_policy = (context_policy - 'maxTurns' - 'refreshNow')
+             || CASE WHEN $3::integer IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('maxTurns', $3::integer) END
+             || CASE WHEN $4::boolean THEN '{"refreshNow": true}'::jsonb ELSE '{}'::jsonb END,
+           updated_at = now()
+       WHERE agent_id = $1 AND archived_at IS NULL
+         AND (coordination_thread_id = $2 OR task_id = (SELECT task_id FROM coordination_threads WHERE id = $2))
+       RETURNING id, context_policy`,
+      [context.agentId, threadId, body.everyTurns ?? null, body.now ?? false]
+    );
+    if (!updated.rows[0]) notFound("Your session on this thread");
+    return { agentThreadId: updated.rows[0].id, contextPolicy: updated.rows[0].context_policy };
   });
 
   app.get("/api/agent-tools/v1/agents/:ref", async (request) => {
@@ -697,11 +917,12 @@ export async function registerCoordinationRoutes(
 
   app.patch("/api/agent-tools/v1/tasks/:ref", async (request) => {
     const context = await requireAgent(pool, request);
-    requireCapability(context, "tasks:update");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
+    // tasks:update, or owning a task above this one (subtree authority).
+    const authority = await requireTaskAuthority(pool, context, id, "update this task");
+    if (authority !== "ancestor") requireCapability(context, "tasks:update");
     const body = taskPatchSchema.parse(request.body);
-    const currentTask = await pool.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [id]);
-    requireTaskOwner(context, currentTask.rows[0] ?? notFound("Task"), "update this task");
+    const before = await pool.query<{ status: string }>("SELECT status FROM tasks WHERE id = $1", [id]);
     if (["completed", "blocked", "cancelled"].includes(body.status ?? "")) {
       const active = await pool.query<{ count: string }>(
         "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [id]
@@ -737,6 +958,11 @@ export async function registerCoordinationRoutes(
        WHERE task_id = $1`,
       [id, body.title ?? null, body.description ?? null, body.body ?? null, body.status ?? null]
     );
+    if (body.status && body.status !== before.rows[0]?.status) {
+      await withTransaction(pool, (client) =>
+        notifyParentOfChildEvent(client, options.managedRoot, id, body.status!, context.agentId)
+      );
+    }
     return { task: await showTask(pool, id) };
   });
 
@@ -825,7 +1051,7 @@ export async function registerCoordinationRoutes(
         id: string; number: number; title: string; status: string; agent_id: string; coordination_thread_id: string | null; orchestration_policy: unknown;
       }>("SELECT id, number, title, status, agent_id, coordination_thread_id, orchestration_policy FROM tasks WHERE id = $1 FOR UPDATE", [taskId]);
       const task = taskResult.rows[0] ?? notFound("Task");
-      requireTaskOwner(context, task, "create assignments for this task");
+      await requireTaskAuthority(client, context, taskId, "create assignments for this task");
       if (["completed", "blocked", "cancelled"].includes(task.status)) throw safetyConflict(`Cannot add an assignment to a ${task.status} task`);
       if (!task.coordination_thread_id) badRequest("This task has no coordination thread; migrate the task before adding an assignment");
       const key = normalizeWorkKey(body.key);
@@ -898,9 +1124,11 @@ export async function registerCoordinationRoutes(
         recipientAgentId: recipient.id,
         body: `ASSIGNMENT-${assignment.number} (${key}) for TASK-${task.number}:\n\n${body.instructions}\n\nUse the same assignment to report completion; do not create a recovery or review thread.`,
         type: "assignment.created",
-        idempotencyKey: body.idempotencyKey
+        idempotencyKey: body.idempotencyKey,
+        // An assignment is a keyed request; completing or blocking it is the reply.
+        request: { key: `assignment:${assignment.id}` }
       });
-      await client.query("UPDATE task_assignments SET last_message_id = $2 WHERE id = $1", [assignment.id, message.id]);
+      await client.query("UPDATE task_assignments SET last_message_id = $2, request_message_id = $2 WHERE id = $1", [assignment.id, message.id]);
       const deliveryId = recipient.id === context.agentId
         ? null
         : await queueDelivery(client, options.managedRoot, task.coordination_thread_id, message.id, recipient.id, assignment.id);
@@ -925,8 +1153,8 @@ export async function registerCoordinationRoutes(
          WHERE task_assignments.id = $1 FOR UPDATE`, [id]
       );
       const assignment = row.rows[0] ?? notFound("Assignment");
-      if (context.agentId !== assignment.assigned_agent_id && context.agentId !== assignment.task_agent_id && context.kind !== "dispatcher") {
-        forbidden("Only the assigned agent, task owner, or orchestrator may send assignment instructions");
+      if (context.agentId !== assignment.assigned_agent_id && !(await taskAuthority(client, context, assignment.task_id))) {
+        forbidden("Only the assigned agent, the task owner or the owner of a task above it, or the orchestrator may send assignment instructions");
       }
       const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
       if (duplicate) return;
@@ -966,7 +1194,7 @@ export async function registerCoordinationRoutes(
          WHERE task_assignments.id = $1 FOR UPDATE`, [id]
       );
       const assignment = row.rows[0] ?? notFound("Assignment");
-      requireTaskOwner(context, { agent_id: assignment.task_agent_id }, "retry this assignment");
+      await requireTaskAuthority(client, context, assignment.task_id, "retry this assignment");
       if (["completed", "cancelled"].includes(assignment.task_status)) throw safetyConflict(`Cannot retry an assignment on a ${assignment.task_status} task`);
       if (["completed", "cancelled"].includes(assignment.status)) throw safetyConflict("A terminal assignment cannot be retried");
       if (assignment.status === "running") throw safetyConflict("The assignment is already running; wait for it to finish or fail");
@@ -1013,9 +1241,10 @@ export async function registerCoordinationRoutes(
       await withTransaction(pool, async (client) => {
         const row = await client.query<{
           task_id: string; assignment_number: number; assigned_agent_id: string; status: string; coordination_thread_id: string; task_agent_id: string; task_number: number; active_delivery_id: string | null;
+          request_message_id: string | null;
         }>(
           `SELECT task_assignments.task_id, task_assignments.number AS assignment_number, task_assignments.assigned_agent_id, task_assignments.status,
-                  task_assignments.active_delivery_id,
+                  task_assignments.active_delivery_id, task_assignments.request_message_id,
                   tasks.coordination_thread_id, tasks.agent_id AS task_agent_id, tasks.number AS task_number
            FROM task_assignments JOIN tasks ON tasks.id = task_assignments.task_id
            WHERE task_assignments.id = $1 FOR UPDATE`, [id]
@@ -1026,6 +1255,9 @@ export async function registerCoordinationRoutes(
         const duplicate = await existingIdempotentMessage(client, context.agentId, body.idempotencyKey);
         if (duplicate) return;
         await client.query("UPDATE task_assignments SET status = $2, result = $3, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, action === "complete" ? "completed" : "blocked", body.result]);
+        if (assignment.request_message_id) {
+          await client.query("UPDATE thread_messages SET request_state = 'replied' WHERE id = $1 AND request_state = 'open'", [assignment.request_message_id]);
+        }
         if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`, { stopRunningTurn: false });
         if (assignment.task_agent_id !== context.agentId) {
           const message = await insertMessage(client, {
@@ -1034,7 +1266,9 @@ export async function registerCoordinationRoutes(
             recipientAgentId: assignment.task_agent_id,
           body: `ASSIGNMENT-${assignment.assignment_number} ${action === "complete" ? "completed" : "blocked"}:\n\n${body.result}`,
             type: action === "complete" ? "assignment.completed" : "assignment.blocked",
-            idempotencyKey: body.idempotencyKey
+            idempotencyKey: body.idempotencyKey,
+            parentMessageId: assignment.request_message_id,
+            inReplyToMessageId: assignment.request_message_id
           });
           await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, assignment.task_agent_id);
         }
@@ -1048,8 +1282,7 @@ export async function registerCoordinationRoutes(
     requireCapability(context, "tasks:complete");
     const id = await resolveResourceId(pool, "tasks", "TASK", refParams.parse(request.params).ref);
     const body = optionalBodySchema.parse(request.body ?? {});
-    const owner = await pool.query<{ agent_id: string }>("SELECT agent_id FROM tasks WHERE id = $1", [id]);
-    requireTaskOwner(context, owner.rows[0] ?? notFound("Task"), "complete this task");
+    const authority = await requireTaskAuthority(pool, context, id, "complete this task");
     const active = await pool.query<{ count: string }>(
       "SELECT count(*)::int AS count FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running')", [id]
     );
@@ -1064,9 +1297,13 @@ export async function registerCoordinationRoutes(
     }
     const task = await showTask(pool, id);
     if (task.coordination_thread_id) {
-      await finalizeThread(pool, options.managedRoot, context, task.coordination_thread_id, "completed", body.body || "Task completed.");
+      await finalizeThread(pool, options.managedRoot, context, task.coordination_thread_id, "completed", body.body || "Task completed.",
+        undefined, undefined, { byTaskAuthority: authority !== "owner" });
     } else {
-      await pool.query("UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1", [id]);
+      await withTransaction(pool, async (client) => {
+        await client.query("UPDATE tasks SET status = 'completed', updated_at = now() WHERE id = $1", [id]);
+        await notifyParentOfChildEvent(client, options.managedRoot, id, "completed", context.agentId, body.body);
+      });
     }
     return { task: await showTask(pool, id) };
   });
@@ -1078,6 +1315,7 @@ export async function registerCoordinationRoutes(
     await reopenTask(pool, {
       taskId: id,
       senderAgentId: context.agentId,
+      senderKind: context.kind,
       capabilities: context.capabilities,
       body: body.body,
       managedRoot: options.managedRoot
@@ -1232,6 +1470,27 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
         [id, nextRunAt]
       );
     });
+    return { schedule: await showSchedule(pool, id) };
+  });
+
+  // Retarget a schedule: with a task, each tick becomes a message on that
+  // task's thread (for example a campaign) instead of a new task.
+  app.patch("/api/agent-tools/v1/schedules/:ref", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "schedules:write");
+    const id = await resolveResourceId(pool, "schedules", "SCHEDULE", refParams.parse(request.params).ref);
+    const body = scheduleUpdateSchema.parse(request.body);
+    const taskId = body.task === undefined
+      ? undefined
+      : body.task === null || body.task === "none" ? null : await resolveResourceId(pool, "tasks", "TASK", body.task);
+    await pool.query(
+      `UPDATE schedules
+       SET task_id = CASE WHEN $2::boolean THEN $3::uuid ELSE task_id END,
+           overlap_policy = COALESCE($4, overlap_policy),
+           updated_at = now()
+       WHERE id = $1`,
+      [id, taskId !== undefined, taskId ?? null, body.overlapPolicy ?? null]
+    );
     return { schedule: await showSchedule(pool, id) };
   });
 
@@ -1612,6 +1871,45 @@ export function requireTaskOwner(context: AgentContext, task: { agent_id: string
   if (context.kind !== "dispatcher" && context.agentId !== task.agent_id) {
     throw safetyForbidden(`Only the task owner or orchestrator may ${operation}`);
   }
+}
+
+export type TaskAuthority = "orchestrator" | "owner" | "ancestor";
+
+// Authority by task tree: the orchestrator, the task's owner, or the owner of
+// any task above it. Workers keep their narrow capabilities; owning a parent
+// (for example a campaign task) lets them act on the subtree it spans.
+export async function taskAuthority(
+  queryable: Queryable,
+  context: Pick<AgentContext, "agentId" | "kind">,
+  taskId: string
+): Promise<TaskAuthority | null> {
+  if (context.kind === "dispatcher") return "orchestrator";
+  const chain = await queryable.query<{ agent_id: string; depth: number }>(
+    `WITH RECURSIVE chain AS (
+       SELECT id, parent_task_id, agent_id, 0::int AS depth FROM tasks WHERE id = $1
+       UNION ALL
+       SELECT parent.id, parent.parent_task_id, parent.agent_id, chain.depth + 1
+       FROM tasks parent JOIN chain ON parent.id = chain.parent_task_id
+       WHERE chain.depth < 32
+     )
+     SELECT agent_id, depth FROM chain ORDER BY depth ASC`,
+    [taskId]
+  );
+  const [task, ...ancestors] = chain.rows;
+  if (!task) notFound("Task");
+  if (task.agent_id === context.agentId) return "owner";
+  return ancestors.some((row) => row.agent_id === context.agentId) ? "ancestor" : null;
+}
+
+export async function requireTaskAuthority(
+  queryable: Queryable,
+  context: Pick<AgentContext, "agentId" | "kind">,
+  taskId: string,
+  operation: string
+): Promise<TaskAuthority> {
+  const authority = await taskAuthority(queryable, context, taskId);
+  if (!authority) throw safetyForbidden(`Only the task owner, the owner of a task above it, or the orchestrator may ${operation}`);
+  return authority;
 }
 
 async function assertTaskCreationAllowed(
@@ -2067,12 +2365,19 @@ async function existingIdempotentMessage(queryable: Queryable, senderAgentId: st
 async function insertMessage(client: PoolClient, input: {
   threadId: string; senderAgentId: string | null; recipientAgentId: string | null; body: string; type: string;
   parentMessageId?: string | null; idempotencyKey?: string;
+  // A request expects one reply; replyBySeconds bounds the wait.
+  request?: { key?: string | null; replyBySeconds?: number | null };
+  inReplyToMessageId?: string | null;
 }): Promise<{ id: string }> {
   const result = await client.query<{ id: string }>(
     `INSERT INTO thread_messages
-       (thread_id, sender_agent_id, recipient_agent_id, parent_message_id, message_type, body, idempotency_key)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-    [input.threadId, input.senderAgentId, input.recipientAgentId, input.parentMessageId ?? null, input.type, input.body, input.idempotencyKey ?? null]
+       (thread_id, sender_agent_id, recipient_agent_id, parent_message_id, message_type, body, idempotency_key,
+        expects_reply, request_state, request_key, reply_by, in_reply_to_message_id)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $8 THEN 'open' ELSE NULL END, $9,
+             CASE WHEN $10::integer IS NULL THEN NULL ELSE now() + ($10::integer * interval '1 second') END, $11)
+     RETURNING id`,
+    [input.threadId, input.senderAgentId, input.recipientAgentId, input.parentMessageId ?? null, input.type, input.body, input.idempotencyKey ?? null,
+      Boolean(input.request), input.request?.key ?? null, input.request?.replyBySeconds ?? null, input.inReplyToMessageId ?? null]
   );
   await client.query("UPDATE coordination_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1", [input.threadId]);
   return result.rows[0]!;
@@ -2715,12 +3020,14 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
     `Thread started by: ${thread.created_by_agent_name ?? "platform"}`,
     `Message from: ${message.sender_agent_name ?? "platform"}`,
     `Message type: ${message.message_type ?? "message"}`,
-    `Why you were triggered: ${message.body}`,
+    `Why you were triggered: ${message.body}${requestHint(message)}`,
     thread.origin_thread_id ? `Origin thread: THREAD-${thread.origin_thread_number ?? thread.origin_thread_id}` : "Origin thread: none",
     `Triggered agent: ${thread.primary_agent_name ?? "none"}`,
     `Result recipient: ${thread.callback_agent_name ?? "none"}`,
     ...formatJobEnvelope(envelope),
     "",
+    "This is a fresh conversation (a first turn, or a refreshed one). The record is the task tree and the thread, not this prompt: " +
+      `run aisevak threads status THREAD-${thread.number}${thread.task_id ? " and aisevak show on the task" : ""} before acting on earlier work.`,
     `Recent thread history (earlier messages; full bodies via aisevak threads messages THREAD-${thread.number}):`,
     ...(lines.length ? lines : ["- No earlier messages."]),
     ""
@@ -2765,8 +3072,17 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
   ].join("\n");
 }
 
-export function coordinationIncrementalPrompt(message: { body: string }, envelope?: JobEnvelope | null): string {
-  return [...formatJobEnvelope(envelope), message.body].filter(Boolean).join("\n");
+export function coordinationIncrementalPrompt(message: { body: string } & RequestHintFields, envelope?: JobEnvelope | null): string {
+  return [...formatJobEnvelope(envelope), message.body, requestHint(message)].filter(Boolean).join("\n");
+}
+
+interface RequestHintFields { number?: number; message_type?: string; expects_reply?: boolean; request_state?: string | null; reply_by?: unknown }
+
+// A request (from `aisevak send --expect-reply`) tells its recipient how to answer.
+function requestHint(message: RequestHintFields): string {
+  if (!message.expects_reply || message.message_type !== "request" || message.request_state !== "open" || !message.number) return "";
+  const deadline = message.reply_by ? ` by ${iso(message.reply_by)}` : "";
+  return `\nThe sender is waiting for your answer${deadline}. Reply with: aisevak reply MESSAGE-${message.number} --body-stdin`;
 }
 
 function formatJobEnvelope(envelope?: JobEnvelope | null): string[] {
@@ -2906,7 +3222,8 @@ async function finalizeThread(
   status: "completed" | "blocked",
   body: string,
   idempotencyKey?: string,
-  updateRelatedResource?: (client: PoolClient) => Promise<void>
+  updateRelatedResource?: (client: PoolClient) => Promise<void>,
+  options: { byTaskAuthority?: boolean } = {}
 ): Promise<string> {
   return withTransaction(pool, async (client) => {
     const taskLink = await client.query<{ task_id: string | null }>(
@@ -2928,7 +3245,7 @@ async function finalizeThread(
     if (duplicate) return duplicate.id;
     // A task owner/orchestrator may close the overall task thread. Specialist
     // agents still use assignment complete/block and cannot finalize the job.
-    if (thread.task_id && context.kind === "dispatcher") {
+    if (thread.task_id && (context.kind === "dispatcher" || options.byTaskAuthority)) {
       if (thread.status !== "active") {
         throw httpError(409, `THREAD-${thread.number} is already ${thread.status}. Send a new message to reactivate it before requesting more work.`);
       }
@@ -2943,7 +3260,12 @@ async function finalizeThread(
     await client.query("UPDATE coordination_threads SET status = $2, last_activity_at = now(), updated_at = now() WHERE id = $1", [threadId, status]);
     if (thread.task_id) await client.query("UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1", [thread.task_id, status === "completed" ? "completed" : "blocked"]);
     if (updateRelatedResource) await updateRelatedResource(client);
-    if (recipientId) await queueDelivery(client, managedRoot, threadId, message.id, recipientId);
+    // A child task reports to its parent task's thread, where the parent's
+    // owner already works. The creator's private session on the child thread
+    // gets the result only when the creator is someone else.
+    const parentOwner = thread.task_id ? await parentTaskOwner(client, thread.task_id) : null;
+    if (recipientId && recipientId !== parentOwner) await queueDelivery(client, managedRoot, threadId, message.id, recipientId);
+    if (thread.task_id) await notifyParentOfChildEvent(client, managedRoot, thread.task_id, status, context.agentId, body);
     return message.id;
   });
 }
@@ -3065,6 +3387,130 @@ function modelOptionsFor(
       })
     : [];
   return options.length ? options : defaultHarnessModelOptions(model);
+}
+
+async function parentTaskOwner(queryable: Queryable, taskId: string): Promise<string | null> {
+  const result = await queryable.query<{ agent_id: string }>(
+    "SELECT parent.agent_id FROM tasks JOIN tasks parent ON parent.id = tasks.parent_task_id WHERE tasks.id = $1",
+    [taskId]
+  );
+  return result.rows[0]?.agent_id ?? null;
+}
+
+// Child task events (completed, blocked, reopened, other status changes) go to
+// the parent task's owner on the parent's coordination thread, so a
+// long-lived controller (for example a campaign task) reacts to events instead
+// of polling, whichever run created the child.
+export async function notifyParentOfChildEvent(
+  client: PoolClient,
+  managedRoot: string,
+  childTaskId: string,
+  event: string,
+  actorAgentId: string | null,
+  detail?: string | null
+): Promise<void> {
+  const result = await client.query<{
+    number: number; title: string; parent_agent_id: string; parent_thread_id: string | null; parent_number: number;
+  }>(
+    `SELECT child.number, child.title, parent.agent_id AS parent_agent_id,
+            parent.coordination_thread_id AS parent_thread_id, parent.number AS parent_number
+     FROM tasks child JOIN tasks parent ON parent.id = child.parent_task_id
+     WHERE child.id = $1`,
+    [childTaskId]
+  );
+  const row = result.rows[0];
+  if (!row?.parent_thread_id) return;
+  const summary = detail?.trim() ? `\n\n${truncate(detail.trim(), 2000)}` : "";
+  const message = await insertMessage(client, {
+    threadId: row.parent_thread_id,
+    senderAgentId: actorAgentId,
+    recipientAgentId: row.parent_agent_id,
+    body: `Child task TASK-${row.number} (${row.title}) of TASK-${row.parent_number} is now ${event}.${summary}\n\n` +
+      `This is an event for the parent task, not new work by itself. Inspect it with: aisevak show TASK-${row.number}`,
+    type: `child.${event}`
+  });
+  if (row.parent_agent_id !== actorAgentId) {
+    await queueDelivery(client, managedRoot, row.parent_thread_id, message.id, row.parent_agent_id);
+  }
+}
+
+export const REQUEST_TIMED_OUT_TYPE = "request.timed_out";
+
+// Requests whose reply_by passed: mark them timed out and tell the requester
+// on the same thread. Runs with the delivery-failure sweep.
+export async function expireRequests(pool: DbPool, managedRoot: string, limit = 20): Promise<number> {
+  return withTransaction(pool, async (client) => {
+    const due = await client.query<{
+      id: string; number: number; thread_id: string; thread_number: number; sender_agent_id: string | null;
+      recipient_name: string | null; reply_by: Date;
+    }>(
+      `SELECT thread_messages.id, thread_messages.number, thread_messages.thread_id, coordination_threads.number AS thread_number,
+              thread_messages.sender_agent_id, recipient.name AS recipient_name, thread_messages.reply_by
+       FROM thread_messages
+       JOIN coordination_threads ON coordination_threads.id = thread_messages.thread_id
+       LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
+       WHERE thread_messages.request_state = 'open' AND thread_messages.reply_by < now()
+       ORDER BY thread_messages.reply_by ASC
+       LIMIT $1
+       FOR UPDATE OF thread_messages SKIP LOCKED`,
+      [limit]
+    );
+    let sent = 0;
+    for (const row of due.rows) {
+      await client.query("UPDATE thread_messages SET request_state = 'timed_out' WHERE id = $1", [row.id]);
+      if (!row.sender_agent_id) continue;
+      await client.query("SAVEPOINT request_timeout_notice");
+      try {
+        const notice = await insertMessage(client, {
+          threadId: row.thread_id,
+          senderAgentId: null,
+          recipientAgentId: row.sender_agent_id,
+          body: `Platform notice (not new work): your request MESSAGE-${row.number} on THREAD-${row.thread_number} to ${row.recipient_name ?? "its recipient"} ` +
+            `got no reply by ${iso(row.reply_by)}. Check the recipient with: aisevak threads status THREAD-${row.thread_number}. ` +
+            `Then resend with a new key, or continue without the reply.`,
+          type: REQUEST_TIMED_OUT_TYPE,
+          parentMessageId: row.id
+        });
+        await queueDelivery(client, managedRoot, row.thread_id, notice.id, row.sender_agent_id);
+        await client.query("RELEASE SAVEPOINT request_timeout_notice");
+        sent += 1;
+      } catch (error) {
+        await client.query("ROLLBACK TO SAVEPOINT request_timeout_notice");
+        console.error(`Could not tell the sender that request ${row.id} timed out`, error);
+      }
+    }
+    return sent;
+  });
+}
+
+export async function requestReply(queryable: Queryable, requestId: string): Promise<any> {
+  const request = await queryable.query<{ request_state: string | null; expects_reply: boolean; reply_by: unknown; number: number }>(
+    "SELECT number, request_state, expects_reply, reply_by FROM thread_messages WHERE id = $1",
+    [requestId]
+  );
+  const row = request.rows[0] ?? notFound("Message");
+  const reply = await queryable.query<{ id: string }>(
+    "SELECT id FROM thread_messages WHERE in_reply_to_message_id = $1 ORDER BY created_at ASC, id ASC LIMIT 1",
+    [requestId]
+  );
+  return {
+    request: `MESSAGE-${row.number}`,
+    state: row.request_state ?? (reply.rows[0] ? "replied" : "none"),
+    replyBy: row.reply_by ? iso(row.reply_by) : null,
+    reply: reply.rows[0] ? await showMessage(queryable, reply.rows[0].id, true) : null
+  };
+}
+
+// Bounded long poll used by `wait`: re-checks once a second, holds no
+// connection between checks, and never waits longer than 120 s per call.
+export async function waitFor<T>(check: () => Promise<T>, done: (value: T) => boolean, seconds: number, intervalMs = 1000): Promise<T> {
+  const deadline = Date.now() + Math.min(Math.max(seconds, 0), 120) * 1000;
+  let value = await check();
+  while (!done(value) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, Math.max(deadline - Date.now(), 0))));
+    value = await check();
+  }
+  return value;
 }
 
 export type ParticipantState = "idle" | "queued" | "running" | "waiting" | "blocked";
@@ -3424,6 +3870,7 @@ export function startDeliveryFailureNotices(pool: DbPool, managedRoot: string, i
     if (busy) return;
     busy = true;
     notifyFailedDeliveries(pool, managedRoot)
+      .then(() => expireRequests(pool, managedRoot))
       .catch((error) => console.error("Delivery failure notices failed", error))
       .finally(() => { busy = false; });
   }, intervalMs);

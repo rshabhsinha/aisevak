@@ -1344,6 +1344,54 @@ ON task_runs(lease_expires_at) WHERE status IN ('running', 'cancel_requested');
 CREATE INDEX IF NOT EXISTS dispatcher_runs_active_lease_idx
 ON dispatcher_runs(lease_expires_at) WHERE status IN ('running', 'cancel_requested');
 
+-- Coordination v2 phase 3: request/reply. A request is a message that expects
+-- one reply; request_state tracks it and reply_by bounds the wait.
+ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS request_key text;
+ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS expects_reply boolean NOT NULL DEFAULT false;
+ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS reply_by timestamptz;
+ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS in_reply_to_message_id uuid;
+ALTER TABLE thread_messages ADD COLUMN IF NOT EXISTS request_state text;
+DO $$ BEGIN
+  ALTER TABLE thread_messages ADD CONSTRAINT thread_messages_in_reply_to_fkey
+    FOREIGN KEY (in_reply_to_message_id) REFERENCES thread_messages(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+DO $$ BEGIN
+  ALTER TABLE thread_messages ADD CONSTRAINT thread_messages_request_state_check
+    CHECK (request_state IS NULL OR request_state IN ('open', 'replied', 'timed_out', 'cancelled'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS thread_messages_request_key_unique
+ON thread_messages(thread_id, sender_agent_id, request_key)
+WHERE request_key IS NOT NULL AND sender_agent_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS thread_messages_open_requests_idx
+ON thread_messages(reply_by) WHERE request_state = 'open';
+CREATE INDEX IF NOT EXISTS thread_messages_in_reply_to_idx
+ON thread_messages(in_reply_to_message_id) WHERE in_reply_to_message_id IS NOT NULL;
+ALTER TABLE task_assignments ADD COLUMN IF NOT EXISTS request_message_id uuid;
+DO $$ BEGIN
+  ALTER TABLE task_assignments ADD CONSTRAINT task_assignments_request_message_fkey
+    FOREIGN KEY (request_message_id) REFERENCES thread_messages(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Task lifecycle: 'explicit' tasks change status only through explicit
+-- commands; 'on_first_success' tasks (created by people) also complete when a
+-- standalone run succeeds. Added without a default so the one-time backfill
+-- below only ever sees rows that predate the column.
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS completion_policy text;
+UPDATE tasks SET completion_policy = CASE WHEN created_by IS NOT NULL THEN 'on_first_success' ELSE 'explicit' END
+WHERE completion_policy IS NULL;
+ALTER TABLE tasks ALTER COLUMN completion_policy SET DEFAULT 'explicit';
+ALTER TABLE tasks ALTER COLUMN completion_policy SET NOT NULL;
+DO $$ BEGIN
+  ALTER TABLE tasks ADD CONSTRAINT tasks_completion_policy_check
+    CHECK (completion_policy IN ('explicit', 'on_first_success'));
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+
+-- Conversation refresh for long-lived threads: after context_policy.maxTurns
+-- successful turns the provider session is reset while the agent thread, its
+-- inbox and the task tree stay.
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS context_policy jsonb NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE agent_threads ADD COLUMN IF NOT EXISTS turns_since_refresh integer NOT NULL DEFAULT 0;
+
 -- The task board resolves each task's column from its latest runs.
 CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx

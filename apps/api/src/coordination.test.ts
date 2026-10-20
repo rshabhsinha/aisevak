@@ -122,6 +122,8 @@ describe("task reopening ownership", () => {
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
       if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
       if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      if (sql.includes("WITH RECURSIVE chain")) return { rows: [{ agent_id: task.agent_id, depth: 0 }] };
+      if (sql.includes("FROM tasks child JOIN tasks parent")) return { rows: [] };
       if (sql.includes("INSERT INTO thread_messages")) return { rows: [{ id: "message-id" }] };
       if (sql.includes("UPDATE tasks") || sql.includes("UPDATE coordination_threads")) return { rows: [] };
       throw new Error(`Unexpected query: ${sql}`);
@@ -140,7 +142,7 @@ describe("task reopening ownership", () => {
     const firstApplicationQuery = queries.find(({ sql }) => !["BEGIN", "COMMIT", "ROLLBACK"].includes(sql));
     expect(firstApplicationQuery?.sql).toContain("SELECT id FROM tasks WHERE id = $1 FOR UPDATE");
     const message = queries.find(({ sql }) => sql.includes("INSERT INTO thread_messages"));
-    expect(message?.params).toEqual([
+    expect(message?.params?.slice(0, 7)).toEqual([
       "thread-id",
       "new-agent",
       "new-agent",
@@ -149,6 +151,8 @@ describe("task reopening ownership", () => {
       "Please continue after the transfer.",
       null
     ]);
+    // A plain message: not a request, not a reply.
+    expect(message?.params?.slice(7)).toEqual([false, null, null, null]);
   });
 
   it("rejects an old provider token after the task has been transferred", async () => {
@@ -166,6 +170,7 @@ describe("task reopening ownership", () => {
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
       if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
       if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      if (sql.includes("WITH RECURSIVE chain")) return { rows: [{ agent_id: task.agent_id, depth: 0 }] };
       throw new Error(`Unexpected query: ${sql}`);
     };
     const client = { query, release() {} };
@@ -198,6 +203,9 @@ describe("task reopening ownership", () => {
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
       if (sql.includes("SELECT id FROM tasks WHERE id = $1 FOR UPDATE")) return { rows: [{ id: "task-id" }] };
       if (sql.includes("SELECT tasks.*")) return { rows: [task] };
+      if (sql.includes("WITH RECURSIVE chain")) {
+        return { rows: [{ agent_id: "populator", depth: 0 }, { agent_id: "campaign-owner", depth: 1 }, { agent_id: "orchestrator", depth: 2 }] };
+      }
       if (sql.includes("INSERT INTO thread_messages")) return { rows: [{ id: "message-id" }] };
       // A settled delivery row stops queueDelivery before it launches a turn.
       if (sql.includes("INSERT INTO message_deliveries")) return { rows: [{ id: "delivery-id", status: "completed" }] };
@@ -207,7 +215,7 @@ describe("task reopening ownership", () => {
     return { query, async connect() { return client; } } as unknown as DbPool;
   }
 
-  it("lets the parent task's owner reopen a child it created and wakes the child's owner", async () => {
+  it("lets the owner of any task above reopen a child and wakes the child's owner", async () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     await reopenTask(childTaskPool(queries), {
       taskId: "task-id",
