@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import {
   classifyClaudeCredential,
   CLAUDE_CODE_TOKEN_SECRET_NAME,
@@ -60,6 +61,8 @@ const REQUEST_TIMEOUT_MS = 10_000;
 // Anthropic's usage endpoint rate-limits per token; without a Retry-After, wait this long.
 const DEFAULT_RETRY_AFTER_MS = 5 * 60_000;
 const MAX_RETRY_AFTER_MS = 60 * 60_000;
+// A failed refresh shows the last good reading only while it is this fresh.
+const LAST_GOOD_MAX_AGE_MS = 6 * 60 * 60_000;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -68,12 +71,19 @@ interface LimitsContext {
   secretKey: string;
   fetchImpl: typeof fetch;
   now: Date;
+  /** Stored secrets the fetch read, so a reading is only reused for the same credential. */
+  secretReads: string[];
+}
+
+interface LastGood {
+  value: AccountLimits;
+  credential: string;
 }
 
 // `good` is the last reading that had windows, kept to show when a later fetch fails.
-const cache = new Map<string, { at: number; value: AccountLimits; good?: AccountLimits }>();
-// Account id -> epoch ms before which the Claude usage endpoint is not called again.
-const claudeUsageBackoff = new Map<string, number>();
+const cache = new Map<string, { at: number; value: AccountLimits; good?: LastGood }>();
+// Account id -> when the Claude usage endpoint may be called again, for that credential.
+const claudeUsageBackoff = new Map<string, { until: number; credential: string }>();
 
 export async function loadAccountLimits(
   pool: DbPool,
@@ -81,7 +91,7 @@ export async function loadAccountLimits(
   accounts: { id: string; driver: ProviderDriver }[],
   options: { refresh?: boolean | string[]; fetchImpl?: typeof fetch } = {}
 ): Promise<AccountLimits[]> {
-  const context: LimitsContext = { pool, secretKey, fetchImpl: options.fetchImpl ?? fetch, now: new Date() };
+  const now = new Date();
   return Promise.all(
     accounts.map(async (account) => {
       const cached = cache.get(account.id);
@@ -89,15 +99,26 @@ export async function loadAccountLimits(
       if (!refresh && cached && Date.now() - cached.at < CACHE_TTL_MS && cached.value.driver === account.driver) {
         return cached.value;
       }
-      const lastGood = cached?.good?.driver === account.driver ? cached.good : undefined;
+      const context: LimitsContext = { pool, secretKey, fetchImpl: options.fetchImpl ?? fetch, now, secretReads: [] };
       let value: AccountLimits;
-      let good = lastGood;
+      let good = cached?.good;
       try {
         value = await fetchLimits(context, account.id, account.driver);
-        if (value.source !== "unavailable" && value.windows.length) good = value;
+        if (value.source !== "unavailable" && value.windows.length) good = { value, credential: fingerprint(context.secretReads) };
       } catch (error) {
-        value = lastGood
-          ? { ...lastGood, note: `Could not refresh (${errorMessage(error)}); showing the reading from ${lastGood.checkedAt}.` }
+        const credential = fingerprint(context.secretReads);
+        if (
+          good &&
+          (good.value.driver !== account.driver ||
+            good.credential !== credential ||
+            now.getTime() - Date.parse(good.value.checkedAt) > LAST_GOOD_MAX_AGE_MS)
+        ) {
+          good = undefined;
+        }
+        // The last good reading keeps its own checkedAt, so it is shown as an
+        // aged reading next to the error rather than as live.
+        value = good
+          ? { ...good.value, source: "snapshot", error: errorMessage(error) }
           : { ...base(context, account.id, account.driver, "unavailable"), error: errorMessage(error) };
       }
       cache.set(account.id, { at: Date.now(), value, good });
@@ -141,7 +162,8 @@ async function claudeLimits(context: LimitsContext, accountId: string): Promise<
   if (classifyClaudeCredential(credential) === "api_key") {
     return { ...result, plan: "API key", note: "Billed per token through the Anthropic API; there are no plan limits." };
   }
-  if ((claudeUsageBackoff.get(accountId) ?? 0) > context.now.getTime()) {
+  const backoff = claudeUsageBackoff.get(accountId);
+  if (backoff && backoff.credential === fingerprint([credential]) && backoff.until > context.now.getTime()) {
     return claudeHeaderProbe(context, credential, result);
   }
   const response = await request(context, "https://api.anthropic.com/api/oauth/usage", {
@@ -160,7 +182,10 @@ async function claudeLimits(context: LimitsContext, accountId: string): Promise<
   // rate-limit headers of a one-token request report the same session and
   // weekly utilization.
   if (response.status === 429) {
-    claudeUsageBackoff.set(accountId, context.now.getTime() + retryAfterMs(response.headers.get("retry-after"), context.now));
+    claudeUsageBackoff.set(accountId, {
+      until: context.now.getTime() + retryAfterMs(response.headers.get("retry-after"), context.now),
+      credential: fingerprint([credential])
+    });
     return claudeHeaderProbe(context, credential, result);
   }
   if (response.status === 401 || response.status === 403) return claudeHeaderProbe(context, credential, result);
@@ -570,7 +595,9 @@ async function readSecret(context: LimitsContext, name: string): Promise<string 
     [name]
   );
   const row = result.rows[0];
-  return row ? decryptSecret(row.encrypted_value, context.secretKey).trim() || undefined : undefined;
+  const value = row ? decryptSecret(row.encrypted_value, context.secretKey).trim() || undefined : undefined;
+  context.secretReads.push(`${name}=${value ?? ""}`);
+  return value;
 }
 
 function request(context: LimitsContext, url: string, init: RequestInit): Promise<Response> {
@@ -596,6 +623,10 @@ export function retryAfterMs(header: string | null, now: Date): number {
   const ms = /^\d+(\.\d+)?$/.test(trimmed) ? Number(trimmed) * 1000 : new Date(trimmed).getTime() - now.getTime();
   if (!Number.isFinite(ms)) return DEFAULT_RETRY_AFTER_MS;
   return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, ms));
+}
+
+function fingerprint(parts: string[]): string {
+  return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
 
 function errorMessage(error: unknown): string {

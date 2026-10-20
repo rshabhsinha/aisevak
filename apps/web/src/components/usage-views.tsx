@@ -268,7 +268,7 @@ function LimitSourceBadge({ limits }: { limits: AccountLimits }) {
   if (limits.source === "snapshot") {
     return (
       <Badge variant="secondary" title={new Date(limits.checkedAt).toLocaleString()}>
-        From last run · {formatRelative(limits.checkedAt)}
+        Last reading · {formatRelative(limits.checkedAt)}
       </Badge>
     );
   }
