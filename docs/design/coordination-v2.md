@@ -1,6 +1,6 @@
 # Coordination v2: reliable, harness-agnostic agent messaging
 
-Status: proposed. Phase 1 is implemented in the PR that adds this document.
+Status: proposed. Phase 1 is implemented in rshabhsinha/aisevak#46 and phase 2 in its follow-up PR (section 9).
 Assumes rshabhsinha/aisevak#45 (successful worker runs only auto-complete standalone tasks; parent-task owners can reopen children) has merged.
 
 ## 1. Why
@@ -264,3 +264,24 @@ Each phase is shippable alone and keeps the component-library workflows (orchest
 * `notifyFailedDeliveries(pool, managedRoot)` claims up to 20 failed, un-notified deliveries (`FOR UPDATE SKIP LOCKED`), and for each one whose message has an agent sender other than the recipient and is not itself a `delivery.failed` notice, inserts a `delivery.failed` message (parent = the failed message) to the sender on the same thread and queues it. Every claimed row is marked notified, inside a savepoint so one bad row cannot wedge the sweep. The API process runs it every 5 s.
 * `settleDeliveryByAssignment` (runner) and `cancelPendingAssignmentDelivery` (API) set `failure_notified_at` on the deliveries they fail, because those are not failures from the sender's point of view.
 * `coordinationPrompt` frames a `delivery.failed` message as a platform notice: decide whether to resend or retry; do not complete or block the thread because of it.
+
+## 9. Phase 2 as built
+
+What shipped, and where it deliberately differs from sections 3.2 and 3.6:
+
+* **Inbox binding.** `queueDelivery` binds every delivery to its consuming agent thread (`message_deliveries.agent_thread_id`) and gives it `seq` from the global `message_delivery_inbox_seq`, which is monotonic per thread. `claimAgentTurnInput` takes inputs in `seq` order. Pending rows are backfilled from their input or run.
+* **Wake step: kept the existing carrier rather than replacing it.** On reading the runner, the "one turn drains the inbox" behaviour already holds. `queueDelivery` folds every queued coordination run of an agent thread into one run, with the other messages attached as turn inputs, and injects into a running coordination turn; the claim queries keep one turn per agent thread. A separate runner wake step would also have to build the full coordination prompt, which only the API can do today (the runner does not depend on the API package). Removing the per-message dispatcher-run machinery therefore moves to phase 5, once prompt building lives in a shared package.
+* **Turn leases.** Claims stamp `runner_id` (`AISEVAK_RUNNER_ID`, default the hostname, so it is stable across restarts) and `lease_expires_at` (60 s). A heartbeat renews them every 15 s.
+  * At boot, a runner recovers its own previous turns, unleased legacy turns, and expired leases.
+  * Every 30 s it sweeps other runners' expired leases. Sweeps do not run the boot-only repairs of crash windows between a run's terminal update and its delivery's, because those windows are normal while runners are live.
+  * Recovery re-checks the lease predicate under the row lock.
+* **Worker turns are now recovered at all.** Before this change, a `task_runs` row left `running` by a stopped runner was never terminalized, and it blocked every later turn on its agent thread. `recoverInterruptedWorkerRuns` fails or cancels it. The task's status is left alone.
+* **Interrupted redelivery.** A coordination turn that was presented and then interrupted is queued again (`redeliverInterruptedRun`) instead of failing and blocking its assignment:
+  * the new run has trigger `redelivery`, keeps the same provider session, and its prompt starts with the interrupted note;
+  * messages the turn had already presented move to the new run with the same note;
+  * `interrupted_count` caps this at the task's `maxAssignmentAttempts` (default 3), after which the old fail, block and `delivery.failed` notice path applies;
+  * the assignment stays `running` throughout.
+* **UI pings: still worker turns, but conversational.** Section 3.2 proposed routing them through the coordination path. Doing that would run git-worktree tasks' pings in the project checkout instead of the task's worktree, because coordination turns use the agent thread's cwd. Instead, messages from the UI (task, run and agent-thread message routes) create worker runs with `trigger='message'`. They still inject into a running turn or wait for the next one, as before, and `finalizeWorkerRunState` never changes task or coordination status for them. Only the task's own runs and explicit commands do.
+* **New read surface.** `aisevak inbox [--thread] [--recent]` (`GET /inbox`) and `aisevak agents status AGENT` (`GET /agents/:ref/status`).
+* **Legacy flag.** `AISEVAK_COORDINATION_LEGACY=1` restores the pre-v2 behaviour for one release: recover everything at boot, no lease sweeps, fail and block interrupted deliveries, and finalize ping turns like task runs.
+* **Deferred:** `consumed_at` (`completed` still means the carrying turn ended successfully), `wait`, and binding inbox items for deliveries that a phase 1 `delivery.failed` sweep cannot queue.

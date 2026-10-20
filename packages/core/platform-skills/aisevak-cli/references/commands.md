@@ -26,6 +26,17 @@ aisevak content REF [--limit N] [--cursor CURSOR]
 
 Use `show` for metadata and a bounded preview. Use `content` for paginated Markdown or message history.
 
+## Inbox and agent status
+
+```bash
+aisevak inbox [--thread THREAD] [--recent] [--limit N]
+aisevak agents status AGENT
+```
+
+`inbox` lists messages addressed to you that are not settled yet, in the order they will reach you, across all your threads (`--recent` adds the last day's settled ones). `agents status` shows one agent's overall state and each of its live threads: `running`, `queued`, `blocked`, `waiting`, or `idle`, with pending messages and what it waits on.
+
+Messages always reach an agent one turn at a time, in order: a message sent while the recipient is busy waits for the next turn boundary or joins the running turn. If a runner restart interrupts a turn, the message is redelivered with a note saying so, and the assignment stays running.
+
 ## Threads and messages
 
 ```text

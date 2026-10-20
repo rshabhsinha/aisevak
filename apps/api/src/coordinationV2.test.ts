@@ -1,7 +1,9 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import {
+  agentStatus,
   coordinationPrompt,
+  inbox,
   DELIVERY_FAILED_TYPE,
   deliveryFailedNotice,
   deliveryState,
@@ -236,5 +238,36 @@ describe("delivery failure notices", () => {
     expect(prompt).toContain("This is a platform notice");
     expect(prompt).toContain("Do not complete or block THREAD-7");
     expect(prompt).not.toContain("Use aisevak assignments create TASK-n");
+  });
+});
+
+describe("agent inbox and status", () => {
+  it("lists pending items in inbox order with their thread and delivery state", async () => {
+    const { queryable, queries } = fakeQueryable((sql) => sql.includes("FROM message_deliveries") ? { rows: [
+      { id: "m1", number: 40, body: "review it", thread_number: 7, thread_title: "Populate", delivery_status: "running", delivery_presented_at: new Date(), inbox_seq: "11", inbox_agent_thread_id: "session" },
+      { id: "m2", number: 41, body: "also X", thread_number: 7, thread_title: "Populate", delivery_status: "queued", inbox_seq: "12", inbox_agent_thread_id: "session" }
+    ] } : undefined);
+    const result = await inbox(queryable, "reviewer", { threadId: null, limit: 20 });
+    expect(result.pending).toBe(2);
+    expect(result.items.map((item: any) => [item.key, item.thread.key, item.delivery.state, item.seq])).toEqual([
+      ["MESSAGE-40", "THREAD-7", "presented", 11],
+      ["MESSAGE-41", "THREAD-7", "queued", 12]
+    ]);
+    expect(queries[0]?.sql).toContain("ORDER BY CASE WHEN message_deliveries.status IN ('queued', 'retrying', 'running') THEN 0 ELSE 1 END");
+  });
+
+  it("reports the busiest state across an agent's threads", async () => {
+    const thread = (overrides: Record<string, unknown>) => ({
+      agent_thread_id: "t", title: "x", coordination_thread_id: null, thread_number: 7, task_id: "task", task_number: 1034,
+      task_status: "open", last_activity_at: new Date(0), active_kind: null, active_id: null, active_started_at: null, queued_turns: 0, pending: 0,
+      ...overrides
+    });
+    const { queryable } = fakeQueryable((sql) => {
+      if (sql.includes("FROM agent_threads")) return { rows: [thread({ agent_thread_id: "a", pending: 1 }), thread({ agent_thread_id: "b", task_status: "needs_attention" })] };
+      return { rows: [] };
+    });
+    const status = await agentStatus(queryable, { id: "reviewer", name: "Reviewer" });
+    expect(status.state).toBe("queued");
+    expect(status.threads.map((item: any) => [item.agentThreadId, item.state])).toEqual([["a", "queued"], ["b", "blocked"]]);
   });
 });

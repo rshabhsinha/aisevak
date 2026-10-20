@@ -21,6 +21,9 @@ async function main() {
     const ref = required(args[1], "Resource reference");
     return print(await request("/api/agent-tools/v1/resources/" + encodeURIComponent(ref) + "/content" + query({ cursor: option("--cursor"), limit: option("--limit") })));
   }
+  if (root === "inbox") return print(await request("/api/agent-tools/v1/inbox" + query({
+    thread: option("--thread"), limit: option("--limit"), recent: args.includes("--recent") ? "true" : undefined
+  })));
   if (["agent", "agents"].includes(root)) return agents();
   if (["skill", "skills"].includes(root)) return skills();
   if (["thread", "threads"].includes(root)) return threads();
@@ -97,7 +100,8 @@ async function agents() {
   const command = args[1] || "list";
   if (command === "list") return print(await request("/api/agent-tools/v1/agents" + listQuery()));
   if (command === "show") return print(await request("/api/agent-tools/v1/agents/" + encodeURIComponent(required(args[2], "Agent reference"))));
-  fail("Usage: aisevak agents list|show", "USAGE");
+  if (command === "status") return print(await request("/api/agent-tools/v1/agents/" + encodeURIComponent(required(args[2], "Agent reference")) + "/status"));
+  fail("Usage: aisevak agents list|show|status", "USAGE");
 }
 
 async function threads() {
@@ -267,7 +271,8 @@ function print(value) { console.log(JSON.stringify(value, null, 2)); }
 function fail(message, code = "CLI_ERROR") { console.error(JSON.stringify({ error: { code, message } })); process.exit(1); }
 function help() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
-  "aisevak agents list | agents show AGENT",
+  "aisevak agents list | agents show AGENT | agents status AGENT",
+  "aisevak inbox [--thread THREAD] [--recent] [--limit N]",
   "aisevak skills path | skills install DIRECTORY",
   "aisevak threads list | show | status | messages | create | send | complete | block",
   "Thread references accept THREAD-n, TASK-n, or a thread id shown in the UI.",

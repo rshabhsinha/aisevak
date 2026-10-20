@@ -1305,6 +1305,45 @@ ALTER TABLE message_deliveries ALTER COLUMN failure_notified_at DROP DEFAULT;
 CREATE INDEX IF NOT EXISTS message_deliveries_failure_notice_idx
 ON message_deliveries(completed_at) WHERE status = 'failed' AND failure_notified_at IS NULL;
 
+-- Coordination v2 phase 2: each delivery is an inbox item bound to the agent
+-- thread that consumes it, ordered by a global sequence (monotonic per thread).
+-- interrupted_count counts redeliveries after a turn was interrupted by a
+-- runner stop.
+CREATE SEQUENCE IF NOT EXISTS message_delivery_inbox_seq;
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS agent_thread_id uuid;
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS seq bigint;
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS interrupted_count integer NOT NULL DEFAULT 0;
+DO $$ BEGIN
+  ALTER TABLE message_deliveries ADD CONSTRAINT message_deliveries_agent_thread_id_fkey
+    FOREIGN KEY (agent_thread_id) REFERENCES agent_threads(id) ON DELETE SET NULL;
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+-- Only pending deliveries need a binding; settled ones are history.
+UPDATE message_deliveries
+SET agent_thread_id = COALESCE(
+      (SELECT agent_turn_inputs.agent_thread_id FROM agent_turn_inputs WHERE agent_turn_inputs.message_delivery_id = message_deliveries.id LIMIT 1),
+      (SELECT dispatcher_runs.agent_thread_id FROM dispatcher_runs WHERE dispatcher_runs.message_delivery_id = message_deliveries.id
+       ORDER BY dispatcher_runs.created_at DESC LIMIT 1)
+    )
+WHERE agent_thread_id IS NULL AND status IN ('queued', 'retrying', 'running');
+UPDATE message_deliveries SET seq = nextval('message_delivery_inbox_seq')
+WHERE seq IS NULL AND status IN ('queued', 'retrying', 'running');
+CREATE INDEX IF NOT EXISTS message_deliveries_inbox_idx
+ON message_deliveries(agent_thread_id, seq) WHERE status IN ('queued', 'retrying', 'running');
+CREATE INDEX IF NOT EXISTS message_deliveries_recipient_pending_idx
+ON message_deliveries(recipient_agent_id, seq) WHERE status IN ('queued', 'retrying', 'running');
+
+-- Turn leases: the runner that claimed a turn renews lease_expires_at while it
+-- runs; recovery only takes over turns whose lease expired (or that belong to
+-- this runner's previous process).
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS runner_id text;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS runner_id text;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+CREATE INDEX IF NOT EXISTS task_runs_active_lease_idx
+ON task_runs(lease_expires_at) WHERE status IN ('running', 'cancel_requested');
+CREATE INDEX IF NOT EXISTS dispatcher_runs_active_lease_idx
+ON dispatcher_runs(lease_expires_at) WHERE status IN ('running', 'cancel_requested');
+
 -- The task board resolves each task's column from its latest runs.
 CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx
