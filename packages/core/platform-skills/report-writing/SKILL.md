@@ -1,6 +1,6 @@
 ---
 name: report-writing
-description: Read before every `aisevak reports create`, `revise`, or `publish`. Write short, simple reports a busy person understands at a glance; publishing is linted for readability.
+description: Read before every `aisevak reports create`, `revise`, or `publish`. Write short, simple reports a busy person understands at a glance; every report write returns readability findings.
 ---
 
 # Report writing
