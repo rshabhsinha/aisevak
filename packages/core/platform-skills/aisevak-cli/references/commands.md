@@ -29,13 +29,25 @@ Use `show` for metadata and a bounded preview. Use `content` for paginated Markd
 ## Inbox and agent status
 
 ```bash
-aisevak inbox [--thread THREAD] [--recent] [--limit N]
+aisevak inbox [--thread THREAD] [--recent] [--limit N] [--wait SECONDS]
 aisevak agents status AGENT
 ```
 
-`inbox` lists messages addressed to you that are not settled yet, in the order they will reach you, across all your threads (`--recent` adds the last day's settled ones). `agents status` shows one agent's overall state and each of its live threads: `running`, `queued`, `blocked`, `waiting`, or `idle`, with pending messages and what it waits on.
+`inbox` lists messages addressed to you that are not settled yet, in the order they will reach you, across all your threads (`--recent` adds the last day's settled ones). With `--wait`, it waits up to that many seconds (at most 120) for a new message to arrive, and reports how many arrived. `agents status` shows one agent's overall state and each of its live threads: `running`, `queued`, `blocked`, `waiting`, or `idle`, with pending messages and what it waits on.
 
 Messages always reach an agent one turn at a time, in order: a message sent while the recipient is busy waits for the next turn boundary or joins the running turn. If a runner restart interrupts a turn, the message is redelivered with a note saying so, and the assignment stays running.
+
+## Requests and replies
+
+```bash
+aisevak send --to AGENT [--thread THREAD] [--key KEY] [--expect-reply [--timeout SECONDS]] --body-stdin
+aisevak reply MESSAGE --body-stdin [--idempotency-key KEY]
+aisevak wait MESSAGE [--timeout SECONDS]
+```
+
+`send` messages another agent on a thread, the current task's thread by default. With `--expect-reply` the message is a request: the recipient is told how to answer, and `wait` returns the reply as soon as it arrives. `wait` checks for up to `--timeout` seconds (default 60, at most 120) and can be run again. A request with `--timeout` that gets no answer in time is marked `timed_out`, and you receive a `request.timed_out` notice. `--key` makes the send idempotent: sending the same key again on the same thread returns the first message.
+
+Only the recipient of a request may reply to it. Assignments are requests too, but answer them with `assignments complete|block`, not `reply`.
 
 ## Threads and messages
 
@@ -51,7 +63,10 @@ aisevak threads send THREAD [--to AGENT] --body-stdin [--reply-to MESSAGE] [--id
 `threads create` is restricted to explicitly detached, keyed streams. Inside an active task use an assignment or keyed child task.
 aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]
 aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
+aisevak threads refresh THREAD [--every N|none] [--now]
 ```
+
+`threads refresh` sets your own session's conversation refresh on that thread. `--every N` starts a fresh provider conversation after every N successful turns, and `--now` does it once after the current turn without changing the period. `--every none` removes the period. The thread, its messages and the task tree stay; the next turn gets the thread's recent history and is told to rebuild context from `threads status` and the task. Use it on long-lived threads such as a campaign task.
 
 `THREAD` accepts `THREAD-n`, `TASK-n` (the task's thread), or a thread id shown in the UI or job envelope.
 
@@ -74,9 +89,17 @@ aisevak tasks complete TASK [--summary-stdin]
 aisevak tasks reopen TASK [--summary-stdin]
 aisevak tasks comment TASK --body-stdin
 aisevak tasks attention TASK --reason-stdin
+aisevak tasks reparent TASK... --parent TASK
+aisevak tasks policy TASK [--max-active-children N] [--max-active-assignments N] [--max-child-depth N] [--max-assignment-attempts N]
 ```
 
 Creating a task without `--agent` assigns it to the Orchestrator for routing. Each created task gets a linked coordination thread and a callback to the creating agent.
+
+A task changes status only through these commands or the web app. A turn ending never completes or blocks a task an agent created. The one exception is a task a person created in the web app: its first successful standalone run still completes it.
+
+The owner of a task, the owner of any task above it, and the Orchestrator may complete, reopen, or update it, and create, retry, or send on its assignments. Reassigning the task itself (`tasks assign`) stays with the Orchestrator. Moving a task (`tasks reparent`) needs authority over the task, its current parent, and the new parent. When a child task is completed, blocked, reopened, or changes status, its parent task's owner receives a `child.<status>` event on the parent's thread.
+
+`tasks reparent` moves tasks, with their subtrees, under a new parent: for example existing component tasks under a campaign task. You need authority over both trees, and the move may not create a cycle. `tasks policy` changes a task's limits and needs `tasks:update`. Raise `--max-active-children` on a campaign task that will hold many children.
 
 ## Assignments
 
@@ -99,12 +122,13 @@ aisevak schedules list [--status scheduled|paused|completed] [--query TEXT] [--l
 aisevak schedules show SCHEDULE
 aisevak schedules create --title TITLE --agent AGENT --at ISO-8601 --prompt-stdin \
   [--task TASK] [--overlap-policy skip|queue|allow] [--interval-seconds N] [--idempotency-key KEY]
+aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy skip|queue|allow]
 aisevak schedules pause SCHEDULE
 aisevak schedules resume SCHEDULE
 aisevak schedules delete SCHEDULE
 ```
 
-Omit `--interval-seconds` for a one-time run. A repeating schedule advances from the current time after downtime instead of replaying every missed interval. Creating, pausing, resuming, or deleting schedules requires `schedules:write`, which is available to the Orchestrator by default; other agents can inspect schedules.
+Omit `--interval-seconds` for a one-time run. With `--task`, each run is a message on that task's thread instead of a new task. That is how a long-lived campaign task receives its periodic check. `skip`, the default, drops a tick while the previous one is still being handled. A repeating schedule advances from the current time after downtime instead of replaying every missed interval. Creating, pausing, resuming, or deleting schedules requires `schedules:write`, which is available to the Orchestrator by default; other agents can inspect schedules.
 
 ## Reports
 

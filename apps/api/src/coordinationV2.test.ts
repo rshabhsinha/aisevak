@@ -2,6 +2,7 @@ import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import {
   agentStatus,
+  coordinationIncrementalPrompt,
   coordinationPrompt,
   inbox,
   DELIVERY_FAILED_TYPE,
@@ -11,6 +12,7 @@ import {
   participantState,
   resolveThreadRef,
   threadStatus,
+  waitFor,
   type Queryable
 } from "./coordination.js";
 
@@ -269,5 +271,28 @@ describe("agent inbox and status", () => {
     const status = await agentStatus(queryable, { id: "reviewer", name: "Reviewer" });
     expect(status.state).toBe("queued");
     expect(status.threads.map((item: any) => [item.agentThreadId, item.state])).toEqual([["a", "queued"], ["b", "blocked"]]);
+  });
+});
+
+describe("requests", () => {
+  it("tells the recipient of an open request how to reply", () => {
+    const prompt = coordinationIncrementalPrompt({
+      body: "Is LM317 in stock?", number: 812, message_type: "request", expects_reply: true, request_state: "open", reply_by: new Date("2026-10-20T10:00:00Z")
+    });
+    expect(prompt).toContain("Is LM317 in stock?");
+    expect(prompt).toContain("by 2026-10-20T10:00:00.000Z. Reply with: aisevak reply MESSAGE-812 --body-stdin");
+    expect(coordinationIncrementalPrompt({ body: "fyi", number: 813, message_type: "message" })).not.toContain("aisevak reply");
+    // Assignments are answered with assignments complete|block, not reply.
+    expect(coordinationIncrementalPrompt({ body: "x", number: 814, message_type: "assignment.created", expects_reply: true, request_state: "open" })).not.toContain("aisevak reply");
+  });
+
+  it("waits until the condition holds, and no longer than asked", async () => {
+    let calls = 0;
+    const ready = await waitFor(async () => ++calls, (value) => value >= 3, 5, 1);
+    expect(ready).toBe(3);
+    const started = Date.now();
+    const notReady = await waitFor(async () => "open", (value) => value !== "open", 0, 1);
+    expect(notReady).toBe("open");
+    expect(Date.now() - started).toBeLessThan(500);
   });
 });

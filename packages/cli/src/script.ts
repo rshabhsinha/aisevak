@@ -22,8 +22,24 @@ async function main() {
     return print(await request("/api/agent-tools/v1/resources/" + encodeURIComponent(ref) + "/content" + query({ cursor: option("--cursor"), limit: option("--limit") })));
   }
   if (root === "inbox") return print(await request("/api/agent-tools/v1/inbox" + query({
-    thread: option("--thread"), limit: option("--limit"), recent: args.includes("--recent") ? "true" : undefined
+    thread: option("--thread"), limit: option("--limit"), recent: args.includes("--recent") ? "true" : undefined,
+    wait: option("--wait")
   })));
+  if (root === "send") return print(await request("/api/agent-tools/v1/send", { method: "POST", body: compact({
+    to: option("--to", true), thread: option("--thread"), body: await markdown("--body"), key: option("--key"),
+    expectReply: args.includes("--expect-reply"), timeoutSeconds: option("--timeout"),
+    idempotencyKey: option("--idempotency-key")
+  }) }));
+  if (root === "reply") {
+    const ref = required(args[1], "Message reference");
+    return print(await request("/api/agent-tools/v1/messages/" + encodeURIComponent(ref) + "/reply", { method: "POST", body: compact({
+      body: await markdown("--body", 2), idempotencyKey: option("--idempotency-key")
+    }) }));
+  }
+  if (root === "wait") {
+    const ref = required(args[1], "Message reference");
+    return print(await request("/api/agent-tools/v1/messages/" + encodeURIComponent(ref) + "/reply" + query({ wait: option("--timeout") })));
+  }
   if (["agent", "agents"].includes(root)) return agents();
   if (["skill", "skills"].includes(root)) return skills();
   if (["thread", "threads"].includes(root)) return threads();
@@ -110,6 +126,9 @@ async function threads() {
   const ref = command === "create" ? null : required(args[2], "Thread reference");
   if (command === "show") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref)));
   if (command === "status") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/status"));
+  if (command === "refresh") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/refresh", { method: "POST", body: compact({
+    everyTurns: option("--every") === "none" ? null : option("--every"), now: args.includes("--now") ? true : undefined
+  }) }));
   if (command === "messages") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/messages" + listQuery()));
   if (command === "create") {
     return print(await request("/api/agent-tools/v1/threads", { method: "POST", body: compact({
@@ -133,7 +152,7 @@ async function threads() {
       body: await markdown(isComplete ? "--summary" : "--reason", 3), idempotencyKey: option("--idempotency-key")
     } }));
   }
-  fail("Usage: aisevak threads list|show|status|messages|create|send|complete|block", "USAGE");
+  fail("Usage: aisevak threads list|show|status|messages|create|send|complete|block|refresh", "USAGE");
 }
 
 async function tasks() {
@@ -150,6 +169,26 @@ async function tasks() {
   if (command === "update") return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref), { method: "PATCH", body: compact({
     title: option("--title"), description: option("--description"), body: await optionalMarkdown("--body"), status: option("--status")
   }) }));
+  if (command === "reparent") {
+    const parent = option("--parent", true);
+    const refs = args.slice(2).filter((item, index, all) => !item.startsWith("--") && !(index > 0 && all[index - 1].startsWith("--")));
+    const moved = [];
+    const failed = [];
+    for (const task of refs) {
+      try {
+        moved.push((await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(task) + "/reparent", { method: "POST", body: { parent } })).task);
+      } catch (error) {
+        failed.push({ task, error: { code: error && error.code, message: error && error.message ? error.message : String(error) } });
+      }
+    }
+    print({ parent, moved, failed });
+    if (failed.length) process.exitCode = 1;
+    return;
+  }
+  if (command === "policy") return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref) + "/policy", { method: "POST", body: compact({
+    maxActiveAssignments: option("--max-active-assignments"), maxActiveChildren: option("--max-active-children"),
+    maxChildDepth: option("--max-child-depth"), maxAssignmentAttempts: option("--max-assignment-attempts")
+  }) }));
   if (command === "assign") return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref) + "/assign", { method: "POST", body: { agent: option("--agent", true) } }));
   if (["complete", "reopen"].includes(command)) return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref) + "/" + command, { method: "POST", body: { body: await optionalMarkdown("--summary") } }));
   if (command === "comment") return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(ref) + "/comment", { method: "POST", body: { body: await markdown("--body", 3) } }));
@@ -158,7 +197,7 @@ async function tasks() {
     await request("/api/agent-tools/tasks/" + encodeURIComponent(ref), { method: "PATCH", body: { status: "needs_attention" } });
     return print(await request("/api/agent-tools/tasks/" + encodeURIComponent(ref) + "/comment", { method: "POST", body: { body } }));
   }
-  fail("Usage: aisevak tasks list|show|create|update|assign|complete|reopen", "USAGE");
+  fail("Usage: aisevak tasks list|show|create|update|assign|complete|reopen|reparent|policy", "USAGE");
 }
 
 async function assignments() {
@@ -200,7 +239,13 @@ async function schedules() {
   if (command === "show") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref)));
   if (command === "pause" || command === "resume") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref) + "/" + command, { method: "POST" }));
   if (command === "delete") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref), { method: "DELETE" }));
-  fail("Usage: aisevak schedules list|show|create|pause|resume|delete", "USAGE");
+  if (command === "update") {
+    const task = option("--task");
+    return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref), { method: "PATCH", body: compact({
+      task: task === "none" ? null : task, overlapPolicy: option("--overlap-policy")
+    }) }));
+  }
+  fail("Usage: aisevak schedules list|show|create|update|pause|resume|delete", "USAGE");
 }
 
 async function reports() {
@@ -272,13 +317,16 @@ function fail(message, code = "CLI_ERROR") { console.error(JSON.stringify({ erro
 function help() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT | agents status AGENT",
-  "aisevak inbox [--thread THREAD] [--recent] [--limit N]",
+  "aisevak inbox [--thread THREAD] [--recent] [--limit N] [--wait SECONDS]",
+  "aisevak send --to AGENT [--thread THREAD] [--key KEY] [--expect-reply [--timeout SECONDS]] --body-stdin",
+  "aisevak reply MESSAGE --body-stdin | wait MESSAGE [--timeout SECONDS]",
   "aisevak skills path | skills install DIRECTORY",
-  "aisevak threads list | show | status | messages | create | send | complete | block",
+  "aisevak threads list | show | status | messages | create | send | complete | block | refresh THREAD [--every N|none] [--now]",
   "Thread references accept THREAD-n, TASK-n, or a thread id shown in the UI.",
   "aisevak tasks list | show | create --work-key KEY | update | assign | complete | reopen",
+  "aisevak tasks reparent TASK... --parent TASK | policy TASK --max-active-children N",
   "aisevak assignments list TASK | show ASSIGNMENT | create TASK --key KEY --to AGENT --instructions-stdin | send | retry | complete | block",
-  "aisevak schedules list | show | create | pause | resume | delete",
+  "aisevak schedules list | show | create | update SCHEDULE --task TASK|none | pause | resume | delete",
   "aisevak reports list | show | create | revise | publish",
   "aisevak incidents list [--include-resolved] | show | declare | update | resolve",
   "",

@@ -12,6 +12,7 @@ import {
 } from "../apps/api/src/coordination.js";
 import {
   finalizeWorkerRunState,
+  noteTurnForRefresh,
   recoverExpiredRunLeases,
   recoverInterruptedCoordinationRuns,
   recoverInterruptedWorkerRuns
@@ -201,5 +202,50 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     } finally {
       delete process.env.AISEVAK_RUNNER_ID;
     }
+  });
+
+  it("lets only on_first_success tasks complete when a run succeeds", async () => {
+    const { orch } = await scenario();
+    // A standalone task: no assignments or children (those never auto-complete).
+    const [task] = await q(
+      "INSERT INTO tasks (title, agent_id, work_scope, work_key, work_fingerprint) VALUES ('Standalone', $1, 'test', $2, 'f') RETURNING id",
+      [orch.id, `standalone-${randomUUID()}`]
+    );
+    const [thread] = await q("INSERT INTO coordination_threads (title, task_id, primary_agent_id) VALUES ('Standalone', $1, $2) RETURNING id", [task.id, orch.id]);
+    for (const [policy, expected] of [["explicit", "open"], ["on_first_success", "completed"]] as const) {
+      await q("UPDATE tasks SET completion_policy = $2, status = 'open' WHERE id = $1", [task.id, policy]);
+      const [session] = await q(
+        "INSERT INTO task_sessions (task_id, agent_snapshot, codex_home) VALUES ($1, '{}', '/tmp/h') ON CONFLICT (task_id) DO UPDATE SET updated_at = now() RETURNING id",
+        [task.id]
+      );
+      const [run] = await q(
+        "INSERT INTO task_runs (task_id, task_session_id, status, cwd, model, prompt) VALUES ($1, $2, 'running', '/tmp', 'gpt-test', 'p') RETURNING id",
+        [task.id, session.id]
+      );
+      await finalizeWorkerRunState(pool, { runId: run.id, taskId: task.id, agentThreadId: null, coordinationThreadId: thread.id, finalStatus: "succeeded", stdout: "", stderr: "", exitCode: 0 });
+      expect((await q("SELECT status FROM tasks WHERE id = $1", [task.id]))[0].status).toBe(expected);
+    }
+  });
+
+  it("refreshes a session after its policy's turn count, once nothing else is queued", async () => {
+    const { orch, task, thread } = await scenario();
+    const [session] = await q(
+      `INSERT INTO agent_threads (agent_id, task_id, provider_instance_id, model, cwd, runtime_home, coordination_thread_id, provider_thread_id, context_policy)
+       VALUES ($1, $2, 'codex-local', 'gpt-test', '/tmp', '/tmp/h', $3, 'provider-old', '{"maxTurns": 2}') RETURNING id`,
+      [orch.id, task.id, thread.id]
+    );
+    expect(await noteTurnForRefresh(pool, session.id)).toBe(false);
+    // Due, but a queued turn was built against the current session: deferred.
+    const [queued] = await q(
+      `INSERT INTO dispatcher_runs (agent_thread_id, scope, status, cwd, codex_home, model, prompt)
+       VALUES ($1, 'coordination', 'queued', '/tmp', '/tmp/h', 'gpt-test', 'p') RETURNING id`,
+      [session.id]
+    );
+    expect(await noteTurnForRefresh(pool, session.id)).toBe(false);
+    await q("UPDATE dispatcher_runs SET status = 'succeeded' WHERE id = $1", [queued.id]);
+    expect(await noteTurnForRefresh(pool, session.id)).toBe(true);
+    const [after] = await q("SELECT provider_thread_id, turns_since_refresh, context_policy FROM agent_threads WHERE id = $1", [session.id]);
+    expect(after).toMatchObject({ provider_thread_id: null, turns_since_refresh: 0, context_policy: { maxTurns: 2 } });
+    expect(after.context_policy.lastRefreshAt).toBeTruthy();
   });
 });

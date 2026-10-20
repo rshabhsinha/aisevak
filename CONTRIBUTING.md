@@ -44,7 +44,7 @@ pnpm typecheck
 pnpm test
 ```
 
-Tests that need PostgreSQL (for example `tests/coordinationV2.db.test.ts`) are skipped unless `AISEVAK_TEST_DATABASE_URL` points at a disposable database. Run them when you change coordination, delivery, or runner recovery SQL: `createdb aisevak_test`, then `AISEVAK_TEST_DATABASE_URL=postgres:///aisevak_test pnpm test`.
+Tests that need PostgreSQL (`*.db.test.ts`, for example `tests/coordinationV2.db.test.ts` and `apps/api/src/coordinationV3.db.test.ts`) are skipped unless `AISEVAK_TEST_DATABASE_URL` points at a disposable database. Run them when you change coordination, delivery, or runner recovery SQL: `createdb aisevak_test`, then `AISEVAK_TEST_DATABASE_URL=postgres:///aisevak_test pnpm test`.
 
 Some runner tests spawn real processes and can time out on a busy machine. If they do, rerun with a longer timeout, for example `pnpm exec vitest run --testTimeout=60000`.
 

@@ -1027,9 +1027,11 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
       `INSERT INTO thread_messages (thread_id, recipient_agent_id, message_type, body)
        VALUES ($1, $2, 'schedule', $3) RETURNING id, number`, [coordinationThreadId, schedule.agent_id, schedule.prompt]
     );
+    // Bound to the session like any inbox item (phase 2 ordering).
     const delivery = await client.query<{ id: string }>(
-      `INSERT INTO message_deliveries (message_id, recipient_agent_id)
-       VALUES ($1, $2) ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET updated_at = now() RETURNING id`, [message.rows[0]!.id, schedule.agent_id]
+      `INSERT INTO message_deliveries (message_id, recipient_agent_id, agent_thread_id, seq)
+       VALUES ($1, $2, $3, nextval('message_delivery_inbox_seq'))
+       ON CONFLICT (message_id, recipient_agent_id) DO UPDATE SET updated_at = now() RETURNING id`, [message.rows[0]!.id, schedule.agent_id, agentThread.id]
     );
     const runResult = await client.query<{ id: string }>(
       `INSERT INTO dispatcher_runs
@@ -1954,6 +1956,7 @@ export async function processOneDispatcherRun(
       await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
     }
     await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
+    if (finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
     if (job.agent_thread_id) {
       await pool.query(
         "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
@@ -2251,6 +2254,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       exitCode
     });
     if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
+    if (finalized && finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
   }
   return true;
 }
@@ -2441,6 +2445,45 @@ async function cancelMismatchedWorkerRun(pool: DbPool, runId: string): Promise<v
   }
 }
 
+// Conversation refresh (context_policy on the agent thread): after maxTurns
+// successful turns, or once after `aisevak threads refresh --now`, the next
+// turn starts a fresh provider session. The agent thread, its inbox and the
+// task tree stay, and the next delivery gets the full coordination prompt.
+// Deferred while another turn is queued or running, since those were built
+// against the current session.
+export async function noteTurnForRefresh(pool: Pick<DbPool, "query">, agentThreadId: string): Promise<boolean> {
+  if (legacyCoordination()) return false;
+  const counted = await pool.query<{ turns_since_refresh: number; context_policy: Record<string, unknown> | null }>(
+    `UPDATE agent_threads SET turns_since_refresh = turns_since_refresh + 1
+     WHERE id = $1 RETURNING turns_since_refresh, context_policy`,
+    [agentThreadId]
+  );
+  const row = counted.rows[0];
+  if (!row) return false;
+  const policy = row.context_policy ?? {};
+  const maxTurns = Number(policy.maxTurns);
+  const due = policy.refreshNow === true || (Number.isInteger(maxTurns) && maxTurns > 0 && row.turns_since_refresh >= maxTurns);
+  if (!due) return false;
+  const refreshed = await pool.query<{ task_id: string | null }>(
+    `UPDATE agent_threads
+     SET provider_thread_id = NULL, turns_since_refresh = 0,
+         context_policy = (context_policy - 'refreshNow') || jsonb_build_object('lastRefreshAt', now()),
+         updated_at = now()
+     WHERE id = $1
+       AND NOT EXISTS (SELECT 1 FROM task_runs WHERE agent_thread_id = $1 AND status IN ('queued', 'running', 'cancel_requested'))
+       AND NOT EXISTS (SELECT 1 FROM dispatcher_runs WHERE agent_thread_id = $1 AND status IN ('queued', 'running', 'cancel_requested'))
+     RETURNING task_id`,
+    [agentThreadId]
+  );
+  if (!refreshed.rows[0]) return false;
+  if (refreshed.rows[0].task_id) {
+    // Task sessions mirror the provider thread for worker runs; clear it too
+    // so a later worker run does not resume the old conversation.
+    await pool.query("UPDATE task_sessions SET codex_thread_id = NULL, updated_at = now() WHERE task_id = $1", [refreshed.rows[0].task_id]);
+  }
+  return true;
+}
+
 export async function finalizeWorkerRunState(
   pool: DbPool,
   input: {
@@ -2487,11 +2530,16 @@ export async function finalizeWorkerRunState(
     if (!finalized.rows[0]) return false;
     if (!ownsCurrentThread) return true;
     // A turn started by a message to the task's thread (a ping from the UI)
-    // is conversation, not a run of the task: it never changes task or
-    // coordination status. Only the task's own runs and explicit commands do.
+    // is conversation, not a run of the task, and a task with the 'explicit'
+    // completion policy (every agent-created task) only changes status through
+    // explicit commands. Neither lets a turn ending change task or
+    // coordination status.
     if (!legacyCoordination()) {
-      const trigger = await client.query<{ trigger: string }>("SELECT trigger FROM task_runs WHERE id = $1", [input.runId]);
-      if (trigger.rows[0]?.trigger === "message") {
+      const trigger = await client.query<{ trigger: string; completion_policy: string | null }>(
+        "SELECT task_runs.trigger, tasks.completion_policy FROM task_runs JOIN tasks ON tasks.id = task_runs.task_id WHERE task_runs.id = $1",
+        [input.runId]
+      );
+      if (trigger.rows[0]?.trigger === "message" || trigger.rows[0]?.completion_policy === "explicit") {
         if (input.agentThreadId) {
           await client.query(
             `UPDATE agent_threads SET last_activity_at = now(), updated_at = now()

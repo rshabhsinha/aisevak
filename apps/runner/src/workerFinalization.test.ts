@@ -56,7 +56,7 @@ describe("worker run finalization", () => {
       "BEGIN",
       expect.stringContaining("SELECT id FROM tasks WHERE id = $1 FOR UPDATE"),
       expect.stringContaining("UPDATE task_runs"),
-      expect.stringContaining("SELECT trigger FROM task_runs"),
+      expect.stringContaining("SELECT task_runs.trigger, tasks.completion_policy"),
       expect.stringContaining("UPDATE tasks"),
       expect.stringContaining("UPDATE coordination_threads"),
       expect.stringContaining("UPDATE agent_threads"),
@@ -74,7 +74,7 @@ describe("worker run finalization", () => {
       async query(sql: string, params?: unknown[]) {
         queries.push({ sql, params });
         if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
-        if (sql.includes("SELECT trigger FROM task_runs")) return { rows: [{ trigger: "message" }] };
+        if (sql.includes("SELECT task_runs.trigger")) return { rows: [{ trigger: "message", completion_policy: "on_first_success" }] };
         return { rows: [] };
       },
       release() {}
@@ -96,6 +96,27 @@ describe("worker run finalization", () => {
     expect(queries.some((query) => query.sql.includes("UPDATE tasks"))).toBe(false);
     expect(queries.some((query) => query.sql.includes("UPDATE coordination_threads"))).toBe(false);
     expect(queries.some((query) => query.sql.includes("UPDATE agent_threads"))).toBe(true);
+  });
+
+  it.each(["succeeded", "failed"] as const)("never changes an explicit-completion task when its run %s", async (finalStatus) => {
+    const queries: string[] = [];
+    const client = {
+      async query(sql: string) {
+        queries.push(sql);
+        if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
+        if (sql.includes("SELECT task_runs.trigger")) return { rows: [{ trigger: "manual", completion_policy: "explicit" }] };
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id", taskId: "task-id", agentThreadId: "agent-thread-id", coordinationThreadId: "coordination-thread-id",
+      finalStatus, stdout: "", stderr: "", exitCode: 0
+    });
+    expect(queries.some((sql) => sql.includes("UPDATE tasks"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("UPDATE coordination_threads"))).toBe(false);
+    expect(queries.some((sql) => sql.includes("UPDATE agent_threads"))).toBe(true);
   });
 
   it("touches nothing else when another runner already took the run over", async () => {
@@ -121,7 +142,7 @@ describe("worker run finalization", () => {
         async query(sql: string) {
           queries.push(sql);
           if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
-          return { rows: sql.includes("SELECT trigger") ? [{ trigger: "message" }] : [] };
+          return { rows: sql.includes("task_runs.trigger") ? [{ trigger: "message", completion_policy: "explicit" }] : [] };
         },
         release() {}
       };
@@ -130,7 +151,7 @@ describe("worker run finalization", () => {
         runId: "run-id", taskId: "task-id", agentThreadId: null, coordinationThreadId: null,
         finalStatus: "succeeded", stdout: "", stderr: "", exitCode: 0
       });
-      expect(queries.some((sql) => sql.includes("SELECT trigger"))).toBe(false);
+      expect(queries.some((sql) => sql.includes("task_runs.trigger"))).toBe(false);
       expect(queries.some((sql) => sql.includes("UPDATE tasks"))).toBe(true);
     } finally {
       delete process.env.AISEVAK_COORDINATION_LEGACY;

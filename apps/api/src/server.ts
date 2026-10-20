@@ -1402,8 +1402,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         if (Number(depthResult.rows[0]?.depth ?? 0) + 1 > policy.maxChildDepth) throw app.httpErrors.conflict(`Child task depth exceeds the limit (${policy.maxChildDepth})`);
       }
       const result = await client.query(
-        `INSERT INTO tasks (title, description, body, project_id, agent_id, created_by, open_pr_on_success, parent_task_id, work_scope, work_key, work_fingerprint)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `INSERT INTO tasks (title, description, body, project_id, agent_id, created_by, open_pr_on_success, parent_task_id, work_scope, work_key, work_fingerprint, completion_policy)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 'on_first_success')
          ON CONFLICT (work_scope, work_key) DO NOTHING
          RETURNING *`,
         [body.title, description, body.body ?? "", body.projectId ?? null, agentId, user.id, body.openPrOnSuccess ?? false, parentTaskId, workScope, workKey, fingerprint]
