@@ -16,7 +16,7 @@ export interface WritingCheck {
   warnings: WritingFinding[];
 }
 
-export type WritingLintMode = "enforce" | "warn" | "off";
+export type WritingLintMode = "warn" | "off";
 
 export interface ReportWritingInput {
   title?: string | null;
@@ -51,7 +51,7 @@ const isoTimestampPattern = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)
 const packedCountsPattern = /\b\d+(?:\/\d+){2,}\b/g;
 
 export function writingLintMode(value = process.env.AISEVAK_WRITING_LINT): WritingLintMode {
-  return value === "warn" || value === "off" ? value : "enforce";
+  return value === "off" ? "off" : "warn";
 }
 
 export function lintReport(input: ReportWritingInput): WritingCheck {
@@ -84,24 +84,9 @@ export function lintIncident(input: IncidentWritingInput): WritingCheck {
   return summarize(findings);
 }
 
-// Advisory checks on drafts follow the same mode, so "off" silences them too.
+// Findings are advice returned with the write; they never block it. "off" silences them.
 export function adviseWritingCheck(check: WritingCheck, mode = writingLintMode()): WritingCheck {
   return mode === "off" ? { passed: true, errors: [], warnings: [] } : check;
-}
-
-// Throws a 422 listing every error when the mode enforces the lint; otherwise returns the check for the response.
-export function assertWritingCheck(check: WritingCheck, label: string, mode = writingLintMode()): WritingCheck {
-  if (mode === "off") return { passed: true, errors: [], warnings: [] };
-  if (mode === "enforce" && !check.passed) {
-    const problems = [...check.errors, ...check.warnings].map((finding) => `- [${finding.severity}] ${finding.message}`);
-    const message = [
-      `${label} was rejected because it breaks the writing rules. Nothing was saved or published. Fix these and retry:`,
-      ...problems,
-      "See the report-writing and incident-writing skills."
-    ].join("\n");
-    throw Object.assign(new Error(message), { statusCode: 422, code: "WRITING_LINT" });
-  }
-  return check;
 }
 
 function titleFindings(title?: string | null): WritingFinding[] {

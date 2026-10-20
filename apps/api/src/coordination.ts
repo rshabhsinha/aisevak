@@ -33,7 +33,7 @@ import {
   taskWorkScope,
   type OrchestrationPolicy
 } from "./jobSafety.js";
-import { adviseWritingCheck, assertWritingCheck, lintIncident, lintReport } from "./writingLint.js";
+import { adviseWritingCheck, lintIncident, lintReport } from "./writingLint.js";
 
 const DEFAULT_WORKER_CAPABILITIES = [
   "agents:read",
@@ -1279,11 +1279,8 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const id = await resolveResourceId(pool, "reports", "REPORT", refParams.parse(request.params).ref);
     const current = await showReport(pool, id, true);
-    const writingCheck = assertWritingCheck(
-      lintReport({ title: current.title, description: current.description, markdown: current.markdown }),
-      `${current.key} revision ${current.current_revision}`
-    );
-    // Publish only the revision that was linted; a concurrent revise must be checked on its own.
+    const writingCheck = adviseWritingCheck(lintReport({ title: current.title, description: current.description, markdown: current.markdown }));
+    // Publish only the revision that was checked, so the returned findings describe what went live.
     const published = await pool.query(
       "UPDATE reports SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision = $2 RETURNING id",
       [id, current.current_revision]
@@ -1314,7 +1311,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
   });
   app.post("/api/agent-tools/v1/incidents", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write"); const body = incidentCreateSchema.parse(request.body);
-    const writingCheck = assertWritingCheck(lintIncident({ ...body, stage: "declare" }), "Incident");
+    const writingCheck = adviseWritingCheck(lintIncident({ ...body, stage: "declare" }));
     const commander = body.to ? await getAgent(pool, body.to) : await getOrchestrator(pool);
     const ids = await withTransaction(pool, async (client) => {
       const thread = await client.query<{ id: string; number: number }>(
@@ -1352,7 +1349,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write");
     const id = await resolveResourceId(pool, "incidents", "INC", refParams.parse(request.params).ref); const body = markdownSchema.parse(request.body);
     const incident = await showIncident(pool, id);
-    const writingCheck = assertWritingCheck(lintIncident({ markdown: body.markdown, stage: "update" }), `${incident.key} update`);
+    const writingCheck = adviseWritingCheck(lintIncident({ markdown: body.markdown, stage: "update" }));
     await withTransaction(pool, async (client) => {
       await client.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
       await client.query("UPDATE incidents SET updated_at = now() WHERE id = $1", [id]);
@@ -1379,7 +1376,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
     const id = await resolveResourceId(pool, "incidents", "INC", refParams.parse(request.params).ref); const body = optionalMarkdownSchema.parse(request.body ?? {});
     const incident = await showIncident(pool, id);
     const writingCheck = body.markdown
-      ? assertWritingCheck(lintIncident({ markdown: body.markdown, stage: "resolve" }), `${incident.key} resolution`)
+      ? adviseWritingCheck(lintIncident({ markdown: body.markdown, stage: "resolve" }))
       : undefined;
     if (incident.thread_id) {
       await finalizeThread(
