@@ -1,26 +1,39 @@
 import type { DbPool } from "@aisevak/core";
-import { describe, expect, it } from "vitest";
-import { getDispatcherAgent } from "./index.js";
+import { rm } from "node:fs/promises";
+import { afterAll, describe, expect, it, vi } from "vitest";
+
+// The runner reads MANAGED_ROOT when its module loads; set it before the import.
+const managedRoot = vi.hoisted(() => {
+  const root = `/tmp/aisevak-dispatcher-heartbeat-test-${process.pid}`;
+  process.env.MANAGED_ROOT = root;
+  return root;
+});
+
+const { enqueueDispatcherHeartbeat } = await import("./index.js");
+
+afterAll(async () => { await rm(managedRoot, { recursive: true, force: true }); });
 
 describe("dispatcher heartbeat session", () => {
-  it("only resumes a successful heartbeat thread from the same Codex home", async () => {
+  it("queues every heartbeat on a fresh provider conversation", async () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     const pool = {
       async query(sql: string, params?: unknown[]) {
         queries.push({ sql, params });
-        return {
-          rows: [{ id: "dispatcher-id", model: "gpt-test", instructions: "route work", thread_id: "thread-id" }]
-        };
+        if (sql.includes("SELECT count(*) FROM dispatcher_runs")) return { rows: [{ count: "0" }] };
+        if (sql.includes("max(created_at)")) return { rows: [{ last_run_at: null }] };
+        if (sql.includes("SELECT count(*)")) return { rows: [{ count: "1" }] };
+        if (sql.includes("kind = 'dispatcher' AND enabled = true")) {
+          return { rows: [{ id: "dispatcher-id", model: "gpt-test", instructions: "route work" }] };
+        }
+        return { rows: [] };
       }
     } as unknown as DbPool;
 
-    const dispatcher = await getDispatcherAgent(pool, "/managed/codex-homes/dispatcher-heartbeat");
+    await enqueueDispatcherHeartbeat(pool);
 
-    expect(dispatcher.threadId).toBe("thread-id");
-    expect(queries).toHaveLength(1);
-    expect(queries[0]?.sql).toContain("scope = 'heartbeat'");
-    expect(queries[0]?.sql).toContain("status = 'succeeded'");
-    expect(queries[0]?.sql).toContain("codex_home = $1");
-    expect(queries[0]?.params).toEqual(["/managed/codex-homes/dispatcher-heartbeat"]);
+    const insert = queries.find((query) => query.sql.includes("INSERT INTO dispatcher_runs"));
+    expect(insert?.params?.[1]).toBe(`${managedRoot}/codex-homes/dispatcher-heartbeat`);
+    expect(insert?.params?.[2]).toBeNull();
+    expect(queries.some((query) => query.sql.includes("codex_thread_id") && !query.sql.includes("INSERT"))).toBe(false);
   });
 });

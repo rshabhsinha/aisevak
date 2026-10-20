@@ -44,6 +44,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   closeAllCodexAppServers,
+  closeIdleCodexSession,
   runCodexAppServerTurn,
   type AppServerTurnInput,
   type AppServerTurnOptions
@@ -59,6 +60,7 @@ import {
   runGitCommand,
   safeChildEnvironment
 } from "./githubCli.js";
+import { pruneHeartbeatRollouts } from "./heartbeatRollouts.js";
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
@@ -1329,7 +1331,7 @@ async function processOneImportJob(pool: DbPool): Promise<void> {
   }
 }
 
-async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
+export async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   if (env.dispatcherHeartbeatMs <= 0) return;
   const pending = await pool.query<{ count: string }>(
     "SELECT count(*) FROM dispatcher_runs WHERE status IN ('queued', 'running', 'cancel_requested')"
@@ -1361,9 +1363,13 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   if (Number(actionable.rows[0]?.count ?? 0) === 0) return;
 
   const codexHome = managedCodexHome(env.managedRoot, "dispatcher-heartbeat");
-  const dispatcher = await getDispatcherAgent(pool, codexHome);
+  const dispatcher = await getDispatcherAgent(pool);
   const context = await getDispatcherContext(pool);
   await mkdir(codexHome, { recursive: true });
+  // No heartbeat is pending or running here, so none of these rollouts is open.
+  await pruneHeartbeatRollouts(codexHome).catch((error) =>
+    console.warn(`Could not prune heartbeat rollouts: ${String(error instanceof Error ? error.message : error)}`)
+  );
   const skillsSnapshot = await resolveAgentSkills(pool, dispatcher.id);
   const prompt = buildDispatcherPrompt({
     dispatcherInstructions: dispatcher.instructions,
@@ -1978,6 +1984,14 @@ export async function processOneDispatcherRun(
     finalStatus = "failed";
   } finally {
     releaseActiveRun();
+    // A heartbeat conversation is used for one turn only. Closing the cached
+    // app-server releases it; otherwise every heartbeat's thread stays loaded
+    // in the one long-lived Codex process.
+    if (job.scope === "heartbeat") {
+      await closeIdleCodexSession(job.codex_home).catch((error) =>
+        console.warn(`Could not close the heartbeat Codex session: ${String(error instanceof Error ? error.message : error)}`)
+      );
+    }
     if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
       console.warn(`Leaving turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
       return true;
@@ -3863,35 +3877,19 @@ async function failPendingAgentTurnInputs(
   });
 }
 
-export async function getDispatcherAgent(pool: DbPool, codexHome: string): Promise<{
+export async function getDispatcherAgent(pool: Queryable): Promise<{
   id: string;
   model: string;
   instructions: string;
-  threadId: string | null;
 }> {
-  const result = await pool.query<{ id: string; model: string; instructions: string; thread_id: string | null }>(
-    `SELECT agents.id,
-            agents.model,
-            agents.instructions,
-            latest.codex_thread_id AS thread_id
+  const result = await pool.query<{ id: string; model: string; instructions: string }>(
+    `SELECT id, model, instructions
      FROM agents
-     LEFT JOIN LATERAL (
-       SELECT codex_thread_id
-       FROM dispatcher_runs
-       WHERE scope = 'heartbeat'
-         AND status = 'succeeded'
-         AND codex_home = $1
-         AND codex_thread_id IS NOT NULL
-       ORDER BY created_at DESC
-       LIMIT 1
-     ) latest ON true
-     WHERE agents.kind = 'dispatcher' AND agents.enabled = true
-     ORDER BY agents.created_at ASC
-     LIMIT 1`,
-    [codexHome]
+     WHERE kind = 'dispatcher' AND enabled = true
+     ORDER BY created_at ASC
+     LIMIT 1`
   );
-  const row = mustRow(result.rows[0]);
-  return { id: row.id, model: row.model, instructions: row.instructions, threadId: row.thread_id };
+  return mustRow(result.rows[0]);
 }
 
 type Queryable = Pick<DbPool, "query">;
