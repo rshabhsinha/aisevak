@@ -1,5 +1,6 @@
 import type { DbPool } from "@aisevak/core";
 import { afterEach, describe, expect, it } from "vitest";
+import { deferFinalizationForShutdown } from "./index.js";
 import {
   INTERRUPTED_PREAMBLE,
   recoverableRunPredicate,
@@ -12,8 +13,7 @@ import {
 afterEach(() => { delete process.env.AISEVAK_COORDINATION_LEGACY; });
 
 describe("turns ending during a runner stop", () => {
-  it("leaves unsuccessful turns for boot recovery only while stopping", async () => {
-    const { deferFinalizationForShutdown } = await import("./index.js");
+  it("leaves unsuccessful turns for boot recovery only while stopping", () => {
     expect(deferFinalizationForShutdown(true, "failed")).toBe(true);
     // Our own cancellations (Stop, ownership changes) settle as usual.
     expect(deferFinalizationForShutdown(true, "cancelled")).toBe(false);
