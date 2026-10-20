@@ -157,9 +157,10 @@ Phase 1 (built):
 
 ```sql
 -- NULL = a terminal failure the sender has not been told about yet.
--- Existing rows get now() once, so history does not produce notices.
-ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS failure_notified_at timestamptz DEFAULT now();
-ALTER TABLE message_deliveries ALTER COLUMN failure_notified_at DROP DEFAULT;
+-- Added once (guarded by a column check): failures that already happened are
+-- marked notified so history produces no notices; in-flight rows stay NULL.
+ALTER TABLE message_deliveries ADD COLUMN failure_notified_at timestamptz;
+UPDATE message_deliveries SET failure_notified_at = now() WHERE status = 'failed';
 CREATE INDEX IF NOT EXISTS message_deliveries_failure_notice_idx
 ON message_deliveries(completed_at) WHERE status = 'failed' AND failure_notified_at IS NULL;
 ```

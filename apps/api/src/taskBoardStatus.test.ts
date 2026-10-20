@@ -14,7 +14,7 @@ describe.skipIf(!databaseUrl)("task board status", () => {
     client = new pg.Client({ connectionString: databaseUrl });
     await client.connect();
     await client.query(`
-      CREATE TEMP TABLE tasks (id int PRIMARY KEY, status text NOT NULL, parent_task_id int);
+      CREATE TEMP TABLE tasks (id int PRIMARY KEY, status text NOT NULL, parent_task_id int, completion_policy text NOT NULL DEFAULT 'on_first_success');
       CREATE TEMP TABLE task_runs (task_id int, run_kind text NOT NULL DEFAULT 'worker', status text, created_at timestamptz, id serial);
       CREATE TEMP TABLE dispatcher_runs (task_id int, status text, created_at timestamptz);
       CREATE TEMP TABLE task_assignments (task_id int, status text);
@@ -27,13 +27,14 @@ describe.skipIf(!databaseUrl)("task board status", () => {
 
   async function boardStatus(setup: {
     status?: string;
+    completionPolicy?: "explicit" | "on_first_success";
     worker?: Array<[string, number]>;
     dispatcher?: Array<[string, number]>;
     assignments?: string[];
     childStatuses?: string[];
   }): Promise<string> {
     await client.query("TRUNCATE tasks, task_runs, dispatcher_runs, task_assignments");
-    await client.query("INSERT INTO tasks (id, status) VALUES (1, $1)", [setup.status ?? "open"]);
+    await client.query("INSERT INTO tasks (id, status, completion_policy) VALUES (1, $1, $2)", [setup.status ?? "open", setup.completionPolicy ?? "on_first_success"]);
     for (const [index, childStatus] of (setup.childStatuses ?? []).entries()) {
       await client.query("INSERT INTO tasks (id, status, parent_task_id) VALUES ($1, $2, 1)", [100 + index, childStatus]);
     }
@@ -76,6 +77,13 @@ describe.skipIf(!databaseUrl)("task board status", () => {
     expect(await boardStatus({ dispatcher: [["succeeded", 1]], assignments: ["queued"] })).toBe("open");
     expect(await boardStatus({ dispatcher: [["succeeded", 1]], childStatuses: ["open"] })).toBe("open");
     expect(await boardStatus({ dispatcher: [["succeeded", 1]], assignments: ["completed"], childStatuses: ["completed"] })).toBe("succeeded");
+  });
+
+  it("keeps an open explicit-completion task out of Completed after a successful run", async () => {
+    expect(await boardStatus({ completionPolicy: "explicit", worker: [["succeeded", 1]] })).toBe("open");
+    expect(await boardStatus({ completionPolicy: "explicit", worker: [["failed", 1]] })).toBe("failed");
+    expect(await boardStatus({ completionPolicy: "explicit", status: "completed", worker: [["succeeded", 1]] })).toBe("succeeded");
+    expect(await boardStatus({ completionPolicy: "on_first_success", worker: [["succeeded", 1]] })).toBe("succeeded");
   });
 
   it("keeps a finalized task status over a dispatcher outcome", async () => {

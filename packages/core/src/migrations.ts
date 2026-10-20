@@ -1298,10 +1298,19 @@ ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS launch_attempted_at timesta
 ALTER TABLE dispatcher_runs ALTER COLUMN launch_attempted_at DROP DEFAULT;
 
 -- Coordination v2 phase 1: a terminal delivery failure the sender has not been
--- told about yet has failure_notified_at NULL. Rows that exist when the column
--- is added get now() so history does not produce notices; new rows start NULL.
-ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS failure_notified_at timestamptz DEFAULT now();
-ALTER TABLE message_deliveries ALTER COLUMN failure_notified_at DROP DEFAULT;
+-- told about yet has failure_notified_at NULL. When the column is added,
+-- failures that already happened are marked as notified so history does not
+-- produce notices; deliveries still in flight stay NULL so a later failure is
+-- reported.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'message_deliveries' AND column_name = 'failure_notified_at'
+  ) THEN
+    ALTER TABLE message_deliveries ADD COLUMN failure_notified_at timestamptz;
+    UPDATE message_deliveries SET failure_notified_at = now() WHERE status = 'failed';
+  END IF;
+END $$;
 CREATE INDEX IF NOT EXISTS message_deliveries_failure_notice_idx
 ON message_deliveries(completed_at) WHERE status = 'failed' AND failure_notified_at IS NULL;
 

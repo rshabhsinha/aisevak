@@ -2388,7 +2388,13 @@ export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
        CROSS JOIN LATERAL (
          SELECT COALESCE(
            active_run.status::text,
-           CASE WHEN latest_any.kind = 'worker' THEN latest_any.status::text END,
+           -- A successful run of an open 'explicit' task does not finish it:
+           -- it stays in its own column until someone completes it.
+           CASE
+             WHEN latest_any.kind = 'worker'
+               AND NOT (latest_any.status = 'succeeded' AND tasks.status = 'open' AND tasks.completion_policy = 'explicit')
+             THEN latest_any.status::text
+           END,
            CASE
              WHEN latest_any.kind = 'dispatcher'
                AND tasks.status = 'open'
