@@ -617,11 +617,12 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
 }
 
 // systemd stops the whole service process group, so a runner stop or restart
-// (every deploy) also kills the harnesses of in-flight turns. A coordination
+// (every deploy) also kills the harnesses of in-flight turns. A dispatcher
 // turn that fails while this runner is stopping was most likely killed by
 // that stop: it is left 'running' under this runner's lease instead of
-// finalized, and the next boot of this runner recovers it and redelivers its
-// message (and any input it had presented) with an "interrupted" note.
+// finalized, and the next boot of this runner recovers it. A coordination
+// turn's message (and any input it had presented) is redelivered with an
+// "interrupted" note; other dispatcher turns are recovered as failed.
 // Succeeded turns and our own cancellations (Stop, ownership changes)
 // finalize as usual.
 export function deferFinalizationForShutdown(stopping: boolean, finalStatus: "succeeded" | "failed" | "cancelled"): boolean {

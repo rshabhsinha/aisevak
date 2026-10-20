@@ -288,6 +288,7 @@ class PersistentAcpSession {
             cancelBusy = false;
           });
       };
+      let inputKilled = false;
       const pollInput = () => {
         if (injectBusy || turnFinished || cancelRequested || !options.nextInput) return;
         injectBusy = true;
@@ -323,7 +324,6 @@ class PersistentAcpSession {
       }, 750);
 
       let promptResult: unknown;
-      let inputKilled = false;
       try {
         promptResult = await promptRequest;
       } finally {
