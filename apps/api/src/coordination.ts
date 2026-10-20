@@ -129,7 +129,8 @@ const reparentSchema = z.object({ parent: z.string().min(1) });
 const taskPolicySchema = z.object({
   maxActiveAssignments: z.coerce.number().int().positive().max(100).optional(),
   maxActiveChildren: z.coerce.number().int().positive().max(1000).optional(),
-  maxChildDepth: z.coerce.number().int().positive().max(100).optional(),
+  // Tree walks (authority, reparent) stop at 32 levels.
+  maxChildDepth: z.coerce.number().int().positive().max(32).optional(),
   maxAssignmentAttempts: z.coerce.number().int().positive().max(100).optional()
 }).refine((value) => Object.keys(value).length > 0, "At least one orchestration limit is required");
 const scheduleUpdateSchema = z.object({
@@ -364,7 +365,13 @@ export async function registerCoordinationRoutes(
     const query = inboxQuerySchema.parse(request.query);
     const threadId = query.thread ? await resolveThreadRef(pool, query.thread) : null;
     const load = () => inbox(pool, context.agentId, { threadId, limit: pageLimit(query.limit, 20, 100), includeRecent: query.recent === "true" });
-    return query.wait ? waitFor(load, (result) => result.pending > 0, query.wait) : load();
+    if (!query.wait) return load();
+    // Wait for something new: the message that started the caller's own turn
+    // is still pending while that turn runs, so "anything pending" would
+    // return at once.
+    const since = Date.now();
+    const result = await waitFor(load, (value) => value.items.some((item: any) => arrivedAfter(item, since)), query.wait);
+    return { ...result, arrived: result.items.filter((item: any) => arrivedAfter(item, since)).length };
   });
 
   // Message an agent on a thread (the current task's thread by default),
@@ -491,6 +498,12 @@ export async function registerCoordinationRoutes(
       await client.query("SELECT id FROM tasks WHERE id = ANY($1::uuid[]) ORDER BY id FOR UPDATE", [[taskId, parentId]]);
       await requireTaskAuthority(client, context, taskId, "move this task");
       await requireTaskAuthority(client, context, parentId, "add children to the new parent");
+      // Owning a child is not enough to take it out of its controller's tree:
+      // moving it out needs authority over the current parent too.
+      const current = await client.query<{ parent_task_id: string | null }>("SELECT parent_task_id FROM tasks WHERE id = $1", [taskId]);
+      if (current.rows[0]?.parent_task_id && current.rows[0].parent_task_id !== parentId) {
+        await requireTaskAuthority(client, context, current.rows[0].parent_task_id, "move a task out of its current parent");
+      }
       const parentChain = await client.query<{ id: string; depth: number; orchestration_policy: unknown }>(
         `WITH RECURSIVE chain AS (
            SELECT id, parent_task_id, orchestration_policy, 0::int AS depth FROM tasks WHERE id = $1
@@ -502,6 +515,8 @@ export async function registerCoordinationRoutes(
         [parentId]
       );
       if (parentChain.rows.some((row) => row.id === taskId)) badRequest("The new parent is inside this task's subtree");
+      // The walks stop at 32 levels; refuse rather than miss a cycle.
+      if (parentChain.rows.some((row) => Number(row.depth) >= 32)) badRequest("The new parent's tree is too deep to check");
       const subtree = await client.query<{ height: number }>(
         `WITH RECURSIVE below AS (
            SELECT id, 0::int AS height FROM tasks WHERE id = $1
@@ -546,16 +561,18 @@ export async function registerCoordinationRoutes(
     requireCapability(context, "threads:read");
     const threadId = await resolveThreadRef(pool, refParams.parse(request.params).ref);
     const body = refreshSchema.parse(request.body ?? {});
+    // everyTurns: a number sets the period, null clears it, omitted keeps it.
+    const setPeriod = body.everyTurns !== undefined;
     const updated = await pool.query<{ id: string; context_policy: unknown }>(
       `UPDATE agent_threads
-       SET context_policy = (context_policy - 'maxTurns' - 'refreshNow')
+       SET context_policy = (CASE WHEN $5::boolean THEN context_policy - 'maxTurns' ELSE context_policy END)
              || CASE WHEN $3::integer IS NULL THEN '{}'::jsonb ELSE jsonb_build_object('maxTurns', $3::integer) END
              || CASE WHEN $4::boolean THEN '{"refreshNow": true}'::jsonb ELSE '{}'::jsonb END,
            updated_at = now()
        WHERE agent_id = $1 AND archived_at IS NULL
          AND (coordination_thread_id = $2 OR task_id = (SELECT task_id FROM coordination_threads WHERE id = $2))
        RETURNING id, context_policy`,
-      [context.agentId, threadId, body.everyTurns ?? null, body.now ?? false]
+      [context.agentId, threadId, body.everyTurns ?? null, body.now ?? false, setPeriod]
     );
     if (!updated.rows[0]) notFound("Your session on this thread");
     return { agentThreadId: updated.rows[0].id, contextPolicy: updated.rows[0].context_policy };
@@ -1215,6 +1232,11 @@ export async function registerCoordinationRoutes(
       if (duplicate) return;
       if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Retrying ASSIGNMENT-${assignment.assignment_number}`, { stopRunningTurn: true });
       await client.query("UPDATE task_assignments SET attempt_count = $2, status = 'queued', result = NULL, active_delivery_id = NULL, updated_at = now() WHERE id = $1", [id, nextAttempt]);
+      // A new attempt reopens the assignment's request, so `wait` waits again.
+      await client.query(
+        "UPDATE thread_messages SET request_state = 'open' WHERE id = (SELECT request_message_id FROM task_assignments WHERE id = $1) AND request_state <> 'open'",
+        [id]
+      );
       const message = await insertMessage(client, {
         threadId: assignment.coordination_thread_id,
         senderAgentId: context.agentId,
@@ -1259,18 +1281,26 @@ export async function registerCoordinationRoutes(
           await client.query("UPDATE thread_messages SET request_state = 'replied' WHERE id = $1 AND request_state = 'open'", [assignment.request_message_id]);
         }
         if (assignment.active_delivery_id) await cancelPendingAssignmentDelivery(client, assignment.active_delivery_id, `Assignment ASSIGNMENT-${assignment.assignment_number} became ${action === "complete" ? "completed" : "blocked"}`, { stopRunningTurn: false });
-        if (assignment.task_agent_id !== context.agentId) {
+        // The result answers the assignment request, so it goes to whoever
+        // asked (an ancestor task's owner, for example), else the task owner.
+        const requester = assignment.request_message_id
+          ? (await client.query<{ sender_agent_id: string | null }>(
+              "SELECT sender_agent_id FROM thread_messages WHERE id = $1", [assignment.request_message_id]
+            )).rows[0]?.sender_agent_id ?? null
+          : null;
+        const resultRecipient = requester ?? assignment.task_agent_id;
+        if (resultRecipient !== context.agentId) {
           const message = await insertMessage(client, {
             threadId: assignment.coordination_thread_id,
             senderAgentId: context.agentId,
-            recipientAgentId: assignment.task_agent_id,
+            recipientAgentId: resultRecipient,
           body: `ASSIGNMENT-${assignment.assignment_number} ${action === "complete" ? "completed" : "blocked"}:\n\n${body.result}`,
             type: action === "complete" ? "assignment.completed" : "assignment.blocked",
             idempotencyKey: body.idempotencyKey,
             parentMessageId: assignment.request_message_id,
             inReplyToMessageId: assignment.request_message_id
           });
-          await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, assignment.task_agent_id);
+          await queueDelivery(client, options.managedRoot, assignment.coordination_thread_id, message.id, resultRecipient);
         }
       });
       return { assignment: await showAssignment(pool, id, true) };
@@ -3389,9 +3419,11 @@ function modelOptionsFor(
   return options.length ? options : defaultHarnessModelOptions(model);
 }
 
+// The parent's owner, when the parent has a thread that child events can go to.
 async function parentTaskOwner(queryable: Queryable, taskId: string): Promise<string | null> {
   const result = await queryable.query<{ agent_id: string }>(
-    "SELECT parent.agent_id FROM tasks JOIN tasks parent ON parent.id = tasks.parent_task_id WHERE tasks.id = $1",
+    `SELECT parent.agent_id FROM tasks JOIN tasks parent ON parent.id = tasks.parent_task_id
+     WHERE tasks.id = $1 AND parent.coordination_thread_id IS NOT NULL`,
     [taskId]
   );
   return result.rows[0]?.agent_id ?? null;
@@ -3429,8 +3461,16 @@ export async function notifyParentOfChildEvent(
       `This is an event for the parent task, not new work by itself. Inspect it with: aisevak show TASK-${row.number}`,
     type: `child.${event}`
   });
-  if (row.parent_agent_id !== actorAgentId) {
+  if (row.parent_agent_id === actorAgentId) return;
+  // The parent's session may be archived or restoring; that must never block
+  // the child's own status change. The event stays on the parent thread.
+  await client.query("SAVEPOINT child_event_delivery");
+  try {
     await queueDelivery(client, managedRoot, row.parent_thread_id, message.id, row.parent_agent_id);
+    await client.query("RELEASE SAVEPOINT child_event_delivery");
+  } catch (error) {
+    await client.query("ROLLBACK TO SAVEPOINT child_event_delivery");
+    console.error(`Could not deliver the child.${event} event for task ${childTaskId} to its parent's owner`, error);
   }
 }
 
@@ -3481,6 +3521,11 @@ export async function expireRequests(pool: DbPool, managedRoot: string, limit = 
     }
     return sent;
   });
+}
+
+function arrivedAfter(item: { created_at?: unknown; delivery?: { state?: string } }, since: number): boolean {
+  const created = item.created_at instanceof Date ? item.created_at.getTime() : Date.parse(String(item.created_at ?? ""));
+  return created >= since && ["queued", "delivering", "presented"].includes(item.delivery?.state ?? "");
 }
 
 export async function requestReply(queryable: Queryable, requestId: string): Promise<any> {

@@ -173,8 +173,17 @@ async function tasks() {
     const parent = option("--parent", true);
     const refs = args.slice(2).filter((item, index, all) => !item.startsWith("--") && !(index > 0 && all[index - 1].startsWith("--")));
     const moved = [];
-    for (const task of refs) moved.push((await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(task) + "/reparent", { method: "POST", body: { parent } })).task);
-    return print({ parent, moved });
+    const failed = [];
+    for (const task of refs) {
+      try {
+        moved.push((await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(task) + "/reparent", { method: "POST", body: { parent } })).task);
+      } catch (error) {
+        failed.push({ task, error: { code: error && error.code, message: error && error.message ? error.message : String(error) } });
+      }
+    }
+    print({ parent, moved, failed });
+    if (failed.length) process.exitCode = 1;
+    return;
   }
   if (command === "policy") return print(await request("/api/agent-tools/v1/tasks/" + encodeURIComponent(ref) + "/policy", { method: "POST", body: compact({
     maxActiveAssignments: option("--max-active-assignments"), maxActiveChildren: option("--max-active-children"),

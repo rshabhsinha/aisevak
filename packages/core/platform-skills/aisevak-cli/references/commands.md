@@ -33,7 +33,7 @@ aisevak inbox [--thread THREAD] [--recent] [--limit N] [--wait SECONDS]
 aisevak agents status AGENT
 ```
 
-`inbox` lists messages addressed to you that are not settled yet, in the order they will reach you, across all your threads (`--recent` adds the last day's settled ones). With `--wait`, it waits up to that many seconds (at most 120) for something to arrive. `agents status` shows one agent's overall state and each of its live threads: `running`, `queued`, `blocked`, `waiting`, or `idle`, with pending messages and what it waits on.
+`inbox` lists messages addressed to you that are not settled yet, in the order they will reach you, across all your threads (`--recent` adds the last day's settled ones). With `--wait`, it waits up to that many seconds (at most 120) for a new message to arrive, and reports how many arrived. `agents status` shows one agent's overall state and each of its live threads: `running`, `queued`, `blocked`, `waiting`, or `idle`, with pending messages and what it waits on.
 
 Messages always reach an agent one turn at a time, in order: a message sent while the recipient is busy waits for the next turn boundary or joins the running turn. If a runner restart interrupts a turn, the message is redelivered with a note saying so, and the assignment stays running.
 
@@ -66,7 +66,7 @@ aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
 aisevak threads refresh THREAD [--every N] [--now]
 ```
 
-`threads refresh` sets your own session's conversation refresh on that thread. `--every N` starts a fresh provider conversation after every N successful turns, and `--now` does it once after the current turn. The thread, its messages and the task tree stay; the next turn gets the thread's recent history and is told to rebuild context from `threads status` and the task. Use it on long-lived threads such as a campaign task.
+`threads refresh` sets your own session's conversation refresh on that thread. `--every N` starts a fresh provider conversation after every N successful turns, and `--now` does it once after the current turn without changing the period. The thread, its messages and the task tree stay; the next turn gets the thread's recent history and is told to rebuild context from `threads status` and the task. Use it on long-lived threads such as a campaign task.
 
 `THREAD` accepts `THREAD-n`, `TASK-n` (the task's thread), or a thread id shown in the UI or job envelope.
 
@@ -97,7 +97,7 @@ Creating a task without `--agent` assigns it to the Orchestrator for routing. Ea
 
 A task changes status only through these commands or the web app. A turn ending never completes or blocks a task an agent created. The one exception is a task a person created in the web app: its first successful standalone run still completes it.
 
-The owner of a task, the owner of any task above it, and the Orchestrator may complete, reopen, update, assign work on, or move it. When a child task is completed, blocked, reopened, or changes status, its parent task's owner receives a `child.<status>` event on the parent's thread.
+The owner of a task, the owner of any task above it, and the Orchestrator may complete, reopen, or update it, and create, retry, or send on its assignments. Reassigning the task itself (`tasks assign`) stays with the Orchestrator. Moving a task (`tasks reparent`) needs authority over the task, its current parent, and the new parent. When a child task is completed, blocked, reopened, or changes status, its parent task's owner receives a `child.<status>` event on the parent's thread.
 
 `tasks reparent` moves tasks, with their subtrees, under a new parent: for example existing component tasks under a campaign task. You need authority over both trees, and the move may not create a cycle. `tasks policy` changes a task's limits and needs `tasks:update`. Raise `--max-active-children` on a campaign task that will hold many children.
 

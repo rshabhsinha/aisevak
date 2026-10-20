@@ -324,10 +324,12 @@ Decisions taken with the user before building:
 * `reply`:
   * only the recipient may reply to a request;
   * the reply carries `in_reply_to_message_id`, closes the request, and is delivered to the requester.
-* `wait` is a bounded long poll on the API: it checks once a second, holds no connection between checks, and waits at most 120 s per call. `inbox --wait` works the same way.
+* `wait` is a bounded long poll on the API: it checks once a second, holds no connection between checks, and waits at most 120 s per call. `inbox --wait` works the same way. It waits for a message that arrives after the call started, because the message that started the caller's own turn stays pending while that turn runs. It reports how many arrived.
 * `expireRequests` runs with the delivery-failure sweep every 5 s. It marks overdue requests `timed_out` and sends the requester a `request.timed_out` platform notice.
 
-**Assignments as requests.** The `assignment.created` message is a keyed request (`assignment:<id>`), recorded as `task_assignments.request_message_id`. `assignments complete|block` replies to it and closes it. The generic `reply` refuses an assignment request and points to `assignments complete|block`, so an assignment can't be closed by accident.
+**Assignments as requests.** The `assignment.created` message is a keyed request (`assignment:<id>`), recorded as `task_assignments.request_message_id`.
+* `assignments complete|block` replies to it and closes it. The result goes to whoever sent the request, which may be an ancestor task's owner, or else to the task owner.
+* `assignments retry` reopens the request. The generic `reply` refuses an assignment request and points to `assignments complete|block`, so an assignment can't be closed by accident.
 
 **Task lifecycle.**
 * `tasks.completion_policy`:
@@ -344,21 +346,22 @@ Decisions taken with the user before building:
   * update it;
   * create, retry and send on its assignments.
 * Completing a task through ancestor authority goes through `finalizeThread` with the primary-agent check bypassed.
-* `tasks policy` still needs `tasks:update`, so a worker can't raise its own fan-out limits.
+* `tasks policy` still needs `tasks:update`, so a worker can't raise its own fan-out limits. `maxChildDepth` is capped at 32, the depth the tree walks cover.
 
 **Child events.**
 * `notifyParentOfChildEvent` posts `child.<status>` (completed, blocked, reopened, or any status set by `tasks update`) on the parent task's thread, addressed to the parent's owner.
-* When the child thread's callback agent is the parent's owner, the old completion delivery on the child thread is skipped. The event on the parent thread replaces it, so the controller hears about it in its long-lived session instead of a per-child one.
+* Queueing the event is best-effort, inside a savepoint. An archived or restoring parent session never blocks the child's own status change, and the event row stays on the parent thread.
+* When the child thread's callback agent is the parent's owner, and the parent has a thread, the old completion delivery on the child thread is skipped. The event on the parent thread replaces it, so the controller hears about it in its long-lived session instead of a per-child one.
 
 **Campaigns.**
 * No `schedules.thread_id` was added. A schedule with `task_id` already ticks a `schedule` message into that task's thread, with the `skip` overlap policy dropping a tick while one is still in flight. `schedules update --task` retargets an existing schedule.
 * The runner now binds schedule ticks to the inbox like other deliveries (`agent_thread_id`, `seq`).
 * `tasks reparent` moves a task and its subtree:
-  * it needs authority over both trees;
-  * it rejects cycles;
+  * it needs authority over the task, its current parent, and the new parent. Owning a child alone isn't enough to move it out of its controller's tree;
+  * it rejects cycles, and refuses when the new parent's chain is deeper than the 32-level walk;
   * it records a safety event when the depth limit would be exceeded, and enforce mode rejects the move;
   * it does not apply the fan-out limit, because it moves existing work.
-* `threads refresh` sets `context_policy.maxTurns` or `refreshNow` on the caller's own session.
+* `threads refresh` sets `context_policy.maxTurns` or `refreshNow` on the caller's own session. `--now` leaves an existing period alone, and `everyTurns: null` clears it.
   * After a successful turn, `noteTurnForRefresh` counts the turn. When the policy says so and nothing is queued or running on the thread, it clears `provider_thread_id` (and `task_sessions.codex_thread_id`) and stamps `lastRefreshAt`.
   * The next delivery then gets the full coordination prompt. It now says the conversation is fresh and that the task tree and thread are the record.
   * The context-size trigger from 3.11 is deferred: providers don't report context size consistently yet.
