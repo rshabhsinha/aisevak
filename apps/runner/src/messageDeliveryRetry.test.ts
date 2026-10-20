@@ -255,7 +255,18 @@ describe("message delivery retry", () => {
     expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
     expect(queries.find((query) => query.sql.includes("SET status = 'failed'"))?.params).toEqual([
       "delivery",
-      "third failure"
+      "third failure",
+      false
     ]);
+  });
+
+  it("marks a cancelled turn's delivery as needing no delivery.failed notice", async () => {
+    const { pool, queries } = retryPool({ attemptCount: 1 });
+
+    await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "cancelled", "stopped");
+
+    const failed = queries.find((query) => query.sql.includes("SET status = 'failed'"))!;
+    expect(failed.sql).toContain("failure_notified_at = CASE WHEN $3::boolean THEN now()");
+    expect(failed.params?.[2]).toBe(true);
   });
 });

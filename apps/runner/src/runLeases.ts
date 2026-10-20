@@ -7,6 +7,26 @@ import { hostname } from "node:os";
 // that is still running somewhere else.
 export const RUN_LEASE_MS = 60_000;
 export const RUN_HEARTBEAT_MS = 15_000;
+// A sweep waits this long past expiry before taking over another runner's
+// turn, so a brief database or network blip on that runner (which stops its
+// heartbeat but not its provider turn) does not cause a takeover.
+export const RUN_TAKEOVER_GRACE_MS = 120_000;
+
+export type RunKind = "worker" | "dispatcher";
+
+// The turns this process is actually executing. Only these leases are renewed:
+// a row left 'running' by a job that died inside this process must expire and
+// be recovered like any other.
+const activeRuns: Record<RunKind, Set<string>> = { worker: new Set(), dispatcher: new Set() };
+
+export function trackActiveRun(kind: RunKind, runId: string): () => void {
+  activeRuns[kind].add(runId);
+  return () => { activeRuns[kind].delete(runId); };
+}
+
+export function activeRunIds(kind: RunKind): string[] {
+  return [...activeRuns[kind]];
+}
 
 // Stable across restarts on the same host, so a restarted runner recovers its
 // own previous turns immediately instead of waiting for their leases.
@@ -39,19 +59,33 @@ export function recoverableRunPredicate(scope: RecoveryScope, alias: string, par
   if (legacyCoordination()) return scope.boot ? `(${param}::text IS NULL OR true)` : `(${param}::text IS NULL AND false)`;
   return scope.boot
     ? `(${alias}.runner_id IS NULL OR ${alias}.runner_id = ${param} OR ${alias}.lease_expires_at < now())`
-    : `(${alias}.runner_id IS NOT NULL AND ${alias}.runner_id <> ${param} AND ${alias}.lease_expires_at < now())`;
+    : `(${alias}.runner_id IS NOT NULL AND ${alias}.runner_id <> ${param} AND ${alias}.lease_expires_at < now() - interval '${RUN_TAKEOVER_GRACE_MS} milliseconds')`;
 }
 
 
-export async function renewRunLeases(pool: Pick<DbPool, "query">, runnerId: string, leaseMs = RUN_LEASE_MS): Promise<void> {
-  for (const table of ["task_runs", "dispatcher_runs"]) {
+export async function renewRunLeases(
+  pool: Pick<DbPool, "query">,
+  runnerId: string,
+  leaseMs = RUN_LEASE_MS,
+  runIds: Record<RunKind, string[]> = { worker: activeRunIds("worker"), dispatcher: activeRunIds("dispatcher") }
+): Promise<void> {
+  for (const [kind, table] of [["worker", "task_runs"], ["dispatcher", "dispatcher_runs"]] as const) {
+    if (runIds[kind].length === 0) continue;
     await pool.query(
       `UPDATE ${table}
        SET lease_expires_at = now() + ($2::integer * interval '1 millisecond')
-       WHERE runner_id = $1 AND status IN ('running', 'cancel_requested')`,
-      [runnerId, leaseMs]
+       WHERE id = ANY($3::uuid[]) AND runner_id = $1 AND status IN ('running', 'cancel_requested')`,
+      [runnerId, leaseMs, runIds[kind]]
     );
   }
+}
+
+// True when another runner took this turn over (its lease lapsed and a sweep
+// recovered it): the turn must stop and must not settle anything.
+export function runTakenOver(row: { status: string; runner_id?: string | null } | undefined, runnerId: string): boolean {
+  if (!row) return false;
+  if (!["running", "cancel_requested"].includes(row.status)) return true;
+  return Boolean(row.runner_id) && row.runner_id !== runnerId;
 }
 
 export function startRunLeaseHeartbeat(pool: Pick<DbPool, "query">, runnerId: string, intervalMs = RUN_HEARTBEAT_MS): () => void {

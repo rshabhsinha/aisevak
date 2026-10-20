@@ -1,5 +1,5 @@
 import type { DbPool } from "@aisevak/core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, onTestFinished } from "vitest";
 import { recoverInterruptedCoordinationRuns } from "./index.js";
 
 type Entry = { sql: string; params?: unknown[] };
@@ -118,7 +118,11 @@ describe("never-presented coordination messages", () => {
     expect(failedDelivery(queries, "run-delivery")).toBe(false);
   });
 
-  it("still fails an interrupted delivery whose prompt may have reached the provider", async () => {
+  // Phase 2 redelivers these instead (interruptedRedelivery.test.ts); the
+  // legacy flag keeps the old outcome.
+  it("still fails an interrupted delivery whose prompt may have reached the provider in legacy mode", async () => {
+    process.env.AISEVAK_COORDINATION_LEGACY = "1";
+    onTestFinished(() => { delete process.env.AISEVAK_COORDINATION_LEGACY; });
     for (const run of [
       { launch_attempted_at: new Date(), presented_at: null },
       { launch_attempted_at: new Date(), presented_at: new Date() }
@@ -175,6 +179,9 @@ describe("never-presented coordination messages", () => {
   });
 
   it("requeues inputs still queued on a run when the run ends instead of failing them", async () => {
+    // Legacy mode, so the presented main delivery fails rather than being redelivered.
+    process.env.AISEVAK_COORDINATION_LEGACY = "1";
+    onTestFinished(() => { delete process.env.AISEVAK_COORDINATION_LEGACY; });
     const { pool, queries } = recoveryPool({
       interruptedRun: { launch_attempted_at: new Date(), presented_at: new Date() },
       runQueuedInputs: ["queued-input"]

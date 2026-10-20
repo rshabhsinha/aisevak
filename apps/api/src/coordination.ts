@@ -3354,6 +3354,7 @@ interface FailedDeliveryRow {
 
 export function deliveryFailedNotice(row: FailedDeliveryRow): string {
   const lines = [
+    "Platform notice (not new work, not a reply): a message you sent was not processed. Do not complete or block the thread or its task because of this notice alone.",
     `Your message MESSAGE-${row.message_number} [${row.message_type}] on THREAD-${row.thread_number} to ${row.recipient_name} was not delivered after ${row.attempt_count} attempt${row.attempt_count === 1 ? "" : "s"}.`,
     `Reason: ${row.error?.trim() || "unknown"}`
   ];

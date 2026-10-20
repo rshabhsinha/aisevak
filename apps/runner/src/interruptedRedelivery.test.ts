@@ -19,6 +19,8 @@ function fakePool(handler: (sql: string, params?: unknown[]) => { rows: any[] } 
 
 const interruptedDelivery = {
   status: "running",
+  presented_at: new Date(),
+  launch_attempted_at: new Date(),
   interrupted_count: 0,
   max_attempts: 3,
   agent_thread_id: "session",
@@ -74,7 +76,8 @@ describe("interrupted turn redelivery", () => {
     ["the attempt limit is reached", { interrupted_count: 3 }],
     ["thread ownership moved", { ownership_generation: 5 }],
     ["the agent thread is archived", { agent_thread_id: null, ownership_generation: null }],
-    ["the delivery is already settled", { status: "completed" }]
+    ["the delivery is already settled", { status: "completed" }],
+    ["the turn never launched its prompt", { presented_at: null, launch_attempted_at: null }]
   ])("refuses when %s", async (_label, change) => {
     const { client, queries } = fakePool(redeliveryHandler({ ...interruptedDelivery, ...change }));
     await expect(redeliverInterruptedRun(client, "interrupted-run", "delivery", "interrupted")).resolves.toBe(false);
@@ -90,7 +93,7 @@ describe("lease-gated restart recovery", () => {
       }
       if (sql.startsWith("SELECT message_delivery_id, status::text")) return { rows: [{ message_delivery_id: "delivery", status: "running" }] };
       // Presented to an established session, so the never-presented retry does not apply.
-      if (sql.includes("source_run.launch_attempted_at")) return { rows: [{ status: "running", attempt_count: 1, presented_at: new Date(), launch_attempted_at: new Date() }] };
+      if (sql.includes("source_run.launch_attempted_at") && !sql.includes("interrupted_count")) return { rows: [{ status: "running", attempt_count: 1, presented_at: new Date(), launch_attempted_at: new Date() }] };
       return extra(sql) ?? redeliveryHandler()(sql);
     };
   }

@@ -4,6 +4,8 @@ import {
   INTERRUPTED_PREAMBLE,
   recoverableRunPredicate,
   renewRunLeases,
+  runTakenOver,
+  trackActiveRun,
   withInterruptedPreamble
 } from "./runLeases.js";
 
@@ -17,7 +19,7 @@ describe("run leases", () => {
 
   it("lets a sweep take over only other runners' expired turns", () => {
     const sql = recoverableRunPredicate({ runnerId: "runner-a", boot: false }, "runs", "$2");
-    expect(sql).toBe("(runs.runner_id IS NOT NULL AND runs.runner_id <> $2 AND runs.lease_expires_at < now())");
+    expect(sql).toBe("(runs.runner_id IS NOT NULL AND runs.runner_id <> $2 AND runs.lease_expires_at < now() - interval '120000 milliseconds')");
   });
 
   it("recovers everything at boot and nothing in sweeps in legacy mode, still binding the parameter", () => {
@@ -26,15 +28,31 @@ describe("run leases", () => {
     expect(recoverableRunPredicate({ runnerId: "r", boot: false }, "runs", "$1")).toBe("($1::text IS NULL AND false)");
   });
 
-  it("renews only this runner's active turns in both run tables", async () => {
+  it("renews only the turns this process is executing", async () => {
     const queries: Array<{ sql: string; params?: unknown[] }> = [];
     const pool = { async query(sql: string, params?: unknown[]) { queries.push({ sql, params }); return { rows: [] }; } } as unknown as DbPool;
-    await renewRunLeases(pool, "runner-a", 60_000);
-    expect(queries.map((query) => query.sql.match(/UPDATE (\w+)/)?.[1])).toEqual(["task_runs", "dispatcher_runs"]);
-    for (const query of queries) {
-      expect(query.sql).toContain("WHERE runner_id = $1 AND status IN ('running', 'cancel_requested')");
-      expect(query.params).toEqual(["runner-a", 60_000]);
+    const release = trackActiveRun("dispatcher", "run-1");
+    try {
+      await renewRunLeases(pool, "runner-a", 60_000);
+    } finally {
+      release();
     }
+    // No worker turn is active, so task_runs is not touched at all.
+    expect(queries).toHaveLength(1);
+    expect(queries[0]?.sql).toContain("UPDATE dispatcher_runs");
+    expect(queries[0]?.sql).toContain("WHERE id = ANY($3::uuid[]) AND runner_id = $1 AND status IN ('running', 'cancel_requested')");
+    expect(queries[0]?.params).toEqual(["runner-a", 60_000, ["run-1"]]);
+    queries.length = 0;
+    await renewRunLeases(pool, "runner-a", 60_000);
+    expect(queries).toHaveLength(0);
+  });
+
+  it("treats a run that left this runner as taken over", () => {
+    expect(runTakenOver({ status: "running", runner_id: "runner-a" }, "runner-a")).toBe(false);
+    expect(runTakenOver({ status: "cancel_requested", runner_id: "runner-a" }, "runner-a")).toBe(false);
+    expect(runTakenOver({ status: "failed", runner_id: "runner-a" }, "runner-a")).toBe(true);
+    expect(runTakenOver({ status: "running", runner_id: "runner-b" }, "runner-a")).toBe(true);
+    expect(runTakenOver({ status: "running", runner_id: null }, "runner-a")).toBe(false);
   });
 
   it("adds the interrupted note once", () => {
