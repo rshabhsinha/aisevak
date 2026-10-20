@@ -29,8 +29,8 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 - Create a child task only when the work is independently trackable and you can provide `--parent-task`; respect the task's fan-out and depth limits. Do not create a root task from inside an active task.
 - Send a message on the existing task thread only for coordination that is not a separately tracked assignment.
 - Create a schedule only when the request explicitly needs future or recurring execution. Choose the target agent deliberately, use an idempotency key, and avoid short or unbounded recurring intervals.
-- Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready.
-- Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures.
+- Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready. Read `$report-writing` before writing one.
+- Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures. Read `$incident-writing` before declaring, updating, or resolving one.
 - Keep local implementation details in the working context unless another agent or a durable record needs them.
 
 ## Inspect lazily
@@ -93,5 +93,11 @@ printf '%s\n' 'Please also check the malformed-input case and report the outcome
 This queues the follow-up on the existing coordination thread and provider session. It does not create another coordination tree. Reopen the task only when the overall job itself must resume.
 
 ## Handle Markdown safely
+
+## Write for humans
+
+Reports and incidents are what people read in the Aisevak web app. Before any `reports create|revise|publish` or `incidents declare|update|resolve`, read the `report-writing` or `incident-writing` skill and follow its shape: a plain title, a one-line description, a `**Bottom line:**` (reports) or `**Status:**` (incidents) first line, and a `**Next:**` line.
+
+Aisevak lints these writes. `reports create` and `revise` return advice under `writingCheck`; `reports publish` and every incident write fail with code `WRITING_LINT` when a rule is broken, and nothing is saved or published. Fix the listed problems and retry. Do not work around the lint by padding, renaming sections, or splitting content.
 
 Prefer the `-stdin` form for bodies, purposes, summaries, reports, and incident updates. This preserves multiline Markdown and avoids shell quoting errors. Never place credentials or secret values in threads, tasks, reports, incidents, logs, or command arguments.
