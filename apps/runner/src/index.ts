@@ -617,13 +617,15 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
 }
 
 // systemd stops the whole service process group, so a runner stop or restart
-// (every deploy) also kills the harnesses of in-flight turns. A turn that ends
-// unsuccessfully while this runner is stopping was most likely killed by that
-// stop: it is left 'running' under this runner's lease instead of finalized,
-// and the next boot of this runner recovers it and redelivers its message
-// with an "interrupted" note. Turns that genuinely succeeded still finalize.
+// (every deploy) also kills the harnesses of in-flight turns. A coordination
+// turn that fails while this runner is stopping was most likely killed by
+// that stop: it is left 'running' under this runner's lease instead of
+// finalized, and the next boot of this runner recovers it and redelivers its
+// message (and any input it had presented) with an "interrupted" note.
+// Succeeded turns and our own cancellations (Stop, ownership changes)
+// finalize as usual.
 export function deferFinalizationForShutdown(stopping: boolean, finalStatus: "succeeded" | "failed" | "cancelled"): boolean {
-  return stopping && finalStatus !== "succeeded" && !legacyCoordination();
+  return stopping && finalStatus === "failed" && !legacyCoordination();
 }
 
 export async function recoverExpiredRunLeases(pool: DbPool, scope: RecoveryScope): Promise<void> {
@@ -2283,11 +2285,9 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
+    // Worker turns have no redelivery path, so they finalize even while
+    // stopping and keep their needs_attention signal.
     releaseActiveRun();
-    if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
-      console.warn(`Leaving worker turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
-      return true;
-    }
     const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,
       taskId: job.task_id,

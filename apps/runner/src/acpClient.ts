@@ -28,6 +28,10 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
 const sessions = new Map<string, PersistentAcpSession>();
 const ACP_SESSION_IDLE_MS = 30 * 60_000;
 
+function stopReasonOf(result: unknown): unknown {
+  return result && typeof result === "object" ? (result as { stopReason?: unknown }).stopReason : undefined;
+}
+
 export async function runAcpTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
   const key = options.runtimeHome;
   await closeIdleAcpSessions(key);
@@ -291,10 +295,18 @@ class PersistentAcpSession {
           const input = await options.nextInput?.();
           if (!input) return;
           try {
-            await this.request("session/prompt", {
+            const injected = await this.request("session/prompt", {
               sessionId: this.sessionId,
               prompt: await acpPromptContent(input.message, this.supportsImages)
             }, true);
+            // A killed harness answers an injected prompt "cancelled" too. That
+            // input was not handled: leave it 'delivering' (boot recovery after
+            // a runner stop redelivers it; otherwise the turn's end fails it)
+            // and fail the turn, whose main prompt may already have ended.
+            if (stopReasonOf(injected) === "cancelled" && !cancelRequested) {
+              inputKilled = true;
+              return;
+            }
             await options.onInputHandled?.(input);
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
@@ -311,6 +323,7 @@ class PersistentAcpSession {
       }, 750);
 
       let promptResult: unknown;
+      let inputKilled = false;
       try {
         promptResult = await promptRequest;
       } finally {
@@ -325,10 +338,7 @@ class PersistentAcpSession {
       // the open prompt with stopReason "cancelled". Unless we asked for the
       // cancel, that turn did not complete: report it as failed so it is
       // retried or redelivered instead of recorded as a success.
-      const stopReason = promptResult && typeof promptResult === "object"
-        ? (promptResult as { stopReason?: unknown }).stopReason
-        : undefined;
-      if (stopReason === "cancelled" && !cancelRequested) {
+      if ((stopReasonOf(promptResult) === "cancelled" || inputKilled) && !cancelRequested) {
         return {
           status: "failed",
           threadId: this.sessionId,

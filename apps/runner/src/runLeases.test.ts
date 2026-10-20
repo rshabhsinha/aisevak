@@ -15,7 +15,8 @@ describe("turns ending during a runner stop", () => {
   it("leaves unsuccessful turns for boot recovery only while stopping", async () => {
     const { deferFinalizationForShutdown } = await import("./index.js");
     expect(deferFinalizationForShutdown(true, "failed")).toBe(true);
-    expect(deferFinalizationForShutdown(true, "cancelled")).toBe(true);
+    // Our own cancellations (Stop, ownership changes) settle as usual.
+    expect(deferFinalizationForShutdown(true, "cancelled")).toBe(false);
     expect(deferFinalizationForShutdown(true, "succeeded")).toBe(false);
     expect(deferFinalizationForShutdown(false, "failed")).toBe(false);
     process.env.AISEVAK_COORDINATION_LEGACY = "1";

@@ -228,3 +228,40 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(stopped.status).toBe("interrupted");
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
+
+it("does not mark a mid-turn input handled when the harness cancels it on its own, and fails the turn", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  // Like claude-agent-acp when killed after a hand-off: the first prompt ends
+  // with end_turn once the injected one arrives, then the injected one is
+  // answered "cancelled".
+  await writeFile(script, `const readline = require('node:readline');
+let first = null;
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && first === null) { first = m.id; return; }
+ if(m.method === 'session/prompt') {
+   console.log(JSON.stringify({id:first,result:{stopReason:'end_turn'}}));
+   setTimeout(() => console.log(JSON.stringify({id:m.id,result:{stopReason:'cancelled'}})), 100);
+   return;
+ }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const handled: Array<{ id: string; error?: string }> = [];
+  let served = false;
+  try {
+    const result = await runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+      model: "auto", prompt: "start", threadId: "s1", env: process.env, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {}, shouldCancel: async () => false,
+      nextInput: async () => {
+        if (served) return null;
+        served = true;
+        return { id: "input-1", message: "also check X", messageDeliveryId: "delivery-1", assignmentId: null };
+      },
+      onInputHandled: async (input, error) => { handled.push({ id: input.id, error }); }
+    });
+    expect(result.status).toBe("failed");
+    expect(handled).toEqual([]);
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});
