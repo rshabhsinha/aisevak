@@ -54,7 +54,7 @@ UI changes should follow [docs/design-language.md](docs/design-language.md) and 
 
 - Keep commits focused on one change.
 - Code that runs inside agent runs must not assume it is in the root checkout; runs execute in runner-managed worktrees.
-- New or changed persistent state needs a migration in `packages/core`. Migrations re-run whenever the schema changes, so every statement must be safe to run again. A one-time backfill uses the `ADD COLUMN ... DEFAULT` then `DROP DEFAULT` pattern.
+- New or changed persistent state needs a migration in `packages/core`. Migrations re-run whenever the schema changes, so every statement must be safe to run again. Guard a one-time backfill so it can't repeat: either a `DO` block that checks the column doesn't exist yet, or `ADD COLUMN` without a default followed by an `UPDATE ... WHERE column IS NULL`.
 - Provider output goes through the runtime event adapters in `packages/core/src/runtime`; add a fixture when you change how a provider's events are mapped.
 
 ## License

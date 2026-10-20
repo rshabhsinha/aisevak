@@ -2352,10 +2352,13 @@ function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
 // occurrences and orchestrated tasks execute as dispatcher runs rather than
 // worker task_runs, so:
 // 1. any active worker or dispatcher run puts the task in Running;
-// 2. otherwise the most recent run of either kind decides: a worker run's
-//    status always counts, while a dispatcher run's counts only for a task
-//    still 'open' with no assignments or child tasks in flight;
-// 3. otherwise the task's own status.
+// 2. otherwise, for a task still 'open', the most recent run of either kind
+//    decides: a worker run's status counts unless it succeeded (an open task
+//    whose run succeeded is waiting for someone to complete it), and a
+//    dispatcher run's counts only with no assignments or child tasks in flight;
+// 3. otherwise the task's own status: once a task is completed, blocked or
+//    cancelled, that wins over any run outcome (task status is set by
+//    explicit commands, not by turns).
 export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
          SELECT id, status
          FROM task_runs
@@ -2388,7 +2391,12 @@ export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
        CROSS JOIN LATERAL (
          SELECT COALESCE(
            active_run.status::text,
-           CASE WHEN latest_any.kind = 'worker' THEN latest_any.status::text END,
+           CASE
+             WHEN latest_any.kind = 'worker'
+               AND tasks.status = 'open'
+               AND latest_any.status <> 'succeeded'
+             THEN latest_any.status::text
+           END,
            CASE
              WHEN latest_any.kind = 'dispatcher'
                AND tasks.status = 'open'
@@ -2405,6 +2413,18 @@ export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
            tasks.status::text
          ) AS status
        ) board`;
+// Tasks the dispatcher is shown as work. Uses the board status, so finished
+// scheduled occurrences and tasks with an active dispatcher run are treated
+// like worker runs. An open task whose latest worker run succeeded is waiting
+// for its owner to complete it, not for the dispatcher (matches the runner's
+// heartbeat check).
+export const DISPATCHER_ACTIONABLE_TASKS = `(
+  board.status IN ('queued', 'running', 'cancel_requested', 'failed')
+  OR tasks.status IN ('needs_attention', 'blocked')
+  OR (tasks.status = 'open'
+      AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
+      AND COALESCE(latest.status::text, '') <> 'succeeded')
+)`;
 const TASK_CURSOR_COLUMN = `to_char(tasks.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at`;
 const TASK_LIST_SELECT = `SELECT tasks.*,
               projects.name AS project_name,
@@ -5172,11 +5192,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
      ${TASK_STATUS_JOINS}
-     -- Same status the board shows, so finished scheduled occurrences and
-     -- tasks with an active dispatcher run are treated like worker runs.
-     WHERE board.status IN ('queued', 'running', 'cancel_requested', 'failed')
-        OR tasks.status IN ('needs_attention', 'blocked')
-        OR (tasks.status = 'open' AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded'))
+     WHERE ${DISPATCHER_ACTIONABLE_TASKS}
      ORDER BY tasks.created_at ASC`
   );
   const agents = await pool.query(

@@ -1310,7 +1310,7 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
        ORDER BY created_at DESC
        LIMIT 1
      ) latest ON true
-     WHERE latest.status = 'failed'
+     WHERE (latest.status = 'failed' AND tasks.status = 'open')
         OR tasks.status IN ('needs_attention', 'blocked')
         OR (
           tasks.status = 'open'
