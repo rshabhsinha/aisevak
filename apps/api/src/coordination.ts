@@ -33,7 +33,7 @@ import {
   taskWorkScope,
   type OrchestrationPolicy
 } from "./jobSafety.js";
-import { assertWritingCheck, lintIncident, lintReport } from "./writingLint.js";
+import { adviseWritingCheck, assertWritingCheck, lintIncident, lintReport } from "./writingLint.js";
 
 const DEFAULT_WORKER_CAPABILITIES = [
   "agents:read",
@@ -1252,7 +1252,7 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
       await client.query("INSERT INTO report_versions (report_id, revision, markdown, created_by_agent_id) VALUES ($1, 1, $2, $3)", [report.rows[0]!.id, body.markdown, context.agentId]);
       return report.rows[0]!.id;
     });
-    return { report: await showReport(pool, id), writingCheck: lintReport(body) };
+    return { report: await showReport(pool, id), writingCheck: adviseWritingCheck(lintReport(body)) };
   });
   app.get("/api/agent-tools/v1/reports/:ref", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:read");
@@ -1269,7 +1269,7 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
     });
     const report = await showReport(pool, id, true);
     const { markdown, ...rest } = report;
-    return { report: rest, writingCheck: lintReport({ title: report.title, description: report.description, markdown }) };
+    return { report: rest, writingCheck: adviseWritingCheck(lintReport({ title: report.title, description: report.description, markdown })) };
   });
   app.post("/api/agent-tools/v1/reports/:ref/publish", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
@@ -1279,7 +1279,12 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
       lintReport({ title: current.title, description: current.description, markdown: current.markdown }),
       `${current.key} revision ${current.current_revision}`
     );
-    await pool.query("UPDATE reports SET status = 'published', updated_at = now() WHERE id = $1", [id]);
+    // Publish only the revision that was linted; a concurrent revise must be checked on its own.
+    const published = await pool.query(
+      "UPDATE reports SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision = $2 RETURNING id",
+      [id, current.current_revision]
+    );
+    if (!published.rows[0]) throw httpError(409, `${current.key} was revised while publishing; check the new revision and publish again`);
     return { report: await showReport(pool, id), writingCheck };
   });
 }

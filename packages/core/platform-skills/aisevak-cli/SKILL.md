@@ -92,12 +92,12 @@ printf '%s\n' 'Please also check the malformed-input case and report the outcome
 
 This queues the follow-up on the existing coordination thread and provider session. It does not create another coordination tree. Reopen the task only when the overall job itself must resume.
 
-## Handle Markdown safely
-
 ## Write for humans
 
-Reports and incidents are what people read in the Aisevak web app. Before any `reports create|revise|publish` or `incidents declare|update|resolve`, read the `report-writing` or `incident-writing` skill and follow its shape: a plain title, a one-line description, a `**Bottom line:**` (reports) or `**Status:**` (incidents) first line, and a `**Next:**` line.
+Reports and incidents are what people read in the Aisevak web app. Before any `reports create|revise|publish` or `incidents declare|update|resolve`, read the `report-writing` or `incident-writing` skill. Keep them short and simple: a reader should see what it is, what it affects, and what happens next within the first few lines, in whatever layout fits.
 
-Aisevak lints these writes. `reports create` and `revise` return advice under `writingCheck`; `reports publish` and every incident write fail with code `WRITING_LINT` when a rule is broken, and nothing is saved or published. Fix the listed problems and retry. Do not work around the lint by padding, renaming sections, or splitting content.
+Aisevak lints these writes for readability: title and description length, body length, table size, and raw IDs. `reports create` and `revise` return advice under `writingCheck`. `reports publish` and every incident write fail with code `WRITING_LINT` when a limit is broken, and nothing is saved or published. Fix the listed problems and retry; do not pad or split content to get around a limit.
+
+## Handle Markdown safely
 
 Prefer the `-stdin` form for bodies, purposes, summaries, reports, and incident updates. This preserves multiline Markdown and avoids shell quoting errors. Never place credentials or secret values in threads, tasks, reports, incidents, logs, or command arguments.

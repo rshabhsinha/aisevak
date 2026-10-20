@@ -1,5 +1,6 @@
 // Deterministic checks that keep agent-written reports and incidents readable.
-// The rules mirror the report-writing and incident-writing platform skills.
+// They check readability limits only, never a particular layout; the report-writing
+// and incident-writing platform skills describe the same limits.
 
 export type WritingSeverity = "error" | "warning";
 
@@ -58,16 +59,9 @@ export function lintReport(input: ReportWritingInput): WritingCheck {
     ...titleFindings(input.title),
     ...descriptionFindings(input.title, input.description)
   ];
-  const lines = contentLines(input.markdown);
   const firstHeading = input.markdown.split(/\r?\n/).map((line) => line.trim()).find((line) => /^#{1,6}\s/.test(line));
   if (firstHeading && input.title && normalize(firstHeading.replace(/^#+\s*/, "")) === normalize(input.title)) {
     findings.push(warning("repeated-title", "Remove the heading that repeats the title; the app already shows it."));
-  }
-  if (!leadsWith(lines, "bottom line")) {
-    findings.push(error("bottom-line", "Start the body with `**Bottom line:**` and one or two plain sentences on what is healthy, broken, or unknown."));
-  }
-  if (!hasLabel(input.markdown, "next")) {
-    findings.push(error("next", "Add a `**Next:**` line with one action and its owner, or \"No action needed.\""));
   }
   findings.push(
     ...lengthFindings(input.markdown, limits.reportWordsWarn, limits.reportWordsError),
@@ -82,24 +76,17 @@ export function lintIncident(input: IncidentWritingInput): WritingCheck {
   if (input.stage === "declare") {
     findings.push(...titleFindings(input.title), ...descriptionFindings(input.title, input.description));
   }
-  const lines = contentLines(input.markdown);
-  if (!leadsWith(lines, "status")) {
-    findings.push(error("status", "Start the update with `**Status:**` (Open, Contained, Monitoring, or Resolved) and one sentence on where it stands."));
-  } else if (input.stage === "resolve" && !/resolved/i.test(lines[0] ?? "")) {
-    findings.push(error("status", "A resolution note starts with `**Status:** Resolved.` and says what was verified."));
-  }
-  if (input.stage !== "resolve" && !hasLabel(input.markdown, "next")) {
-    findings.push(error("next", "Add a `**Next:**` line with one action, its owner, and the check that closes the incident."));
-  }
-  if (input.stage !== "resolve" && !hasLabel(input.markdown, "impact")) {
-    findings.push(warning("impact", "Add an `**Impact:**` line; write \"Unconfirmed.\" when customer impact is unknown."));
-  }
   findings.push(
     ...lengthFindings(input.markdown, limits.incidentWordsWarn, limits.incidentWordsError),
     ...tableFindings(input.markdown),
     ...bodyStyleFindings(input.markdown)
   );
   return summarize(findings);
+}
+
+// Advisory checks on drafts follow the same mode, so "off" silences them too.
+export function adviseWritingCheck(check: WritingCheck, mode = writingLintMode()): WritingCheck {
+  return mode === "off" ? { passed: true, errors: [], warnings: [] } : check;
 }
 
 // Throws a 422 listing every error when the mode enforces the lint; otherwise returns the check for the response.
@@ -110,7 +97,7 @@ export function assertWritingCheck(check: WritingCheck, label: string, mode = wr
     const message = [
       `${label} was rejected because it breaks the writing rules. Nothing was saved or published. Fix these and retry:`,
       ...problems,
-      "See the report-writing and incident-writing skills for the expected shape."
+      "See the report-writing and incident-writing skills."
     ].join("\n");
     throw Object.assign(new Error(message), { statusCode: 422, code: "WRITING_LINT" });
   }
@@ -188,48 +175,30 @@ function summarize(findings: WritingFinding[]): WritingCheck {
   return { passed: errors.length === 0, errors, warnings };
 }
 
-// Non-blank lines that are not headings, so a leading `# Title` does not hide the lead line.
-function contentLines(markdown: string): string[] {
-  return markdown.split(/\r?\n/).map((line) => line.trim()).filter((line) => line && !/^#{1,6}\s/.test(line));
-}
-
-function leadsWith(lines: string[], label: string): boolean {
-  return labelPattern(label).test(lines[0] ?? "");
-}
-
-function hasLabel(markdown: string, label: string): boolean {
-  const heading = new RegExp(`^#{1,6}\\s*${label}\\b`, "i");
-  return markdown.split(/\r?\n/).some((line) => {
-    const trimmed = line.trim().replace(/^[-*]\s+/, "");
-    return labelPattern(label).test(trimmed) || heading.test(trimmed);
-  });
-}
-
-// Matches `**Label:**`, `**Label**:`, `__Label:__`, or a bare `Label:` at the start of a line.
-function labelPattern(label: string): RegExp {
-  return new RegExp(`^(?:\\*\\*|__)?\\s*${label.replace(/ /g, "\\s+")}\\s*(?::\\s*(?:\\*\\*|__)|(?:\\*\\*|__)\\s*:|:)`, "i");
-}
-
+// Splits prose from tables and fenced code. A table is a header line followed by a
+// separator line; its body rows are the following lines that contain a pipe.
 function markdownParts(markdown: string): { prose: string[]; tableRows: number } {
+  const lines = markdown.split(/\r?\n/).map((line) => line.trim());
   const prose: string[] = [];
   let tableRows = 0;
   let inFence = false;
-  for (const raw of markdown.split(/\r?\n/)) {
-    const line = raw.trim();
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
     if (/^(```|~~~)/.test(line)) { inFence = !inFence; continue; }
     if (inFence) continue;
-    if (line.startsWith("|")) {
-      if (!/^\|?[\s:|-]+\|?$/.test(line)) tableRows += 1;
+    if (line.includes("|") && isTableSeparator(lines[index + 1] ?? "")) {
+      index += 2;
+      while (index < lines.length && lines[index]!.includes("|")) { tableRows += 1; index += 1; }
+      index -= 1;
       continue;
     }
     prose.push(line);
   }
-  // The header row is not content.
-  return { prose, tableRows: Math.max(0, tableRows - countTables(markdown)) };
+  return { prose, tableRows };
 }
 
-function countTables(markdown: string): number {
-  return markdown.split(/\r?\n/).filter((line) => /^\s*\|?[\s:]*-{3,}[\s:|-]*\|?\s*$/.test(line) && line.includes("|")).length;
+function isTableSeparator(line: string): boolean {
+  return line.includes("-") && /^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?$/.test(line);
 }
 
 function proseWords(markdown: string): number {

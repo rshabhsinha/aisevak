@@ -10,7 +10,7 @@ afterEach(async () => {
   await Promise.all(openApps.splice(0).map((app) => app.close()));
 });
 
-async function lintServer(reportMarkdown: string): Promise<{ app: FastifyInstance; queries: string[] }> {
+async function lintServer(reportMarkdown: string, publishMatches = true): Promise<{ app: FastifyInstance; queries: string[] }> {
   const queries: string[] = [];
   const pool = {
     async query(sql: string) {
@@ -25,7 +25,7 @@ async function lintServer(reportMarkdown: string): Promise<{ app: FastifyInstanc
         return { rows: [{ number: 9, current_revision: 2, title: "Daily review", description: "Scope.", markdown: reportMarkdown }] };
       }
       if (sql.includes("FROM incidents")) return { rows: [{ number: 3, title: "Queue stalled", thread_id: null }] };
-      if (sql.startsWith("UPDATE reports")) return { rows: [] };
+      if (sql.startsWith("UPDATE reports")) return { rows: publishMatches ? [{ id: "report" }] : [] };
       throw new Error(`Unexpected query: ${sql}`);
     }
   } as unknown as DbPool;
@@ -36,7 +36,7 @@ async function lintServer(reportMarkdown: string): Promise<{ app: FastifyInstanc
 
 describe("writing lint on agent routes", () => {
   it("refuses to publish a report that breaks the writing rules", async () => {
-    const { app, queries } = await lintServer("## Snapshot\n- Counts 33/5/9/0");
+    const { app, queries } = await lintServer(Array.from({ length: 450 }, () => "word").join(" "));
     const response = await app.inject({ method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/publish", headers });
     expect(response.statusCode).toBe(422);
     expect(response.json()).toMatchObject({ code: "WRITING_LINT" });
@@ -44,12 +44,19 @@ describe("writing lint on agent routes", () => {
     expect(queries.some((sql) => sql.startsWith("UPDATE reports"))).toBe(false);
   });
 
-  it("publishes a report in the documented shape", async () => {
-    const { app, queries } = await lintServer("**Bottom line:** All quiet.\n\n**Next:** No action needed.");
+  it("publishes a short report", async () => {
+    const { app, queries } = await lintServer("All quiet. No action needed.");
     const response = await app.inject({ method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/publish", headers });
     expect(response.statusCode).toBe(200);
     expect(response.json().writingCheck).toMatchObject({ passed: true });
     expect(queries.some((sql) => sql.startsWith("UPDATE reports"))).toBe(true);
+  });
+
+  it("refuses to publish when the report was revised after linting", async () => {
+    const { app, queries } = await lintServer("All quiet. No action needed.", false);
+    const response = await app.inject({ method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/publish", headers });
+    expect(response.statusCode).toBe(409);
+    expect(queries.find((sql) => sql.startsWith("UPDATE reports"))).toContain("current_revision = $2");
   });
 
   it("rejects an incident update before recording it", async () => {
@@ -58,7 +65,7 @@ describe("writing lint on agent routes", () => {
       method: "POST",
       url: "/api/agent-tools/v1/incidents/INC-3/updates",
       headers,
-      payload: { markdown: "Builder traced the warning to module-load validation." }
+      payload: { markdown: "Raw owner 981758a4-c188-4078-b1f3-8774a7272a46, 981758a4-c188-4078-b1f3-8774a7272a47, 981758a4-c188-4078-b1f3-8774a7272a48, 981758a4-c188-4078-b1f3-8774a7272a49." }
     });
     expect(response.statusCode).toBe(422);
     expect(response.json().message).toContain("INC-3 update");

@@ -39,13 +39,13 @@ describe("installed skills", () => {
       platformManaged: true,
       defaultForAgents: true
     });
-    expect(skills[1]?.instructions).toContain("**Status:**");
+    expect(skills[1]?.instructions).toContain("what happens next, and who does it");
     expect(skills[2]).toMatchObject({
       name: "report-writing",
       platformManaged: true,
       defaultForAgents: true
     });
-    expect(skills[2]?.instructions).toContain("**Bottom line:**");
+    expect(skills[2]?.instructions).toContain("Lead with the point");
   });
 
   it("uses a persistent skills directory below the managed root", () => {
