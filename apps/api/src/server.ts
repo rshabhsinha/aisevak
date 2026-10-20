@@ -2352,10 +2352,13 @@ function taskBucketCondition(bucket: (typeof TASK_BUCKETS)[number]): string {
 // occurrences and orchestrated tasks execute as dispatcher runs rather than
 // worker task_runs, so:
 // 1. any active worker or dispatcher run puts the task in Running;
-// 2. otherwise the most recent run of either kind decides: a worker run's
-//    status always counts, while a dispatcher run's counts only for a task
-//    still 'open' with no assignments or child tasks in flight;
-// 3. otherwise the task's own status.
+// 2. otherwise, for a task still 'open', the most recent run of either kind
+//    decides: a worker run's status counts unless it succeeded (an open task
+//    whose run succeeded is waiting for someone to complete it), and a
+//    dispatcher run's counts only with no assignments or child tasks in flight;
+// 3. otherwise the task's own status: once a task is completed, blocked or
+//    cancelled, that wins over any run outcome (task status is set by
+//    explicit commands, not by turns).
 export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
          SELECT id, status
          FROM task_runs
@@ -2388,11 +2391,10 @@ export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
        CROSS JOIN LATERAL (
          SELECT COALESCE(
            active_run.status::text,
-           -- A successful run of an open 'explicit' task does not finish it:
-           -- it stays in its own column until someone completes it.
            CASE
              WHEN latest_any.kind = 'worker'
-               AND NOT (latest_any.status = 'succeeded' AND tasks.status = 'open' AND tasks.completion_policy = 'explicit')
+               AND tasks.status = 'open'
+               AND latest_any.status <> 'succeeded'
              THEN latest_any.status::text
            END,
            CASE

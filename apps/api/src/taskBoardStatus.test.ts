@@ -79,11 +79,18 @@ describe.skipIf(!databaseUrl)("task board status", () => {
     expect(await boardStatus({ dispatcher: [["succeeded", 1]], assignments: ["completed"], childStatuses: ["completed"] })).toBe("succeeded");
   });
 
-  it("keeps an open explicit-completion task out of Completed after a successful run", async () => {
+  it("keeps an open task whose run succeeded in its own column until someone completes it", async () => {
     expect(await boardStatus({ completionPolicy: "explicit", worker: [["succeeded", 1]] })).toBe("open");
+    // The runner leaves some on_first_success tasks open too (message turns, children, assignments).
+    expect(await boardStatus({ completionPolicy: "on_first_success", worker: [["succeeded", 1]] })).toBe("open");
     expect(await boardStatus({ completionPolicy: "explicit", worker: [["failed", 1]] })).toBe("failed");
-    expect(await boardStatus({ completionPolicy: "explicit", status: "completed", worker: [["succeeded", 1]] })).toBe("succeeded");
-    expect(await boardStatus({ completionPolicy: "on_first_success", worker: [["succeeded", 1]] })).toBe("succeeded");
+  });
+
+  it("lets a finalized task status win over any run outcome", async () => {
+    expect(await boardStatus({ completionPolicy: "explicit", status: "blocked", worker: [["succeeded", 1]] })).toBe("blocked");
+    expect(await boardStatus({ completionPolicy: "explicit", status: "completed", worker: [["failed", 1]] })).toBe("completed");
+    expect(await boardStatus({ completionPolicy: "explicit", status: "cancelled", worker: [["succeeded", 1]] })).toBe("cancelled");
+    expect(await boardStatus({ completionPolicy: "on_first_success", status: "completed", worker: [["succeeded", 1]] })).toBe("completed");
   });
 
   it("keeps a finalized task status over a dispatcher outcome", async () => {
