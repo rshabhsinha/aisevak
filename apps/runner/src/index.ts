@@ -228,15 +228,16 @@ async function main(): Promise<void> {
         .finally(() => { cleanupJob = null; });
     }
     startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
-    try {
-      await processOneGithubConnection(pool);
-      await processOneImportJob(pool);
-      await enqueueDueSchedule(pool);
-      await enqueueDispatcherHeartbeat(pool);
-      if (!shuttingDown) startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
-    } catch (error) {
-      console.error("runner loop error", error);
+    // Each step fails on its own: one broken schedule or import must not stop
+    // the others (or the heartbeat) from running.
+    for (const step of [processOneGithubConnection, processOneImportJob, enqueueDueSchedule, enqueueDispatcherHeartbeat]) {
+      try {
+        await step(pool);
+      } catch (error) {
+        console.error(`runner loop error in ${step.name}`, error);
+      }
     }
+    if (!shuttingDown) startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     await sleep(env.pollMs);
   }
   await waitForRunJobs(activeRunJobs);
@@ -814,7 +815,30 @@ function scheduleJobEnvelopePrompt(
   return taskEnvelopePrompt(task, coordinationThreadId, agentThreadId, providerThreadId, prompt);
 }
 
+// A schedule whose tick fails is moved back by a few minutes with its error
+// recorded, so it stops being the earliest due schedule and cannot block the
+// others; it retries on its own and the error shows on the schedule.
+const FAILED_SCHEDULE_BACKOFF_SECONDS = 300;
+
 export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
+  let claimedScheduleId: string | null = null;
+  try {
+    await enqueueDueScheduleInTransaction(pool, (id) => { claimedScheduleId = id; });
+  } catch (error) {
+    if (claimedScheduleId) {
+      await pool.query(
+        `UPDATE schedules
+         SET next_run_at = now() + ($2::integer * interval '1 second'),
+             last_error = left($3, 2000), updated_at = now()
+         WHERE id = $1`,
+        [claimedScheduleId, FAILED_SCHEDULE_BACKOFF_SECONDS, error instanceof Error ? error.message : String(error)]
+      );
+    }
+    throw error;
+  }
+}
+
+async function enqueueDueScheduleInTransaction(pool: DbPool, onClaim: (scheduleId: string) => void): Promise<void> {
   await withTransaction(pool, async (client) => {
     const dueResult = await client.query<DueSchedule>(
       `SELECT schedules.id,
@@ -840,6 +864,7 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     );
     const schedule = dueResult.rows[0];
     if (!schedule) return;
+    onClaim(schedule.id);
 
     const scheduledFor = schedule.next_run_at;
     const alreadyRecorded = await client.query("SELECT id FROM schedule_runs WHERE schedule_id = $1 AND scheduled_for = $2 LIMIT 1", [schedule.id, scheduledFor]);
@@ -862,7 +887,7 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
           `SELECT tasks.id, tasks.number, tasks.title, tasks.agent_id, tasks.project_id,
                   tasks.coordination_thread_id, projects.local_path, projects.workspace_mode, projects.source
            FROM tasks LEFT JOIN projects ON projects.id = tasks.project_id
-           WHERE tasks.id = $1 FOR UPDATE`, [schedule.task_id]
+           WHERE tasks.id = $1 FOR UPDATE OF tasks`, [schedule.task_id]
         )
       : null;
     if (schedule.task_id && !target?.rows[0]) {
@@ -945,7 +970,9 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
     const sessionTaskId = taskOwnerAgentId === schedule.agent_id ? taskId : null;
     const runtimeHome = managedCodexHome(
       env.managedRoot,
-      sessionTaskId ?? `schedule-thread-${coordinationThreadId}-${schedule.agent_id}`
+      // Same home as the API's queueDelivery gives this agent's session on the
+      // thread, so a tick reuses it instead of resetting its provider session.
+      sessionTaskId ?? `thread-${coordinationThreadId}-${schedule.agent_id}`
     );
     const providerInstanceId = schedule.provider_instance_id ?? "codex-local";
     const existingSession = await client.query<{
@@ -1060,6 +1087,7 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
            next_run_at = $2,
            last_run_at = now(),
            last_agent_thread_id = $3,
+           last_error = NULL,
            updated_at = now()
        WHERE id = $1`,
       [schedule.id, nextRunAt, agentThread.id]
