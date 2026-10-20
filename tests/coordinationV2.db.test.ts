@@ -3,6 +3,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool, runMigrations, withTransaction, type DbPool } from "../packages/core/src/index.js";
 import {
   agentStatus,
+  cancelStaleQueuedAgentThreadRuns,
   inbox,
   notifyFailedDeliveries,
   queueDelivery,
@@ -109,6 +110,23 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     expect((await q("SELECT status, failure_notified_at IS NOT NULL AS quiet FROM message_deliveries WHERE id = $1", [sent.deliveryId]))[0])
       .toEqual({ status: "failed", quiet: true });
     expect(await q("SELECT 1 FROM thread_messages WHERE thread_id = $1 AND message_type = 'delivery.failed'", [thread.id])).toHaveLength(0);
+  });
+
+  it("notifies the sender when an internal ownership change cancels a queued delivery", async () => {
+    const { orch, rev, thread, assignment, send } = await scenario();
+    const sent = await send("review it", orch.id, rev.id, assignment.id);
+    const [bound] = await q("SELECT agent_thread_id FROM message_deliveries WHERE id = $1", [sent.deliveryId]);
+    const [moved] = await q(
+      "UPDATE agent_threads SET ownership_generation = ownership_generation + 1 WHERE id = $1 RETURNING ownership_generation",
+      [bound.agent_thread_id]
+    );
+
+    await cancelStaleQueuedAgentThreadRuns(pool, bound.agent_thread_id, moved.ownership_generation);
+    await notifyFailedDeliveries(pool, managedRoot, 200);
+
+    expect((await q("SELECT status FROM message_deliveries WHERE id = $1", [sent.deliveryId]))[0].status).toBe("failed");
+    const notices = await q("SELECT recipient_agent_id FROM thread_messages WHERE thread_id = $1 AND message_type = 'delivery.failed'", [thread.id]);
+    expect(notices).toEqual([{ recipient_agent_id: orch.id }]);
   });
 
   it("leaves live leases alone, redelivers an expired interrupted turn, and fences the old runner", async () => {
