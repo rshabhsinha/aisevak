@@ -30,8 +30,8 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 - Send a message on the existing task thread only for coordination that is not a separately tracked assignment.
 - Before deciding another agent is stuck or idle, run `aisevak threads status THREAD-n`. A `delivery.failed` notice means a message you sent was not processed; retry deliberately rather than creating new threads.
 - Create a schedule only when the request explicitly needs future or recurring execution. Choose the target agent deliberately, use an idempotency key, and avoid short or unbounded recurring intervals.
-- Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready.
-- Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures.
+- Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready. Read `$report-writing` before writing one.
+- Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures. Read `$incident-writing` before declaring, updating, or resolving one.
 - Keep local implementation details in the working context unless another agent or a durable record needs them.
 
 ## Inspect lazily
@@ -92,6 +92,12 @@ printf '%s\n' 'Please also check the malformed-input case and report the outcome
 ```
 
 This queues the follow-up on the existing coordination thread and provider session. It does not create another coordination tree. Reopen the task only when the overall job itself must resume.
+
+## Write for humans
+
+Reports and incidents are what people read in the Aisevak web app. Before any `reports create|revise|publish` or `incidents declare|update|resolve`, read the `report-writing` or `incident-writing` skill. Keep them short and simple: a reader should see what it is, what it affects, and what happens next within the first few lines, in whatever layout fits.
+
+Aisevak lints these writes for readability: title and description length, body length, table size, and raw IDs. `reports create` and `revise` return advice under `writingCheck`. `reports publish` and every incident write fail with code `WRITING_LINT` when a limit is broken, and nothing is saved or published. Fix the listed problems and retry; do not pad or split content to get around a limit.
 
 ## Handle Markdown safely
 

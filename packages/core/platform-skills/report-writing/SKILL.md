@@ -1,18 +1,33 @@
 ---
 name: report-writing
-description: Write short, plain-language Aisevak reports that make the current situation, impact, evidence, and next action obvious at a glance.
+description: Read before every `aisevak reports create`, `revise`, or `publish`. Write short, simple reports a busy person understands at a glance; publishing is linted for readability.
 ---
 
 # Report writing
 
-Write reports for a busy human, not for a log parser. The first two lines must answer: “What happened?” and “What should I care about?”
+A person skimming the Activity feed should understand a report from its title and first few lines. They need to know what it is about, what it affects, and whether anyone has to do anything. Pick whatever layout makes that easiest: a short paragraph, a few bullets, a small table, or headings for a longer report.
 
-- Start with a short, human title. Put exact time windows and identifiers in a small `Window` or `References` line, not in the title.
-- Begin with `**Bottom line:**` and state the outcome in one or two sentences. Say what is healthy, what is broken, and what is unknown.
-- Use at most three short sections: `Bottom line`, `Evidence`, and `Next`. Prefer three to five bullets total. Keep the report under 180 words unless the user explicitly needs detail.
-- Use concrete numbers only when they change the conclusion. Explain internal names the first time; keep product names, URLs, incident IDs, and error codes in backticks.
-- Separate facts from interpretation. Say “not observed” or “not checked” instead of implying that an unavailable source was healthy.
-- End with one clear next action, owner, or “no action needed”. Link related incidents with their stable references.
-- Do not repeat the title, restate the prompt, narrate every query, or include boilerplate sections with no useful content.
+## Keep it short and simple
 
-Before publishing, remove sentences that do not change the reader’s understanding or next decision.
+- Lead with the point. Write the conclusion first; supporting detail comes after it, if at all.
+- Make the title something a person would say out loud, and keep it to 80 characters or fewer. Put no timestamps or IDs in it.
+- Use the description (200 characters or fewer) for scope, such as "Three-hour production check, 23:46–02:46 UTC". Do not repeat the title.
+- Aim for under 250 words. More than 400 words is rejected.
+- Leave out how you got the answer: the queries you ran, the sources you checked, your methodology. That belongs in the thread or run log. Mention a gap only when it changes the conclusion.
+- Remove every sentence that does not change the reader's understanding or what they do next.
+
+## Use plain words
+
+- Write numbers as sentences. "Errors rose from 0 to 5" reads well; "33/5/9/0 vs 13/0/2/0" does not.
+- Use short times, such as "02:11 UTC" or "in the last 3 hours".
+- Refer to things by name or by a stable reference such as `INC-40` or `TASK-1033`. Never paste UUIDs, run IDs, or hashes.
+- Explain an internal name the first time it appears, for example "`llmProxy`, the function that calls Anthropic".
+- Say "not checked" or "unknown" when you don't know. Missing data never means healthy.
+
+## Living reports
+
+A report is not a database. When you revise a recurring report such as a backlog or a status board, lead with what changed and what is blocked. Show at most 25 table rows, covering the active, blocked, and recently changed items, and link the full list kept in the system that owns it.
+
+## Publishing is linted
+
+`create` and `revise` return readability advice under `writingCheck`. `publish` fails with `WRITING_LINT` if the title, description, length, tables, or raw IDs break the limits above. The error message lists each problem. Fix the writing and publish again; do not split or pad the report to get around a limit.
