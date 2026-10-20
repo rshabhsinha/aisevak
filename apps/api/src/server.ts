@@ -2413,6 +2413,18 @@ export const TASK_STATUS_JOINS = `LEFT JOIN LATERAL (
            tasks.status::text
          ) AS status
        ) board`;
+// Tasks the dispatcher is shown as work. Uses the board status, so finished
+// scheduled occurrences and tasks with an active dispatcher run are treated
+// like worker runs. An open task whose latest worker run succeeded is waiting
+// for its owner to complete it, not for the dispatcher (matches the runner's
+// heartbeat check).
+export const DISPATCHER_ACTIONABLE_TASKS = `(
+  board.status IN ('queued', 'running', 'cancel_requested', 'failed')
+  OR tasks.status IN ('needs_attention', 'blocked')
+  OR (tasks.status = 'open'
+      AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
+      AND COALESCE(latest.status::text, '') <> 'succeeded')
+)`;
 const TASK_CURSOR_COLUMN = `to_char(tasks.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS cursor_created_at`;
 const TASK_LIST_SELECT = `SELECT tasks.*,
               projects.name AS project_name,
@@ -5180,11 +5192,7 @@ async function getDispatcherContext(pool: DbPool): Promise<{
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      JOIN agents ON agents.id = tasks.agent_id
      ${TASK_STATUS_JOINS}
-     -- Same status the board shows, so finished scheduled occurrences and
-     -- tasks with an active dispatcher run are treated like worker runs.
-     WHERE board.status IN ('queued', 'running', 'cancel_requested', 'failed')
-        OR tasks.status IN ('needs_attention', 'blocked')
-        OR (tasks.status = 'open' AND board.status NOT IN ('queued', 'running', 'cancel_requested', 'succeeded'))
+     WHERE ${DISPATCHER_ACTIONABLE_TASKS}
      ORDER BY tasks.created_at ASC`
   );
   const agents = await pool.query(
