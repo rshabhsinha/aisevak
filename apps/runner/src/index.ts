@@ -862,7 +862,7 @@ export async function enqueueDueSchedule(pool: DbPool): Promise<void> {
           `SELECT tasks.id, tasks.number, tasks.title, tasks.agent_id, tasks.project_id,
                   tasks.coordination_thread_id, projects.local_path, projects.workspace_mode, projects.source
            FROM tasks LEFT JOIN projects ON projects.id = tasks.project_id
-           WHERE tasks.id = $1 FOR UPDATE`, [schedule.task_id]
+           WHERE tasks.id = $1 FOR UPDATE OF tasks`, [schedule.task_id]
         )
       : null;
     if (schedule.task_id && !target?.rows[0]) {

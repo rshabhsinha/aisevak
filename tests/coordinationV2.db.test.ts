@@ -11,6 +11,7 @@ import {
   threadStatus
 } from "../apps/api/src/coordination.js";
 import {
+  enqueueDueSchedule,
   finalizeWorkerRunState,
   noteTurnForRefresh,
   recoverExpiredRunLeases,
@@ -247,5 +248,36 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     const [after] = await q("SELECT provider_thread_id, turns_since_refresh, context_policy FROM agent_threads WHERE id = $1", [session.id]);
     expect(after).toMatchObject({ provider_thread_id: null, turns_since_refresh: 0, context_policy: { maxTurns: 2 } });
     expect(after.context_policy.lastRefreshAt).toBeTruthy();
+  });
+
+  it("ticks a task-targeted schedule into that task's thread without creating a task", async () => {
+    const { orch, task, thread } = await scenario();
+    // A project-less task: the target query left-joins projects.
+    const [schedule] = await q(
+      `INSERT INTO schedules (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, task_id, overlap_policy)
+       VALUES ('campaign tick', 'Check the campaign', $1, 'interval', now() - interval '1 minute', 1800, $2, 'skip') RETURNING id`,
+      [orch.id, task.id]
+    );
+    // Other due schedules may exist in a shared test database; tick until ours ran.
+    const tasksBefore = Number((await q("SELECT count(*)::int AS n FROM tasks"))[0].n);
+    for (let i = 0; i < 20; i += 1) {
+      await enqueueDueSchedule(pool);
+      if ((await q("SELECT 1 FROM schedule_runs WHERE schedule_id = $1", [schedule.id])).length) break;
+    }
+    const ticks = await q(
+      `SELECT md.agent_thread_id, md.seq, d.task_id FROM thread_messages tm
+       JOIN message_deliveries md ON md.message_id = tm.id
+       JOIN dispatcher_runs d ON d.message_delivery_id = md.id
+       WHERE tm.thread_id = $1 AND tm.message_type = 'schedule'`,
+      [thread.id]
+    );
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0].task_id).toBe(task.id);
+    expect(ticks[0].agent_thread_id).toBeTruthy();
+    expect(Number(ticks[0].seq)).toBeGreaterThan(0);
+    const created = await q("SELECT count(*)::int AS n FROM tasks WHERE work_scope = $1", [`schedule:${schedule.id}`]);
+    expect(created[0].n).toBe(0);
+    expect(Number((await q("SELECT count(*)::int AS n FROM tasks"))[0].n)).toBe(tasksBefore);
+    await q("DELETE FROM schedules WHERE id = $1", [schedule.id]);
   });
 });
