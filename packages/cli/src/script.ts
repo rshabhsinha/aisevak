@@ -105,6 +105,7 @@ async function threads() {
   if (command === "list") return print(await request("/api/agent-tools/v1/threads" + listQuery()));
   const ref = command === "create" ? null : required(args[2], "Thread reference");
   if (command === "show") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref)));
+  if (command === "status") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/status"));
   if (command === "messages") return print(await request("/api/agent-tools/v1/threads/" + encodeURIComponent(ref) + "/messages" + listQuery()));
   if (command === "create") {
     return print(await request("/api/agent-tools/v1/threads", { method: "POST", body: compact({
@@ -128,7 +129,7 @@ async function threads() {
       body: await markdown(isComplete ? "--summary" : "--reason", 3), idempotencyKey: option("--idempotency-key")
     } }));
   }
-  fail("Usage: aisevak threads list|show|messages|create|send|complete|block", "USAGE");
+  fail("Usage: aisevak threads list|show|status|messages|create|send|complete|block", "USAGE");
 }
 
 async function tasks() {
@@ -268,7 +269,8 @@ function help() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT",
   "aisevak skills path | skills install DIRECTORY",
-  "aisevak threads list | show | messages | create | send | complete | block",
+  "aisevak threads list | show | status | messages | create | send | complete | block",
+  "Thread references accept THREAD-n, TASK-n, or a thread id shown in the UI.",
   "aisevak tasks list | show | create --work-key KEY | update | assign | complete | reopen",
   "aisevak assignments list TASK | show ASSIGNMENT | create TASK --key KEY --to AGENT --instructions-stdin | send | retry | complete | block",
   "aisevak schedules list | show | create | pause | resume | delete",

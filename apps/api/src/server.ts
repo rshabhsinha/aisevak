@@ -84,6 +84,7 @@ import { forgetAccountLimits, loadAccountLimits } from "./usageLimits.js";
 import {
   cancelStaleQueuedAgentThreadRuns,
   registerCoordinationRoutes,
+  startDeliveryFailureNotices,
   requireAgent,
   requireCapability,
   requireTaskOwner,
@@ -5319,6 +5320,7 @@ async function main(): Promise<void> {
   const pool = createPool();
   await runMigrations(pool);
   const app = await buildServer(pool);
+  startDeliveryFailureNotices(pool, env.managedRoot);
   app.log.info(
     { codexBinary: env.codexBinary, cursorBinary: env.cursorBinary, openCodeBinary: env.openCodeBinary },
     "Harness binaries configured"

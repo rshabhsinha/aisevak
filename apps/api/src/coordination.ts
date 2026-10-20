@@ -378,7 +378,7 @@ export async function registerCoordinationRoutes(
     const recipient = await getAgent(pool, body.to);
     if (!recipient.enabled) badRequest(`Agent ${recipient.name} is disabled`);
     let originThread = body.originThread
-      ? await resolveResourceId(pool, "coordination_threads", "THREAD", body.originThread)
+      ? await resolveThreadRef(pool, body.originThread)
       : context.coordinationThreadId;
     const originMessage = body.originMessage
       ? await resolveResourceId(pool, "thread_messages", "MESSAGE", body.originMessage)
@@ -507,14 +507,14 @@ export async function registerCoordinationRoutes(
   app.get("/api/agent-tools/v1/threads/:ref", async (request) => {
     const context = await requireAgent(pool, request);
     requireCapability(context, "threads:read");
-    const id = await resolveResourceId(pool, "coordination_threads", "THREAD", refParams.parse(request.params).ref);
+    const id = await resolveThreadRef(pool, refParams.parse(request.params).ref);
     return { thread: await showThread(pool, id) };
   });
 
   app.get("/api/agent-tools/v1/threads/:ref/messages", async (request) => {
     const context = await requireAgent(pool, request);
     requireCapability(context, "threads:read");
-    const id = await resolveResourceId(pool, "coordination_threads", "THREAD", refParams.parse(request.params).ref);
+    const id = await resolveThreadRef(pool, refParams.parse(request.params).ref);
     const query = pageSchema.parse(request.query);
     const cursor = parseCursor(query.cursor);
     const limit = pageLimit(query.limit, 20, 100);
@@ -523,7 +523,10 @@ export async function registerCoordinationRoutes(
               sender.name AS sender_agent_name,
               recipient.name AS recipient_agent_name,
               message_deliveries.status AS delivery_status,
-              message_deliveries.attempt_count AS delivery_attempt_count
+              message_deliveries.attempt_count AS delivery_attempt_count,
+              message_deliveries.presented_at AS delivery_presented_at,
+              message_deliveries.error AS delivery_error,
+              message_deliveries.updated_at AS delivery_updated_at
        FROM thread_messages
        LEFT JOIN agents sender ON sender.id = thread_messages.sender_agent_id
        LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
@@ -547,7 +550,7 @@ export async function registerCoordinationRoutes(
   app.post("/api/agent-tools/v1/threads/:ref/messages", async (request) => {
     const context = await requireAgent(pool, request);
     requireCapability(context, "threads:send");
-    const threadId = await resolveResourceId(pool, "coordination_threads", "THREAD", refParams.parse(request.params).ref);
+    const threadId = await resolveThreadRef(pool, refParams.parse(request.params).ref);
     const body = messageSchema.parse(request.body);
     const output = await withTransaction(pool, async (client) => {
       const thread = await lockThread(client, threadId);
@@ -581,11 +584,18 @@ export async function registerCoordinationRoutes(
     return { message: await showMessage(pool, output.messageId), duplicate: output.duplicate };
   });
 
+  app.get("/api/agent-tools/v1/threads/:ref/status", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:read");
+    const id = await resolveThreadRef(pool, refParams.parse(request.params).ref);
+    return threadStatus(pool, id);
+  });
+
   for (const action of ["complete", "block"] as const) {
     app.post(`/api/agent-tools/v1/threads/:ref/${action}`, async (request) => {
       const context = await requireAgent(pool, request);
       requireCapability(context, "threads:complete");
-      const threadId = await resolveResourceId(pool, "coordination_threads", "THREAD", refParams.parse(request.params).ref);
+      const threadId = await resolveThreadRef(pool, refParams.parse(request.params).ref);
       const body = finalMessageSchema.parse(request.body);
       const messageId = await finalizeThread(
         pool,
@@ -1242,7 +1252,7 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
   app.post("/api/agent-tools/v1/reports", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const body = reportCreateSchema.parse(request.body);
-    const threadId = body.thread ? await resolveResourceId(pool, "coordination_threads", "THREAD", body.thread) : context.coordinationThreadId;
+    const threadId = body.thread ? await resolveThreadRef(pool, body.thread) : context.coordinationThreadId;
     const id = await withTransaction(pool, async (client) => {
       const report = await client.query<{ id: string }>(
         `INSERT INTO reports (title, description, project_id, thread_id, author_agent_id)
@@ -1549,10 +1559,11 @@ export async function cancelPendingAssignmentDelivery(
   // the task owner stops a running turn that still holds the active delivery;
   // after a block the active delivery is already cleared, so the retry's new
   // delivery reaches the assignee's still-running turn as a mid-turn input
-  // and the runner treats the old delivery as superseded.
+  // and the runner treats the old delivery as superseded. These are not
+  // failures from the sender's side, so they are marked as needing no notice.
   await client.query(
     `UPDATE message_deliveries
-     SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+     SET status = 'failed', completed_at = now(), error = $2, failure_notified_at = now(), updated_at = now()
      WHERE id = $1 AND status IN ('queued', 'retrying')`,
     [deliveryId, reason]
   );
@@ -1850,6 +1861,46 @@ async function agentForTask(queryable: Queryable, taskId: string | null): Promis
   return result.rows[0] ?? getOrchestrator(queryable);
 }
 
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// Agents are handed ids from several places: THREAD-n from the CLI, task refs
+// from the envelope, and agent thread (provider session) ids from the UI and
+// the job envelope. All of them name a coordination thread, so every
+// agent-facing thread route resolves through here instead of 404ing on an id
+// from the other namespace.
+export async function resolveThreadRef(queryable: Queryable, ref: string): Promise<string> {
+  const trimmed = ref.trim();
+  const number = trimmed.match(/^(?:THREAD-)?(\d+)$/i);
+  if (number) {
+    const result = await queryable.query<{ id: string }>("SELECT id FROM coordination_threads WHERE number = $1 LIMIT 1", [Number(number[1])]);
+    return (result.rows[0] ?? notFound(`THREAD-${number[1]}`)).id;
+  }
+  const task = trimmed.match(/^TASK-(\d+)$/i);
+  if (task) {
+    const result = await queryable.query<{ coordination_thread_id: string | null }>(
+      "SELECT coordination_thread_id FROM tasks WHERE number = $1 LIMIT 1", [Number(task[1])]
+    );
+    const row = result.rows[0] ?? notFound(`TASK-${task[1]}`);
+    return row.coordination_thread_id ?? notFound(`Coordination thread for TASK-${task[1]}`);
+  }
+  if (!UUID_PATTERN.test(trimmed)) badRequest(`Unknown thread reference ${trimmed}; use THREAD-n, TASK-n, or a thread id`);
+  const direct = await queryable.query<{ id: string }>("SELECT id FROM coordination_threads WHERE id = $1::uuid LIMIT 1", [trimmed]);
+  if (direct.rows[0]) return direct.rows[0].id;
+  const session = await queryable.query<{ coordination_thread_id: string | null; task_coordination_thread_id: string | null }>(
+    `SELECT agent_threads.coordination_thread_id, tasks.coordination_thread_id AS task_coordination_thread_id
+     FROM agent_threads LEFT JOIN tasks ON tasks.id = agent_threads.task_id
+     WHERE agent_threads.id = $1::uuid LIMIT 1`,
+    [trimmed]
+  );
+  const row = session.rows[0];
+  if (!row) notFound(`Thread ${trimmed}`);
+  const resolved = row.coordination_thread_id ?? row.task_coordination_thread_id;
+  if (!resolved) {
+    throw httpError(404, `Agent thread ${trimmed} is a direct chat with no coordination thread; message its agent on a task or THREAD-n instead`);
+  }
+  return resolved;
+}
+
 async function resolveResourceId(queryable: Queryable, table: string, prefix: string, ref: string): Promise<string> {
   const allowed = new Set(["coordination_threads", "tasks", "thread_messages", "reports", "incidents", "schedules", "task_assignments"]);
   if (!allowed.has(table)) throw new Error("Unsupported resource table");
@@ -1878,7 +1929,9 @@ async function showThread(queryable: Queryable, id: string, includeContent = fal
 async function showMessage(queryable: Queryable, id: string, includeContent = false): Promise<any> {
   const result = await queryable.query(
     `SELECT thread_messages.*, sender.name AS sender_agent_name, recipient.name AS recipient_agent_name,
-            message_deliveries.status AS delivery_status, message_deliveries.attempt_count AS delivery_attempt_count
+            message_deliveries.status AS delivery_status, message_deliveries.attempt_count AS delivery_attempt_count,
+            message_deliveries.presented_at AS delivery_presented_at, message_deliveries.error AS delivery_error,
+            message_deliveries.updated_at AS delivery_updated_at
      FROM thread_messages LEFT JOIN agents sender ON sender.id = thread_messages.sender_agent_id
      LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
      LEFT JOIN message_deliveries ON message_deliveries.message_id = thread_messages.id
@@ -1996,7 +2049,7 @@ async function existingIdempotentMessage(queryable: Queryable, senderAgentId: st
   return result.rows[0] ?? null;
 }
 async function insertMessage(client: PoolClient, input: {
-  threadId: string; senderAgentId: string; recipientAgentId: string | null; body: string; type: string;
+  threadId: string; senderAgentId: string | null; recipientAgentId: string | null; body: string; type: string;
   parentMessageId?: string | null; idempotencyKey?: string;
 }): Promise<{ id: string }> {
   const result = await client.query<{ id: string }>(
@@ -2657,6 +2710,14 @@ export function coordinationPrompt(thread: any, recipient: any, message: any, hi
       `If the triggered agent needs to do more work, explicitly send a new message on the same thread with: aisevak threads send THREAD-${thread.number} --body-stdin. That reactivates the thread and delivers the follow-up to the triggered agent.`
     ].join("\n");
   }
+  if (message.message_type === DELIVERY_FAILED_TYPE) {
+    return [
+      ...context,
+      "This is a platform notice: a message you sent was not processed by its recipient. It is not new work and not a reply.",
+      `Decide whether the original request still matters. If it does, resend it (aisevak threads send THREAD-${thread.number} --to AGENT --body-stdin) or retry the assignment named above; check aisevak threads status THREAD-${thread.number} first.`,
+      `Do not complete or block THREAD-${thread.number} or its task because of this notice alone.`
+    ].join("\n");
+  }
   if (envelope?.assignmentId && envelope.assignmentRef) {
     return [
       ...context,
@@ -2878,17 +2939,18 @@ export function assertThreadCanFinalize(
 }
 
 async function showResource(pool: DbPool, context: AgentContext, ref: string): Promise<any> {
-  if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); return showThread(pool, await resolveResourceId(pool, "coordination_threads", "THREAD", ref)); }
+  if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); return showThread(pool, await resolveThreadRef(pool, ref)); }
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); return showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref)); }
   if (/^ASSIGNMENT-/i.test(ref)) { requireCapability(context, "assignments:read"); return showAssignment(pool, await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", ref)); }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); return showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref)); }
   if (/^INC-/i.test(ref)) { requireCapability(context, "incidents:read"); return showIncident(pool, await resolveResourceId(pool, "incidents", "INC", ref)); }
   if (/^SCHEDULE-/i.test(ref)) { requireCapability(context, "schedules:read"); return showSchedule(pool, await resolveResourceId(pool, "schedules", "SCHEDULE", ref)); }
   if (/^AGENT-/i.test(ref)) { requireCapability(context, "agents:read"); return getAgent(pool, ref); }
-  badRequest("Use a typed resource reference such as TASK-12, THREAD-8, or SCHEDULE-3");
+  if (/^MESSAGE-/i.test(ref)) { requireCapability(context, "threads:read"); return showMessage(pool, await resolveResourceId(pool, "thread_messages", "MESSAGE", ref)); }
+  badRequest("Use a typed resource reference such as TASK-12, THREAD-8, MESSAGE-40, or SCHEDULE-3");
 }
 async function contentResource(pool: DbPool, context: AgentContext, ref: string): Promise<{ ref: string; title: string; content: string; revision: string }> {
-  if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); const row = await showThread(pool, await resolveResourceId(pool, "coordination_threads", "THREAD", ref), true); return { ref: row.key, title: row.title, content: row.purpose, revision: iso(row.updated_at) }; }
+  if (/^THREAD-/i.test(ref)) { requireCapability(context, "threads:read"); const row = await showThread(pool, await resolveThreadRef(pool, ref), true); return { ref: row.key, title: row.title, content: row.purpose, revision: iso(row.updated_at) }; }
   if (/^TASK-/i.test(ref)) { requireCapability(context, "tasks:read"); const row = await showTask(pool, await resolveResourceId(pool, "tasks", "TASK", ref), true); return { ref: row.key, title: row.title, content: row.body, revision: iso(row.updated_at) }; }
   if (/^ASSIGNMENT-/i.test(ref)) { requireCapability(context, "assignments:read"); const row = await showAssignment(pool, await resolveResourceId(pool, "task_assignments", "ASSIGNMENT", ref), true); return { ref: row.key, title: `${row.task_title}: ${row.assignment_key}`, content: row.instructions, revision: iso(row.updated_at) }; }
   if (/^REPORT-/i.test(ref)) { requireCapability(context, "reports:read"); const row = await showReport(pool, await resolveResourceId(pool, "reports", "REPORT", ref), true); return { ref: row.key, title: row.title, content: row.markdown, revision: String(row.current_revision) }; }
@@ -2912,7 +2974,46 @@ function assignmentResource(row: any, includeContent = false) {
 function reportResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `REPORT-${row.number}` }); }
 function incidentResource(row: any, includeContent = false) { const { markdown, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { markdown } : {}), key: `INC-${row.number}` }); }
 function scheduleResource(row: any, includeContent = false) { const { prompt, ...rest } = row; return resourcePreview({ ...rest, ...(includeContent ? { prompt } : {}), key: `SCHEDULE-${row.number}` }); }
-function messageResource(row: any, includeContent = false) { const { body, ...rest } = row; return { ...rest, ...(includeContent ? { body } : {}), key: `MESSAGE-${row.number}`, bodyPreview: previewText(body), bodyTotalBytes: Buffer.byteLength(body ?? ""), bodyTruncated: Buffer.byteLength(body ?? "") > 1000 }; }
+function messageResource(row: any, includeContent = false) {
+  const { body, delivery_presented_at, delivery_error, delivery_updated_at, ...rest } = row;
+  return {
+    ...rest,
+    ...(includeContent ? { body } : {}),
+    key: `MESSAGE-${row.number}`,
+    delivery: deliveryState({ status: row.delivery_status, attemptCount: row.delivery_attempt_count, presentedAt: delivery_presented_at, error: delivery_error, updatedAt: delivery_updated_at }),
+    bodyPreview: previewText(body),
+    bodyTotalBytes: Buffer.byteLength(body ?? ""),
+    bodyTruncated: Buffer.byteLength(body ?? "") > 1000
+  };
+}
+
+export type SenderDeliveryState = "none" | "queued" | "delivering" | "presented" | "delivered" | "failed";
+
+// What the sender can rely on, in words that do not leak runner internals:
+// queued = waiting for the recipient's next turn; delivering = a turn is
+// picking it up; presented = the recipient's harness has it; delivered = the
+// turn that carried it ended successfully; failed = it will not be processed
+// (the sender also receives a delivery.failed notice).
+export function deliveryState(input: {
+  status: string | null | undefined; attemptCount?: number | null; presentedAt?: unknown; error?: string | null; updatedAt?: unknown;
+}): { state: SenderDeliveryState; attempts: number; error: string | null; updatedAt: string | null } {
+  const status = input.status ?? null;
+  const state: SenderDeliveryState = status === null
+    ? "none"
+    : status === "queued" || status === "retrying"
+      ? "queued"
+      : status === "running"
+        ? input.presentedAt ? "presented" : "delivering"
+        : status === "completed"
+          ? "delivered"
+          : "failed";
+  return {
+    state,
+    attempts: Number(input.attemptCount ?? 0),
+    error: state === "failed" || state === "queued" ? input.error ?? null : null,
+    updatedAt: input.updatedAt ? iso(input.updatedAt) : null
+  };
+}
 function resourcePreview(row: any) {
   const { content_preview, content_total_bytes, ...rest } = row;
   const total = Number(content_total_bytes ?? 0);
@@ -2941,6 +3042,250 @@ function modelOptionsFor(
       })
     : [];
   return options.length ? options : defaultHarnessModelOptions(model);
+}
+
+export type ParticipantState = "idle" | "queued" | "running" | "waiting" | "blocked";
+
+export interface ParticipantStatusInput {
+  activeTurn: boolean;
+  queuedTurn: boolean;
+  pendingMessages: number;
+  waitingOn: string[];
+  blockedReason: string | null;
+}
+
+// Precedence: work in hand beats work waiting, which beats a stuck or
+// waiting agent; an agent with nothing pending and nothing outstanding is idle.
+export function participantState(input: ParticipantStatusInput): ParticipantState {
+  if (input.activeTurn) return "running";
+  if (input.queuedTurn || input.pendingMessages > 0) return "queued";
+  if (input.blockedReason) return "blocked";
+  if (input.waitingOn.length > 0) return "waiting";
+  return "idle";
+}
+
+export async function threadStatus(queryable: Queryable, threadId: string): Promise<any> {
+  const thread = await showThread(queryable, threadId);
+  const task = thread.task_id
+    ? (await queryable.query<{ id: string; number: number; status: string; agent_id: string }>(
+        "SELECT id, number, status, agent_id FROM tasks WHERE id = $1", [thread.task_id]
+      )).rows[0] ?? null
+    : null;
+  const participants = await queryable.query<{ agent_id: string; agent_name: string; role: string }>(
+    `SELECT agents.id AS agent_id, agents.name AS agent_name, members.role
+     FROM (
+       SELECT agent_id, role FROM thread_participants WHERE thread_id = $1
+       UNION ALL SELECT primary_agent_id, 'primary' FROM coordination_threads WHERE id = $1 AND primary_agent_id IS NOT NULL
+       UNION ALL SELECT callback_agent_id, 'callback' FROM coordination_threads WHERE id = $1 AND callback_agent_id IS NOT NULL
+       UNION ALL SELECT tasks.agent_id, 'owner' FROM coordination_threads JOIN tasks ON tasks.id = coordination_threads.task_id WHERE coordination_threads.id = $1
+     ) members
+     JOIN agents ON agents.id = members.agent_id
+     ORDER BY agents.name ASC`,
+    [threadId]
+  );
+  const byAgent = new Map<string, { agent_id: string; agent_name: string; roles: string[] }>();
+  for (const row of participants.rows) {
+    const entry = byAgent.get(row.agent_id) ?? { agent_id: row.agent_id, agent_name: row.agent_name, roles: [] };
+    if (!entry.roles.includes(row.role)) entry.roles.push(row.role);
+    byAgent.set(row.agent_id, entry);
+  }
+  const agentIds = [...byAgent.keys()];
+  if (agentIds.length === 0) return { thread: threadStatusHeader(thread, task), participants: [] };
+
+  const sessions = await queryable.query<{
+    agent_id: string; agent_thread_id: string; last_activity_at: unknown; archived_at: unknown;
+    active_kind: string | null; active_id: string | null; active_started_at: unknown; queued_turns: number;
+  }>(
+    `SELECT agent_threads.agent_id, agent_threads.id AS agent_thread_id, agent_threads.last_activity_at, agent_threads.archived_at,
+            active.kind AS active_kind, active.id AS active_id, active.started_at AS active_started_at,
+            (SELECT count(*)::int FROM (
+               SELECT 1 FROM task_runs WHERE task_runs.agent_thread_id = agent_threads.id AND task_runs.status = 'queued'
+                 AND task_runs.agent_thread_generation = agent_threads.ownership_generation
+               UNION ALL
+               SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.agent_thread_id = agent_threads.id AND dispatcher_runs.status = 'queued'
+                 AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+             ) queued) AS queued_turns
+     FROM agent_threads
+     LEFT JOIN LATERAL (
+       SELECT 'worker' AS kind, task_runs.id, task_runs.started_at FROM task_runs
+       WHERE task_runs.agent_thread_id = agent_threads.id AND task_runs.status IN ('running', 'cancel_requested')
+       UNION ALL
+       SELECT 'coordination', dispatcher_runs.id, dispatcher_runs.started_at FROM dispatcher_runs
+       WHERE dispatcher_runs.agent_thread_id = agent_threads.id AND dispatcher_runs.status IN ('running', 'cancel_requested')
+       ORDER BY started_at DESC NULLS LAST
+       LIMIT 1
+     ) active ON true
+     WHERE agent_threads.agent_id = ANY($2::uuid[])
+       AND (agent_threads.coordination_thread_id = $1 OR ($3::uuid IS NOT NULL AND agent_threads.task_id = $3))`,
+    [threadId, agentIds, task?.id ?? null]
+  );
+  const pending = await queryable.query<{ recipient_agent_id: string; pending: number }>(
+    `SELECT message_deliveries.recipient_agent_id, count(*)::int AS pending
+     FROM message_deliveries JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+     WHERE thread_messages.thread_id = $1 AND message_deliveries.status IN ('queued', 'retrying', 'running')
+     GROUP BY message_deliveries.recipient_agent_id`,
+    [threadId]
+  );
+  const failures = await queryable.query<{ recipient_agent_id: string; number: number; error: string | null; completed_at: unknown }>(
+    `SELECT DISTINCT ON (message_deliveries.recipient_agent_id)
+            message_deliveries.recipient_agent_id, thread_messages.number, message_deliveries.error, message_deliveries.completed_at
+     FROM message_deliveries JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+     WHERE thread_messages.thread_id = $1 AND message_deliveries.status = 'failed'
+     ORDER BY message_deliveries.recipient_agent_id, message_deliveries.completed_at DESC NULLS LAST`,
+    [threadId]
+  );
+  const assignments = task
+    ? (await queryable.query<{ number: number; assigned_agent_id: string; created_by_agent_id: string | null; status: string }>(
+        "SELECT number, assigned_agent_id, created_by_agent_id, status FROM task_assignments WHERE task_id = $1 AND status IN ('queued', 'running', 'blocked')",
+        [task.id]
+      )).rows
+    : [];
+
+  const items = agentIds.map((agentId) => {
+    const member = byAgent.get(agentId)!;
+    const session = sessions.rows.find((row) => row.agent_id === agentId && row.active_id)
+      ?? sessions.rows.find((row) => row.agent_id === agentId)
+      ?? null;
+    const queuedTurns = sessions.rows.filter((row) => row.agent_id === agentId).reduce((sum, row) => sum + Number(row.queued_turns ?? 0), 0);
+    const pendingMessages = Number(pending.rows.find((row) => row.recipient_agent_id === agentId)?.pending ?? 0);
+    const isOwner = task?.agent_id === agentId;
+    const waitingOn = [
+      ...assignments
+        .filter((row) => ["queued", "running"].includes(row.status) && (isOwner || row.created_by_agent_id === agentId) && row.assigned_agent_id !== agentId)
+        .map((row) => `ASSIGNMENT-${row.number}`),
+      ...(!task && thread.status === "active" && thread.callback_agent_id === agentId && thread.primary_agent_id && thread.primary_agent_id !== agentId
+        ? [`THREAD-${thread.number}`]
+        : [])
+    ];
+    const blockedAssignment = assignments.find((row) => row.status === "blocked" && row.assigned_agent_id === agentId);
+    const blockedReason = isOwner && task && ["blocked", "needs_attention"].includes(task.status)
+      ? `TASK-${task.number} is ${task.status}`
+      : blockedAssignment
+        ? `ASSIGNMENT-${blockedAssignment.number} is blocked`
+        : null;
+    const failure = failures.rows.find((row) => row.recipient_agent_id === agentId);
+    return {
+      agent: { id: agentId, name: member.agent_name, key: `AGENT-${member.agent_name}` },
+      roles: member.roles,
+      state: participantState({ activeTurn: Boolean(session?.active_id), queuedTurn: queuedTurns > 0, pendingMessages, waitingOn, blockedReason }),
+      agentThreadId: session?.agent_thread_id ?? null,
+      archived: Boolean(session?.archived_at),
+      currentTurn: session?.active_id ? { kind: session.active_kind, id: session.active_id, startedAt: session.active_started_at ? iso(session.active_started_at) : null } : null,
+      pendingMessages,
+      queuedTurns,
+      waitingOn,
+      blockedReason,
+      lastActivityAt: session?.last_activity_at ? iso(session.last_activity_at) : null,
+      lastFailedDelivery: failure
+        ? { message: `MESSAGE-${failure.number}`, error: failure.error, at: failure.completed_at ? iso(failure.completed_at) : null }
+        : null
+    };
+  });
+  return { thread: threadStatusHeader(thread, task), participants: items };
+}
+
+function threadStatusHeader(thread: any, task: { number: number; status: string } | null) {
+  return { key: thread.key, id: thread.id, title: thread.title, status: thread.status, task: task ? { key: `TASK-${task.number}`, status: task.status } : null };
+}
+
+export const DELIVERY_FAILED_TYPE = "delivery.failed";
+
+interface FailedDeliveryRow {
+  delivery_id: string;
+  error: string | null;
+  attempt_count: number;
+  assignment_id: string | null;
+  assignment_number: number | null;
+  assignment_status: string | null;
+  message_id: string;
+  message_number: number;
+  message_type: string;
+  thread_id: string;
+  thread_number: number;
+  sender_agent_id: string | null;
+  recipient_agent_id: string;
+  recipient_name: string;
+}
+
+export function deliveryFailedNotice(row: FailedDeliveryRow): string {
+  const lines = [
+    `Your message MESSAGE-${row.message_number} [${row.message_type}] on THREAD-${row.thread_number} to ${row.recipient_name} was not delivered after ${row.attempt_count} attempt${row.attempt_count === 1 ? "" : "s"}.`,
+    `Reason: ${row.error?.trim() || "unknown"}`
+  ];
+  if (row.assignment_number) {
+    lines.push(`ASSIGNMENT-${row.assignment_number} is now ${row.assignment_status ?? "unknown"}.`);
+    lines.push(`To try again: aisevak assignments retry ASSIGNMENT-${row.assignment_number}`);
+  } else {
+    lines.push(`To try again: aisevak threads send THREAD-${row.thread_number} --to AGENT-${row.recipient_name} --body-stdin`);
+  }
+  lines.push(`Check the recipient first with: aisevak threads status THREAD-${row.thread_number}`);
+  return lines.join("\n");
+}
+
+// Tells senders about deliveries that failed terminally. Runs in the API
+// process (it needs queueDelivery). Every claimed row is marked notified even
+// when the notice cannot be queued, so one bad row never wedges the sweep, and
+// a notice's own failure never produces another notice.
+export async function notifyFailedDeliveries(pool: DbPool, managedRoot: string, limit = 20): Promise<number> {
+  return withTransaction(pool, async (client) => {
+    const claimed = await client.query<FailedDeliveryRow>(
+      `SELECT delivery.id AS delivery_id, delivery.error, delivery.attempt_count, delivery.assignment_id,
+              task_assignments.number AS assignment_number, task_assignments.status AS assignment_status,
+              thread_messages.id AS message_id, thread_messages.number AS message_number, thread_messages.message_type,
+              thread_messages.thread_id, coordination_threads.number AS thread_number,
+              thread_messages.sender_agent_id, delivery.recipient_agent_id, recipient.name AS recipient_name
+       FROM message_deliveries delivery
+       JOIN thread_messages ON thread_messages.id = delivery.message_id
+       JOIN coordination_threads ON coordination_threads.id = thread_messages.thread_id
+       JOIN agents recipient ON recipient.id = delivery.recipient_agent_id
+       LEFT JOIN task_assignments ON task_assignments.id = delivery.assignment_id
+       WHERE delivery.status = 'failed' AND delivery.failure_notified_at IS NULL
+       ORDER BY delivery.completed_at ASC NULLS FIRST, delivery.id ASC
+       LIMIT $1
+       FOR UPDATE OF delivery SKIP LOCKED`,
+      [limit]
+    );
+    let sent = 0;
+    for (const row of claimed.rows) {
+      const notify = row.sender_agent_id !== null
+        && row.sender_agent_id !== row.recipient_agent_id
+        && row.message_type !== DELIVERY_FAILED_TYPE;
+      if (notify) {
+        await client.query("SAVEPOINT delivery_failure_notice");
+        try {
+          const notice = await insertMessage(client, {
+            threadId: row.thread_id,
+            senderAgentId: null,
+            recipientAgentId: row.sender_agent_id,
+            body: deliveryFailedNotice(row),
+            type: DELIVERY_FAILED_TYPE,
+            parentMessageId: row.message_id
+          });
+          await queueDelivery(client, managedRoot, row.thread_id, notice.id, row.sender_agent_id!);
+          await client.query("RELEASE SAVEPOINT delivery_failure_notice");
+          sent += 1;
+        } catch (error) {
+          await client.query("ROLLBACK TO SAVEPOINT delivery_failure_notice");
+          console.error(`Could not notify the sender of failed delivery ${row.delivery_id}`, error);
+        }
+      }
+      await client.query("UPDATE message_deliveries SET failure_notified_at = now() WHERE id = $1", [row.delivery_id]);
+    }
+    return sent;
+  });
+}
+
+export function startDeliveryFailureNotices(pool: DbPool, managedRoot: string, intervalMs = 5000): () => void {
+  let busy = false;
+  const timer = setInterval(() => {
+    if (busy) return;
+    busy = true;
+    notifyFailedDeliveries(pool, managedRoot)
+      .catch((error) => console.error("Delivery failure notices failed", error))
+      .finally(() => { busy = false; });
+  }, intervalMs);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 
 function unauthorized(message: string): never { throw httpError(401, message); }

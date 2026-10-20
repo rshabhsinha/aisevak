@@ -1297,6 +1297,14 @@ ALTER TABLE agents ADD COLUMN IF NOT EXISTS provider_instance_id text NOT NULL D
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS launch_attempted_at timestamptz DEFAULT now();
 ALTER TABLE dispatcher_runs ALTER COLUMN launch_attempted_at DROP DEFAULT;
 
+-- Coordination v2 phase 1: a terminal delivery failure the sender has not been
+-- told about yet has failure_notified_at NULL. Rows that exist when the column
+-- is added get now() so history does not produce notices; new rows start NULL.
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS failure_notified_at timestamptz DEFAULT now();
+ALTER TABLE message_deliveries ALTER COLUMN failure_notified_at DROP DEFAULT;
+CREATE INDEX IF NOT EXISTS message_deliveries_failure_notice_idx
+ON message_deliveries(completed_at) WHERE status = 'failed' AND failure_notified_at IS NULL;
+
 -- The task board resolves each task's column from its latest runs.
 CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx
