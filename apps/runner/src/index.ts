@@ -616,6 +616,16 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
   }
 }
 
+// systemd stops the whole service process group, so a runner stop or restart
+// (every deploy) also kills the harnesses of in-flight turns. A turn that ends
+// unsuccessfully while this runner is stopping was most likely killed by that
+// stop: it is left 'running' under this runner's lease instead of finalized,
+// and the next boot of this runner recovers it and redelivers its message
+// with an "interrupted" note. Turns that genuinely succeeded still finalize.
+export function deferFinalizationForShutdown(stopping: boolean, finalStatus: "succeeded" | "failed" | "cancelled"): boolean {
+  return stopping && finalStatus !== "succeeded" && !legacyCoordination();
+}
+
 export async function recoverExpiredRunLeases(pool: DbPool, scope: RecoveryScope): Promise<void> {
   await recoverInterruptedCoordinationRuns(pool, scope);
   await recoverInterruptedDispatcherRuns(pool, scope);
@@ -1960,6 +1970,10 @@ export async function processOneDispatcherRun(
     finalStatus = "failed";
   } finally {
     releaseActiveRun();
+    if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
+      console.warn(`Leaving turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
+      return true;
+    }
     // Fenced on ownership: if this runner's lease lapsed and another runner
     // recovered the turn (and possibly redelivered it), the recovery already
     // settled its delivery and inputs, and settling them again here would
@@ -2270,6 +2284,10 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     finalStatus = "failed";
   } finally {
     releaseActiveRun();
+    if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
+      console.warn(`Leaving worker turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
+      return true;
+    }
     const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,
       taskId: job.task_id,
