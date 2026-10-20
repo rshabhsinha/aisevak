@@ -1385,7 +1385,12 @@ async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
     [
       env.managedRoot,
       codexHome,
-      dispatcher.threadId ?? null,
+      // Every heartbeat starts a fresh provider conversation: its prompt
+      // carries the whole current context (tasks, agents, projects). Resuming
+      // one conversation forever grew a single Codex session to 5.4 GB in
+      // production; loading it took every heartbeat process to ~7 GB and
+      // OOM-killed or hung the host.
+      null,
       dispatcher.model,
       heartbeatPrompt,
       serializeCodexSkillSnapshots(skillsSnapshot)
