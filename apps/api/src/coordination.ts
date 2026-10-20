@@ -33,6 +33,7 @@ import {
   taskWorkScope,
   type OrchestrationPolicy
 } from "./jobSafety.js";
+import { adviseWritingCheck, assertWritingCheck, lintIncident, lintReport } from "./writingLint.js";
 
 const DEFAULT_WORKER_CAPABILITIES = [
   "agents:read",
@@ -1251,7 +1252,7 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
       await client.query("INSERT INTO report_versions (report_id, revision, markdown, created_by_agent_id) VALUES ($1, 1, $2, $3)", [report.rows[0]!.id, body.markdown, context.agentId]);
       return report.rows[0]!.id;
     });
-    return { report: await showReport(pool, id) };
+    return { report: await showReport(pool, id), writingCheck: adviseWritingCheck(lintReport(body)) };
   });
   app.get("/api/agent-tools/v1/reports/:ref", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:read");
@@ -1260,19 +1261,35 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
   app.post("/api/agent-tools/v1/reports/:ref/revisions", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const id = await resolveResourceId(pool, "reports", "REPORT", refParams.parse(request.params).ref); const body = markdownSchema.parse(request.body);
-    await withTransaction(pool, async (client) => {
-      const locked = await client.query<{ current_revision: number }>("SELECT current_revision FROM reports WHERE id = $1 FOR UPDATE", [id]);
-      const revision = (locked.rows[0] ?? notFound("Report")).current_revision + 1;
+    const locked = await withTransaction(pool, async (client) => {
+      const locked = await client.query<{ current_revision: number; title: string; description: string }>(
+        "SELECT current_revision, title, description FROM reports WHERE id = $1 FOR UPDATE", [id]
+      );
+      const report = locked.rows[0] ?? notFound("Report");
+      const revision = report.current_revision + 1;
       await client.query("INSERT INTO report_versions (report_id, revision, markdown, created_by_agent_id) VALUES ($1, $2, $3, $4)", [id, revision, body.markdown, context.agentId]);
       await client.query("UPDATE reports SET current_revision = $2, status = 'draft', updated_at = now() WHERE id = $1", [id, revision]);
+      return report;
     });
-    return { report: await showReport(pool, id) };
+    // Advise on the revision this call wrote, even if another revise has landed since.
+    const writingCheck = adviseWritingCheck(lintReport({ title: locked.title, description: locked.description, markdown: body.markdown }));
+    return { report: await showReport(pool, id), writingCheck };
   });
   app.post("/api/agent-tools/v1/reports/:ref/publish", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const id = await resolveResourceId(pool, "reports", "REPORT", refParams.parse(request.params).ref);
-    await pool.query("UPDATE reports SET status = 'published', updated_at = now() WHERE id = $1", [id]);
-    return { report: await showReport(pool, id) };
+    const current = await showReport(pool, id, true);
+    const writingCheck = assertWritingCheck(
+      lintReport({ title: current.title, description: current.description, markdown: current.markdown }),
+      `${current.key} revision ${current.current_revision}`
+    );
+    // Publish only the revision that was linted; a concurrent revise must be checked on its own.
+    const published = await pool.query(
+      "UPDATE reports SET status = 'published', updated_at = now() WHERE id = $1 AND current_revision = $2 RETURNING id",
+      [id, current.current_revision]
+    );
+    if (!published.rows[0]) throw httpError(409, `${current.key} was revised while publishing; check the new revision and publish again`);
+    return { report: await showReport(pool, id), writingCheck };
   });
 }
 
@@ -1297,6 +1314,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
   });
   app.post("/api/agent-tools/v1/incidents", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write"); const body = incidentCreateSchema.parse(request.body);
+    const writingCheck = assertWritingCheck(lintIncident({ ...body, stage: "declare" }), "Incident");
     const commander = body.to ? await getAgent(pool, body.to) : await getOrchestrator(pool);
     const ids = await withTransaction(pool, async (client) => {
       const thread = await client.query<{ id: string; number: number }>(
@@ -1324,7 +1342,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
       if (commander.id !== context.agentId) await queueDelivery(client, managedRoot, thread.rows[0]!.id, message.id, commander.id);
       return { incidentId: incident.rows[0]!.id, threadId: thread.rows[0]!.id };
     });
-    return { incident: await showIncident(pool, ids.incidentId), thread: await showThread(pool, ids.threadId) };
+    return { incident: await showIncident(pool, ids.incidentId), thread: await showThread(pool, ids.threadId), writingCheck };
   });
   app.get("/api/agent-tools/v1/incidents/:ref", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:read");
@@ -1334,6 +1352,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write");
     const id = await resolveResourceId(pool, "incidents", "INC", refParams.parse(request.params).ref); const body = markdownSchema.parse(request.body);
     const incident = await showIncident(pool, id);
+    const writingCheck = assertWritingCheck(lintIncident({ markdown: body.markdown, stage: "update" }), `${incident.key} update`);
     await withTransaction(pool, async (client) => {
       await client.query("INSERT INTO incident_updates (incident_id, author_agent_id, markdown) VALUES ($1, $2, $3)", [id, context.agentId, body.markdown]);
       await client.query("UPDATE incidents SET updated_at = now() WHERE id = $1", [id]);
@@ -1353,12 +1372,15 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
         if (recipientId) await queueDelivery(client, managedRoot, incident.thread_id, message.id, recipientId);
       }
     });
-    return { incident: await showIncident(pool, id) };
+    return { incident: await showIncident(pool, id), writingCheck };
   });
   app.post("/api/agent-tools/v1/incidents/:ref/resolve", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "incidents:write");
     const id = await resolveResourceId(pool, "incidents", "INC", refParams.parse(request.params).ref); const body = optionalMarkdownSchema.parse(request.body ?? {});
     const incident = await showIncident(pool, id);
+    const writingCheck = body.markdown
+      ? assertWritingCheck(lintIncident({ markdown: body.markdown, stage: "resolve" }), `${incident.key} resolution`)
+      : undefined;
     if (incident.thread_id) {
       await finalizeThread(
         pool,
@@ -1385,7 +1407,7 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
         await client.query("UPDATE incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE id = $1", [id]);
       });
     }
-    return { incident: await showIncident(pool, id) };
+    return { incident: await showIncident(pool, id), ...(writingCheck ? { writingCheck } : {}) };
   });
 }
 

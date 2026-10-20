@@ -43,6 +43,28 @@ describe("embedded aisevak CLI", () => {
     expect(JSON.parse(result.stdout)).toMatchObject({ report: { status: "published" } });
   });
 
+  it("surfaces the API error code from Fastify's flat error body", async () => {
+    const server = createServer((_request, response) => {
+      response.statusCode = 422;
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({ statusCode: 422, code: "WRITING_LINT", error: "Unprocessable Entity", message: "REPORT-1 was rejected" }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const failure = await execFileAsync(process.execPath, [cliPath, "reports", "publish", "REPORT-1"], {
+      env: { ...process.env, AISEVAK_API_URL: `http://127.0.0.1:${address.port}`, AISEVAK_AGENT_TOKEN: "test-token" }
+    }).catch((error: { stderr: string }) => error);
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    expect(JSON.parse((failure as { stderr: string }).stderr)).toEqual({ error: { code: "WRITING_LINT", message: "REPORT-1 was rejected" } });
+  });
+
   it("documents the durable coordination resources", async () => {
     const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
     cleanup.push(directory);
