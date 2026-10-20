@@ -10,6 +10,10 @@ EnvironmentFile=/opt/aisevak/.env
 ExecStart=/usr/bin/env pnpm --filter @aisevak/runner start
 Restart=always
 RestartSec=5
+# A harness (for example a runaway codex process) being OOM-killed must not
+# stop the whole runner and every in-flight turn with it: only that turn
+# fails. systemd's default for services is OOMPolicy=stop.
+OOMPolicy=continue
 User=aisevak
 Group=aisevak
 UMask=0077
