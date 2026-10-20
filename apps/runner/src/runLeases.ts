@@ -57,9 +57,12 @@ export function bootRecoveryScope(): RecoveryScope {
 export function recoverableRunPredicate(scope: RecoveryScope, alias: string, param: string): string {
   // The legacy forms still reference the parameter so callers bind the same values.
   if (legacyCoordination()) return scope.boot ? `(${param}::text IS NULL OR true)` : `(${param}::text IS NULL AND false)`;
+  // Another runner's turn is only taken over past the grace period, at boot
+  // as in sweeps; this runner's own previous turns are recovered at once.
+  const othersExpired = `${alias}.lease_expires_at < now() - interval '${RUN_TAKEOVER_GRACE_MS} milliseconds'`;
   return scope.boot
-    ? `(${alias}.runner_id IS NULL OR ${alias}.runner_id = ${param} OR ${alias}.lease_expires_at < now())`
-    : `(${alias}.runner_id IS NOT NULL AND ${alias}.runner_id <> ${param} AND ${alias}.lease_expires_at < now() - interval '${RUN_TAKEOVER_GRACE_MS} milliseconds')`;
+    ? `(${alias}.runner_id IS NULL OR ${alias}.runner_id = ${param} OR ${othersExpired})`
+    : `(${alias}.runner_id IS NOT NULL AND ${alias}.runner_id <> ${param} AND ${othersExpired})`;
 }
 
 

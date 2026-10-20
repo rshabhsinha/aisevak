@@ -14,7 +14,7 @@ packages/
   core/      Shared types, migrations, harness adapters, and runtime events
 scripts/     install.sh, update.sh, and the Codex runtime publisher the installer uses
 tests/       Cross-package tests and fixtures
-docs/        Design language, provider event notes, and UI QA checklists
+docs/        Design language, design docs (docs/design), provider event notes, and UI QA checklists
 ```
 
 ## Setup
@@ -44,6 +44,8 @@ pnpm typecheck
 pnpm test
 ```
 
+Tests that need PostgreSQL (for example `tests/coordinationV2.db.test.ts`) are skipped unless `AISEVAK_TEST_DATABASE_URL` points at a disposable database. Run them when you change coordination, delivery, or runner recovery SQL: `createdb aisevak_test`, then `AISEVAK_TEST_DATABASE_URL=postgres:///aisevak_test pnpm test`.
+
 Some runner tests spawn real processes and can time out on a busy machine. If they do, rerun with a longer timeout, for example `pnpm exec vitest run --testTimeout=60000`.
 
 UI changes should follow [docs/design-language.md](docs/design-language.md) and be checked in light and dark mode at desktop and narrow widths. [docs/MOBILE_UI_QA.md](docs/MOBILE_UI_QA.md) lists the mobile checks.
@@ -52,7 +54,7 @@ UI changes should follow [docs/design-language.md](docs/design-language.md) and 
 
 - Keep commits focused on one change.
 - Code that runs inside agent runs must not assume it is in the root checkout; runs execute in runner-managed worktrees.
-- New or changed persistent state needs a migration in `packages/core`.
+- New or changed persistent state needs a migration in `packages/core`. Migrations re-run whenever the schema changes, so every statement must be safe to run again. A one-time backfill uses the `ADD COLUMN ... DEFAULT` then `DROP DEFAULT` pattern.
 - Provider output goes through the runtime event adapters in `packages/core/src/runtime`; add a fixture when you change how a provider's events are mapped.
 
 ## License

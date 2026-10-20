@@ -12,9 +12,9 @@ import {
 afterEach(() => { delete process.env.AISEVAK_COORDINATION_LEGACY; });
 
 describe("run leases", () => {
-  it("lets a boot recover its own previous turns, unleased legacy turns, and expired leases", () => {
+  it("lets a boot recover its own previous turns, unleased legacy turns, and other runners' leases past the grace period", () => {
     const sql = recoverableRunPredicate({ runnerId: "runner-a", boot: true }, "runs", "$1");
-    expect(sql).toBe("(runs.runner_id IS NULL OR runs.runner_id = $1 OR runs.lease_expires_at < now())");
+    expect(sql).toBe("(runs.runner_id IS NULL OR runs.runner_id = $1 OR runs.lease_expires_at < now() - interval '120000 milliseconds')");
   });
 
   it("lets a sweep take over only other runners' expired turns", () => {

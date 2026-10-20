@@ -104,7 +104,7 @@ describe("lease-gated restart recovery", () => {
     await recoverInterruptedCoordinationRuns(pool, { runnerId: "runner-a", boot: true });
 
     const scan = queries.find((entry) => entry.sql.trim().startsWith("SELECT id, status::text, message_delivery_id"))!;
-    expect(scan.sql).toContain("runner_id = $1 OR dispatcher_runs.lease_expires_at < now()");
+    expect(scan.sql).toContain("runner_id = $1 OR dispatcher_runs.lease_expires_at < now() - interval '120000 milliseconds'");
     expect(scan.params).toEqual(["runner-a"]);
     expect(queries.some((entry) => entry.sql.includes("'redelivery'"))).toBe(true);
     expect(queries.some((entry) => entry.sql.includes("UPDATE task_assignments") && entry.sql.includes("SET status = $2"))).toBe(false);
