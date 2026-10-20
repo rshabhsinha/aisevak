@@ -38,7 +38,9 @@ export async function setThreadArchived(pool: DbPool, id: string, archived: bool
         WHERE agent_thread_id = $1 AND status IN ('queued','running','cancel_requested')`, [id]);
     }
     await client.query("UPDATE agent_turn_inputs SET status = 'failed', error = 'Chat archived', updated_at = now() WHERE agent_thread_id = $1 AND status IN ('queued','delivering')", [id]);
-    await client.query(`UPDATE message_deliveries SET status = 'failed', error = 'Chat archived', completed_at = now(), updated_at = now()
+    // Archiving is a deliberate stop: no delivery.failed notice invites the sender to undo it.
+    await client.query(`UPDATE message_deliveries SET status = 'failed', error = 'Chat archived', completed_at = now(),
+      failure_notified_at = now(), updated_at = now()
       WHERE id IN (SELECT message_delivery_id FROM dispatcher_runs WHERE agent_thread_id = $1
         UNION SELECT message_delivery_id FROM agent_turn_inputs WHERE agent_thread_id = $1)
         AND status IN ('queued','retrying','running')`,[id]);

@@ -8,6 +8,7 @@ function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?:
   const client = {
     async query(sql: string, params?: unknown[]) {
       queries.push({ sql, params });
+      if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
       if (sql.includes("UPDATE tasks")) return { rows: [{ id: params?.[0] }] };
       return { rows: [] };
     },
@@ -55,15 +56,85 @@ describe("worker run finalization", () => {
       "BEGIN",
       expect.stringContaining("SELECT id FROM tasks WHERE id = $1 FOR UPDATE"),
       expect.stringContaining("UPDATE task_runs"),
+      expect.stringContaining("SELECT trigger FROM task_runs"),
       expect.stringContaining("UPDATE tasks"),
       expect.stringContaining("UPDATE coordination_threads"),
       expect.stringContaining("UPDATE agent_threads"),
       "COMMIT"
     ]);
-    expect(queries[3]?.params).toEqual(["task-id", "completed"]);
-    expect(queries[4]?.params).toEqual(["coordination-thread-id", "completed"]);
-    expect(queries[3]?.sql).toContain("status = 'open'");
-    expect(queries[4]?.sql).toContain("status = 'active'");
+    expect(queries[4]?.params).toEqual(["task-id", "completed"]);
+    expect(queries[5]?.params).toEqual(["coordination-thread-id", "completed"]);
+    expect(queries[4]?.sql).toContain("status = 'open'");
+    expect(queries[5]?.sql).toContain("status = 'active'");
+  });
+
+  it.each(["succeeded", "failed"] as const)("leaves task and thread status alone when a ping turn %s", async (finalStatus) => {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const client = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
+        if (sql.includes("SELECT trigger FROM task_runs")) return { rows: [{ trigger: "message" }] };
+        return { rows: [] };
+      },
+      release() {}
+    };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+
+    await finalizeWorkerRunState(pool, {
+      runId: "run-id",
+      taskId: "task-id",
+      agentThreadId: "agent-thread-id",
+      coordinationThreadId: "coordination-thread-id",
+      finalStatus,
+      stdout: "",
+      stderr: "",
+      exitCode: 0
+    });
+
+    expect(queries.some((query) => query.sql.includes("UPDATE task_runs"))).toBe(true);
+    expect(queries.some((query) => query.sql.includes("UPDATE tasks"))).toBe(false);
+    expect(queries.some((query) => query.sql.includes("UPDATE coordination_threads"))).toBe(false);
+    expect(queries.some((query) => query.sql.includes("UPDATE agent_threads"))).toBe(true);
+  });
+
+  it("touches nothing else when another runner already took the run over", async () => {
+    const queries: string[] = [];
+    const client = { async query(sql: string) { queries.push(sql); return { rows: [] }; }, release() {} };
+    const pool = { async connect() { return client; } } as unknown as DbPool;
+    const finalized = await finalizeWorkerRunState(pool, {
+      runId: "run-id", taskId: "task-id", agentThreadId: null, coordinationThreadId: "coordination-thread-id",
+      finalStatus: "succeeded", stdout: "", stderr: "", exitCode: 0
+    });
+    expect(finalized).toBe(false);
+    const update = queries.find((sql) => sql.includes("UPDATE task_runs"))!;
+    expect(update).toContain("status IN ('running', 'cancel_requested')");
+    expect(update).toContain("runner_id IS NULL OR runner_id = $6");
+    expect(queries.some((sql) => sql.includes("UPDATE tasks") || sql.includes("UPDATE coordination_threads"))).toBe(false);
+  });
+
+  it("finalizes ping turns like task runs in legacy mode", async () => {
+    process.env.AISEVAK_COORDINATION_LEGACY = "1";
+    try {
+      const queries: string[] = [];
+      const client = {
+        async query(sql: string) {
+          queries.push(sql);
+          if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
+          return { rows: sql.includes("SELECT trigger") ? [{ trigger: "message" }] : [] };
+        },
+        release() {}
+      };
+      const pool = { async connect() { return client; } } as unknown as DbPool;
+      await finalizeWorkerRunState(pool, {
+        runId: "run-id", taskId: "task-id", agentThreadId: null, coordinationThreadId: null,
+        finalStatus: "succeeded", stdout: "", stderr: "", exitCode: 0
+      });
+      expect(queries.some((sql) => sql.includes("SELECT trigger"))).toBe(false);
+      expect(queries.some((sql) => sql.includes("UPDATE tasks"))).toBe(true);
+    } finally {
+      delete process.env.AISEVAK_COORDINATION_LEGACY;
+    }
   });
 
   it.each(["failed", "cancelled"] as const)("blocks the thread when a run is %s", async (finalStatus) => {
@@ -130,6 +201,7 @@ describe("worker run finalization", () => {
     const client = {
       async query(sql: string, params?: unknown[]) {
         queries.push({ sql, params });
+        if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
         // The guarded task update matches no row: the task is a child job.
         return { rows: [] };
       },
@@ -152,6 +224,7 @@ describe("worker run finalization", () => {
     const client = {
       async query(sql: string, params?: unknown[]) {
         queries.push({ sql, params });
+        if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
         if (sql.includes("SELECT ownership_generation")) return { rows: [{ ownership_generation: 8 }] };
         return { rows: [] };
       },
@@ -182,6 +255,7 @@ describe("worker run finalization", () => {
     const client = {
       async query(sql: string) {
         queries.push(sql);
+        if (sql.includes("UPDATE task_runs")) return { rows: [{ id: "run-id" }] };
         if (sql.includes("SELECT ownership_generation")) return { rows: [{ ownership_generation: 4 }] };
         return { rows: [] };
       },

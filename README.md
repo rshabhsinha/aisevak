@@ -13,7 +13,7 @@ You give Aisevak a task. An **Orchestrator** agent breaks it down, hands pieces 
 - **Use the harnesses you already have.** Codex, Claude Code, Cursor, OpenCode, and Devin, each signed in with your own account or API key. Mix them freely: one agent can run on Codex while another runs on Claude Code.
 - **Threads that last.** A conversation outlives a single model turn. Each agent keeps its own provider session, so follow-ups, retries, and steering messages pick up where they left off.
 - **One worktree per task.** Agents never trip over each other's branches. Each task gets its own git worktree, so many can run in parallel.
-- **Agents coordinate through a CLI.** Inside every run, agents use the `aisevak` command to create tasks, message each other, and close out work.
+- **Agents coordinate through a CLI.** Inside every run, agents use the `aisevak` command to create tasks, message each other, see whether another agent is busy, and close out work.
 - **Built-in operations.** Schedules for recurring jobs, incidents for things that break, and reports for things worth writing down.
 
 ## A look around
@@ -79,6 +79,10 @@ A **task** is the durable unit of work. It has a stable work key and exactly one
 
 The **runner** polls for queued turns and executes them on the host. Turns on the same agent thread run one at a time; independent turns run in parallel.
 
+**Messages between agents** are delivered in order, one turn at a time per agent thread. A message to a busy agent joins its running turn or waits for the next one, so sending a follow-up never starts a second turn. Messages sent from the web app on a task's thread are conversation: they never change the task's status. A sender can see each message's delivery state. If a message cannot be delivered, the sender gets a `delivery.failed` notice on the same thread with the command to retry. Turns stopped on purpose (with Stop, or by archiving the chat) don't send a notice.
+
+**Restarts.** Each running turn holds a lease that its runner renews while the turn is running. When a runner restarts, it recovers its own unfinished turns at once. Another runner's turn is only recovered once that turn's lease has been expired for two minutes. If a restart interrupted a turn that had already seen its message, the message is delivered again in the same provider session, with a note that the previous turn was interrupted. The agent's assignment stays running instead of being marked blocked. The design and roadmap are in [docs/design/coordination-v2.md](docs/design/coordination-v2.md).
+
 ## The aisevak CLI
 
 Every agent run gets the CLI on its `PATH`, authenticated with a token scoped to that run. It is how agents read and change shared state. People use the web app for the same things.
@@ -92,8 +96,13 @@ aisevak tasks create --title "Paginate GET /api/orders" \
   --description "Cursor pagination, 50 per page" --agent Builder \
   --work-key orders-pagination
 
-# Message another agent on a thread
+# Message another agent on a thread (THREAD-n, TASK-n, or a thread id from the web app)
 aisevak threads send THREAD-8 --to Reviewer --body-stdin < notes.md
+
+# Check who is running, queued, waiting, or blocked before nudging anyone
+aisevak threads status THREAD-8
+aisevak agents status Reviewer
+aisevak inbox
 
 # Finish a thread with a summary
 aisevak threads complete THREAD-8 --summary-stdin < summary.md
@@ -116,6 +125,8 @@ Defaults below are the values the code uses when a variable is unset.
 | `MANAGED_ROOT` | `/srv/aisevak` | Where worktrees, harness homes, and skills live (`.env.example` uses `.aisevak-managed` for local dev) |
 | `AISEVAK_JOB_SAFETY_MODE` | `enforce` | `audit` records unsafe or duplicate work in `job_safety_events` without rejecting it. `.env.example` starts in `audit` for a trial period; switch to `enforce` once the recorded events look right |
 | `AISEVAK_AUTO_WORKTREE_CLEANUP` | `1` | Set to `0` to stop the runner removing finished task checkouts |
+| `AISEVAK_RUNNER_ID` | the hostname | Identifies a runner process. It is used for turn leases and restart recovery. Give each runner process on the same host its own value |
+| `AISEVAK_COORDINATION_LEGACY` | unset | Set to `1` to restore the earlier coordination behaviour for one release. A restart then fails interrupted deliveries and blocks their assignments, and runners don't sweep each other's expired leases |
 
 **Harness sign-in**
 
@@ -155,6 +166,7 @@ The installer puts the app in `/opt/aisevak` and workspaces in `/srv/aisevak`, g
 ```bash
 pnpm test        # unit tests
 pnpm typecheck   # type-check every package
+AISEVAK_TEST_DATABASE_URL=postgres:///aisevak_test pnpm test   # also run the Postgres integration tests
 pnpm build       # build everything
 ```
 

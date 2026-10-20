@@ -113,6 +113,7 @@ const incidentsPageSchema = pageSchema.extend({
   includeResolved: z.enum(["true", "false"]).default("false").transform(value => value === "true")
 });
 const refParams = z.object({ ref: z.string().min(1) });
+const inboxQuerySchema = z.object({ thread: z.string().optional(), limit: z.string().optional(), recent: z.string().optional() });
 const threadCreateSchema = z.object({
   title: z.string().trim().min(1),
   description: z.string().trim().min(1),
@@ -323,6 +324,21 @@ export async function registerCoordinationRoutes(
       key: `AGENT-${row.name}`,
       capabilities: effectiveCapabilities(String(row.kind), row.capabilities)
     }));
+  });
+
+  app.get("/api/agent-tools/v1/agents/:ref/status", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "agents:read");
+    const agent = await getAgent(pool, refParams.parse(request.params).ref);
+    return agentStatus(pool, agent);
+  });
+
+  app.get("/api/agent-tools/v1/inbox", async (request) => {
+    const context = await requireAgent(pool, request);
+    requireCapability(context, "threads:read");
+    const query = inboxQuerySchema.parse(request.query);
+    const threadId = query.thread ? await resolveThreadRef(pool, query.thread) : null;
+    return inbox(pool, context.agentId, { threadId, limit: pageLimit(query.limit, 20, 100), includeRecent: query.recent === "true" });
   });
 
   app.get("/api/agent-tools/v1/agents/:ref", async (request) => {
@@ -2312,6 +2328,13 @@ export async function queueDelivery(
   }
 
   await assertThreadAcceptsInput(client, session.id);
+  // The delivery is an inbox item of this agent thread; seq orders the inbox.
+  await client.query(
+    `UPDATE message_deliveries
+     SET agent_thread_id = $2, seq = COALESCE(seq, nextval('message_delivery_inbox_seq')), updated_at = now()
+     WHERE id = $1`,
+    [delivery.rows[0]!.id, session.id]
+  );
   const message = await showMessage(client, messageId, true);
   const envelope = await loadJobEnvelope(client, thread.task_id, assignmentId ?? null, {
     coordinationThreadId: threadId,
@@ -3188,6 +3211,125 @@ function threadStatusHeader(thread: any, task: { number: number; status: string 
   return { key: thread.key, id: thread.id, title: thread.title, status: thread.status, task: task ? { key: `TASK-${task.number}`, status: task.status } : null };
 }
 
+// The calling agent's inbox: messages addressed to it that are not settled
+// yet, in delivery order, across all of its threads. With includeRecent, the
+// last day's settled items follow so an agent can see what it already got.
+export async function inbox(
+  queryable: Queryable,
+  agentId: string,
+  options: { threadId: string | null; limit: number; includeRecent?: boolean }
+): Promise<any> {
+  const result = await queryable.query(
+    `SELECT thread_messages.*, sender.name AS sender_agent_name, recipient.name AS recipient_agent_name,
+            coordination_threads.number AS thread_number, coordination_threads.title AS thread_title,
+            message_deliveries.status AS delivery_status, message_deliveries.attempt_count AS delivery_attempt_count,
+            message_deliveries.presented_at AS delivery_presented_at, message_deliveries.error AS delivery_error,
+            message_deliveries.updated_at AS delivery_updated_at, message_deliveries.seq AS inbox_seq,
+            message_deliveries.agent_thread_id AS inbox_agent_thread_id
+     FROM message_deliveries
+     JOIN thread_messages ON thread_messages.id = message_deliveries.message_id
+     JOIN coordination_threads ON coordination_threads.id = thread_messages.thread_id
+     LEFT JOIN agents sender ON sender.id = thread_messages.sender_agent_id
+     LEFT JOIN agents recipient ON recipient.id = thread_messages.recipient_agent_id
+     WHERE message_deliveries.recipient_agent_id = $1
+       AND ($2::uuid IS NULL OR thread_messages.thread_id = $2)
+       AND (message_deliveries.status IN ('queued', 'retrying', 'running')
+            OR ($3::boolean AND message_deliveries.updated_at > now() - interval '1 day'))
+     ORDER BY CASE WHEN message_deliveries.status IN ('queued', 'retrying', 'running') THEN 0 ELSE 1 END,
+              message_deliveries.seq ASC NULLS LAST, message_deliveries.created_at ASC
+     LIMIT $4`,
+    [agentId, options.threadId, options.includeRecent ?? false, options.limit]
+  );
+  const items = result.rows.map((row: any) => {
+    const { inbox_seq, inbox_agent_thread_id, thread_number, thread_title, ...message } = row;
+    return {
+      ...messageResource(message),
+      thread: { key: `THREAD-${thread_number}`, title: thread_title },
+      seq: inbox_seq === null || inbox_seq === undefined ? null : Number(inbox_seq),
+      agentThreadId: inbox_agent_thread_id ?? null
+    };
+  });
+  return { pending: items.filter((item: any) => ["queued", "delivering", "presented"].includes(item.delivery.state)).length, items };
+}
+
+// One agent across all of its live agent threads: what each is doing and the
+// agent's overall state (running if any thread runs, and so on).
+export async function agentStatus(queryable: Queryable, agent: { id: string; name: string }): Promise<any> {
+  const threads = await queryable.query<{
+    agent_thread_id: string; title: string; coordination_thread_id: string | null; thread_number: number | null;
+    task_id: string | null; task_number: number | null; task_status: string | null; last_activity_at: unknown;
+    active_kind: string | null; active_id: string | null; active_started_at: unknown; queued_turns: number; pending: number;
+  }>(
+    `SELECT agent_threads.id AS agent_thread_id, agent_threads.title, agent_threads.coordination_thread_id,
+            coordination_threads.number AS thread_number, tasks.id AS task_id, tasks.number AS task_number,
+            tasks.status AS task_status, agent_threads.last_activity_at,
+            active.kind AS active_kind, active.id AS active_id, active.started_at AS active_started_at,
+            (SELECT count(*)::int FROM (
+               SELECT 1 FROM task_runs WHERE task_runs.agent_thread_id = agent_threads.id AND task_runs.status = 'queued'
+                 AND task_runs.agent_thread_generation = agent_threads.ownership_generation
+               UNION ALL
+               SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.agent_thread_id = agent_threads.id AND dispatcher_runs.status = 'queued'
+                 AND dispatcher_runs.agent_thread_generation = agent_threads.ownership_generation
+             ) queued) AS queued_turns,
+            (SELECT count(*)::int FROM message_deliveries
+             WHERE message_deliveries.agent_thread_id = agent_threads.id
+               AND message_deliveries.status IN ('queued', 'retrying', 'running')) AS pending
+     FROM agent_threads
+     LEFT JOIN coordination_threads ON coordination_threads.id = agent_threads.coordination_thread_id
+     LEFT JOIN tasks ON tasks.id = COALESCE(agent_threads.task_id, coordination_threads.task_id)
+     LEFT JOIN LATERAL (
+       SELECT 'worker' AS kind, task_runs.id, task_runs.started_at FROM task_runs
+       WHERE task_runs.agent_thread_id = agent_threads.id AND task_runs.status IN ('running', 'cancel_requested')
+       UNION ALL
+       SELECT dispatcher_runs.scope, dispatcher_runs.id, dispatcher_runs.started_at FROM dispatcher_runs
+       WHERE dispatcher_runs.agent_thread_id = agent_threads.id AND dispatcher_runs.status IN ('running', 'cancel_requested')
+       ORDER BY started_at DESC NULLS LAST
+       LIMIT 1
+     ) active ON true
+     WHERE agent_threads.agent_id = $1 AND agent_threads.archived_at IS NULL
+     ORDER BY (active.id IS NOT NULL) DESC, agent_threads.last_activity_at DESC
+     LIMIT 25`,
+    [agent.id]
+  );
+  const assignments = await queryable.query<{ number: number; status: string; task_id: string; assigned_agent_id: string; created_by_agent_id: string | null }>(
+    `SELECT number, status, task_id, assigned_agent_id, created_by_agent_id FROM task_assignments
+     WHERE (assigned_agent_id = $1 OR created_by_agent_id = $1) AND status IN ('queued', 'running', 'blocked')`,
+    [agent.id]
+  );
+  const items = threads.rows.map((row) => {
+    const waitingOn = assignments.rows
+      .filter((assignment) => assignment.task_id === row.task_id && assignment.created_by_agent_id === agent.id
+        && assignment.assigned_agent_id !== agent.id && ["queued", "running"].includes(assignment.status))
+      .map((assignment) => `ASSIGNMENT-${assignment.number}`);
+    const blockedAssignment = assignments.rows.find((assignment) => assignment.task_id === row.task_id
+      && assignment.assigned_agent_id === agent.id && assignment.status === "blocked");
+    const blockedReason = row.task_status && ["blocked", "needs_attention"].includes(row.task_status)
+      ? `TASK-${row.task_number} is ${row.task_status}`
+      : blockedAssignment ? `ASSIGNMENT-${blockedAssignment.number} is blocked` : null;
+    const pendingMessages = Number(row.pending ?? 0);
+    const queuedTurns = Number(row.queued_turns ?? 0);
+    return {
+      agentThreadId: row.agent_thread_id,
+      title: row.title,
+      thread: row.thread_number ? `THREAD-${row.thread_number}` : null,
+      task: row.task_number ? { key: `TASK-${row.task_number}`, status: row.task_status } : null,
+      state: participantState({ activeTurn: Boolean(row.active_id), queuedTurn: queuedTurns > 0, pendingMessages, waitingOn, blockedReason }),
+      currentTurn: row.active_id ? { kind: row.active_kind, id: row.active_id, startedAt: row.active_started_at ? iso(row.active_started_at) : null } : null,
+      pendingMessages,
+      queuedTurns,
+      waitingOn,
+      blockedReason,
+      lastActivityAt: row.last_activity_at ? iso(row.last_activity_at) : null
+    };
+  });
+  const order: ParticipantState[] = ["running", "queued", "blocked", "waiting", "idle"];
+  const state = items.reduce<ParticipantState>(
+    (best, item) => (order.indexOf(item.state) < order.indexOf(best) ? item.state : best),
+    "idle"
+  );
+  return { agent: { id: agent.id, name: agent.name, key: `AGENT-${agent.name}` }, state, threads: items };
+}
+
 export const DELIVERY_FAILED_TYPE = "delivery.failed";
 
 interface FailedDeliveryRow {
@@ -3209,6 +3351,7 @@ interface FailedDeliveryRow {
 
 export function deliveryFailedNotice(row: FailedDeliveryRow): string {
   const lines = [
+    "Platform notice (not new work, not a reply): a message you sent was not processed. Do not complete or block the thread or its task because of this notice alone.",
     `Your message MESSAGE-${row.message_number} [${row.message_type}] on THREAD-${row.thread_number} to ${row.recipient_name} was not delivered after ${row.attempt_count} attempt${row.attempt_count === 1 ? "" : "s"}.`,
     `Reason: ${row.error?.trim() || "unknown"}`
   ];

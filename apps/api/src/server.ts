@@ -4306,6 +4306,9 @@ async function queueWorkerRun(
       });
       if (incremental) return incremental.run;
     }
+    // A message to the task's thread is conversation, not a run of the task:
+    // the runner never lets a "message" turn change task status.
+    const runTrigger = options.promptOverride && options.allowQueuedFollowUp ? "message" : trigger;
     const agentThreadId = options.agentThreadId ?? thread.id;
     if (agentThreadId !== thread.id) {
       throw new Error("The worker agent thread changed while queueing the turn");
@@ -4324,7 +4327,7 @@ async function queueWorkerRun(
         workspaceKey,
         workspaceMode,
         projectSource,
-        trigger,
+        runTrigger,
         projectPath,
         branch,
         model,

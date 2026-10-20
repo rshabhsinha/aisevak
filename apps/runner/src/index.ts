@@ -63,6 +63,18 @@ import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
+import {
+  bootRecoveryScope,
+  currentRunnerId,
+  legacyCoordination,
+  recoverableRunPredicate,
+  RUN_LEASE_MS,
+  runTakenOver,
+  startRunLeaseHeartbeat,
+  trackActiveRun,
+  withInterruptedPreamble,
+  type RecoveryScope
+} from "./runLeases.js";
 
 const env = {
   managedRoot: resolve(process.env.MANAGED_ROOT ?? "/srv/aisevak"),
@@ -183,9 +195,13 @@ async function main(): Promise<void> {
   await mkdir(env.managedRoot, { recursive: true });
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
-  await recoverInterruptedCoordinationRuns(pool);
-  await recoverInterruptedDispatcherRuns(pool);
+  const bootScope = bootRecoveryScope();
+  await recoverInterruptedCoordinationRuns(pool, bootScope);
+  await recoverInterruptedDispatcherRuns(pool, bootScope);
+  await recoverInterruptedWorkerRuns(pool, bootScope);
   await recoverStaleAgentThreadRuns(pool);
+  const stopHeartbeat = startRunLeaseHeartbeat(pool, bootScope.runnerId);
+  const sweepScope: RecoveryScope = { runnerId: bootScope.runnerId, boot: false };
 
   const beginShutdown = () => {
     shuttingDown = true;
@@ -198,7 +214,13 @@ async function main(): Promise<void> {
   );
   let cleanupJob: Promise<void> | null = null;
   let nextCleanupAt = 0;
+  let nextLeaseSweepAt = Date.now() + RUN_LEASE_MS;
   while (!shuttingDown) {
+    if (Date.now() >= nextLeaseSweepAt) {
+      // Other runners' turns whose lease expired: their runner died.
+      nextLeaseSweepAt = Date.now() + RUN_LEASE_MS / 2;
+      await recoverExpiredRunLeases(pool, sweepScope).catch((error) => console.error("Run lease recovery failed", error));
+    }
     if (process.platform === "linux" && !cleanupJob && Date.now() >= nextCleanupAt) {
       nextCleanupAt = Date.now() + 60_000;
       cleanupJob = sweepLifecycleCleanup(pool, env.managedRoot, env.codexBinary)
@@ -218,6 +240,7 @@ async function main(): Promise<void> {
     await sleep(env.pollMs);
   }
   await waitForRunJobs(activeRunJobs);
+  stopHeartbeat();
   if (cleanupJob) await cleanupJob;
   await closeAllCodexAppServers();
   await closeAllAcpSessions();
@@ -333,7 +356,8 @@ export async function recoverAmbiguousWorkspaceRuns(pool: DbPool): Promise<void>
   });
 }
 
-export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<void> {
+export async function recoverInterruptedCoordinationRuns(pool: DbPool, scope: RecoveryScope = bootRecoveryScope()): Promise<void> {
+  const recoverable = recoverableRunPredicate(scope, "dispatcher_runs", "$1");
   const interrupted = await pool.query<{
     id: string;
     status: "running" | "cancel_requested";
@@ -343,7 +367,9 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
      FROM dispatcher_runs
      WHERE scope = 'coordination'
        AND status IN ('running', 'cancel_requested')
-     ORDER BY started_at ASC NULLS FIRST, id ASC`
+       AND ${recoverable}
+     ORDER BY started_at ASC NULLS FIRST, id ASC`,
+    [scope.runnerId]
   );
 
   for (const run of interrupted.rows) {
@@ -356,9 +382,9 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       const locked = await client.query<{ message_delivery_id: string | null; status: string }>(
         `SELECT message_delivery_id, status::text
          FROM dispatcher_runs
-         WHERE id = $1
+         WHERE id = $1 AND ${recoverableRunPredicate(scope, "dispatcher_runs", "$2")}
          FOR UPDATE`,
-        [run.id]
+        [run.id, scope.runnerId]
       );
       const current = locked.rows[0];
       if (!current || !["running", "cancel_requested"].includes(current.status)) return;
@@ -376,17 +402,21 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
       const settled = Boolean(deliveryId && await settleDeliveryByAssignment(client, deliveryId, error));
       // A delivery the provider never acknowledged was not seen by the
       // recipient, so a runner restart retries it rather than dropping it.
+      // One it did see is redelivered with an "interrupted" note: the
+      // assignment stays running until its attempt limit.
       const requeued = settled || Boolean(
         deliveryId &&
           finalStatus === "failed" &&
-          await requeueUnpresentedRunDelivery(client, run.id, deliveryId, error)
+          (await requeueUnpresentedRunDelivery(client, run.id, deliveryId, error) ||
+            (!legacyCoordination() && await redeliverInterruptedRun(client, run.id, deliveryId, error)))
       );
       if (deliveryId && !requeued) {
         await client.query(
           `UPDATE message_deliveries
-           SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+           SET status = 'failed', completed_at = now(), error = $2, updated_at = now(),
+               failure_notified_at = CASE WHEN $3::boolean THEN now() ELSE failure_notified_at END
            WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
-          [deliveryId, error]
+          [deliveryId, error, finalStatus === "cancelled"]
         );
         await markAssignmentDeliveryTerminal(client, deliveryId, error, finalStatus === "cancelled" ? "cancelled" : "blocked");
         await cancelQueuedDeliveryRuns(client, deliveryId, error);
@@ -395,6 +425,11 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
     });
   }
 
+  // The rest repairs crash windows between a run's terminal update and its
+  // delivery's. While runners are live those windows are normal (a finalizer
+  // is mid-flight), so only a boot, which owns its previous process's
+  // leftovers, repairs them.
+  if (!scope.boot) return;
   const interruptedDeliveries = await pool.query<{
     run_id: string;
     message_delivery_id: string;
@@ -477,7 +512,7 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool): Promise<
   }
 }
 
-export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<void> {
+export async function recoverInterruptedDispatcherRuns(pool: DbPool, scope: RecoveryScope = bootRecoveryScope()): Promise<void> {
   const interrupted = await pool.query<{
     id: string;
     status: "running" | "cancel_requested";
@@ -488,7 +523,9 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<vo
      FROM dispatcher_runs
      WHERE scope <> 'coordination'
        AND status IN ('running', 'cancel_requested')
-     ORDER BY started_at ASC NULLS FIRST, id ASC`
+       AND ${recoverableRunPredicate(scope, "dispatcher_runs", "$1")}
+     ORDER BY started_at ASC NULLS FIRST, id ASC`,
+    [scope.runnerId]
   );
 
   for (const run of interrupted.rows) {
@@ -501,9 +538,9 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<vo
       const locked = await client.query<{ message_delivery_id: string | null; status: string }>(
         `SELECT message_delivery_id, status::text
          FROM dispatcher_runs
-         WHERE id = $1
+         WHERE id = $1 AND ${recoverableRunPredicate(scope, "dispatcher_runs", "$2")}
          FOR UPDATE`,
-        [run.id]
+        [run.id, scope.runnerId]
       );
       const current = locked.rows[0];
       if (!current || !["running", "cancel_requested"].includes(current.status)) return;
@@ -539,6 +576,49 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool): Promise<vo
       }
     });
   }
+}
+
+// Worker turns left running by a runner that stopped. Before leases nothing
+// recovered them, so they stayed 'running' forever and blocked every later
+// turn on their agent thread. The task itself is left as it is: an interrupted
+// turn says nothing about whether the task is done.
+export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: RecoveryScope = bootRecoveryScope()): Promise<void> {
+  const interrupted = await pool.query<{ id: string; status: "running" | "cancel_requested"; agent_thread_id: string | null }>(
+    `SELECT id, status::text, agent_thread_id
+     FROM task_runs
+     WHERE status IN ('running', 'cancel_requested')
+       AND ${recoverableRunPredicate(scope, "task_runs", "$1")}
+     ORDER BY started_at ASC NULLS FIRST, id ASC`,
+    [scope.runnerId]
+  );
+  for (const run of interrupted.rows) {
+    const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
+    const error = run.status === "cancel_requested"
+      ? "The worker turn was cancelled when the runner stopped"
+      : "The worker turn was interrupted when the runner stopped";
+    await withTransaction(pool, async (client) => {
+      const updated = await client.query<{ id: string }>(
+        `UPDATE task_runs
+         SET status = $2::run_status, error = $3, finished_at = now(), updated_at = now()
+         WHERE id = $1 AND status IN ('running', 'cancel_requested')
+           AND ${recoverableRunPredicate(scope, "task_runs", "$4")}
+         RETURNING id`,
+        [run.id, finalStatus, error, scope.runnerId]
+      );
+      if (!updated.rows[0]) return;
+      await appendRunCancelEvent(client, "worker", run.id, error);
+      await failPendingAgentTurnInputsInTransaction(client, "worker", run.id, finalStatus);
+      if (run.agent_thread_id) {
+        await client.query("UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1", [run.agent_thread_id]);
+      }
+    });
+  }
+}
+
+export async function recoverExpiredRunLeases(pool: DbPool, scope: RecoveryScope): Promise<void> {
+  await recoverInterruptedCoordinationRuns(pool, scope);
+  await recoverInterruptedDispatcherRuns(pool, scope);
+  await recoverInterruptedWorkerRuns(pool, scope);
 }
 
 export async function recoverStaleAgentThreadRuns(pool: DbPool): Promise<void> {
@@ -1395,10 +1475,11 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
     if (!lockedCandidate.rows[0]) return null;
     const claimed = await client.query<{ id: string }>(
       `UPDATE dispatcher_runs
-       SET status = 'running', started_at = now(), updated_at = now()
+       SET status = 'running', started_at = now(), updated_at = now(),
+           runner_id = $2, lease_expires_at = now() + ($3::integer * interval '1 millisecond')
        WHERE id = $1 AND status = 'queued'
        RETURNING id`,
-      [candidate.id]
+      [candidate.id, currentRunnerId(), RUN_LEASE_MS]
     );
     return claimed.rows[0] ?? null;
   });
@@ -1515,10 +1596,11 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
     if (!lockedCandidate.rows[0]) return null;
     const claimed = await client.query<{ id: string }>(
       `UPDATE task_runs
-       SET status = 'running', started_at = now(), updated_at = now()
+       SET status = 'running', started_at = now(), updated_at = now(),
+           runner_id = $2, lease_expires_at = now() + ($3::integer * interval '1 millisecond')
        WHERE id = $1 AND status = 'queued'
        RETURNING id`,
-      [candidate.id]
+      [candidate.id, currentRunnerId(), RUN_LEASE_MS]
     );
     return claimed.rows[0] ?? null;
   });
@@ -1612,6 +1694,7 @@ export async function processOneDispatcherRun(
     }
   }
 
+  const releaseActiveRun = trackActiveRun("dispatcher", job.id);
   let stdout = "";
   let stderr = "";
   let exitCode: number | null = null;
@@ -1779,6 +1862,7 @@ export async function processOneDispatcherRun(
           ownership_generation: number | null;
         }>(
           `SELECT dispatcher_runs.status,
+                  dispatcher_runs.runner_id,
                   dispatcher_runs.agent_thread_id,
                   dispatcher_runs.agent_thread_generation,
                   agent_threads.ownership_generation
@@ -1791,6 +1875,7 @@ export async function processOneDispatcherRun(
         return Boolean(
           row &&
             (row.status === "cancel_requested" ||
+              runTakenOver(row, currentRunnerId()) ||
               (row.agent_thread_id !== null && row.agent_thread_generation !== row.ownership_generation))
         );
       },
@@ -1844,7 +1929,12 @@ export async function processOneDispatcherRun(
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
-    await pool.query(
+    releaseActiveRun();
+    // Fenced on ownership: if this runner's lease lapsed and another runner
+    // recovered the turn (and possibly redelivered it), the recovery already
+    // settled its delivery and inputs, and settling them again here would
+    // cancel the redelivery.
+    const finalized = await pool.query<{ id: string }>(
       `UPDATE dispatcher_runs
        SET status = $2::run_status,
            raw_stdout = $3,
@@ -1853,9 +1943,13 @@ export async function processOneDispatcherRun(
            finished_at = now(),
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
-       WHERE id = $1`,
-      [job.id, finalStatus, encodePostgresText(stdout), encodePostgresText(stderr), exitCode]
+       WHERE id = $1
+         AND status IN ('running', 'cancel_requested')
+         AND (runner_id IS NULL OR runner_id = $6)
+       RETURNING id`,
+      [job.id, finalStatus, encodePostgresText(stdout), encodePostgresText(stderr), exitCode, currentRunnerId()]
     );
+    if (!finalized.rows[0]) return true;
     if (job.message_delivery_id) {
       await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
     }
@@ -1953,6 +2047,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     return true;
   }
 
+  const releaseActiveRun = trackActiveRun("worker", job.id);
   let stdout = "";
   let stderr = "";
   let exitCode: number | null = null;
@@ -2077,6 +2172,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
           ownership_generation: number | null;
         }>(
           `SELECT task_runs.status,
+                  task_runs.runner_id,
                   task_runs.agent_thread_id,
                   task_runs.agent_thread_generation,
                   agent_threads.ownership_generation
@@ -2089,6 +2185,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
         return Boolean(
           row &&
             (row.status === "cancel_requested" ||
+              runTakenOver(row, currentRunnerId()) ||
               (row.agent_thread_id !== null && row.agent_thread_generation !== row.ownership_generation))
         );
       },
@@ -2141,7 +2238,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
-    await finalizeWorkerRunState(pool, {
+    releaseActiveRun();
+    const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,
       taskId: job.task_id,
       agentThreadId: job.agent_thread_id,
@@ -2152,7 +2250,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       stderr,
       exitCode
     });
-    await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
+    if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
   }
   return true;
 }
@@ -2356,10 +2454,12 @@ export async function finalizeWorkerRunState(
     stderr: string;
     exitCode: number | null;
   }
-): Promise<void> {
+): Promise<boolean> {
   const taskStatus = input.finalStatus === "succeeded" ? "completed" : "needs_attention";
   const threadStatus = input.finalStatus === "succeeded" ? "completed" : "blocked";
-  await withTransaction(pool, async (client) => {
+  // Returns false when the run is no longer this runner's (another runner
+  // recovered it after this runner's lease lapsed); nothing else is touched.
+  return withTransaction(pool, async (client) => {
     await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE", [input.taskId]);
     let ownsCurrentThread = true;
     if (input.agentThreadId && input.agentThreadGeneration !== null && input.agentThreadGeneration !== undefined) {
@@ -2369,7 +2469,7 @@ export async function finalizeWorkerRunState(
       );
       ownsCurrentThread = ownership.rows[0]?.ownership_generation === input.agentThreadGeneration;
     }
-    await client.query(
+    const finalized = await client.query<{ id: string }>(
       `UPDATE task_runs
        SET status = $2::run_status,
            raw_stdout = $3,
@@ -2378,10 +2478,30 @@ export async function finalizeWorkerRunState(
            finished_at = now(),
            updated_at = now(),
            error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
-       WHERE id = $1`,
-      [input.runId, input.finalStatus, encodePostgresText(input.stdout), encodePostgresText(input.stderr), input.exitCode]
+       WHERE id = $1
+         AND status IN ('running', 'cancel_requested')
+         AND (runner_id IS NULL OR runner_id = $6)
+       RETURNING id`,
+      [input.runId, input.finalStatus, encodePostgresText(input.stdout), encodePostgresText(input.stderr), input.exitCode, currentRunnerId()]
     );
-    if (!ownsCurrentThread) return;
+    if (!finalized.rows[0]) return false;
+    if (!ownsCurrentThread) return true;
+    // A turn started by a message to the task's thread (a ping from the UI)
+    // is conversation, not a run of the task: it never changes task or
+    // coordination status. Only the task's own runs and explicit commands do.
+    if (!legacyCoordination()) {
+      const trigger = await client.query<{ trigger: string }>("SELECT trigger FROM task_runs WHERE id = $1", [input.runId]);
+      if (trigger.rows[0]?.trigger === "message") {
+        if (input.agentThreadId) {
+          await client.query(
+            `UPDATE agent_threads SET last_activity_at = now(), updated_at = now()
+             WHERE id = $1 AND ($2::integer IS NULL OR ownership_generation = $2)`,
+            [input.agentThreadId, input.agentThreadGeneration ?? null]
+          );
+        }
+        return true;
+      }
+    }
     // A successful turn only closes a standalone task. A child task, or one with
     // assignments or open children, is part of a coordinated job: one of its
     // turns ending (for example a ping) does not mean the job is done, and
@@ -2424,6 +2544,7 @@ export async function finalizeWorkerRunState(
         [input.agentThreadId, input.agentThreadGeneration ?? null]
       );
     }
+    return true;
   });
 }
 
@@ -2813,11 +2934,14 @@ export async function finishMessageDelivery(
       }
 
       if (status !== "failed" || delivery.attempt_count >= 3) {
+        // A cancelled turn was stopped on purpose (Stop, reassignment,
+        // archive): the sender gets no delivery.failed notice inviting a retry.
         await client.query(
           `UPDATE message_deliveries
-           SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now()
+           SET status = 'failed', completed_at = now(), error = NULLIF($2, ''), updated_at = now(),
+               failure_notified_at = CASE WHEN $3::boolean THEN now() ELSE failure_notified_at END
            WHERE id = $1 AND status = 'running'`,
-          [messageDeliveryId, encodePostgresText(error)]
+          [messageDeliveryId, encodePostgresText(error), status === "cancelled"]
         );
         await markAssignmentDeliveryTerminal(client, messageDeliveryId, error, status === "cancelled" ? "cancelled" : "blocked");
         await cancelQueuedDeliveryRuns(client, messageDeliveryId, error || "Delivery failed");
@@ -3076,7 +3200,10 @@ export async function claimAgentTurnInput(
                  AND task_assignments.status IN ('queued', 'running')
              )
            )
-         ORDER BY created_at ASC
+         -- Inbox order: deliveries by their sequence, then plain steering
+         -- inputs (no delivery) in arrival order.
+         ORDER BY (SELECT seq FROM message_deliveries WHERE message_deliveries.id = agent_turn_inputs.message_delivery_id) ASC NULLS LAST,
+                  created_at ASC
          LIMIT 1
          FOR UPDATE SKIP LOCKED
        )
@@ -3287,9 +3414,10 @@ async function failPendingAgentTurnInputsInTransaction(
   if (deliveryIds.length === 0) return;
   await client.query(
       `UPDATE message_deliveries
-       SET status = 'failed', completed_at = now(), error = $2, updated_at = now()
+       SET status = 'failed', completed_at = now(), error = $2, updated_at = now(),
+           failure_notified_at = CASE WHEN $3::boolean THEN now() ELSE failure_notified_at END
        WHERE id = ANY($1::uuid[]) AND status IN ('queued', 'retrying', 'running')`,
-      [deliveryIds, deliveryError]
+      [deliveryIds, deliveryError, finalStatus === "cancelled"]
     );
   for (const deliveryId of deliveryIds) {
     await markAssignmentDeliveryTerminal(client, deliveryId, deliveryError, finalStatus === "cancelled" ? "cancelled" : "blocked");
@@ -3420,6 +3548,140 @@ export async function requeueUnpresentedAgentTurnInput(
   // gone rather than terminal: a later supersede may need to re-add it.
   await client.query("DELETE FROM agent_turn_inputs WHERE id = $1", [inputId]);
   return true;
+}
+
+// Crash recovery for a coordination run that was presented to the recipient
+// and then interrupted by a runner stop. Today's alternative is failing the
+// delivery and blocking its assignment, which silently drops the work. Instead
+// the same delivery is queued again on a fresh run in the same provider
+// session, with a note that the previous turn was interrupted, up to the
+// task's assignment attempt limit (3 by default). Messages that had been
+// injected into the interrupted turn are moved onto the fresh run the same
+// way. Returns false when it cannot redeliver safely; the caller then fails
+// the delivery as before (and the sender gets a delivery.failed notice).
+export async function redeliverInterruptedRun(
+  client: Pick<DbPool, "query">,
+  runId: string,
+  deliveryId: string,
+  error: string
+): Promise<boolean> {
+  const result = await client.query<{
+    status: string;
+    presented_at: Date | null;
+    launch_attempted_at: Date | null;
+    interrupted_count: number;
+    max_attempts: number;
+    agent_thread_id: string | null;
+    agent_thread_generation: number;
+    ownership_generation: number | null;
+    provider_thread_id: string | null;
+  }>(
+    `SELECT delivery.status,
+            delivery.presented_at,
+            source_run.launch_attempted_at,
+            delivery.interrupted_count,
+            COALESCE(NULLIF(tasks.orchestration_policy->>'maxAssignmentAttempts', '')::integer, 3) AS max_attempts,
+            source_run.agent_thread_id,
+            source_run.agent_thread_generation,
+            agent_threads.ownership_generation,
+            agent_threads.provider_thread_id
+     FROM message_deliveries delivery
+     JOIN dispatcher_runs source_run
+       ON source_run.id = $2 AND source_run.message_delivery_id = delivery.id
+     LEFT JOIN agent_threads ON agent_threads.id = source_run.agent_thread_id AND agent_threads.archived_at IS NULL
+     LEFT JOIN tasks ON tasks.id = source_run.task_id
+     WHERE delivery.id = $1
+     FOR UPDATE OF delivery`,
+    [deliveryId, runId]
+  );
+  const delivery = result.rows[0];
+  if (!delivery || !["queued", "retrying", "running"].includes(delivery.status)) return false;
+  // Only a turn that may have shown the message was "interrupted while
+  // handling" it; a never-launched one belongs to the plain retry path and
+  // its attempt cap.
+  if (!delivery.presented_at && !delivery.launch_attempted_at) return false;
+  if (delivery.interrupted_count >= Math.max(1, Number(delivery.max_attempts) || 3)) return false;
+  // The fresh run inherits the interrupted run's workspace and session, so
+  // the agent thread must still be live and owned by the same generation.
+  if (!delivery.agent_thread_id || delivery.ownership_generation === null) return false;
+  if (delivery.agent_thread_generation !== delivery.ownership_generation) return false;
+  const retry = await client.query<{ id: string }>(
+    `INSERT INTO dispatcher_runs
+       (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+        codex_thread_id, model, model_options, prompt, skills_snapshot)
+     SELECT source_run.task_id, source_run.assignment_id, 'redelivery', source_run.scope, source_run.agent_thread_id,
+            source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+            COALESCE($3, source_run.codex_thread_id), source_run.model, source_run.model_options,
+            $4, source_run.skills_snapshot
+     FROM dispatcher_runs source_run
+     WHERE source_run.id = $1
+       AND source_run.message_delivery_id = $2
+       AND NOT EXISTS (
+         SELECT 1
+         FROM dispatcher_runs overlapping_run
+         WHERE overlapping_run.message_delivery_id = $2
+           AND overlapping_run.id <> source_run.id
+           AND overlapping_run.status IN ('queued', 'running', 'cancel_requested')
+       )
+     RETURNING id`,
+    [runId, deliveryId, delivery.provider_thread_id, withInterruptedPreamble(await runPrompt(client, runId))]
+  );
+  const newRunId = retry.rows[0]?.id;
+  if (!newRunId) return false;
+  await client.query(
+    `UPDATE message_deliveries
+     SET status = 'retrying', available_at = now(), interrupted_count = interrupted_count + 1,
+         error = $2, updated_at = now()
+     WHERE id = $1`,
+    [deliveryId, encodePostgresText(error)]
+  );
+  await redeliverInterruptedInputs(client, runId, newRunId, error);
+  return true;
+}
+
+async function runPrompt(client: Pick<DbPool, "query">, runId: string): Promise<string> {
+  const result = await client.query<{ prompt: string }>("SELECT prompt FROM dispatcher_runs WHERE id = $1", [runId]);
+  return result.rows[0]?.prompt ?? "";
+}
+
+// Inputs the interrupted turn had already presented ('delivering') get the
+// same treatment as its main delivery. Inputs still 'queued' were never seen
+// and are moved by failPendingAgentTurnInputsInTransaction's requeue.
+async function redeliverInterruptedInputs(
+  client: Pick<DbPool, "query">,
+  sourceRunId: string,
+  newRunId: string,
+  error: string
+): Promise<void> {
+  const presented = await client.query<{ id: string; message_delivery_id: string; message: string }>(
+    `SELECT input.id, input.message_delivery_id, input.message
+     FROM agent_turn_inputs input
+     JOIN message_deliveries delivery ON delivery.id = input.message_delivery_id
+     LEFT JOIN task_assignments ON task_assignments.id = delivery.assignment_id
+     LEFT JOIN tasks ON tasks.id = task_assignments.task_id
+     WHERE input.dispatcher_run_id = $1
+       AND input.status = 'delivering'
+       AND delivery.status = 'running'
+       AND delivery.interrupted_count < COALESCE(NULLIF(tasks.orchestration_policy->>'maxAssignmentAttempts', '')::integer, 3)
+     ORDER BY delivery.seq ASC NULLS LAST, input.created_at ASC
+     FOR UPDATE OF input, delivery`,
+    [sourceRunId]
+  );
+  for (const input of presented.rows) {
+    await client.query(
+      `UPDATE message_deliveries
+       SET status = 'retrying', available_at = now(), interrupted_count = interrupted_count + 1,
+           error = $2, updated_at = now()
+       WHERE id = $1`,
+      [input.message_delivery_id, encodePostgresText(error)]
+    );
+    await client.query(
+      `UPDATE agent_turn_inputs
+       SET status = 'queued', dispatcher_run_id = $2, message = $3, error = NULL, updated_at = now()
+       WHERE id = $1`,
+      [input.id, newRunId, withInterruptedPreamble(input.message)]
+    );
+  }
 }
 
 // Crash recovery for a coordination run that stopped before it ever sent its

@@ -1,6 +1,6 @@
 # Coordination v2: reliable, harness-agnostic agent messaging
 
-Status: proposed. Phase 1 is implemented in the PR that adds this document.
+Status: phases 1 and 2 are implemented: phase 1 in rshabhsinha/aisevak#46 (section 8) and phase 2 in rshabhsinha/aisevak#48 (section 9). Phases 3–5 are proposed. Where a section 3 proposal was built differently, section 9 is authoritative.
 Assumes rshabhsinha/aisevak#45 (successful worker runs only auto-complete standalone tasks; parent-task owners can reopen children) has merged.
 
 ## 1. Why
@@ -19,7 +19,16 @@ Investigating coordination thread `84a89858` showed that agents could not coordi
 
 The goal is messaging that behaves like Claude Code subagents (`ListAgents` / `SendMessage`): any agent can find another, send it a message at any time, optionally wait for a reply, and trust that the message is either processed or that it will be told it was not, on every harness (Codex, Claude Code, Cursor, OpenCode, Devin).
 
-## 2. Current state map
+## 2. State before v2 (baseline)
+
+This section maps the system as it was before v2, at `main` after #45. It is kept as the baseline the design was measured against. Phases 1 and 2 changed several of the behaviours below:
+* thread ids from the UI now resolve;
+* messages carry a delivery state and failures notify the sender;
+* runner restarts redeliver interrupted turns instead of blocking their assignments;
+* worker turns left running are recovered;
+* UI pings no longer change task status.
+
+Sections 8 and 9 describe the code as it is now.
 
 ### 2.1 Entities (`packages/core/src/migrations.ts`)
 
@@ -82,7 +91,7 @@ A coordination thread (a conversation with several participants) and an agent th
 1. `send()` appends; it never starts a turn directly.
 2. A **wake step** in the runner looks for agent threads with pending inbox items: if the thread has an active turn, items are injected at the next turn boundary (`nextInput`, unchanged harness code); if idle, one turn is started that drains all pending items in `seq` order (batched into one prompt). This replaces one-dispatcher-run-per-message and the supersede/migrate machinery (`queueIncrementalCoordinationInput`, `migrateStaleCoordinationRuns`, `appendIncrementalAgentTurnInput`'s folding).
 3. Never two concurrent turns on one agent thread (already enforced by the claim queries; kept).
-4. UI messages to task-bound threads go through the same inbox (as a `user` sender) instead of `queueWorkerRun`, so a ping can never start a second writer or a worker finalization.
+4. UI messages to task-bound threads go through the same inbox (as a `user` sender) instead of `queueWorkerRun`, so a ping can never start a second writer or a worker finalization. *Built differently in phase 2:* pings stay worker turns, so git-worktree tasks keep their workspace, but with `trigger='message'`, which never changes task status. The separate wake step (point 2) moved to phase 5. See section 9.
 
 With that, "pinging" is always safe: the worst case is one extra inbox item consumed at the next boundary.
 
@@ -96,11 +105,11 @@ Only explicit `tasks complete|block|reopen|cancel` (and the human UI) change tas
 
 ### 3.5 Sender-visible message state
 
-Per recipient: `queued → presented → consumed → replied`, or `failed`/`expired`. Mapping from today's columns: `queued|retrying → queued`, `running → delivering` (presented once `presented_at` is set), `completed → delivered` (phase 2 splits this into consumed vs presented), `failed → failed`. A terminal failure is itself delivered to the sender as a `delivery.failed` inbox item that names the message, recipient, error, affected assignment, and the exact retry command. Settlements that are not failures from the sender's point of view (assignment already terminal, superseded by a retry) are quiet.
+Per recipient: `queued → presented → consumed → replied`, or `failed`/`expired`. Mapping from the existing columns (built in phase 1): `queued|retrying → queued`, `running → delivering` (or `presented` once `presented_at` is set), `completed → delivered`, `failed → failed`. Splitting `delivered` into consumed and replied is phase 3. A terminal failure is itself delivered to the sender as a `delivery.failed` inbox item that names the message, recipient, error, affected assignment, and the exact retry command. Settlements that are not failures from the sender's point of view are quiet: the assignment was already terminal, a retry superseded the delivery, or the turn was stopped on purpose.
 
 ### 3.6 Turn leases and restart redelivery
 
-Runs get `runner_id`, `lease_expires_at`, and a heartbeat (every 15 s, lease 60 s). Recovery acts only on expired leases (so two runners or a fast restart never steal a live turn). For an interrupted turn, every inbox item it presented but did not consume is requeued with `attempt+1` and an "Your previous turn was interrupted by a platform restart while handling this message; check what you already did before redoing it" preamble. The assignment stays `running`; it is only blocked after `maxAssignmentAttempts`, and that blocking produces a `delivery.failed` notice. This fixes the ASSIGNMENT-70 class of bug. Tool calls are already idempotent through idempotency keys, which makes redelivery safe.
+Runs get `runner_id`, `lease_expires_at`, and a heartbeat (every 15 s, lease 60 s). Recovery acts only on this runner's own previous turns, or on other runners' leases that expired more than 2 minutes ago, so two runners or a fast restart never steal a live turn. If a takeover happens anyway, the old runner stops its turn and its finalizers are fenced, so it settles nothing (section 9). For an interrupted turn, every inbox item it presented but did not consume is requeued with `attempt+1` and an "Your previous turn was interrupted by a platform restart while handling this message; check what you already did before redoing it" preamble. The assignment stays `running`; it is only blocked after `maxAssignmentAttempts`, and that blocking produces a `delivery.failed` notice. This fixes the ASSIGNMENT-70 class of bug. Tool calls are already idempotent through idempotency keys, which makes redelivery safe.
 
 ### 3.7 Queryable thread state
 
@@ -144,7 +153,7 @@ Trade-offs:
 
 All migrations are additive (`ADD COLUMN IF NOT EXISTS`, new tables), consistent with `additiveSql`.
 
-Phase 1 (this PR):
+Phase 1 (built):
 
 ```sql
 -- NULL = a terminal failure the sender has not been told about yet.
@@ -155,18 +164,22 @@ CREATE INDEX IF NOT EXISTS message_deliveries_failure_notice_idx
 ON message_deliveries(completed_at) WHERE status = 'failed' AND failure_notified_at IS NULL;
 ```
 
-Phase 2 (inbox + leases):
+Phase 2 (built; the full statements are in `packages/core/src/migrations.ts`):
 
 ```sql
-ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS agent_thread_id uuid REFERENCES agent_threads(id) ON DELETE SET NULL;
-ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS seq bigint;              -- per agent_thread, from a sequence
-ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS consumed_at timestamptz;   -- carrying turn ended OK after presentation
+CREATE SEQUENCE IF NOT EXISTS message_delivery_inbox_seq;        -- global, so monotonic per agent thread
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS agent_thread_id uuid;  -- FK to agent_threads, ON DELETE SET NULL
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS seq bigint;
 ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS interrupted_count integer NOT NULL DEFAULT 0;
-CREATE INDEX IF NOT EXISTS message_deliveries_inbox_idx
-ON message_deliveries(agent_thread_id, seq) WHERE status IN ('queued', 'retrying');
-ALTER TABLE task_runs       ADD COLUMN IF NOT EXISTS runner_id text, ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
-ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS runner_id text, ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+-- Pending rows are backfilled from their turn input or run; partial indexes on
+-- (agent_thread_id, seq) and (recipient_agent_id, seq) cover pending deliveries.
+ALTER TABLE task_runs       ADD COLUMN IF NOT EXISTS runner_id text;
+ALTER TABLE task_runs       ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS runner_id text;
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS lease_expires_at timestamptz;
 ```
+
+`consumed_at` (presented and then finished successfully, as distinct from today's `completed`) is deferred to phase 3, together with `wait`.
 
 Backfill: `agent_thread_id` from `agent_turn_inputs`/`dispatcher_runs.message_delivery_id`; `seq` from `created_at` order.
 
@@ -219,7 +232,7 @@ All routes live under `/api/agent-tools/v1` and use the existing bearer token.
 | Thread state | `GET threads/:ref/status` | `aisevak threads status THREAD-n` | `status` | 1 |
 | Failure notices | `delivery.failed` messages | — (arrive as inbox items) | — | 1 |
 | Agent state | `GET agents/:ref/status` | `aisevak agents status AGENT-x` | `status` | 2 |
-| Inbox | `GET inbox[?wait=60s]` | `aisevak inbox [--wait 60]` | `inbox`, `wait` | 2 |
+| Inbox | `GET inbox[?thread=&recent=true]` (built); `?wait=60s` in phase 3 | `aisevak inbox [--thread THREAD] [--recent]`; `--wait` in phase 3 | `inbox`, `wait` | 2 (wait: 3) |
 | Send (any thread/agent) | `POST send {to, thread?, body, key?, expectReply?, timeout?}` | `aisevak send --to AGENT [--thread THREAD-n] [--key K] [--expect-reply] [--timeout 30m] --body-stdin` | `send` | 3 |
 | Reply | `POST messages/:ref/reply` | `aisevak reply MESSAGE-n --body-stdin` | `reply` | 3 |
 | Wait for reply | `GET messages/:ref/reply?wait=60s` | `aisevak wait MESSAGE-n [--timeout 60]` | `wait` | 3 |
@@ -231,12 +244,15 @@ Existing commands (`threads send|complete|block`, `assignments *`, `tasks *`) ke
 
 | Failure | Today | Target |
 | --- | --- | --- |
-| Runner restarts during a turn | Presented deliveries failed, assignment blocked, sender not told | Phase 1: sender gets `delivery.failed` with the retry command. Phase 2: lease expiry requeues with an "interrupted" preamble; assignment stays running until the attempt limit. |
-| Two runners / overlapping restart | Recovery runs at boot and can fail a turn another runner still owns | Recovery acts only on expired leases. |
+| Runner restarts during a turn | Presented deliveries failed, assignment blocked, sender not told | Built. Phase 1: the sender gets `delivery.failed` with the retry command. Phase 2: the delivery is requeued with an "interrupted" preamble in the same session, and the assignment stays running until the attempt limit. |
+| Two runners / overlapping restart | Recovery runs at boot and can fail a turn another runner still owns | Built. Recovery takes over only this runner's own previous turns, or other runners' leases expired for more than 2 minutes. A runner whose turn was taken over stops it, and its fenced finalizers settle nothing. |
+| Turn stopped on purpose (Stop, archive) | Delivery failed silently | Built. Delivery fails with no `delivery.failed` notice, so the sender is not invited to undo the stop. |
+| Queued turn cancelled by an internal ownership change (for example, opening or relinking a task's chat) | Delivery failed silently; assignment left active | Built in phase 1: the sender gets a `delivery.failed` notice. This is deliberately not quiet, because nothing else settles the assignment. Proposed for phase 3: requeue the delivery onto the new owner instead. |
+| Worker turn left `running` by a dead runner | Never recovered; blocked its agent thread forever | Built. Recovered at boot (own) or by a sweep (others'); task status is left alone. |
 | Message to an agent with an active turn | Injected (Codex steer / ACP prompt) or queued run | Same; ordered by inbox `seq`. |
 | Message to an idle agent | One dispatcher run per message, later folded | One turn drains all pending items. |
 | Ping on a task thread | Could start a worker run that auto-closed the task | Inbox item; no worker finalization; task status untouched. |
-| Recipient's thread archived | `assertThreadAcceptsInput` throws; send fails | Phase 1: notice sweeper skips (one attempt, recorded). Phase 2: send succeeds, delivery fails fast with `delivery.failed` to sender. |
+| Recipient's thread archived | `assertThreadAcceptsInput` throws; send fails | Built in phase 1: the notice sweeper skips the notice (one attempt, recorded). Proposed for phase 3: the send succeeds and the delivery fails fast with `delivery.failed` to the sender. |
 | Duplicate send (retry by agent) | Idempotency key on `(sender, key)` | Same, plus `request_key` for requests. |
 | Delivery-failure notice itself fails | n/a | Never generates another notice (`delivery.failed` is excluded), so no loops. |
 | Assignment completed, then turn fails | `settleDeliveryByAssignment` settles quietly | Same; quiet settlements are marked notified so they produce no notice. |
@@ -250,11 +266,11 @@ Existing commands (`threads send|complete|block`, `assignments *`, `tasks *`) ke
 
 Each phase is shippable alone and keeps the component-library workflows (orchestrator → populator → reviewer through tasks, assignments and threads) running unchanged.
 
-1. **Addressing and visibility (this PR).** `resolveThreadRef` for every `threads/:ref` route; normalized `delivery` state on messages; `MESSAGE-n` in `show`; `threads status`; `delivery.failed` notices from an API sweeper with quiet settlements marked; prompt framing for notices; skill update. No behaviour change for existing sends.
-2. **Inbox and leases.** Bind deliveries to agent threads with `seq`; runner wake step drains the inbox; leases and heartbeat; restart redelivery with an interrupted preamble; UI pings on task threads via the inbox; `inbox`/`agents status`. Keep the old dispatcher-run path behind a flag for one release.
+1. **Addressing and visibility (built, #46).** `resolveThreadRef` for every `threads/:ref` route; normalized `delivery` state on messages; `MESSAGE-n` in `show`; `threads status`; `delivery.failed` notices from an API sweeper with quiet settlements marked; prompt framing for notices; skill update. No behaviour change for existing sends.
+2. **Inbox and leases (built, #48).** Bind deliveries to agent threads with `seq`; leases and heartbeat; restart redelivery with an interrupted preamble; recovery of stuck worker turns; ping turns that never change task status; `inbox`/`agents status`; `AISEVAK_COORDINATION_LEGACY` for one release. Deviations are in section 9.
 3. **Requests, lifecycle and campaigns.** `send`/`reply`/`wait`, assignments as requests, `completion_policy`, tree authority (`canActOnTask`). Campaign support (3.11): schedules that tick into a thread, child-task events routed to the parent owner's inbox, conversation refresh that keeps the thread id. Then move the component-library workflow to one campaign task: the orchestrator creates the campaign task once, the 30-minute schedule targets its thread, and new component tasks are created with `--parent-task` set to the campaign task. Existing children stay where they are (ancestor authority covers them) unless the optional re-parenting migration is run. **Needs user decisions before shipping**: (a) whether agent-created tasks default to `explicit` completion (recommended), which changes what a successful worker turn does for tasks created by agents; (b) whether to re-parent existing open component tasks under the campaign task.
-4. **MCP and watchdog.** `aisevak mcp`, harness wiring, watchdog nudges/escalations/timeouts; update the `aisevak-cli` skill to say pinging is safe and to prefer `send --expect-reply` + `wait`.
-5. **Cleanup.** Lazily give every agent thread a coordination thread; UI shows `THREAD-n`; remove the superseded dispatcher-run-per-message path and legacy routes.
+4. **MCP and watchdog.** `aisevak mcp`, harness wiring, watchdog nudges/escalations/timeouts; update the `aisevak-cli` skill to prefer `send --expect-reply` + `wait`. The skill already says, as of phase 2, that follow-up pings are safe.
+5. **Cleanup.** Lazily give every agent thread a coordination thread; UI shows `THREAD-n`. Move coordination prompt building into a shared package so the runner can drain an inbox itself (the wake step from 3.2), then remove the dispatcher-run-per-message path, its supersede/migrate machinery, `AISEVAK_COORDINATION_LEGACY`, and legacy routes.
 
 ## 8. Phase 1 details
 
@@ -262,5 +278,33 @@ Each phase is shippable alone and keeps the component-library workflows (orchest
 * `deliveryState(row)` maps raw delivery columns to `{ state, attempts, error, updatedAt }` on every message resource; `delivery_status` stays for compatibility.
 * `GET /api/agent-tools/v1/threads/:ref/status` returns the thread, its task, and per participant `{ agent, role, state, agentThreadId, pendingMessages, currentTurn, waitingOn, blockedReason, lastFailedDelivery }` with precedence `running > queued > blocked > waiting > idle`.
 * `notifyFailedDeliveries(pool, managedRoot)` claims up to 20 failed, un-notified deliveries (`FOR UPDATE SKIP LOCKED`), and for each one whose message has an agent sender other than the recipient and is not itself a `delivery.failed` notice, inserts a `delivery.failed` message (parent = the failed message) to the sender on the same thread and queues it. Every claimed row is marked notified, inside a savepoint so one bad row cannot wedge the sweep. The API process runs it every 5 s.
-* `settleDeliveryByAssignment` (runner) and `cancelPendingAssignmentDelivery` (API) set `failure_notified_at` on the deliveries they fail, because those are not failures from the sender's point of view.
-* `coordinationPrompt` frames a `delivery.failed` message as a platform notice: decide whether to resend or retry; do not complete or block the thread because of it.
+* `settleDeliveryByAssignment` (runner) and `cancelPendingAssignmentDelivery` (API) set `failure_notified_at` on the deliveries they fail, because those are not failures from the sender's point of view. Since phase 2, so do the three places that fail a delivery because its turn was cancelled.
+* The notice body opens with "Platform notice (not new work, not a reply)…", and `coordinationPrompt` adds the same framing for cold sessions. The body carries it because warm sessions only receive the incremental prompt.
+
+## 9. Phase 2 as built
+
+What shipped, and where it deliberately differs from sections 3.2 and 3.6:
+
+* **Inbox binding.** `queueDelivery` binds every delivery to its consuming agent thread (`message_deliveries.agent_thread_id`) and gives it `seq` from the global `message_delivery_inbox_seq`, which is monotonic per thread. `claimAgentTurnInput` takes inputs in `seq` order. Pending rows are backfilled from their input or run.
+* **Wake step: kept the existing carrier rather than replacing it.** On reading the runner, the "one turn drains the inbox" behaviour already holds. `queueDelivery` folds every queued coordination run of an agent thread into one run, with the other messages attached as turn inputs, and injects into a running coordination turn; the claim queries keep one turn per agent thread. A separate runner wake step would also have to build the full coordination prompt, which only the API can do today (the runner does not depend on the API package). Removing the per-message dispatcher-run machinery therefore moves to phase 5, once prompt building lives in a shared package.
+* **Turn leases.** Claims stamp `runner_id` (`AISEVAK_RUNNER_ID`, default the hostname, so it is stable across restarts) and `lease_expires_at` (60 s). Set `AISEVAK_RUNNER_ID` explicitly when several runner processes share a host.
+  * A heartbeat renews the leases every 15 s, but only for the turns this process is actually executing. A row left `running` by a job that died inside the process therefore expires and is recovered.
+  * At boot, a runner recovers its own previous turns, unleased legacy turns, and expired leases.
+  * Every 30 s it sweeps other runners' turns whose lease expired more than 2 minutes ago. The grace period means a brief database or network blip on the owning runner does not cause a takeover.
+  * Sweeps do not run the boot-only repairs of crash windows between a run's terminal update and its delivery's, because those windows are normal while runners are live.
+  * Recovery re-checks the lease predicate under the row lock.
+  * If a takeover does happen while the old runner is still alive:
+    * its `shouldCancel` sees the run is no longer its own, and stops the provider turn;
+    * its finalizers are fenced on `status IN ('running','cancel_requested') AND runner_id = me`, so it settles nothing the recovery already settled.
+* **Worker turns are now recovered at all.** Before this change, a `task_runs` row left `running` by a stopped runner was never terminalized, and it blocked every later turn on its agent thread. `recoverInterruptedWorkerRuns` fails or cancels it. The task's status is left alone.
+* **Interrupted redelivery.** A coordination turn that was launched or presented and then interrupted is queued again (`redeliverInterruptedRun`) instead of failing and blocking its assignment. A turn that never launched its prompt stays on the plain retry path and its attempt cap. For a redelivery:
+  * the new run has trigger `redelivery`, keeps the same provider session, and its prompt starts with the interrupted note;
+  * messages the turn had already presented move to the new run with the same note;
+  * `interrupted_count` caps this at the task's `maxAssignmentAttempts` (default 3), after which the old fail, block and `delivery.failed` notice path applies;
+  * the assignment stays `running` throughout.
+* **UI pings: still worker turns, but conversational.** Section 3.2 proposed routing them through the coordination path. Doing that would run git-worktree tasks' pings in the project checkout instead of the task's worktree, because coordination turns use the agent thread's cwd. Instead, messages from the UI (task, run and agent-thread message routes) create worker runs with `trigger='message'`. They still inject into a running turn or wait for the next one, as before, and `finalizeWorkerRunState` never changes task or coordination status for them. Only the task's own runs and explicit commands do.
+* **New read surface.** `aisevak inbox [--thread] [--recent]` (`GET /inbox`) and `aisevak agents status AGENT` (`GET /agents/:ref/status`).
+* **Quiet cancellations.** A delivery that fails because its turn was cancelled on purpose is marked as needing no `delivery.failed` notice, so the sender is not invited to undo the stop. This covers a user Stop, archiving the chat, and the runner seeing its running turn's ownership move. Queued runs cancelled by the API's internal ownership changes (`cancelStaleQueuedAgentThreadRuns`, `linkTaskRunsToThread`) still notify the sender, because nothing else settles their assignment. The notice body itself now says it is a platform notice and not new work. This matters because warm sessions receive only the incremental prompt, not `coordinationPrompt`'s framing.
+* **Legacy flag.** `AISEVAK_COORDINATION_LEGACY=1` restores the pre-v2 behaviour for one release: recover everything at boot, no lease sweeps, fail and block interrupted deliveries, and finalize ping turns like task runs. Worker turns left `running` are still recovered at boot, because that is a bug fix rather than a behaviour change.
+* **Tests against Postgres.** `tests/coordinationV2.db.test.ts` runs the phase 1 and phase 2 SQL against a real database when `AISEVAK_TEST_DATABASE_URL` is set, and is skipped otherwise.
+* **Deferred:** `consumed_at` (`completed` still means the carrying turn ended successfully), `wait`, and binding inbox items for deliveries that a phase 1 `delivery.failed` sweep cannot queue.
