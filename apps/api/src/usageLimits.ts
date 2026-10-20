@@ -57,6 +57,9 @@ const SESSION_MINUTES = 300;
 const WEEK_MINUTES = 7 * 24 * 60;
 const CACHE_TTL_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 10_000;
+// Anthropic's usage endpoint rate-limits per token; without a Retry-After, wait this long.
+const DEFAULT_RETRY_AFTER_MS = 5 * 60_000;
+const MAX_RETRY_AFTER_MS = 60 * 60_000;
 
 type JsonRecord = Record<string, unknown>;
 
@@ -67,7 +70,10 @@ interface LimitsContext {
   now: Date;
 }
 
-const cache = new Map<string, { at: number; value: AccountLimits }>();
+// `good` is the last reading that had windows, kept to show when a later fetch fails.
+const cache = new Map<string, { at: number; value: AccountLimits; good?: AccountLimits }>();
+// Account id -> epoch ms before which the Claude usage endpoint is not called again.
+const claudeUsageBackoff = new Map<string, number>();
 
 export async function loadAccountLimits(
   pool: DbPool,
@@ -83,16 +89,18 @@ export async function loadAccountLimits(
       if (!refresh && cached && Date.now() - cached.at < CACHE_TTL_MS && cached.value.driver === account.driver) {
         return cached.value;
       }
+      const lastGood = cached?.good?.driver === account.driver ? cached.good : undefined;
       let value: AccountLimits;
+      let good = lastGood;
       try {
         value = await fetchLimits(context, account.id, account.driver);
+        if (value.source !== "unavailable" && value.windows.length) good = value;
       } catch (error) {
-        value = {
-          ...base(context, account.id, account.driver, "unavailable"),
-          error: error instanceof Error ? error.message : String(error)
-        };
+        value = lastGood
+          ? { ...lastGood, note: `Could not refresh (${errorMessage(error)}); showing the reading from ${lastGood.checkedAt}.` }
+          : { ...base(context, account.id, account.driver, "unavailable"), error: errorMessage(error) };
       }
-      cache.set(account.id, { at: Date.now(), value });
+      cache.set(account.id, { at: Date.now(), value, good });
       return value;
     })
   );
@@ -101,6 +109,7 @@ export async function loadAccountLimits(
 /** Forget an account's cached limits, e.g. after it is removed. */
 export function forgetAccountLimits(accountId: string): void {
   cache.delete(accountId);
+  claudeUsageBackoff.delete(accountId);
 }
 
 async function fetchLimits(context: LimitsContext, accountId: string, driver: ProviderDriver): Promise<AccountLimits> {
@@ -132,6 +141,9 @@ async function claudeLimits(context: LimitsContext, accountId: string): Promise<
   if (classifyClaudeCredential(credential) === "api_key") {
     return { ...result, plan: "API key", note: "Billed per token through the Anthropic API; there are no plan limits." };
   }
+  if ((claudeUsageBackoff.get(accountId) ?? 0) > context.now.getTime()) {
+    return claudeHeaderProbe(context, credential, result);
+  }
   const response = await request(context, "https://api.anthropic.com/api/oauth/usage", {
     headers: {
       authorization: `Bearer ${credential}`,
@@ -140,11 +152,17 @@ async function claudeLimits(context: LimitsContext, accountId: string): Promise<
     }
   });
   if (response.ok) {
+    claudeUsageBackoff.delete(accountId);
     return { ...parseClaudeUsage(objectValue(await response.json()) ?? {}, result), source: "live" };
   }
   // `claude setup-token` tokens carry only the inference scope, which the usage
-  // endpoint can reject; the unified rate-limit headers of a one-token request
-  // report the same session and weekly utilization.
+  // endpoint can reject, and the endpoint rate-limits hard; the unified
+  // rate-limit headers of a one-token request report the same session and
+  // weekly utilization.
+  if (response.status === 429) {
+    claudeUsageBackoff.set(accountId, context.now.getTime() + retryAfterMs(response.headers.get("retry-after"), context.now));
+    return claudeHeaderProbe(context, credential, result);
+  }
   if (response.status === 401 || response.status === 403) return claudeHeaderProbe(context, credential, result);
   throw new Error(`Anthropic usage endpoint returned ${response.status}`);
 }
@@ -570,6 +588,14 @@ function clampPercent(value: number): number {
 
 function humanize(value: string): string {
   return value.replace(/[_-]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+export function retryAfterMs(header: string | null, now: Date): number {
+  const trimmed = header?.trim();
+  if (!trimmed) return DEFAULT_RETRY_AFTER_MS;
+  const ms = /^\d+(\.\d+)?$/.test(trimmed) ? Number(trimmed) * 1000 : new Date(trimmed).getTime() - now.getTime();
+  if (!Number.isFinite(ms)) return DEFAULT_RETRY_AFTER_MS;
+  return Math.min(MAX_RETRY_AFTER_MS, Math.max(0, ms));
 }
 
 function errorMessage(error: unknown): string {

@@ -1,6 +1,6 @@
 import { encryptSecret, providerInstanceSecretName, type DbPool } from "@aisevak/core";
 import { describe, expect, it, vi } from "vitest";
-import { forgetAccountLimits, loadAccountLimits, parseClaudeUsage, parseCursorUsage, parseWhamUsage, type AccountLimits } from "./usageLimits.js";
+import { forgetAccountLimits, loadAccountLimits, parseClaudeUsage, parseCursorUsage, parseWhamUsage, retryAfterMs, type AccountLimits } from "./usageLimits.js";
 
 const key = Buffer.alloc(32, 7).toString("base64");
 
@@ -145,5 +145,61 @@ describe("account limits", () => {
     forgetAccountLimits("claude-local");
     const afterForget = await loadAccountLimits(pool, key, accounts, options);
     expect(afterForget.map((entry) => entry.windows[0]?.usedPercent)).toEqual([70, 70]);
+  });
+
+  it("falls back to the rate-limit headers on a 429 and honors Retry-After", async () => {
+    const usageCalls: string[] = [];
+    const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+      if (String(url).includes("oauth/usage")) {
+        usageCalls.push(String(url));
+        return new Response("rate limited", { status: 429, headers: { "retry-after": "600" } });
+      }
+      return new Response("{}", {
+        headers: {
+          "anthropic-ratelimit-unified-5h-utilization": "0.25",
+          "anthropic-ratelimit-unified-7d-utilization": "0.5",
+          "anthropic-ratelimit-unified-status": "allowed"
+        }
+      });
+    });
+    const pool = poolWith({ [providerInstanceSecretName("claude_code_token", "claude-429")]: "sk-ant-oat01-limited-token" });
+    const accounts = [{ id: "claude-429", driver: "claude" as const }];
+    const options = { fetchImpl: fetchImpl as unknown as typeof fetch, refresh: true };
+    const first = await loadAccountLimits(pool, key, accounts, options);
+    expect(first[0]).toMatchObject({ source: "live", error: null });
+    expect(first[0]!.windows.map((window) => window.usedPercent)).toEqual([25, 50]);
+    await loadAccountLimits(pool, key, accounts, options);
+    expect(usageCalls).toHaveLength(1);
+    forgetAccountLimits("claude-429");
+  });
+
+  it("keeps showing the last good reading when a refresh fails", async () => {
+    let fail = false;
+    const fetchImpl = vi.fn(async () =>
+      fail ? new Response("busy", { status: 500 }) : new Response(JSON.stringify({ five_hour: { utilization: 30 } }))
+    );
+    const pool = poolWith({ [providerInstanceSecretName("claude_code_token", "claude-stale")]: "sk-ant-oat01-stale-token" });
+    const accounts = [{ id: "claude-stale", driver: "claude" as const }];
+    const options = { fetchImpl: fetchImpl as unknown as typeof fetch, refresh: true };
+    await loadAccountLimits(pool, key, accounts, options);
+    fail = true;
+    const [stale] = await loadAccountLimits(pool, key, accounts, options);
+    expect(stale).toMatchObject({ source: "live", error: null });
+    expect(stale!.windows[0]!.usedPercent).toBe(30);
+    expect(stale!.note).toContain("Anthropic usage endpoint returned 500");
+    const [again] = await loadAccountLimits(pool, key, accounts, options);
+    expect(again!.windows[0]!.usedPercent).toBe(30);
+    forgetAccountLimits("claude-stale");
+  });
+});
+
+describe("retryAfterMs", () => {
+  const now = new Date("2026-10-20T00:00:00Z");
+  it("reads seconds, HTTP dates and defaults", () => {
+    expect(retryAfterMs("30", now)).toBe(30_000);
+    expect(retryAfterMs("Tue, 20 Oct 2026 00:02:00 GMT", now)).toBe(120_000);
+    expect(retryAfterMs(null, now)).toBe(5 * 60_000);
+    expect(retryAfterMs("garbage", now)).toBe(5 * 60_000);
+    expect(retryAfterMs("999999", now)).toBe(60 * 60_000);
   });
 });
