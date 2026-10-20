@@ -28,6 +28,7 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 - A task owns exactly one coordination thread. Delegate specialist work with a keyed assignment inside that task. Assignments preserve the same coordination thread and provider session across follow-ups, review, rejection, provider failure, usage-limit recovery, and explicit retry.
 - Create a child task only when the work is independently trackable and you can provide `--parent-task`; respect the task's fan-out and depth limits. Do not create a root task from inside an active task.
 - Send a message on the existing task thread only for coordination that is not a separately tracked assignment.
+- Before deciding another agent is stuck or idle, run `aisevak threads status THREAD-n`. A `delivery.failed` notice means a message you sent was not processed; retry deliberately rather than creating new threads.
 - Create a schedule only when the request explicitly needs future or recurring execution. Choose the target agent deliberately, use an idempotency key, and avoid short or unbounded recurring intervals.
 - Create a report for durable Markdown findings, analysis, plans, or handoff documents. Revise it instead of replacing history, then publish only when ready.
 - Declare an incident for an operational problem that needs severity, updates, ownership, and explicit resolution. Do not use incidents for ordinary task failures.

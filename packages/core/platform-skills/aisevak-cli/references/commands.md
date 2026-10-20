@@ -31,7 +31,9 @@ Use `show` for metadata and a bounded preview. Use `content` for paginated Markd
 ```text
 aisevak threads list [--status STATUS] [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak threads show THREAD
+aisevak threads status THREAD
 aisevak threads messages THREAD [--limit N] [--cursor CURSOR]
+aisevak show MESSAGE-n
 aisevak threads create --title TITLE --description DESCRIPTION --to AGENT --purpose-stdin \
   --work-key KEY [--work-scope SCOPE] [--project-id UUID] [--idempotency-key KEY]
 aisevak threads send THREAD [--to AGENT] --body-stdin [--reply-to MESSAGE] [--idempotency-key KEY]
@@ -39,6 +41,12 @@ aisevak threads send THREAD [--to AGENT] --body-stdin [--reply-to MESSAGE] [--id
 aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]
 aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]
 ```
+
+`THREAD` accepts `THREAD-n`, `TASK-n` (the task's thread), or a thread id shown in the UI or job envelope.
+
+`threads status` shows each participant's state (`running`, `queued`, `blocked`, `waiting`, `idle`), pending messages, what it is waiting on, and its last failed delivery. Use it instead of guessing whether another agent is idle.
+
+Every message carries `delivery.state`: `queued`, `delivering`, `presented`, `delivered`, or `failed` (with `delivery.error`). When a message you sent fails, you receive a `delivery.failed` notice on the same thread naming the message and the command to retry. Treat it as information, not new work, and do not finalize a thread or task because of it.
 
 Addressing a message queues it for the recipient. Completing or blocking is reserved for the agent triggered on an active thread and sends one final result to the triggering agent. The triggering agent must treat that result as a notification and must not finalize the same thread in response. If more work is needed, `threads send` on the completed or blocked thread reactivates it and queues the follow-up to the triggered agent.
 

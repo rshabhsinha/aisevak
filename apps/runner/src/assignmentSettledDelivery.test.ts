@@ -53,6 +53,8 @@ describe("delivery settled by its assignment", () => {
     expect(deliveryUpdate(queries)?.params?.[1]).toBe("failed");
     expect(String(deliveryUpdate(queries)?.params?.[2])).toContain(`Assignment was ${status}`);
     expect(assignmentChanged(queries)).toBe(false);
+    // The assignment already decided the outcome: no delivery.failed notice.
+    expect(deliveryUpdate(queries)?.sql).toContain("failure_notified_at = now()");
   });
 
   it("does not retry or touch the assignment when an owner retry superseded the delivery", async () => {

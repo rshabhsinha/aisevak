@@ -2706,9 +2706,11 @@ export async function settleDeliveryByAssignment(
     : row.assignment_status === "completed" && options.presented !== false
       ? null
       : `Assignment was ${row.assignment_status}${error ? `; turn ended with: ${error}` : ""}`;
+  // Settled here means the assignment already decided the outcome, so the
+  // sender needs no delivery.failed notice.
   await queryable.query(
     `UPDATE message_deliveries
-     SET status = $2, completed_at = now(), error = $3, updated_at = now()
+     SET status = $2, completed_at = now(), error = $3, failure_notified_at = now(), updated_at = now()
      WHERE id = $1 AND status IN ('queued', 'retrying', 'running')`,
     [messageDeliveryId, settledError === null ? "completed" : "failed", settledError === null ? null : encodePostgresText(settledError)]
   );
