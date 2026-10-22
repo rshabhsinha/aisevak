@@ -5,9 +5,18 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/aisevak/current
+WorkingDirectory=/opt/aisevak/current/apps/runner
 EnvironmentFile=/opt/aisevak/.env
-ExecStart=/usr/bin/env pnpm --filter @aisevak/runner start
+# Run node directly so SIGTERM reaches the runner itself (pnpm in between
+# reported the child as killed by the signal).
+ExecStart=/usr/bin/env node dist/index.js
+# Graceful drain on stop/restart: SIGTERM only the runner, which stops
+# claiming work and lets in-flight agent turns finish (RUNNER_DRAIN_TIMEOUT_MS,
+# default 9 min). Harness child processes are left alone until then; anything
+# still alive when TimeoutStopSec expires is killed.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=600
 Restart=always
 RestartSec=5
 User=aisevak

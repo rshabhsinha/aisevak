@@ -73,6 +73,9 @@ const env = {
   databaseUrl: process.env.DATABASE_URL,
   pollMs: Number(process.env.RUNNER_POLL_MS ?? "1500"),
   maxConcurrency: positiveNumber(process.env.RUNNER_MAX_CONCURRENCY, 4, 32),
+  // How long a stopping runner lets in-flight turns finish before it closes
+  // provider sessions. Keep below TimeoutStopSec in aisevak-runner.service.
+  drainTimeoutMs: positiveNumber(process.env.RUNNER_DRAIN_TIMEOUT_MS, 540_000),
   dispatcherHeartbeatMs: Number(process.env.DISPATCHER_HEARTBEAT_MS ?? "300000"),
   apiUrl: process.env.API_URL ?? "http://localhost:8787",
   secretKey: process.env.SECRET_KEY ?? "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
@@ -213,10 +216,21 @@ async function main(): Promise<void> {
     }
     await sleep(env.pollMs);
   }
-  await waitForRunJobs(activeRunJobs);
+  // Drain: no new runs are claimed, and in-flight turns get a bounded window
+  // to finish. Turns still running at the deadline are cut off by closing
+  // their provider sessions; they then fail like any interrupted turn, and
+  // the short wait lets them record that before the pool closes.
+  if (activeRunJobs.size > 0) {
+    console.log(`Runner stopping; waiting up to ${Math.round(env.drainTimeoutMs / 1000)}s for ${activeRunJobs.size} in-flight run job(s)`);
+  }
+  const drained = await waitForRunJobsWithin(activeRunJobs, env.drainTimeoutMs);
+  if (!drained) {
+    console.warn(`Runner drain timed out with ${activeRunJobs.size} run job(s) still active; interrupting them`);
+  }
   if (cleanupJob) await cleanupJob;
   await closeAllCodexAppServers();
   await closeAllAcpSessions();
+  if (!drained) await waitForRunJobsWithin(activeRunJobs, 30_000);
   await pool.end();
 }
 
@@ -255,6 +269,20 @@ export function startAvailableRunJobs(
 export async function waitForRunJobs(activeJobs: Set<Promise<void>>): Promise<void> {
   while (activeJobs.size > 0) {
     await Promise.all([...activeJobs]);
+  }
+}
+
+// Resolves true once every job has settled, or false when the timeout ends
+// first (the jobs keep running).
+export async function waitForRunJobsWithin(activeJobs: Set<Promise<void>>, timeoutMs: number): Promise<boolean> {
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<false>((resolve) => {
+    timer = setTimeout(() => resolve(false), Math.max(0, timeoutMs));
+  });
+  try {
+    return await Promise.race([waitForRunJobs(activeJobs).then(() => true as const), timedOut]);
+  } finally {
+    if (timer) clearTimeout(timer);
   }
 }
 

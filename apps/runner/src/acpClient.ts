@@ -25,6 +25,14 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
 }
 
 const sessions = new Map<string, PersistentAcpSession>();
+
+const EXTERNAL_CANCEL_ERROR =
+  "The harness ended the turn as cancelled without a cancel request from Aisevak; the turn was interrupted (for example by a harness or runner shutdown) and did not finish";
+
+function stopReasonOf(result: unknown): string | null {
+  const stopReason = (result as { stopReason?: unknown } | null | undefined)?.stopReason;
+  return typeof stopReason === "string" ? stopReason : null;
+}
 const ACP_SESSION_IDLE_MS = 30 * 60_000;
 
 export async function runAcpTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
@@ -279,11 +287,19 @@ class PersistentAcpSession {
           const input = await options.nextInput?.();
           if (!input) return;
           try {
-            await this.request("session/prompt", {
+            const injected = await this.request("session/prompt", {
               sessionId: this.sessionId,
               prompt: [{ type: "text", text: input.message }]
             }, true);
-            await options.onInputHandled?.(input);
+            if (stopReasonOf(injected) === "cancelled") {
+              // The injected turn was cut off: by Stop/fencing when Aisevak
+              // asked for it, otherwise by the harness (e.g. a shutdown).
+              await options.onInputHandled?.(input, cancelRequested
+                ? "The turn was stopped before this message's turn finished"
+                : EXTERNAL_CANCEL_ERROR);
+            } else {
+              await options.onInputHandled?.(input);
+            }
           } catch (error) {
             await options.onInputHandled?.(input, error instanceof Error ? error.message : String(error));
           }
@@ -298,8 +314,9 @@ class PersistentAcpSession {
         pollInput();
       }, 750);
 
+      let promptResult: Record<string, unknown>;
       try {
-        await promptRequest;
+        promptResult = await promptRequest;
       } finally {
         turnFinished = true;
       }
@@ -308,6 +325,9 @@ class PersistentAcpSession {
       monitor = null;
       await cancelTask;
       if (this.closed) throw new Error("ACP session closed while handling a mid-turn input");
+      // A turn the harness ended as cancelled without Aisevak asking was cut
+      // off (typically the harness or runner shutting down), not finished.
+      if (stopReasonOf(promptResult) === "cancelled" && !cancelRequested) throw new Error(EXTERNAL_CANCEL_ERROR);
 
       return {
         status: cancelRequested ? "interrupted" : "completed",

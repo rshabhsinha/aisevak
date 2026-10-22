@@ -149,3 +149,58 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(promptError.aisevakRecovered).toBeUndefined();
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
+
+it("treats a turn the harness cancelled on its own as interrupted, not completed", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  // Mirrors Claude Code's ACP adapter on SIGTERM: the open prompt is answered
+  // with stopReason "cancelled" although nobody sent session/cancel. Injected
+  // prompts are cancelled the same way.
+  await writeFile(script, `const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'main') { setTimeout(() => console.log(JSON.stringify({id:m.id,result:{stopReason:'cancelled'}})), 1500); return; }
+ if(m.method === 'session/prompt') { console.log(JSON.stringify({id:m.id,result:{stopReason:'cancelled'}})); return; }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  const handled: Array<{ id: string; error?: string }> = [];
+  let served = false;
+  try {
+    const result = await runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+      model: "auto", prompt: "main", threadId: null, env: process.env, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {},
+      shouldCancel: async () => false,
+      nextInput: async () => {
+        if (served) return null;
+        served = true;
+        return { id: "input-1", message: "follow-up", messageDeliveryId: null };
+      },
+      onInputHandled: async (input, error) => { handled.push({ id: input.id, error }); }
+    });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("without a cancel request from Aisevak");
+    expect(result.promptMayHaveBeenPresented).toBe(true);
+    expect(handled).toHaveLength(1);
+    expect(handled[0]?.error).toContain("without a cancel request from Aisevak");
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});
+
+it("still completes a turn that ends normally", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  await writeFile(script, `const readline = require('node:readline');
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/prompt') { console.log(JSON.stringify({id:m.id,result:{stopReason:'end_turn'}})); return; }
+ console.log(JSON.stringify({id:m.id,result:{sessionId:'s1'}}));
+});`);
+  try {
+    const result = await runAcpTurn({
+      binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+      model: "auto", prompt: "main", threadId: null, env: process.env, secrets: [],
+      onLine: async () => {}, onThreadId: async () => {}, shouldCancel: async () => false
+    });
+    expect(result.status).toBe("completed");
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});
