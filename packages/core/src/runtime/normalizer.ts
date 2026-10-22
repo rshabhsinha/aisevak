@@ -1,6 +1,7 @@
 import { createAcpAdapter } from "./acpAdapter.js";
 import { normalizeCodexMessage } from "./codexAdapter.js";
 import { RUNTIME_EVENT_VERSION, type RuntimeEvent, type RuntimeProvider } from "./events.js";
+import { boundRuntimeEvent } from "./limits.js";
 
 export interface RuntimeNormalizer {
   /** One provider stdout line in, at most one canonical event out (null for blank lines). */
@@ -34,7 +35,8 @@ export function createRuntimeNormalizer(
         };
       }
       try {
-        return acp ? acp.normalize(message) : normalizeCodexMessage(message);
+        const event = acp ? acp.normalize(message) : normalizeCodexMessage(message);
+        return event && boundRuntimeEvent(event);
       } catch {
         // Normalization only feeds the timeline. An adapter bug must never
         // reject the runner's line handler, which would fail the live turn,

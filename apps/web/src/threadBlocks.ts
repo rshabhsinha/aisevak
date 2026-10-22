@@ -46,6 +46,9 @@ export interface ThreadToolCall {
   command?: string;
   /** Final or streamed output (command stdout, tool result). */
   output?: string;
+  /** Characters the server left out of `output`; the full text loads from `outputEventId`. */
+  outputOmittedChars?: number;
+  outputEventId?: string;
   diffs?: ThreadFileDiff[];
   status: ToolStatus;
   exitCode?: number | null;
@@ -530,7 +533,7 @@ function processRunGroup(
         } else if (item.itemType === "context_compaction") {
           if (completed) push({ kind: "system", id: `system:${event.id}`, text: item.text ? `Context compacted: ${item.text}` : "Context compacted", createdAt });
         } else {
-          upsertTool(itemId, createdAt, (entry) => applyToolItem(entry, item));
+          upsertTool(itemId, createdAt, (entry) => applyToolItem(entry, item, event.id));
         }
         break;
       }
@@ -604,11 +607,15 @@ function processRunGroup(
   endTurn("completed", undefined, lastAt, true);
 }
 
-function applyToolItem(entry: ThreadToolCall, item: RuntimeItem): void {
+function applyToolItem(entry: ThreadToolCall, item: RuntimeItem, eventId: string): void {
   if (item.title) entry.title = unwrapShellCommand(item.title);
   else if (!entry.title) entry.title = item.toolName ?? TOOL_LABELS[item.itemType];
   if (item.command) entry.command = unwrapShellCommand(item.command);
-  if (item.output) entry.output = item.output;
+  if (item.output) {
+    entry.output = item.output;
+    entry.outputOmittedChars = item.outputOmittedChars;
+    entry.outputEventId = eventId;
+  }
   if (item.exitCode !== undefined) entry.exitCode = item.exitCode;
   if (item.changes?.length) entry.diffs = item.changes.flatMap(fileDiff);
   entry.icon = toolIcon(item.itemType);

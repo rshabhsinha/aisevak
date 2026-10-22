@@ -98,3 +98,29 @@ describe("normalized provider event storage", () => {
     expect(decodePostgresJson(queries[0]?.params[4])).toMatchObject({ v: 2, type: "parse.error", raw: { payload: line } });
   });
 });
+
+describe("replayed session history", () => {
+  it.each(["worker", "dispatcher"] as const)("is normalized but not stored for %s runs", async (kind) => {
+    const { pool, queries } = recordingPool();
+    const normalizer = createRuntimeNormalizer("claude");
+    const update = (text: string, replay: boolean) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "ses_1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } },
+        ...(replay ? { aisevakReplay: true } : {})
+      });
+    const persist = (line: string, seq: number) =>
+      kind === "worker"
+        ? persistCodexLine(pool, { id: "run-1", task_session_id: "session-1", agent_thread_id: "thread-1" }, line, seq, normalizer)
+        : persistDispatcherCodexLine(pool, { id: "run-1" }, line, seq, normalizer);
+
+    await persist(update("from an earlier run", true), 1);
+    expect(queries).toHaveLength(0);
+
+    await persist(update("new reply", false), 2);
+    const inserts = queries.filter((query) => query.sql.includes("INSERT INTO"));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.params.slice(0, 3)).toEqual(["run-1", 2, "content.delta"]);
+  });
+});

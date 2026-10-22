@@ -129,7 +129,9 @@ function formatUsd(value: number | null, precise = false): string {
   if (value === null) return "—";
   if (value === 0) return "$0";
   if (value < 0.01) return "<$0.01";
-  return `$${value.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: precise || value < 100 ? 2 : 0 })}`;
+  // Min and max must agree: toLocaleString throws a RangeError when max < min.
+  const digits = precise || value < 100 ? 2 : 0;
+  return `$${value.toLocaleString(undefined, { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
 function formatPercent(value: number): string {

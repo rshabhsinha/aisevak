@@ -61,6 +61,8 @@ export interface RuntimeItem {
   cwd?: string;
   exitCode?: number;
   output?: string;
+  /** Characters cut from the middle of `output` to keep it within size limits. */
+  outputOmittedChars?: number;
   changes?: RuntimeFileChange[];
   toolName?: string;
   input?: unknown;

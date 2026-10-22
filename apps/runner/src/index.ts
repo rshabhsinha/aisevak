@@ -2805,7 +2805,9 @@ export async function persistCodexLine(
   normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
-  if (!normalized) return;
+  // A reloaded session replays its whole history, which earlier runs already
+  // stored; persisting it again duplicated every past tool output per run.
+  if (!normalized || normalized.replay) return;
   const threadId = normalized.threadId;
   if (threadId) {
     if (!job.agent_thread_id) {
@@ -2834,7 +2836,9 @@ export async function persistDispatcherCodexLine(
   normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
-  if (!normalized) return;
+  // A reloaded session replays its whole history, which earlier runs already
+  // stored; persisting it again duplicated every past tool output per run.
+  if (!normalized || normalized.replay) return;
   const threadId = normalized.threadId;
   if (threadId) {
     await pool.query(

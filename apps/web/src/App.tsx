@@ -35,6 +35,7 @@ import {
   RefreshCw,
   Search,
   SettingsIcon,
+  SlidersHorizontal,
   Square,
   Terminal,
   Trash2,
@@ -81,7 +82,17 @@ import {
 } from "./agentRunTimeline";
 import { ChatTimeline, CollapsibleText, CopyButton } from "./components/chat-timeline";
 import { AgentComposer, optionsForModel, selectionForModel } from "./components/agent-composer";
-import { mergeRefreshedAgentThreads, updateAgentThreadInPlace } from "./agentThreads";
+import {
+  SIDEBAR_THREAD_GROUP_LABELS,
+  groupSidebarThreads,
+  isThreadUnread,
+  loadThreadSeenState,
+  markThreadSeen,
+  mergeRefreshedAgentThreads,
+  saveThreadSeenState,
+  updateAgentThreadInPlace,
+  type ThreadSeenState
+} from "./agentThreads";
 import { DEFAULT_AGENT_MODEL, reconcileSelectedAgent } from "./agentModels";
 import { appPath, parseAppRoute, type AppView as View } from "./appRouting";
 import { isThreadScrollNearBottom, shouldShowThreadScrollDown } from "./threadScroll";
@@ -95,6 +106,13 @@ import {
   threadDetailReady,
   type ThreadDetailState
 } from "./threadDetailState";
+import {
+  applyThreadTimelineResponse,
+  threadTimelineEvents,
+  threadTimelineQuery,
+  type ThreadTimelineCache,
+  type ThreadTimelineResponse
+} from "./threadTimelineSync";
 
 interface User {
   id: string;
@@ -364,6 +382,8 @@ interface Run {
 }
 
 const SIDEBAR_THREAD_PAGE_SIZE = 10;
+const THREAD_POLL_INTERVAL_MS = 2_000;
+const SIDEBAR_THREAD_POLL_MS = 8000;
 const RESOURCE_FEED_PAGE_SIZE = 15;
 const TASK_COLUMN_PAGE_SIZE = 25;
 
@@ -487,6 +507,7 @@ export function App() {
   const [refreshingThreads, setRefreshingThreads] = useState(false);
   const [agentThreads, setAgentThreads] = useState<AgentThread[]>([]);
   const [nextThreadCursor, setNextThreadCursor] = useState<string | null>(null);
+  const [threadSeen, setThreadSeen] = useState<ThreadSeenState>(() => loadThreadSeenState());
   const [selectedThreadId, setSelectedThreadId] = useState<string | null>(initialRoute.threadId);
   const [draftThread, setDraftThread] = useState(() => startsWithThreadDraft(initialRoute.threadId, window.innerWidth));
   const [selectedThreadRun, setSelectedThreadRun] = useState<AgentRunTimelineRun | null>(null);
@@ -509,11 +530,23 @@ export function App() {
   const [message, setMessage] = useState<string | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
   const threadLoadGuardRef = useRef(createThreadLoadGuard(initialRoute.threadId));
+  // The selected thread's timeline as last fetched; polls continue from its cursor.
+  const threadTimelineRef = useRef<ThreadTimelineCache<RunEvent> | null>(null);
 
   const selectedThread = useMemo(
     () => agentThreads.find((thread) => thread.id === selectedThreadId) ?? null,
     [agentThreads, selectedThreadId]
   );
+
+  const selectedActivityAt = selectedThread?.last_activity_at;
+  useEffect(() => {
+    if (!selectedThreadId || !selectedActivityAt) return;
+    setThreadSeen((current) => {
+      const next = markThreadSeen(current, selectedThreadId, selectedActivityAt);
+      if (next !== current) saveThreadSeenState(next);
+      return next;
+    });
+  }, [selectedThreadId, selectedActivityAt]);
 
   const filteredAgents = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -681,13 +714,24 @@ export function App() {
       setThreadDetailState(threadDetailIdle());
       return;
     }
-    void loadAgentThread(selectedThreadId);
+    const initialLoad = loadAgentThread(selectedThreadId);
     if (!isActiveRun(selectedThread?.latest_status) && selectedThread?.cleanup_state !== "restoring" && selectedThread?.cleanup_state !== "pending") return;
-    const timer = window.setInterval(() => {
-      void loadAgentThread(selectedThreadId);
-      void reloadAgentThreads();
-    }, 2000);
-    return () => window.clearInterval(timer);
+    // Each poll starts only after the previous one settles. A fixed interval
+    // stacked requests whenever a load outlasted it, and each newer request
+    // discarded the older one's result, so a slow thread never rendered.
+    let cancelled = false;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (!cancelled) timer = window.setTimeout(poll, THREAD_POLL_INTERVAL_MS);
+    };
+    const poll = () => {
+      void Promise.allSettled([loadAgentThread(selectedThreadId), pollAgentThreads()]).then(schedule);
+    };
+    void initialLoad.finally(schedule);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
   }, [user?.id, selectedThreadId, selectedThread?.latest_status, selectedThread?.cleanup_state]);
 
   useEffect(() => {
@@ -893,6 +937,22 @@ export function App() {
     if (user) void reloadAgentThreads().catch(error => setMessage(error instanceof Error ? error.message : "Could not load chats"));
   }, [includeArchivedThreads]);
 
+  // Keep the sidebar live whichever thread is open, so new threads and status
+  // changes show up without clicking into them. Paused while the tab is hidden;
+  // catches up as soon as it is visible again.
+  useEffect(() => {
+    if (!user) return;
+    const poll = () => {
+      if (document.visibilityState === "visible") void pollAgentThreads().catch(() => {});
+    };
+    const timer = window.setInterval(poll, SIDEBAR_THREAD_POLL_MS);
+    document.addEventListener("visibilitychange", poll);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", poll);
+    };
+  }, [user?.id, includeArchivedThreads]);
+
   function toggleArchivedThreads(include: boolean) {
     threadsRequestRef.current += 1;
     setAgentThreads(current => selectedThread ? current.filter(thread => thread.id === selectedThread.id) : []);
@@ -929,6 +989,18 @@ export function App() {
     return data.threads;
   }
 
+  // Refreshes the first page in place. Unlike reloadAgentThreads it leaves the
+  // pagination cursor alone, so polling never undoes "Load older threads", and
+  // it drops its result if a full reload or archive toggle started meanwhile.
+  async function pollAgentThreads() {
+    const requestId = threadsRequestRef.current;
+    const data = await api<{ threads: AgentThread[]; nextCursor: string | null }>(
+      `/api/agent-threads?limit=${SIDEBAR_THREAD_PAGE_SIZE}&includeArchived=${includeArchivedThreads}`
+    );
+    if (requestId !== threadsRequestRef.current) return;
+    setAgentThreads((current) => mergeRefreshedAgentThreads(current, data.threads));
+  }
+
   async function reloadGithub() {
     if (!user || user.role === "member") {
       setGithubConnection(null);
@@ -948,28 +1020,26 @@ export function App() {
     const isCurrentRequest = threadLoadGuardRef.current.begin(threadId);
     if (!isCurrentRequest()) return;
     setThreadDetailState(threadDetailLoading());
-    let data: {
+    type ThreadDetailResponse = ThreadTimelineResponse<RunEvent> & {
       thread: AgentThread;
       run?: AgentRunTimelineRun | null;
-      events: RunEvent[];
-      eventsTruncated?: boolean;
     };
+    let data: ThreadDetailResponse;
     try {
-      data = await api<{
-        thread: AgentThread;
-        run?: AgentRunTimelineRun | null;
-        events: RunEvent[];
-        eventsTruncated?: boolean;
-      }>(`/api/agent-threads/${threadId}`);
+      data = await api<ThreadDetailResponse>(
+        `/api/agent-threads/${threadId}${threadTimelineQuery(threadTimelineRef.current, threadId)}`
+      );
     } catch (error) {
       if (isCurrentRequest()) setThreadDetailState(threadDetailFailed(error));
       return;
     }
     if (!isCurrentRequest()) return;
+    const timeline = applyThreadTimelineResponse(threadTimelineRef.current, threadId, data);
+    threadTimelineRef.current = timeline;
     setAgentThreads((current) => updateAgentThreadInPlace(current, data.thread));
     setSelectedThreadRun(data.run ?? null);
-    setAgentThreadEvents(data.events);
-    setAgentThreadEventsTruncated(Boolean(data.eventsTruncated));
+    setAgentThreadEvents(threadTimelineEvents(timeline));
+    setAgentThreadEventsTruncated(timeline.truncated);
     setThreadDetailState(threadDetailReady());
   }
 
@@ -1143,16 +1213,41 @@ export function App() {
 
           <div className="sidebar-agent-heading">
             <span className="nav-label">Threads</span>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="sidebar-new-thread"
-              title="New thread"
-              aria-label="New thread"
-              onClick={createAgentThread}
-            >
-              <Plus size={13} weight="bold" />
-            </Button>
+            <div className="sidebar-agent-heading-actions">
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className={cn("sidebar-new-thread", includeArchivedThreads && "is-active")}
+                    title="Filter threads"
+                    aria-label="Filter threads"
+                  >
+                    <SlidersHorizontal size={13} weight="bold" />
+                  </Button>
+                </PopoverTrigger>
+                <PopoverContent className="sidebar-thread-filter" side="right" align="start">
+                  <label className="thread-list-archived">
+                    <Switch
+                      checked={includeArchivedThreads}
+                      onCheckedChange={toggleArchivedThreads}
+                      aria-label="Show archived chats"
+                    />
+                    <span>Show archived</span>
+                  </label>
+                </PopoverContent>
+              </Popover>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="sidebar-new-thread"
+                title="New thread"
+                aria-label="New thread"
+                onClick={createAgentThread}
+              >
+                <Plus size={13} weight="bold" />
+              </Button>
+            </div>
           </div>
 
           <div className="sidebar-agent-runs">
@@ -1161,20 +1256,11 @@ export function App() {
                 <Search size={12} />
                 <input
                   value={query}
-                  placeholder="Search tasks"
-                  aria-label="Search agent tasks"
+                  placeholder="Search threads"
+                  aria-label="Search agent threads"
                   onChange={(event) => setQuery(event.target.value)}
                 />
               </div>
-            ) : null}
-
-            {view === "runs" ? (
-              <ThreadListControls
-                includeArchived={includeArchivedThreads}
-                onIncludeArchivedChange={toggleArchivedThreads}
-                refreshing={refreshingThreads}
-                onRefresh={() => void refreshThreads()}
-              />
             ) : null}
 
             {draftThread && view === "runs" ? (
@@ -1183,9 +1269,9 @@ export function App() {
                 className="sidebar-run-item selected"
                 onClick={() => navigateToView("runs", null)}
               >
-                <div className="sidebar-run-avatar">
+                <span className="sidebar-run-avatar-frame is-draft">
                   <Plus size={12} weight="bold" />
-                </div>
+                </span>
                 <div className="sidebar-run-copy">
                   <span className="sidebar-run-title">New thread</span>
                   <span className="sidebar-run-meta">Draft</span>
@@ -1193,40 +1279,30 @@ export function App() {
               </button>
             ) : null}
 
-            {(view === "runs" ? filteredThreads : agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at)).map((thread) => {
-              const isSelected = view === "runs" && selectedThreadId === thread.id;
-              return (
-                <button
-                  type="button"
-                  className={`sidebar-run-item ${isSelected ? "selected" : ""}`}
-                  key={thread.id}
-                  onClick={async () => {
-                    selectAgentThread(thread.id);
-                    await loadAgentThread(thread.id);
-                  }}
-                  title={`${thread.title || "Untitled"} (${thread.agent_name || "Agent"})`}
-                >
-                  <AgentAvatar
-                    agentId={thread.agent_id || "default"}
-                    agentName={thread.agent_name || "Agent"}
-                    className="sidebar-run-avatar"
-                    motion={isActiveRun(thread.latest_status) ? "always" : "hover"}
-                    orbVariant={isActiveRun(thread.latest_status) ? "working" : undefined}
+            {groupSidebarThreads(view === "runs" ? filteredThreads : agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at), {
+              now: new Date(),
+              isRunning: (thread) => isActiveRun(thread.latest_status),
+              needsAttention: (thread) => runBucket(thread.latest_status) === "failed" && isThreadUnread(threadSeen, thread)
+            }).map((group) => (
+              <section className="sidebar-run-group" key={group.id} aria-label={SIDEBAR_THREAD_GROUP_LABELS[group.id]}>
+                <div className="sidebar-run-group-label">
+                  <span>{SIDEBAR_THREAD_GROUP_LABELS[group.id]}</span>
+                  {group.id === "running" || group.id === "attention" ? <span>{group.threads.length}</span> : null}
+                </div>
+                {group.threads.map((thread) => (
+                  <SidebarThreadRow
+                    key={thread.id}
+                    thread={thread}
+                    selected={view === "runs" && selectedThreadId === thread.id}
+                    unread={selectedThreadId !== thread.id && isThreadUnread(threadSeen, thread)}
+                    onSelect={async () => {
+                      selectAgentThread(thread.id);
+                      await loadAgentThread(thread.id);
+                    }}
                   />
-                  <div className="sidebar-run-copy">
-                    <span className="sidebar-run-title">{thread.title || "Untitled task"}</span>
-                    <span className="sidebar-run-meta">
-                      <span className="sidebar-run-agent truncate">{thread.agent_name || "Agent"}</span>
-                      <span className="sidebar-run-dot">·</span>
-                      <span className="sidebar-run-time shrink-0">{formatSidebarRunTime(thread.last_activity_at)}</span>
-                    </span>
-                  </div>
-                  {isActiveRun(thread.latest_status) ? (
-                    <DotMatrixLoader size={11} className="text-primary shrink-0" />
-                  ) : null}
-                </button>
-              );
-            })}
+                ))}
+              </section>
+            ))}
 
             {(view === "runs" ? filteredThreads : agentThreads.filter(thread => includeArchivedThreads || !thread.archived_at)).length === 0 && !draftThread ? (
               <div className="sidebar-runs-empty">
@@ -3202,6 +3278,58 @@ function AgentThreadSidebar(props: {
         </div>
       </ScrollArea>
     </aside>
+  );
+}
+
+function SidebarThreadRow(props: {
+  thread: AgentThread;
+  selected: boolean;
+  unread: boolean;
+  onSelect: () => void;
+}) {
+  const { thread } = props;
+  const state = isActiveRun(thread.latest_status) ? "running" : runBucket(thread.latest_status) === "failed" ? "failed" : "idle";
+  const error = thread.latest_error?.split("\n")[0]?.trim();
+  return (
+    <button
+      type="button"
+      className={cn("sidebar-run-item", props.selected && "selected", props.unread && "is-unread")}
+      onClick={props.onSelect}
+      title={`${thread.title || "Untitled"} · ${thread.agent_name || "Agent"} · ${statusLabel(thread.latest_status ?? "open")}`}
+    >
+      <span className={`sidebar-run-avatar-frame is-${state}`}>
+        <AgentAvatar
+          agentId={thread.agent_id || "default"}
+          agentName={thread.agent_name || "Agent"}
+          className="sidebar-run-avatar"
+        />
+        {state === "running" ? <span className="sidebar-run-ring" aria-hidden="true" /> : null}
+        {state === "failed" ? <span className="sidebar-run-badge" aria-hidden="true" /> : null}
+      </span>
+      <span className="sidebar-run-copy">
+        <span className="sidebar-run-title">{thread.title || "Untitled task"}</span>
+        {state === "failed" ? (
+          <span className="sidebar-run-meta is-failed">
+            <span className="truncate">{statusLabel(thread.latest_status)}{error ? ` · ${error}` : ""}</span>
+          </span>
+        ) : (
+          <span className="sidebar-run-meta">
+            <span className="sidebar-run-agent">{thread.agent_name || "Agent"}</span>
+            {thread.task_number ? (
+              <>
+                <span className="sidebar-run-dot">·</span>
+                <span className="shrink-0">TASK-{thread.task_number}</span>
+              </>
+            ) : null}
+          </span>
+        )}
+      </span>
+      {props.unread ? (
+        <span className="sidebar-run-unread" aria-label="New activity" />
+      ) : (
+        <span className="sidebar-run-time">{formatSidebarRunTime(thread.last_activity_at, { compact: true })}</span>
+      )}
+    </button>
   );
 }
 
@@ -6316,17 +6444,18 @@ function viewTitle(view: View): string {
   }[view];
 }
 
-function formatSidebarRunTime(value: string): string {
+function formatSidebarRunTime(value: string, options: { compact?: boolean } = {}): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
   const diffMins = Math.floor(diffMs / 60000);
-  if (diffMins < 1) return "just now";
-  if (diffMins < 60) return `${diffMins}m ago`;
+  const suffix = options.compact ? "" : " ago";
+  if (diffMins < 1) return options.compact ? "now" : "just now";
+  if (diffMins < 60) return `${diffMins}m${suffix}`;
   const diffHours = Math.floor(diffMins / 60);
   if (diffHours < 24 && date.toDateString() === now.toDateString()) {
-    return `${diffHours}h ago`;
+    return `${diffHours}h${suffix}`;
   }
   return date.toLocaleDateString([], { month: "short", day: "numeric" });
 }

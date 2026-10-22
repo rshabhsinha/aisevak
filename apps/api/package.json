@@ -7,7 +7,8 @@
     "build": "pnpm --filter @aisevak/core build && tsc -p tsconfig.json",
     "dev": "cd ../.. && NODE_OPTIONS='--conditions=development' tsx watch --env-file=.env apps/api/src/server.ts",
     "start": "node dist/server.js",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "backfill:timeline-events": "cd ../.. && NODE_OPTIONS='--conditions=development' tsx --env-file=.env apps/api/src/backfillTimelineEvents.ts"
   },
   "dependencies": {
     "@aisevak/core": "workspace:*",
