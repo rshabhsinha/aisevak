@@ -48,6 +48,13 @@ Tests that need PostgreSQL (`*.db.test.ts`, for example `tests/coordinationV2.db
 
 Some runner tests spawn real processes and can time out on a busy machine. If they do, rerun with a longer timeout, for example `pnpm exec vitest run --testTimeout=60000`.
 
+Database pools cancel statements after 30 seconds and stop waiting for a free
+connection after 5 seconds. `createPool` accepts PostgreSQL pool options as its
+second argument for an explicit override, for example
+`createPool(process.env.DATABASE_URL, { statement_timeout: 0 })` for a maintenance
+operation that intentionally needs longer. Keep request-serving pools bounded;
+client-only query timeouts do not cancel SQL on the server.
+
 UI changes should follow [docs/design-language.md](docs/design-language.md) and be checked in light and dark mode at desktop and narrow widths. [docs/MOBILE_UI_QA.md](docs/MOBILE_UI_QA.md) lists the mobile checks.
 
 ## Guidelines
