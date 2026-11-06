@@ -22,6 +22,19 @@ it("applies DDL once and skips it on subsequent API/runner boots", async () => {
   expect(client.release).toHaveBeenCalledTimes(2);
 });
 
+it("runs migrations without the request statement timeout and restores it", async () => {
+  const statements: string[] = [];
+  const client = { query: async (sql: string) => { statements.push(sql); return { rows: [] }; }, release: vi.fn() };
+  await runMigrations({ connect: async () => client } as unknown as Pool);
+  const disable = statements.indexOf("SET statement_timeout = 0");
+  const lock = statements.findIndex(sql => sql.includes("pg_advisory_lock"));
+  const unlock = statements.findIndex(sql => sql.includes("pg_advisory_unlock"));
+  expect(disable).toBeGreaterThanOrEqual(0);
+  expect(disable).toBeLessThan(lock);
+  expect(statements.indexOf("RESET statement_timeout")).toBeGreaterThan(unlock);
+  expect(client.release).toHaveBeenCalledWith();
+});
+
 describe("run snapshot migration", () => {
   it("correlates task snapshots to their own task and project", () => {
     const start = additiveSql.indexOf("WITH task_workspace_projects");

@@ -13,6 +13,9 @@ export function createPool(
     // Cancel work in PostgreSQL itself so a timed-out request releases its
     // database connection. A client-only query timeout leaves SQL running.
     statement_timeout: 30_000,
+    // A transaction left open by a stalled request must not hold its client
+    // (and its row locks) indefinitely.
+    idle_in_transaction_session_timeout: 60_000,
     // Bound both connection setup and the wait for a free pool client.
     connectionTimeoutMillis: 5_000,
     ...options,
