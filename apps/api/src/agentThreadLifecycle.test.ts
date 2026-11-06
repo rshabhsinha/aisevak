@@ -413,7 +413,9 @@ describe("coordinated task agent threads", () => {
     expect(queries).toHaveLength(3);
     expect(queries[0]?.sql).toContain("task_runs.agent_thread_id = $2");
     expect(queries[0]?.sql).toContain("dispatcher_runs.agent_thread_id = $2");
-    expect(queries[1]?.sql).toContain("dispatcher_runs.agent_thread_id = $2");
+    expect(queries[1]?.sql).toContain("dispatcher_runs.agent_thread_id = $1");
+    expect(queries[1]?.sql).not.toContain("task_id = $1");
+    expect(queries[1]?.params?.[0]).toBe("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb");
     expect(queries[0]?.params).toEqual([
       "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"

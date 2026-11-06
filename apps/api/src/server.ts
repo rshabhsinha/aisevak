@@ -4709,59 +4709,73 @@ async function queueDispatcherRun(
 // Picks the newest `limit` timeline events in two steps so Postgres never
 // sorts or window-counts wide text/payload rows: rank narrow keys first
 // (fetching one extra to detect truncation), then load bodies by id.
+//
+// Each run-backed branch walks the scope's runs newest first (the
+// (agent_thread_id | task_id, queued_at) indexes) and keeps at most `limit + 1`
+// events per run, so a thread with a thousand runs stops after its newest runs
+// instead of joining every event table row (INC-61). Each visited run's events
+// are still read in full through the run's event index and top-N sorted, since
+// that index is not in created_at order. Events inside one run share its
+// queued_at, so the per-run order (created_at, seq, id) is the global order
+// within that run.
 export async function loadTimelineEvents(
   pool: Pick<DbPool, "query">,
   taskId: string | null,
   agentThreadId: string | null,
   limit: number
 ): Promise<{ events: TimelineEventRow[]; truncated: boolean }> {
+  const scopeId = agentThreadId ?? taskId;
+  if (!scopeId) return { events: [], truncated: false };
+  const byThread = agentThreadId !== null;
+  const runScope = (table: "task_runs" | "dispatcher_runs") =>
+    byThread ? `${table}.agent_thread_id = $1` : `${table}.task_id = $1`;
+  const inputScope = byThread
+    ? "agent_turn_inputs.agent_thread_id = $1"
+    : "(task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)";
   const keysResult = await pool.query<TimelineEventKeyRow>(
     `SELECT source, id
      FROM (
-       SELECT 'run'::text AS source,
-              run_events.id,
-              run_events.seq,
-              run_events.created_at,
-              task_runs.queued_at
-       FROM run_events
-       JOIN task_runs ON task_runs.id = run_events.run_id
-       WHERE task_runs.run_kind = 'worker'
-         AND (
-           ($2::uuid IS NOT NULL AND task_runs.agent_thread_id = $2)
-           OR ($2::uuid IS NULL AND task_runs.task_id = $1)
-         )
+       (SELECT 'run'::text AS source, run_keys.id, run_keys.seq, run_keys.created_at, task_runs.queued_at
+        FROM task_runs
+        CROSS JOIN LATERAL (
+          SELECT run_events.id, run_events.seq, run_events.created_at
+          FROM run_events
+          WHERE run_events.run_id = task_runs.id
+          ORDER BY run_events.created_at DESC, run_events.seq DESC, run_events.id DESC
+          LIMIT $2
+        ) run_keys
+        WHERE task_runs.run_kind = 'worker' AND ${runScope("task_runs")}
+        ORDER BY task_runs.queued_at DESC, run_keys.created_at DESC, run_keys.seq DESC, run_keys.id DESC
+        LIMIT $2)
        UNION ALL
-       SELECT 'dispatcher'::text AS source,
-              dispatcher_run_events.id,
-              dispatcher_run_events.seq,
-              dispatcher_run_events.created_at,
-              dispatcher_runs.queued_at
-       FROM dispatcher_run_events
-       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-       WHERE (
-           ($2::uuid IS NOT NULL AND dispatcher_runs.agent_thread_id = $2)
-           OR ($2::uuid IS NULL AND dispatcher_runs.task_id = $1)
-         )
+       (SELECT 'dispatcher'::text AS source, dispatcher_keys.id, dispatcher_keys.seq, dispatcher_keys.created_at, dispatcher_runs.queued_at
+        FROM dispatcher_runs
+        CROSS JOIN LATERAL (
+          SELECT dispatcher_run_events.id, dispatcher_run_events.seq, dispatcher_run_events.created_at
+          FROM dispatcher_run_events
+          WHERE dispatcher_run_events.dispatcher_run_id = dispatcher_runs.id
+          ORDER BY dispatcher_run_events.created_at DESC, dispatcher_run_events.seq DESC, dispatcher_run_events.id DESC
+          LIMIT $2
+        ) dispatcher_keys
+        WHERE ${runScope("dispatcher_runs")}
+        ORDER BY dispatcher_runs.queued_at DESC, dispatcher_keys.created_at DESC, dispatcher_keys.seq DESC, dispatcher_keys.id DESC
+        LIMIT $2)
        UNION ALL
-       SELECT 'input'::text AS source,
-              agent_turn_inputs.id,
-              0 AS seq,
-              agent_turn_inputs.created_at,
-              COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
-       FROM agent_turn_inputs
-       LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
-       LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-       WHERE (
-           ($2::uuid IS NOT NULL AND agent_turn_inputs.agent_thread_id = $2)
-           OR (
-             $2::uuid IS NULL
-             AND (task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)
-           )
-         )
+       (SELECT 'input'::text AS source,
+               agent_turn_inputs.id,
+               0 AS seq,
+               agent_turn_inputs.created_at,
+               COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
+        FROM agent_turn_inputs
+        LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
+        LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+        WHERE ${inputScope}
+        ORDER BY 5 DESC, 4 DESC, 3 DESC, 2 DESC
+        LIMIT $2)
      ) task_event_keys
      ORDER BY queued_at DESC, created_at DESC, seq DESC, id DESC
-     LIMIT $3`,
-    [taskId, agentThreadId, limit + 1]
+     LIMIT $2`,
+    [scopeId, limit + 1]
   );
   const truncated = keysResult.rows.length > limit;
   const keys = keysResult.rows.slice(0, limit).reverse();

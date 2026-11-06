@@ -116,11 +116,15 @@ describe("agent thread timeline selection", () => {
       "user-message:dispatcher-run",
       "dispatcher-event"
     ]);
-    const scopedQueries = queries.filter((query) => !query.sql.includes("id = ANY"));
-    expect(scopedQueries.every((query) => query.params?.[0] === null || query.params?.[1] === "thread-id")).toBe(true);
+    const runsQuery = queries.find((query) => query.sql.includes("task_runs_and_dispatches"));
+    const keysQuery = queries.find((query) => query.sql.includes("task_event_keys"));
+    expect(runsQuery?.params?.[0] === null || runsQuery?.params?.[1] === "thread-id").toBe(true);
+    // Thread mode scopes every key branch by the thread id alone.
+    expect(keysQuery?.params?.[0]).toBe("thread-id");
+    expect(keysQuery?.sql).toContain("dispatcher_runs.agent_thread_id = $1");
+    expect(keysQuery?.sql).toContain("agent_turn_inputs.agent_thread_id = $1");
+    expect(keysQuery?.sql).not.toContain("task_id = $1");
     expect(queries.find((query) => query.sql.includes("id = ANY"))?.params).toEqual([["worker-event"], ["dispatcher-event"], []]);
-    expect(queries[0]?.sql).toContain("agent_thread_id = $2");
-    expect(queries[1]?.sql).toContain("agent_turn_inputs.agent_thread_id = $2");
   });
 
   it("ranks narrow keys with one extra row and loads bodies only for the kept events", async () => {
@@ -141,7 +145,8 @@ describe("agent thread timeline selection", () => {
 
     expect(result.truncated).toBe(true);
     expect(result.events.map((event) => event.id)).toEqual(["e2", "e3"]);
-    expect(queries[0]?.params).toEqual(["task-id", null, 3]);
+    expect(queries[0]?.params).toEqual(["task-id", 3]);
+    expect(queries[0]?.sql).toContain("dispatcher_runs.task_id = $1");
     expect(queries[0]?.sql).not.toMatch(/OVER \(|payload|\.text\b|\.message\b/);
     expect(queries[1]?.params).toEqual([["e2", "e3"], [], []]);
   });

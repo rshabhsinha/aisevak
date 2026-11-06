@@ -84,6 +84,73 @@ describe.skipIf(!databaseUrl)("timeline events against Postgres", () => {
     expect(input?.payload).toMatchObject({ role: "user", text: "steer", deliveryStatus: "delivered" });
   });
 
+  // INC-61: a thread with about a thousand runs (139k events) timed out because
+  // the key query joined every dispatcher event before applying the limit.
+  it("reads only the newest runs' events of a thread with many runs", async () => {
+    const { threadId, taskId } = await seed();
+    const runs = 300;
+    const perRun = 40;
+    // Runs come in pairs sharing queued_at with interleaved created_at, so the
+    // merge across runs is exercised; one more big thread adds unrelated rows.
+    await q(
+      `WITH big_runs AS (
+         INSERT INTO dispatcher_runs (task_id, agent_thread_id, scope, status, cwd, codex_home, model, prompt, queued_at)
+         SELECT $1, thread_id, 'coordination', 'succeeded', '/tmp', '/tmp', 'gpt-test', 'p',
+                timestamptz '2026-11-02T00:00:00Z' + ((n / 2) * interval '1 hour')
+         FROM generate_series(0, $3 - 1) AS n
+         CROSS JOIN (VALUES ($2::uuid), (NULL::uuid)) AS threads(thread_id)
+         RETURNING id, queued_at
+       )
+       INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload, created_at)
+       SELECT big_runs.id, seq, 'item', 'event', '{}'::jsonb,
+              big_runs.queued_at + (seq * interval '1 minute') + (CASE WHEN random() < 0.5 THEN interval '1 second' ELSE interval '0' END)
+       FROM big_runs CROSS JOIN generate_series(1, $4) AS seq`,
+      [taskId, threadId, runs, perRun]
+    );
+    await q("ANALYZE dispatcher_runs; ANALYZE dispatcher_run_events");
+
+    const limit = 100;
+    // Thread mode and task mode walk different run indexes; both must stop early.
+    for (const mode of ["thread", "task"] as const) {
+      let keysQuery: { sql: string; params: unknown[] } | undefined;
+      const recording = {
+        query: (sql: string, params: unknown[]) => {
+          if (sql.includes("task_event_keys")) keysQuery = { sql, params };
+          return pool.query(sql, params);
+        }
+      } as unknown as DbPool;
+      const result = mode === "thread"
+        ? await loadTimelineEvents(recording, null, threadId, limit)
+        : await loadTimelineEvents(recording, taskId, null, limit);
+
+      const ordered = await q(
+        `SELECT dispatcher_run_events.id
+         FROM dispatcher_run_events
+         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+         WHERE ${mode === "thread" ? "dispatcher_runs.agent_thread_id" : "dispatcher_runs.task_id"} = $1
+         ORDER BY dispatcher_runs.queued_at DESC, dispatcher_run_events.created_at DESC,
+                  dispatcher_run_events.seq DESC, dispatcher_run_events.id DESC
+         LIMIT $2`,
+        [mode === "thread" ? threadId : taskId, limit]
+      );
+      expect(result.events.map((row) => row.id), mode).toEqual(ordered.map((row) => row.id).reverse());
+      expect(result.truncated, mode).toBe(true);
+
+      const [{ "QUERY PLAN": plan }] = await q(`EXPLAIN (ANALYZE, FORMAT JSON) ${keysQuery!.sql}`, keysQuery!.params);
+      let eventRowsRead = 0;
+      const visit = (node: Record<string, unknown>) => {
+        if (node["Relation Name"] === "dispatcher_run_events") {
+          eventRowsRead += Number(node["Actual Rows"]) * Number(node["Actual Loops"]);
+        }
+        for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) visit(child);
+      };
+      visit(plan[0].Plan);
+      // The newest few runs cover the limit; the scope's runs hold 12,000+.
+      expect(eventRowsRead, mode).toBeGreaterThan(0);
+      expect(eventRowsRead, mode).toBeLessThan(limit * 10);
+    }
+  });
+
   it("covers every thread of the task in task mode, still skipping review runs", async () => {
     const { taskId, expected, otherEvent } = await seed();
     const withOther = [...expected, { source: "dispatcher" as const, id: otherEvent, queued: 30, created: 31, seq: 1 }];
