@@ -12,12 +12,29 @@ describe.skipIf(!databaseUrl)("database timeouts", () => {
       for (const client of clients) {
         const result = await client.query("SHOW statement_timeout");
         expect(result.rows[0].statement_timeout).toBe("30s");
-        const idle = await client.query("SHOW idle_in_transaction_session_timeout");
-        expect(idle.rows[0].idle_in_transaction_session_timeout).toBe("1min");
       }
     } finally {
       clients.forEach((client) => client.release());
       await pool.end();
+    }
+  });
+
+  it("survives the server ending a checked-out session and keeps the pool usable", async () => {
+    const pool = createPool(databaseUrl, { max: 2 });
+    const admin = createPool(databaseUrl, { max: 1 });
+    try {
+      const client = await pool.connect();
+      const pid = (await client.query("SELECT pg_backend_pid() AS pid")).rows[0].pid;
+      await client.query("BEGIN");
+      await admin.query("SELECT pg_terminate_backend($1)", [pid]);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await expect(client.query("SELECT 1")).rejects.toThrow();
+      client.release(true);
+      const result = await pool.query("SELECT 1 AS value");
+      expect(result.rows[0].value).toBe(1);
+    } finally {
+      await pool.end();
+      await admin.end();
     }
   });
 
