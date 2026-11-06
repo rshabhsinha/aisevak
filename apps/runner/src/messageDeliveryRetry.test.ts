@@ -287,6 +287,7 @@ describe("message delivery retry", () => {
       expect(String(insert?.params?.[3])).toContain("review it");
       const wait = queries.find((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"));
       expect(wait?.params?.[1]).toBeInstanceOf(Date);
+      expect(wait?.sql).toContain("attempt_count = GREATEST(attempt_count - 1, 0)");
       expect(String(wait?.params?.[2])).toContain("Waiting for the provider usage limit to reset");
       expect(queries.some((query) => query.sql.includes("SET status = 'failed'"))).toBe(false);
       expect(queries.some((query) => query.sql.includes("UPDATE task_assignments"))).toBe(false);
@@ -299,7 +300,7 @@ describe("message delivery retry", () => {
     });
 
     it("falls back to the ordinary failure once the wait budget is spent", async () => {
-      const { pool, queries } = retryPool({ providerThreadId: "provider-thread", limitWaitCount: 12 });
+      const { pool, queries } = retryPool({ providerThreadId: "provider-thread", limitWaitCount: 24 });
       await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);
       expect(queries.some((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"))).toBe(false);
       expect(queries.some((query) => query.sql.includes("SET status = 'failed'"))).toBe(true);

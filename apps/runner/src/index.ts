@@ -3682,15 +3682,6 @@ export async function requeueUnpresentedAgentTurnInput(
   return true;
 }
 
-// Crash recovery for a coordination run that was presented to the recipient
-// and then interrupted by a runner stop. Today's alternative is failing the
-// delivery and blocking its assignment, which silently drops the work. Instead
-// the same delivery is queued again on a fresh run in the same provider
-// session, with a note that the previous turn was interrupted, up to the
-// task's assignment attempt limit (3 by default). Messages that had been
-// injected into the interrupted turn are moved onto the fresh run the same
-// way. Returns false when it cannot redeliver safely; the caller then fails
-// the delivery as before (and the sender gets a delivery.failed notice).
 // Queue the same message again on the same agent thread and provider
 // session, gated by available_at until the provider's usage limit resets. A
 // presented message is re-sent with a note so the agent checks what it did.
@@ -3732,6 +3723,9 @@ async function deferDeliveryForUsageLimit(
   await client.query(
     `UPDATE message_deliveries
      SET status = 'retrying', available_at = $2, limit_wait_count = limit_wait_count + 1,
+         -- The claim counted this attempt; a limit hold must not spend the
+         -- ordinary retry budget for later transient failures.
+         attempt_count = GREATEST(attempt_count - 1, 0),
          error = $3, updated_at = now()
      WHERE id = $1 AND status = 'running'`,
     [deliveryId, retryAt, encodePostgresText(`${waitNote}${error ? ` Original error: ${error}` : ""}`)]
@@ -3761,6 +3755,15 @@ async function deferDeliveryForUsageLimit(
   return true;
 }
 
+// Crash recovery for a coordination run that was presented to the recipient
+// and then interrupted by a runner stop. Today's alternative is failing the
+// delivery and blocking its assignment, which silently drops the work. Instead
+// the same delivery is queued again on a fresh run in the same provider
+// session, with a note that the previous turn was interrupted, up to the
+// task's assignment attempt limit (3 by default). Messages that had been
+// injected into the interrupted turn are moved onto the fresh run the same
+// way. Returns false when it cannot redeliver safely; the caller then fails
+// the delivery as before (and the sender gets a delivery.failed notice).
 export async function redeliverInterruptedRun(
   client: Pick<DbPool, "query">,
   runId: string,

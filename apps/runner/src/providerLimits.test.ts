@@ -9,8 +9,30 @@ describe("parseUsageLimit", () => {
     expect(parseUsageLimit(error, now)).toEqual({ resetAt: new Date("2026-10-29T08:50:00Z") });
   });
 
-  it("rolls a time already past today over to tomorrow", () => {
+  it("rolls a time well past today over to tomorrow", () => {
     expect(parseUsageLimit("You've hit your weekly limit · resets 3am (UTC)", now)?.resetAt).toEqual(new Date("2026-10-30T03:00:00Z"));
+  });
+
+  it("treats a reset that just passed as over, not as tomorrow's", () => {
+    const late = new Date("2026-10-29T08:50:20Z");
+    expect(parseUsageLimit("You've hit your session limit · resets 8:50am (UTC)", late)?.resetAt).toEqual(late);
+  });
+
+  it("reads the last limit message when earlier output holds an older one", () => {
+    const error = "You've hit your session limit · resets 8:50am (UTC)\n...\nYou've hit your weekly limit · resets Nov 2, 4pm (UTC)";
+    expect(parseUsageLimit(error, now)?.resetAt).toEqual(new Date("2026-11-02T16:00:00Z"));
+  });
+
+  it("recognises unqualified and hour-window limits", () => {
+    expect(parseUsageLimit("You've hit your limit · resets 3pm (UTC)", now)?.resetAt).toEqual(new Date("2026-10-29T15:00:00Z"));
+    expect(parseUsageLimit("5-hour limit reached ∙ resets 3pm (UTC)", now)?.resetAt).toEqual(new Date("2026-10-29T15:00:00Z"));
+  });
+
+  it("reads relative and epoch resets", () => {
+    expect(parseUsageLimit("You've hit your usage limit. try again in 4 days 3 hours 12 minutes.", now)?.resetAt)
+      .toEqual(new Date(now.getTime() + ((4 * 24 + 3) * 60 + 12) * 60_000));
+    expect(parseUsageLimit("You've hit your usage limit, try again in 2h 5m", now)?.resetAt).toEqual(new Date(now.getTime() + 125 * 60_000));
+    expect(parseUsageLimit("Claude AI usage limit reached|1793266200", now)?.resetAt).toEqual(new Date(1793266200 * 1000));
   });
 
   it("reads a dated Claude reset", () => {
@@ -47,9 +69,9 @@ describe("usageLimitRetryAt", () => {
     expect(usageLimitRetryAt({ resetAt }, 0, now, 0.5)).toEqual(new Date("2026-10-29T08:53:30Z"));
   });
 
-  it("backs off 15, 30, 60 then 120 minutes without a reset time", () => {
-    const minutes = [0, 1, 2, 3, 6].map((waits) => (usageLimitRetryAt({ resetAt: null }, waits, now, 0).getTime() - now.getTime()) / 60000);
-    expect(minutes).toEqual([15, 30, 60, 120, 120]);
+  it("backs off 15, 30, 60, 120, 240 then 360 minutes without a reset time", () => {
+    const minutes = [0, 1, 2, 3, 4, 5, 9].map((waits) => (usageLimitRetryAt({ resetAt: null }, waits, now, 0).getTime() - now.getTime()) / 60000);
+    expect(minutes).toEqual([15, 30, 60, 120, 240, 360, 360]);
   });
 });
 
