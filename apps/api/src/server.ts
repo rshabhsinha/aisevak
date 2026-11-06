@@ -82,6 +82,7 @@ import { runHarnessCommand } from "./harnessCommand.js";
 import { loadUsageAnalytics } from "./usageAnalytics.js";
 import { forgetAccountLimits, loadAccountLimits } from "./usageLimits.js";
 import {
+  cancelPendingAssignmentDelivery,
   cancelStaleQueuedAgentThreadRuns,
   registerCoordinationRoutes,
   startDeliveryFailureNotices,
@@ -3343,7 +3344,40 @@ export async function cancelAgentThread(
      SELECT * FROM updated_dispatcher`,
     [id]
   );
-  return { turn: result.rows[0] ?? null };
+  const turn = result.rows[0] ?? null;
+  // A queued coordination turn never reaches the runner's terminalizer, so a
+  // Stop settles its message (and inputs moved onto it) here, as a stopped
+  // running turn is settled: no failure notice, assignment cancelled.
+  if (turn?.kind === "dispatcher" && turn.status === "cancelled") await settleStoppedQueuedRun(pool, turn.id);
+  return { turn };
+}
+
+async function settleStoppedQueuedRun(pool: DbPool, runId: string): Promise<void> {
+  const reason = "Stopped before the turn started";
+  await withTransaction(pool, async (client) => {
+    const deliveries = await client.query<{ id: string }>(
+      `SELECT message_delivery_id AS id FROM dispatcher_runs WHERE id = $1 AND message_delivery_id IS NOT NULL
+       UNION
+       SELECT message_delivery_id FROM agent_turn_inputs
+       WHERE dispatcher_run_id = $1 AND status = 'queued' AND message_delivery_id IS NOT NULL`,
+      [runId]
+    );
+    for (const delivery of deliveries.rows) {
+      await cancelPendingAssignmentDelivery(client, delivery.id, reason, { stopRunningTurn: false });
+      await client.query(
+        `UPDATE task_assignments
+         SET status = 'cancelled', result = CASE WHEN result IS NULL OR result = '' THEN $2 ELSE result END,
+             active_delivery_id = NULL, updated_at = now()
+         WHERE active_delivery_id = $1 AND status IN ('queued', 'running')`,
+        [delivery.id, reason]
+      );
+    }
+    await client.query(
+      `UPDATE agent_turn_inputs SET status = 'failed', error = $2, updated_at = now()
+       WHERE dispatcher_run_id = $1 AND status = 'queued'`,
+      [runId, reason]
+    );
+  });
 }
 
 export async function queueAgentTurnInput(

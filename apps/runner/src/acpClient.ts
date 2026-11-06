@@ -6,6 +6,7 @@ import {
 } from "@aisevak/core";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { acpPromptContent } from "./promptImages.js";
+import { parseUsageLimit } from "./providerLimits.js";
 import type { AppServerTurnInput, AppServerTurnOptions, AppServerTurnResult } from "./appServerClient.js";
 
 export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary" | "codexHome"> {
@@ -175,6 +176,8 @@ class PersistentAcpSession {
   async runTurn(options: AcpTurnOptions): Promise<AppServerTurnResult> {
     if (this.isRunning) throw new Error("ACP session already has an active turn");
     this.isRunning = true;
+    // The harness process is reused across turns; report only this turn's stderr.
+    const stderrStart = this.rawStderr.length;
     let seq = 0;
     let promptMayHaveBeenPresented = false;
     let cancelRequested = false;
@@ -211,6 +214,9 @@ class PersistentAcpSession {
           this.sessionId = options.threadId;
         } catch (error) {
           if (this.closed) throw error;
+          // A provider usage limit is not a lost session: fail the turn and
+          // keep the session so the delivery resumes it after the reset.
+          if (parseUsageLimit(error instanceof Error ? error.message : String(error))) throw error;
           console.warn("ACP session/load failed; starting a fresh session and orphaning prior context", {
             threadId: options.threadId,
             error: error instanceof Error ? error.message : String(error)
@@ -238,7 +244,7 @@ class PersistentAcpSession {
           threadId: this.sessionId,
           turnId: null,
           rawStdout: rawLines.join("\n"),
-          rawStderr: this.rawStderr,
+          rawStderr: this.rawStderr.slice(stderrStart),
           exitCode: null,
           error: "provider turn cancelled because run ownership changed before launch",
           promptMayHaveBeenPresented: false
@@ -344,7 +350,7 @@ class PersistentAcpSession {
           threadId: this.sessionId,
           turnId: this.sessionId,
           rawStdout: rawLines.join("\n"),
-          rawStderr: this.rawStderr,
+          rawStderr: this.rawStderr.slice(stderrStart),
           exitCode: null,
           error: "The harness ended the turn as cancelled without a cancel request (it was likely stopped with its runner)",
           promptMayHaveBeenPresented
@@ -356,7 +362,7 @@ class PersistentAcpSession {
         threadId: this.sessionId,
         turnId: this.sessionId,
         rawStdout: rawLines.join("\n"),
-        rawStderr: this.rawStderr,
+        rawStderr: this.rawStderr.slice(stderrStart),
         exitCode: 0,
         error: null,
         promptMayHaveBeenPresented
@@ -372,7 +378,7 @@ class PersistentAcpSession {
         threadId: this.sessionId ?? "",
         turnId: null,
         rawStdout: rawLines.join("\n"),
-        rawStderr: this.rawStderr,
+        rawStderr: this.rawStderr.slice(stderrStart),
         exitCode: null,
         error: error instanceof Error ? error.message : String(error),
         promptMayHaveBeenPresented

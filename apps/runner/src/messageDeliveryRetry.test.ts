@@ -4,6 +4,7 @@ import { finishMessageDelivery } from "./index.js";
 
 interface RetryPoolOptions {
   attemptCount?: number;
+  limitWaitCount?: number;
   failInsert?: boolean;
   overlappingRun?: boolean;
   presentedAt?: Date | null;
@@ -28,6 +29,7 @@ function retryPool(options: RetryPoolOptions = {}): {
           {
             status: deliveryStatus,
             attempt_count: options.attemptCount ?? 1,
+            limit_wait_count: options.limitWaitCount ?? 0,
             presented_at:
               options.presentedAt === undefined
                 ? new Date("2026-08-11T00:00:00Z")
@@ -52,6 +54,7 @@ function retryPool(options: RetryPoolOptions = {}): {
         ]
       };
     }
+    if (sql.includes("SELECT prompt FROM dispatcher_runs")) return { rows: [{ prompt: "review it" }] };
     if (sql.includes("INSERT INTO dispatcher_runs")) {
       if (options.failInsert) throw new Error("injected insert failure");
       if (retryQueued) return { rows: [] };
@@ -269,4 +272,51 @@ describe("message delivery retry", () => {
     expect(failed.sql).toContain("failure_notified_at = CASE WHEN $3::boolean THEN now()");
     expect(failed.params?.[2]).toBe(true);
   });
+
+  describe("provider usage limits", () => {
+    const limitError = "Internal error: You've hit your session limit · resets 8:50am (UTC)";
+
+    it("holds a presented delivery on its provider session until the limit resets", async () => {
+      const { pool, queries } = retryPool({ providerThreadId: "provider-thread", attemptCount: 3 });
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);
+
+      const insert = queries.find((query) => query.sql.includes("INSERT INTO dispatcher_runs"));
+      expect(insert?.sql).toContain("'usage_limit'");
+      expect(insert?.params?.[2]).toBe("provider-thread");
+      expect(String(insert?.params?.[3])).toContain("usage limit was reached");
+      expect(String(insert?.params?.[3])).toContain("review it");
+      const wait = queries.find((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"));
+      expect(wait?.params?.[1]).toBeInstanceOf(Date);
+      expect(wait?.sql).toContain("attempt_count = GREATEST(attempt_count - 1, 0)");
+      expect(String(wait?.params?.[2])).toContain("Waiting for the provider usage limit to reset");
+      expect(queries.some((query) => query.sql.includes("SET status = 'failed'"))).toBe(false);
+      expect(queries.some((query) => query.sql.includes("UPDATE task_assignments"))).toBe(false);
+    });
+
+    it("re-sends an unpresented message without the note", async () => {
+      const { pool, queries } = retryPool({ presentedAt: null });
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);
+      expect(queries.find((query) => query.sql.includes("INSERT INTO dispatcher_runs"))?.params?.[3]).toBe("review it");
+    });
+
+    it("falls back to the ordinary failure once the wait budget is spent", async () => {
+      const { pool, queries } = retryPool({ providerThreadId: "provider-thread", limitWaitCount: 24 });
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);
+      expect(queries.some((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"))).toBe(false);
+      expect(queries.some((query) => query.sql.includes("SET status = 'failed'"))).toBe(true);
+    });
+
+    it("does not wait when thread ownership changed", async () => {
+      const { pool, queries } = retryPool({ agentThreadId: "agent-thread", agentThreadGeneration: 1, ownershipGeneration: 2 });
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);
+      expect(queries.some((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"))).toBe(false);
+    });
+
+    it("leaves a cancelled turn alone", async () => {
+      const { pool, queries } = retryPool({ providerThreadId: "provider-thread" });
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "cancelled", limitError);
+      expect(queries.some((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"))).toBe(false);
+    });
+  });
 });
+

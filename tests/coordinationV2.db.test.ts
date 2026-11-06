@@ -18,12 +18,14 @@ import {
 import {
   enqueueDueSchedule,
   finalizeWorkerRunState,
+  finishMessageDelivery,
   noteTurnForRefresh,
   recoverExpiredRunLeases,
   recoverInterruptedCoordinationRuns,
   recoverInterruptedWorkerRuns
 } from "../apps/runner/src/index.js";
 import { setThreadArchived } from "../apps/api/src/threadArchive.js";
+import { cancelAgentThread } from "../apps/api/src/server.js";
 import { renewRunLeases } from "../apps/runner/src/runLeases.js";
 
 // Runs the coordination v2 SQL against a real Postgres. Point
@@ -167,6 +169,66 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
       [run.agent_thread_id, run.id, assignment.id]
     );
     expect(await live()).toBe("a pending turn input");
+  });
+
+  async function limitedTurn() {
+    const ctx = await scenario();
+    const first = await ctx.send("review it", ctx.orch.id, ctx.rev.id, ctx.assignment.id);
+    const [run] = await q("SELECT id, agent_thread_id, prompt FROM dispatcher_runs WHERE message_delivery_id = $1", [first.deliveryId]);
+    await q("UPDATE agent_threads SET provider_thread_id = 'provider-1' WHERE id = $1", [run.agent_thread_id]);
+    await q("UPDATE dispatcher_runs SET status = 'running', started_at = now(), codex_thread_id = 'provider-1' WHERE id = $1", [run.id]);
+    await q("UPDATE message_deliveries SET status = 'running', attempt_count = 1, presented_at = now() WHERE id = $1", [first.deliveryId]);
+    await q("UPDATE task_assignments SET status = 'running', active_delivery_id = $2 WHERE id = $1", [ctx.assignment.id, first.deliveryId]);
+    const reset = new Date(Date.now() + 3 * 60 * 60 * 1000);
+    const hh = reset.getUTCHours(), mm = String(reset.getUTCMinutes()).padStart(2, "0");
+    const limit = `[session/load] phase=replay Internal error: You've hit your session limit · resets ${hh % 12 || 12}:${mm}${hh < 12 ? "am" : "pm"} (UTC)`;
+    await finishMessageDelivery(pool, { id: run.id, message_delivery_id: first.deliveryId }, "failed", limit);
+    await q("UPDATE dispatcher_runs SET status = 'failed', finished_at = now() WHERE id = $1", [run.id]);
+    return { ...ctx, first, run };
+  }
+
+  it("holds a limit-stopped delivery on its session until the reset, keeping the assignment", async () => {
+    const { first, run, assignment } = await limitedTurn();
+    const [delivery] = await q("SELECT status, attempt_count, limit_wait_count, available_at > now() + interval '2 hours' AS waits FROM message_deliveries WHERE id = $1", [first.deliveryId]);
+    expect(delivery).toMatchObject({ status: "retrying", attempt_count: 0, limit_wait_count: 1, waits: true });
+    const [next] = await q("SELECT status, trigger, codex_thread_id, agent_thread_id, prompt FROM dispatcher_runs WHERE message_delivery_id = $1 AND id <> $2", [first.deliveryId, run.id]);
+    expect(next).toMatchObject({ status: "queued", trigger: "usage_limit", codex_thread_id: "provider-1", agent_thread_id: run.agent_thread_id });
+    expect(next.prompt).toContain("usage limit was reached");
+    expect((await q("SELECT status, active_delivery_id FROM task_assignments WHERE id = $1", [assignment.id]))[0])
+      .toEqual({ status: "running", active_delivery_id: first.deliveryId });
+  });
+
+  it("settles a waiting delivery and its inputs when the queued turn is stopped", async () => {
+    const { first, run, orch, rev, send, assignment } = await limitedTurn();
+    const [next] = await q("SELECT id FROM dispatcher_runs WHERE message_delivery_id = $1 AND status = 'queued'", [first.deliveryId]);
+    const extra = await send("also check X", orch.id, rev.id, null);
+    expect((await q("SELECT dispatcher_run_id FROM agent_turn_inputs WHERE message_delivery_id = $1", [extra.deliveryId]))[0].dispatcher_run_id).toBe(next.id);
+
+    const stopped = await cancelAgentThread(pool, run.agent_thread_id);
+    expect(stopped.turn).toMatchObject({ id: next.id, status: "cancelled" });
+    for (const id of [first.deliveryId, extra.deliveryId]) {
+      const [row] = await q("SELECT status, failure_notified_at IS NOT NULL AS quiet FROM message_deliveries WHERE id = $1", [id]);
+      expect(row).toEqual({ status: "failed", quiet: true });
+    }
+    expect((await q("SELECT status FROM agent_turn_inputs WHERE message_delivery_id = $1", [extra.deliveryId]))[0].status).toBe("failed");
+    expect((await q("SELECT status, active_delivery_id FROM task_assignments WHERE id = $1", [assignment.id]))[0])
+      .toEqual({ status: "cancelled", active_delivery_id: null });
+  });
+
+  it("moves a superseded waiting turn's inputs onto the active turn", async () => {
+    const { first, run, orch, rev, send } = await limitedTurn();
+    const [waiting] = await q("SELECT id FROM dispatcher_runs WHERE message_delivery_id = $1 AND status = 'queued'", [first.deliveryId]);
+    const extra = await send("also check X", orch.id, rev.id, null);
+    const [active] = await q(
+      `INSERT INTO dispatcher_runs (agent_thread_id, agent_thread_generation, scope, status, started_at, cwd, codex_home, model, prompt)
+       SELECT id, ownership_generation, 'coordination', 'running', now(), '/tmp', '/tmp', 'gpt-test', 'other' FROM agent_threads WHERE id = $1
+       RETURNING id`,
+      [run.agent_thread_id]
+    );
+    await send("one more", orch.id, rev.id, null);
+    expect((await q("SELECT status FROM dispatcher_runs WHERE id = $1", [waiting.id]))[0].status).toBe("cancelled");
+    expect((await q("SELECT dispatcher_run_id FROM agent_turn_inputs WHERE message_delivery_id = $1", [extra.deliveryId]))[0].dispatcher_run_id).toBe(active.id);
+    expect((await q("SELECT dispatcher_run_id FROM agent_turn_inputs WHERE message_delivery_id = $1", [first.deliveryId]))[0].dispatcher_run_id).toBe(active.id);
   });
 
   it("leaves live leases alone, redelivers an expired interrupted turn, and fences the old runner", async () => {

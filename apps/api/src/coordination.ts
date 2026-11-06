@@ -2894,6 +2894,12 @@ async function queueIncrementalCoordinationInput(
         );
       }
     }
+    // Inputs already attached to the superseded run move with its message.
+    await client.query(
+      `UPDATE agent_turn_inputs SET dispatcher_run_id = $2, updated_at = now()
+       WHERE dispatcher_run_id = $1 AND status = 'queued'`,
+      [stale.id, run.id]
+    );
     await client.query(
       `UPDATE dispatcher_runs
        SET message_delivery_id = NULL,
