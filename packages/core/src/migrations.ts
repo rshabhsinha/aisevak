@@ -1414,6 +1414,9 @@ export async function runMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
   const fingerprint = createHash("sha256").update(enumSql + tableSql + additiveSql).digest("hex");
   try {
+    // Boot DDL and the wait for another process's migration lock may exceed the
+    // pool's request statement timeout; a cancelled lock wait would crash boot.
+    await client.query("SET statement_timeout = 0");
     // Keep settings and DDL on one connection, and serialize API/runner boot.
     await client.query("SELECT pg_advisory_lock(hashtextextended('aisevak.schema-migrations', 0))");
     await client.query("SELECT set_config('aisevak.default_model', $1, false)", [resolveCodexDefaultModel()]);
@@ -1427,8 +1430,11 @@ export async function runMigrations(pool: Pool): Promise<void> {
       await client.query("INSERT INTO aisevak_schema_revisions(fingerprint) VALUES ($1) ON CONFLICT DO NOTHING", [fingerprint]);
     }
   } finally {
-    try { await client.query("SELECT pg_advisory_unlock(hashtextextended('aisevak.schema-migrations', 0))"); }
-    catch (error) { client.release(true); throw error; }
+    try {
+      await client.query("SELECT pg_advisory_unlock(hashtextextended('aisevak.schema-migrations', 0))");
+      // Return the client to the pool with its configured request timeout.
+      await client.query("RESET statement_timeout");
+    } catch (error) { client.release(true); throw error; }
     client.release();
   }
   await migrateAndSynchronizeInstalledSkills(pool, installedSkillsRoot(process.env.MANAGED_ROOT ?? "/srv/aisevak"));

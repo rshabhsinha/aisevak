@@ -42,6 +42,8 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
     ORDER BY cleanup_attempt_at NULLS FIRST, updated_at LIMIT 5`,[cleanupEnabled]);
   for (const candidate of pending.rows) {
     await withTransaction(pool, async client => {
+      // Cleanup holds its row locks across slow filesystem, git and provider work.
+      await client.query("SET LOCAL idle_in_transaction_session_timeout = 0");
       if (candidate.task_id) await client.query("SELECT id FROM tasks WHERE id = $1 FOR UPDATE",[candidate.task_id]);
       const locked = await client.query<Thread>(`SELECT agent_threads.*, provider_instances.driver FROM agent_threads
         JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
@@ -98,6 +100,8 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
       AND (attempt.cleaned_at IS NULL OR tasks.updated_at > attempt.cleaned_at OR runs.created_at > attempt.cleaned_at) LIMIT 5`);
   for (const worktree of completed.rows) {
     await withTransaction(pool, async client => {
+      // Cleanup holds its row locks across slow filesystem, git and provider work.
+      await client.query("SET LOCAL idle_in_transaction_session_timeout = 0");
       const task = await client.query<{status:string}>("SELECT status FROM tasks WHERE id = $1 FOR UPDATE SKIP LOCKED",[worktree.task_id]);
       if (!task.rows[0] || !['completed','cancelled'].includes(task.rows[0].status)) return;
       let error: string|null = null;
