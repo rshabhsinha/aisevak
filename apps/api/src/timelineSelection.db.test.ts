@@ -110,40 +110,45 @@ describe.skipIf(!databaseUrl)("timeline events against Postgres", () => {
     await q("ANALYZE dispatcher_runs; ANALYZE dispatcher_run_events");
 
     const limit = 100;
-    let keysQuery: { sql: string; params: unknown[] } | undefined;
-    const recording = {
-      query: (sql: string, params: unknown[]) => {
-        if (sql.includes("task_event_keys")) keysQuery = { sql, params };
-        return pool.query(sql, params);
-      }
-    } as unknown as DbPool;
-    const result = await loadTimelineEvents(recording, null, threadId, limit);
+    // Thread mode and task mode walk different run indexes; both must stop early.
+    for (const mode of ["thread", "task"] as const) {
+      let keysQuery: { sql: string; params: unknown[] } | undefined;
+      const recording = {
+        query: (sql: string, params: unknown[]) => {
+          if (sql.includes("task_event_keys")) keysQuery = { sql, params };
+          return pool.query(sql, params);
+        }
+      } as unknown as DbPool;
+      const result = mode === "thread"
+        ? await loadTimelineEvents(recording, null, threadId, limit)
+        : await loadTimelineEvents(recording, taskId, null, limit);
 
-    const ordered = await q(
-      `SELECT dispatcher_run_events.id
-       FROM dispatcher_run_events
-       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-       WHERE dispatcher_runs.agent_thread_id = $1
-       ORDER BY dispatcher_runs.queued_at DESC, dispatcher_run_events.created_at DESC,
-                dispatcher_run_events.seq DESC, dispatcher_run_events.id DESC
-       LIMIT $2`,
-      [threadId, limit]
-    );
-    expect(result.events.map((row) => row.id)).toEqual(ordered.map((row) => row.id).reverse());
-    expect(result.truncated).toBe(true);
+      const ordered = await q(
+        `SELECT dispatcher_run_events.id
+         FROM dispatcher_run_events
+         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+         WHERE ${mode === "thread" ? "dispatcher_runs.agent_thread_id" : "dispatcher_runs.task_id"} = $1
+         ORDER BY dispatcher_runs.queued_at DESC, dispatcher_run_events.created_at DESC,
+                  dispatcher_run_events.seq DESC, dispatcher_run_events.id DESC
+         LIMIT $2`,
+        [mode === "thread" ? threadId : taskId, limit]
+      );
+      expect(result.events.map((row) => row.id), mode).toEqual(ordered.map((row) => row.id).reverse());
+      expect(result.truncated, mode).toBe(true);
 
-    const [{ "QUERY PLAN": plan }] = await q(`EXPLAIN (ANALYZE, FORMAT JSON) ${keysQuery!.sql}`, keysQuery!.params);
-    let eventRowsRead = 0;
-    const visit = (node: Record<string, unknown>) => {
-      if (node["Relation Name"] === "dispatcher_run_events") {
-        eventRowsRead += Number(node["Actual Rows"]) * Number(node["Actual Loops"]);
-      }
-      for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) visit(child);
-    };
-    visit(plan[0].Plan);
-    // The newest few runs cover the limit; all of the thread's runs hold 12,000.
-    expect(eventRowsRead).toBeGreaterThan(0);
-    expect(eventRowsRead).toBeLessThan(limit * 10);
+      const [{ "QUERY PLAN": plan }] = await q(`EXPLAIN (ANALYZE, FORMAT JSON) ${keysQuery!.sql}`, keysQuery!.params);
+      let eventRowsRead = 0;
+      const visit = (node: Record<string, unknown>) => {
+        if (node["Relation Name"] === "dispatcher_run_events") {
+          eventRowsRead += Number(node["Actual Rows"]) * Number(node["Actual Loops"]);
+        }
+        for (const child of (node.Plans as Record<string, unknown>[] | undefined) ?? []) visit(child);
+      };
+      visit(plan[0].Plan);
+      // The newest few runs cover the limit; the scope's runs hold 12,000+.
+      expect(eventRowsRead, mode).toBeGreaterThan(0);
+      expect(eventRowsRead, mode).toBeLessThan(limit * 10);
+    }
   });
 
   it("covers every thread of the task in task mode, still skipping review runs", async () => {

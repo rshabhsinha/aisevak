@@ -4710,11 +4710,14 @@ async function queueDispatcherRun(
 // sorts or window-counts wide text/payload rows: rank narrow keys first
 // (fetching one extra to detect truncation), then load bodies by id.
 //
-// Each run-backed branch walks the scope's runs newest first and reads at most
-// `limit + 1` events per run through the run's own event index, so a thread
-// with a thousand runs stops after its newest runs instead of joining every
-// event table row (INC-61). Events inside one run share its queued_at, so the
-// per-run order (created_at, seq, id) is the global order within that run.
+// Each run-backed branch walks the scope's runs newest first (the
+// (agent_thread_id | task_id, queued_at) indexes) and keeps at most `limit + 1`
+// events per run, so a thread with a thousand runs stops after its newest runs
+// instead of joining every event table row (INC-61). Each visited run's events
+// are still read in full through the run's event index and top-N sorted, since
+// that index is not in created_at order. Events inside one run share its
+// queued_at, so the per-run order (created_at, seq, id) is the global order
+// within that run.
 export async function loadTimelineEvents(
   pool: Pick<DbPool, "query">,
   taskId: string | null,
