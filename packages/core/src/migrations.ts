@@ -1410,6 +1410,17 @@ ALTER TABLE schedules ADD COLUMN IF NOT EXISTS last_error text;
 CREATE INDEX IF NOT EXISTS task_runs_task_created_idx ON task_runs(task_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_created_idx
 ON dispatcher_runs(task_id, created_at DESC) WHERE task_id IS NOT NULL;
+
+-- The timeline walks a thread's or task's runs newest first and stops once it
+-- has enough events (INC-61); without an ordered run source Postgres joins
+-- every event of a thousand-run thread before applying the limit.
+CREATE INDEX IF NOT EXISTS task_runs_agent_thread_queued_idx
+ON task_runs(agent_thread_id, queued_at DESC) WHERE agent_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS dispatcher_runs_agent_thread_queued_idx
+ON dispatcher_runs(agent_thread_id, queued_at DESC) WHERE agent_thread_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS task_runs_task_queued_idx ON task_runs(task_id, queued_at DESC);
+CREATE INDEX IF NOT EXISTS dispatcher_runs_task_queued_idx
+ON dispatcher_runs(task_id, queued_at DESC) WHERE task_id IS NOT NULL;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {
