@@ -12,6 +12,8 @@ describe.skipIf(!databaseUrl)("database timeouts", () => {
       for (const client of clients) {
         const result = await client.query("SHOW statement_timeout");
         expect(result.rows[0].statement_timeout).toBe("30s");
+        const idle = await client.query("SHOW idle_in_transaction_session_timeout");
+        expect(idle.rows[0].idle_in_transaction_session_timeout).toBe("1min");
       }
     } finally {
       clients.forEach((client) => client.release());

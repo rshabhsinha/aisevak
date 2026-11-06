@@ -31,6 +31,10 @@ describe('durable lifecycle cleanup',()=>{
   await expect(lstat(join(f.home,'.agents','skills'))).rejects.toMatchObject({code:'ENOENT'});
   expect(await readFile(join(f.home,'history.jsonl'),'utf8')).toBe('retained transcript');
   expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(true);
+  // The transaction outlives the pool's idle-in-transaction limit while it archives and removes files.
+  const optOut=f.queries.findIndex(q=>q.sql==="SET LOCAL idle_in_transaction_session_timeout = 0");
+  expect(optOut).toBeGreaterThan(f.queries.findIndex(q=>q.sql==="BEGIN"));
+  expect(optOut).toBeLessThan(f.queries.findIndex(q=>q.sql.includes('provider_instances.driver')));
  });
  it.each(['busy','shared'] as const)('defers %s owners without touching their provider',async(flag)=>{
   const f=await fixture({[flag]:true});await sweepLifecycleCleanup(f.pool,root,'codex');
