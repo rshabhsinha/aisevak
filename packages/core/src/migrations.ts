@@ -1322,6 +1322,8 @@ CREATE SEQUENCE IF NOT EXISTS message_delivery_inbox_seq;
 ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS agent_thread_id uuid;
 ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS seq bigint;
 ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS interrupted_count integer NOT NULL DEFAULT 0;
+-- limit_wait_count counts redeliveries held until a provider usage limit reset.
+ALTER TABLE message_deliveries ADD COLUMN IF NOT EXISTS limit_wait_count integer NOT NULL DEFAULT 0;
 DO $$ BEGIN
   ALTER TABLE message_deliveries ADD CONSTRAINT message_deliveries_agent_thread_id_fkey
     FOREIGN KEY (agent_thread_id) REFERENCES agent_threads(id) ON DELETE SET NULL;

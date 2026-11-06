@@ -64,6 +64,7 @@ import { pruneHeartbeatRollouts } from "./heartbeatRollouts.js";
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
+import { MAX_USAGE_LIMIT_WAITS, parseUsageLimit, usageLimitRetryAt, withUsageLimitPreamble } from "./providerLimits.js";
 import { encodePostgresJson, encodePostgresText } from "./postgresText.js";
 import {
   bootRecoveryScope,
@@ -3002,6 +3003,7 @@ export async function finishMessageDelivery(
       const result = await client.query<{
         status: string;
         attempt_count: number;
+        limit_wait_count?: number | null;
         presented_at: Date | null;
         agent_thread_id: string | null;
         agent_thread_generation: number;
@@ -3010,6 +3012,7 @@ export async function finishMessageDelivery(
       }>(
         `SELECT delivery.status,
                 delivery.attempt_count,
+                delivery.limit_wait_count,
                 delivery.presented_at,
                 source_run.agent_thread_id,
                 source_run.agent_thread_generation,
@@ -3045,6 +3048,21 @@ export async function finishMessageDelivery(
         const currentOwnership = ownership.rows[0];
         delivery.ownership_generation = currentOwnership?.ownership_generation ?? null;
         delivery.provider_thread_id = currentOwnership?.provider_thread_id ?? null;
+      }
+
+      // A provider usage limit is not a failure of the message: hold it on the
+      // same thread and session until the limit resets (INC-45). Runs ahead
+      // of the attempt cap and presented-turn suppression, which would
+      // otherwise strand the assignment until someone redelivers it.
+      const usageLimit = status === "failed" ? parseUsageLimit(error) : null;
+      if (
+        usageLimit &&
+        (delivery.limit_wait_count ?? 0) < MAX_USAGE_LIMIT_WAITS &&
+        (!delivery.agent_thread_id || delivery.agent_thread_generation === delivery.ownership_generation)
+      ) {
+        const retryAt = usageLimitRetryAt(usageLimit, delivery.limit_wait_count ?? 0);
+        const presented = Boolean(delivery.presented_at || promptMayHaveBeenPresented);
+        if (await deferDeliveryForUsageLimit(client, job.id, messageDeliveryId, error, retryAt, presented, delivery.provider_thread_id)) return;
       }
 
       if (status !== "failed" || delivery.attempt_count >= 3) {
@@ -3673,6 +3691,76 @@ export async function requeueUnpresentedAgentTurnInput(
 // injected into the interrupted turn are moved onto the fresh run the same
 // way. Returns false when it cannot redeliver safely; the caller then fails
 // the delivery as before (and the sender gets a delivery.failed notice).
+// Queue the same message again on the same agent thread and provider
+// session, gated by available_at until the provider's usage limit resets. A
+// presented message is re-sent with a note so the agent checks what it did.
+// Inputs the stopped turn had begun presenting move to the new run.
+async function deferDeliveryForUsageLimit(
+  client: Pick<DbPool, "query">,
+  runId: string,
+  deliveryId: string,
+  error: string,
+  retryAt: Date,
+  presented: boolean,
+  providerThreadId: string | null
+): Promise<boolean> {
+  const prompt = await runPrompt(client, runId);
+  const retry = await client.query<{ id: string }>(
+    `INSERT INTO dispatcher_runs
+       (task_id, assignment_id, trigger, scope, agent_thread_id, agent_thread_generation, workspace_key, workspace_mode, workspace_source, message_delivery_id, status, cwd, codex_home,
+        codex_thread_id, model, model_options, prompt, skills_snapshot)
+     SELECT source_run.task_id, source_run.assignment_id, 'usage_limit', source_run.scope, source_run.agent_thread_id,
+            source_run.agent_thread_generation, source_run.workspace_key, source_run.workspace_mode, source_run.workspace_source, source_run.message_delivery_id, 'queued', source_run.cwd, source_run.codex_home,
+            COALESCE($3, source_run.codex_thread_id), source_run.model, source_run.model_options,
+            $4, source_run.skills_snapshot
+     FROM dispatcher_runs source_run
+     WHERE source_run.id = $1
+       AND source_run.message_delivery_id = $2
+       AND NOT EXISTS (
+         SELECT 1
+         FROM dispatcher_runs overlapping_run
+         WHERE overlapping_run.message_delivery_id = $2
+           AND overlapping_run.id <> source_run.id
+           AND overlapping_run.status IN ('queued', 'running', 'cancel_requested')
+       )
+     RETURNING id`,
+    [runId, deliveryId, providerThreadId, presented ? withUsageLimitPreamble(prompt) : prompt]
+  );
+  const newRunId = retry.rows[0]?.id;
+  if (!newRunId) return false;
+  const waitNote = `Waiting for the provider usage limit to reset; delivery resumes at ${retryAt.toISOString()}.`;
+  await client.query(
+    `UPDATE message_deliveries
+     SET status = 'retrying', available_at = $2, limit_wait_count = limit_wait_count + 1,
+         error = $3, updated_at = now()
+     WHERE id = $1 AND status = 'running'`,
+    [deliveryId, retryAt, encodePostgresText(`${waitNote}${error ? ` Original error: ${error}` : ""}`)]
+  );
+  const inputs = await client.query<{ id: string; message_delivery_id: string; message: string }>(
+    `SELECT input.id, input.message_delivery_id, input.message
+     FROM agent_turn_inputs input
+     JOIN message_deliveries delivery ON delivery.id = input.message_delivery_id
+     WHERE input.dispatcher_run_id = $1
+       AND input.status = 'delivering'
+       AND delivery.status = 'running'
+     FOR UPDATE OF input, delivery`,
+    [runId]
+  );
+  for (const input of inputs.rows) {
+    await client.query(
+      `UPDATE message_deliveries SET status = 'retrying', available_at = $2, error = $3, updated_at = now() WHERE id = $1`,
+      [input.message_delivery_id, retryAt, encodePostgresText(waitNote)]
+    );
+    await client.query(
+      `UPDATE agent_turn_inputs
+       SET status = 'queued', dispatcher_run_id = $2, message = $3, error = NULL, updated_at = now()
+       WHERE id = $1`,
+      [input.id, newRunId, withUsageLimitPreamble(input.message)]
+    );
+  }
+  return true;
+}
+
 export async function redeliverInterruptedRun(
   client: Pick<DbPool, "query">,
   runId: string,
