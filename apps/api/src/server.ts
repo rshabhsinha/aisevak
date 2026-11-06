@@ -2587,8 +2587,11 @@ interface TimelineEventRow {
   created_at?: string | Date | null;
 }
 
-interface TimelineEventQueryRow extends TimelineEventRow {
-  total_count?: string | number;
+type TimelineEventSource = "run" | "dispatcher" | "input";
+
+interface TimelineEventKeyRow {
+  source: TimelineEventSource;
+  id: string;
 }
 
 type ModelSelectionInput = z.infer<typeof modelSelectionSchema>;
@@ -4669,6 +4672,102 @@ async function queueDispatcherRun(
   });
 }
 
+// Picks the newest `limit` timeline events in two steps so Postgres never
+// sorts or window-counts wide text/payload rows: rank narrow keys first
+// (fetching one extra to detect truncation), then load bodies by id.
+export async function loadTimelineEvents(
+  pool: Pick<DbPool, "query">,
+  taskId: string | null,
+  agentThreadId: string | null,
+  limit: number
+): Promise<{ events: TimelineEventRow[]; truncated: boolean }> {
+  const keysResult = await pool.query<TimelineEventKeyRow>(
+    `SELECT source, id
+     FROM (
+       SELECT 'run'::text AS source,
+              run_events.id,
+              run_events.seq,
+              run_events.created_at,
+              task_runs.queued_at
+       FROM run_events
+       JOIN task_runs ON task_runs.id = run_events.run_id
+       WHERE task_runs.run_kind = 'worker'
+         AND (
+           ($2::uuid IS NOT NULL AND task_runs.agent_thread_id = $2)
+           OR ($2::uuid IS NULL AND task_runs.task_id = $1)
+         )
+       UNION ALL
+       SELECT 'dispatcher'::text AS source,
+              dispatcher_run_events.id,
+              dispatcher_run_events.seq,
+              dispatcher_run_events.created_at,
+              dispatcher_runs.queued_at
+       FROM dispatcher_run_events
+       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+       WHERE (
+           ($2::uuid IS NOT NULL AND dispatcher_runs.agent_thread_id = $2)
+           OR ($2::uuid IS NULL AND dispatcher_runs.task_id = $1)
+         )
+       UNION ALL
+       SELECT 'input'::text AS source,
+              agent_turn_inputs.id,
+              0 AS seq,
+              agent_turn_inputs.created_at,
+              COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
+       FROM agent_turn_inputs
+       LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
+       LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
+       WHERE (
+           ($2::uuid IS NOT NULL AND agent_turn_inputs.agent_thread_id = $2)
+           OR (
+             $2::uuid IS NULL
+             AND (task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)
+           )
+         )
+     ) task_event_keys
+     ORDER BY queued_at DESC, created_at DESC, seq DESC, id DESC
+     LIMIT $3`,
+    [taskId, agentThreadId, limit + 1]
+  );
+  const truncated = keysResult.rows.length > limit;
+  const keys = keysResult.rows.slice(0, limit).reverse();
+  if (keys.length === 0) return { events: [], truncated };
+  const idsFor = (source: TimelineEventSource) => keys.filter((key) => key.source === source).map((key) => key.id);
+  const bodiesResult = await pool.query<TimelineEventRow & { source: TimelineEventSource }>(
+    `SELECT 'run'::text AS source, id, run_id, NULL::uuid AS dispatcher_run_id, seq, event_type, text, payload, created_at
+     FROM run_events
+     WHERE id = ANY($1::uuid[])
+     UNION ALL
+     SELECT 'dispatcher'::text, id, NULL::uuid, dispatcher_run_id, seq, event_type, text, payload, created_at
+     FROM dispatcher_run_events
+     WHERE id = ANY($2::uuid[])
+     UNION ALL
+     SELECT 'input'::text,
+            id,
+            task_run_id,
+            dispatcher_run_id,
+            0,
+            'thread.message-sent',
+            message,
+            jsonb_build_object(
+              'type', 'thread.message-sent',
+              'role', 'user',
+              'text', message,
+              'steer', true,
+              'deliveryStatus', status,
+              'error', error
+            ),
+            created_at
+     FROM agent_turn_inputs
+     WHERE id = ANY($3::uuid[])`,
+    [idsFor("run"), idsFor("dispatcher"), idsFor("input")]
+  );
+  const bodies = new Map(bodiesResult.rows.map(({ source, ...event }) => [`${source}:${event.id}`, event]));
+  // Events deleted between the two reads are dropped rather than failing the timeline.
+  const events = keys.flatMap((key) => bodies.get(`${key.source}:${key.id}`) ?? []);
+  return { events, truncated };
+}
+
 export async function getTaskSessionTimeline(
   pool: DbPool,
   taskId: string | null,
@@ -4738,78 +4837,7 @@ export async function getTaskSessionTimeline(
        ORDER BY queued_at ASC, created_at ASC`,
       [taskId, agentThreadId ?? null]
     ),
-    pool.query<TimelineEventQueryRow>(
-      `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at, total_count
-       FROM (
-         SELECT task_events.*,
-                COUNT(*) OVER () AS total_count
-         FROM (
-           SELECT run_events.id,
-                run_events.run_id,
-                NULL::uuid AS dispatcher_run_id,
-                run_events.seq,
-                run_events.event_type,
-                run_events.text,
-                run_events.payload,
-                run_events.created_at,
-                task_runs.queued_at
-         FROM run_events
-         JOIN task_runs ON task_runs.id = run_events.run_id
-         WHERE task_runs.run_kind = 'worker'
-           AND (
-             ($2::uuid IS NOT NULL AND task_runs.agent_thread_id = $2)
-             OR ($2::uuid IS NULL AND task_runs.task_id = $1)
-           )
-         UNION ALL
-         SELECT dispatcher_run_events.id,
-                NULL::uuid AS run_id,
-                dispatcher_run_events.dispatcher_run_id,
-                dispatcher_run_events.seq,
-                dispatcher_run_events.event_type,
-                dispatcher_run_events.text,
-                dispatcher_run_events.payload,
-                dispatcher_run_events.created_at,
-                dispatcher_runs.queued_at
-         FROM dispatcher_run_events
-         JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
-         WHERE (
-             ($2::uuid IS NOT NULL AND dispatcher_runs.agent_thread_id = $2)
-             OR ($2::uuid IS NULL AND dispatcher_runs.task_id = $1)
-           )
-         UNION ALL
-         SELECT agent_turn_inputs.id,
-                agent_turn_inputs.task_run_id AS run_id,
-                agent_turn_inputs.dispatcher_run_id,
-                0 AS seq,
-                'thread.message-sent' AS event_type,
-                agent_turn_inputs.message AS text,
-                jsonb_build_object(
-                  'type', 'thread.message-sent',
-                  'role', 'user',
-                  'text', agent_turn_inputs.message,
-                  'steer', true,
-                  'deliveryStatus', agent_turn_inputs.status,
-                  'error', agent_turn_inputs.error
-                ) AS payload,
-                agent_turn_inputs.created_at,
-                COALESCE(task_runs.queued_at, dispatcher_runs.queued_at) AS queued_at
-         FROM agent_turn_inputs
-         LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
-         LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-         WHERE (
-             ($2::uuid IS NOT NULL AND agent_turn_inputs.agent_thread_id = $2)
-             OR (
-               $2::uuid IS NULL
-               AND (task_runs.task_id = $1 OR dispatcher_runs.task_id = $1)
-             )
-           )
-         ) task_events
-         ORDER BY queued_at DESC, created_at DESC, seq DESC
-         LIMIT $3
-       ) limited_task_events
-       ORDER BY queued_at ASC, created_at ASC, seq ASC`,
-      [taskId, agentThreadId ?? null, MAX_AGENT_THREAD_EVENTS]
-    ),
+    loadTimelineEvents(pool, taskId, agentThreadId ?? null, MAX_AGENT_THREAD_EVENTS),
     pool.query<TimelineEventRow>(
       `SELECT task_comments.id,
               NULL::uuid AS run_id,
@@ -4829,9 +4857,7 @@ export async function getTaskSessionTimeline(
   ]);
   const runs = runsResult.rows;
   const latest = selectPreferredTimelineRun(runs);
-  const timelineEvents = eventsResult.rows.map(({ total_count: _totalCount, ...event }) => event);
-  const totalEvents = Number(eventsResult.rows[0]?.total_count ?? 0);
-  const eventsTruncated = totalEvents > timelineEvents.length;
+  const { events: timelineEvents, truncated: eventsTruncated } = eventsResult;
   return {
     run: latest ? { ...latest, prompt: null } : null,
     events: withSyntheticUserMessages(runs, [...timelineEvents, ...commentsResult.rows]),
