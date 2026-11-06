@@ -1215,7 +1215,18 @@ export async function registerCoordinationRoutes(
       await requireTaskAuthority(client, context, assignment.task_id, "retry this assignment");
       if (["completed", "cancelled"].includes(assignment.task_status)) throw safetyConflict(`Cannot retry an assignment on a ${assignment.task_status} task`);
       if (["completed", "cancelled"].includes(assignment.status)) throw safetyConflict("A terminal assignment cannot be retried");
-      if (assignment.status === "running") throw safetyConflict("The assignment is already running; wait for it to finish or fail");
+      if (assignment.status === "running") {
+        // A turn can end without the assignee completing or blocking, which
+        // leaves the assignment "running" with nothing live behind it. Such an
+        // idle assignment may be retried on its same thread and session.
+        const live = await assignmentLiveWork(client, {
+          assignmentId: id,
+          assignedAgentId: assignment.assigned_agent_id,
+          coordinationThreadId: assignment.coordination_thread_id,
+          taskId: assignment.task_id
+        });
+        if (live) throw safetyConflict(`The assignment is already running (${live}); wait for it to finish or fail`);
+      }
       const policy = orchestrationPolicy(assignment.max_attempts);
       if (assignment.attempt_count >= policy.maxAssignmentAttempts) {
         await recordSafetyEvent(client, {
@@ -1724,6 +1735,43 @@ function registerIncidentRoutes(app: FastifyInstance, pool: DbPool, managedRoot:
     }
     return { incident: await showIncident(pool, id), ...(writingCheck ? { writingCheck } : {}) };
   });
+}
+
+/**
+ * Describes the live work still behind an assignment, or returns null when a
+ * "running" assignment is idle: no pending delivery or turn input for it and no
+ * queued or running turn of its assignee on the task's thread.
+ */
+export async function assignmentLiveWork(
+  queryable: Pick<PoolClient, "query">,
+  input: { assignmentId: string; assignedAgentId: string; coordinationThreadId: string | null; taskId: string }
+): Promise<string | null> {
+  const result = await queryable.query<{ live: string }>(
+    `SELECT 'a pending delivery' AS live FROM message_deliveries
+     WHERE (message_deliveries.assignment_id = $1
+            OR message_deliveries.id = (SELECT active_delivery_id FROM task_assignments WHERE id = $1))
+       AND message_deliveries.status IN ('queued', 'retrying', 'running')
+     UNION ALL
+     SELECT 'a pending turn input' FROM agent_turn_inputs
+     WHERE agent_turn_inputs.assignment_id = $1 AND agent_turn_inputs.status IN ('queued', 'delivering')
+     UNION ALL
+     SELECT 'a live turn' FROM dispatcher_runs
+     WHERE dispatcher_runs.status IN ('queued', 'running', 'cancel_requested')
+       AND (dispatcher_runs.assignment_id = $1 OR dispatcher_runs.agent_thread_id IN (
+         SELECT agent_threads.id FROM agent_threads
+         WHERE agent_threads.agent_id = $2
+           AND (agent_threads.coordination_thread_id = $3 OR agent_threads.task_id = $4)))
+     UNION ALL
+     SELECT 'a live turn' FROM task_runs
+     WHERE task_runs.status IN ('queued', 'running', 'cancel_requested')
+       AND task_runs.agent_thread_id IN (
+         SELECT agent_threads.id FROM agent_threads
+         WHERE agent_threads.agent_id = $2
+           AND (agent_threads.coordination_thread_id = $3 OR agent_threads.task_id = $4))
+     LIMIT 1`,
+    [input.assignmentId, input.assignedAgentId, input.coordinationThreadId, input.taskId]
+  );
+  return result.rows[0]?.live ?? null;
 }
 
 export async function requireAgent(pool: DbPool, request: FastifyRequest): Promise<AgentContext> {

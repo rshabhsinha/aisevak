@@ -7,6 +7,7 @@ vi.hoisted(() => { process.env.MANAGED_ROOT = "/tmp/aisevak-coordination-v2-test
 import { createPool, runMigrations, withTransaction, type DbPool } from "../packages/core/src/index.js";
 import {
   agentStatus,
+  assignmentLiveWork,
   cancelStaleQueuedAgentThreadRuns,
   inbox,
   notifyFailedDeliveries,
@@ -133,6 +134,39 @@ describe.skipIf(!databaseUrl)("coordination v2 against Postgres", () => {
     expect((await q("SELECT status FROM message_deliveries WHERE id = $1", [sent.deliveryId]))[0].status).toBe("failed");
     const notices = await q("SELECT recipient_agent_id FROM thread_messages WHERE thread_id = $1 AND message_type = 'delivery.failed'", [thread.id]);
     expect(notices).toEqual([{ recipient_agent_id: orch.id }]);
+  });
+
+  it("treats a running assignment as retryable only once nothing is live behind it", async () => {
+    const { orch, rev, task, thread, assignment, send } = await scenario();
+    const live = () => assignmentLiveWork(pool, {
+      assignmentId: assignment.id, assignedAgentId: rev.id, coordinationThreadId: thread.id, taskId: task.id
+    });
+    const first = await send("review it", orch.id, rev.id, assignment.id);
+    const [run] = await q("SELECT id, agent_thread_id FROM dispatcher_runs WHERE message_delivery_id = $1", [first.deliveryId]);
+    await q("UPDATE task_assignments SET status = 'running', active_delivery_id = $2 WHERE id = $1", [assignment.id, first.deliveryId]);
+    expect(await live()).toBe("a pending delivery");
+
+    // The turn ran and succeeded without the reviewer completing the assignment.
+    await q("UPDATE message_deliveries SET status = 'delivered', completed_at = now() WHERE id = $1", [first.deliveryId]);
+    await q("UPDATE task_assignments SET active_delivery_id = NULL WHERE id = $1", [assignment.id]);
+    expect(await live()).toBe("a live turn");
+    await q("UPDATE dispatcher_runs SET status = 'succeeded', finished_at = now() WHERE id = $1", [run.id]);
+    expect(await live()).toBeNull();
+
+    // Any queued or running turn of the assignee on this thread keeps it live.
+    await q(
+      `INSERT INTO dispatcher_runs (agent_thread_id, scope, status, cwd, codex_home, model, prompt)
+       VALUES ($1, 'agent_thread', 'running', '/tmp', '/tmp', 'gpt-test', 'other work')`,
+      [run.agent_thread_id]
+    );
+    expect(await live()).toBe("a live turn");
+    await q("UPDATE dispatcher_runs SET status = 'cancelled' WHERE agent_thread_id = $1 AND status = 'running'", [run.agent_thread_id]);
+    await q(
+      `INSERT INTO agent_turn_inputs (agent_thread_id, dispatcher_run_id, assignment_id, status, message)
+       VALUES ($1, $2, $3, 'queued', 'follow-up')`,
+      [run.agent_thread_id, run.id, assignment.id]
+    );
+    expect(await live()).toBe("a pending turn input");
   });
 
   it("leaves live leases alone, redelivers an expired interrupted turn, and fences the old runner", async () => {

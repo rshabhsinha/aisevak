@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool, hashToken, runMigrations, type DbPool } from "@aisevak/core";
-import { expireRequests, registerCoordinationRoutes } from "./coordination.js";
+import { assignmentLiveWork, expireRequests, registerCoordinationRoutes } from "./coordination.js";
 
 // Phase 3 of coordination v2 through the real agent-tools routes and a real
 // Postgres. Runs when AISEVAK_TEST_DATABASE_URL points at a disposable database.
@@ -222,6 +222,78 @@ describe.skipIf(!databaseUrl)("coordination v2 phase 3 against Postgres", () => 
     const escape = await call(await token(populator.id, child.id, child.threadId), "POST", `/api/agent-tools/v1/tasks/TASK-${child.number}/reparent`, { parent: `TASK-${elsewhere.number}` });
     expect(escape.status).toBe(403);
     expect((await q("SELECT parent_task_id FROM tasks WHERE id = $1", [child.id]))[0].parent_task_id).toBe(campaign.id);
+  });
+
+  it("retries a running assignment only once nothing is live behind it (INC-48)", async () => {
+    const owner = await agent("Owner");
+    const reviewer = await agent("Reviewer");
+    const work = await task(owner.id, "Review a record");
+    await q("UPDATE agents SET capabilities = '[\"assignments:create\", \"assignments:read\", \"assignments:retry\", \"tasks:read\"]' WHERE id = $1", [owner.id]);
+    const ownerToken = await token(owner.id, work.id, work.threadId);
+    const created = await call(ownerToken, "POST", `/api/agent-tools/v1/tasks/TASK-${work.number}/assignments`, { key: "review", to: reviewer.name, instructions: "Review it" });
+    expect(created.status).toBe(200);
+    const number = created.body.assignment.number;
+    const [assignment] = await q("SELECT id, active_delivery_id, request_message_id, attempt_count FROM task_assignments WHERE task_id = $1", [work.id]);
+    const [run] = await q("SELECT id, agent_thread_id FROM dispatcher_runs WHERE message_delivery_id = $1", [assignment.active_delivery_id]);
+    await q("UPDATE agent_threads SET provider_thread_id = 'provider-session' WHERE id = $1", [run.agent_thread_id]);
+
+    // While the reviewer's turn runs, retry is refused and names what is live.
+    await q("UPDATE dispatcher_runs SET status = 'running', started_at = now() WHERE id = $1", [run.id]);
+    await q("UPDATE message_deliveries SET status = 'running', presented_at = now() WHERE id = $1", [assignment.active_delivery_id]);
+    await q("UPDATE task_assignments SET status = 'running' WHERE id = $1", [assignment.id]);
+    const refused = await call(ownerToken, "POST", `/api/agent-tools/v1/assignments/ASSIGNMENT-${number}/retry`, {});
+    expect(refused.status).toBe(409);
+    expect(JSON.stringify(refused.body)).toContain("a pending delivery");
+
+    // The turn ends without the reviewer completing or blocking: INC-48's stuck state.
+    await q("UPDATE dispatcher_runs SET status = 'succeeded', finished_at = now() WHERE id = $1", [run.id]);
+    await q("UPDATE message_deliveries SET status = 'completed', completed_at = now() WHERE id = $1", [assignment.active_delivery_id]);
+    await q("UPDATE task_assignments SET active_delivery_id = NULL WHERE id = $1", [assignment.id]);
+    await q("UPDATE thread_messages SET request_state = 'replied' WHERE id = $1", [assignment.request_message_id]);
+    const retried = await call(ownerToken, "POST", `/api/agent-tools/v1/assignments/ASSIGNMENT-${number}/retry`, {});
+    expect(retried.status).toBe(200);
+    const [after] = await q("SELECT status, attempt_count, active_delivery_id FROM task_assignments WHERE id = $1", [assignment.id]);
+    expect(after.status).toBe("queued");
+    expect(after.attempt_count).toBe(assignment.attempt_count + 1);
+    expect((await q("SELECT request_state FROM thread_messages WHERE id = $1", [assignment.request_message_id]))[0].request_state).toBe("open");
+    const [delivery] = await q("SELECT agent_thread_id FROM message_deliveries WHERE id = $1", [after.active_delivery_id]);
+    expect(delivery.agent_thread_id).toBe(run.agent_thread_id);
+    const [nextRun] = await q("SELECT codex_thread_id FROM dispatcher_runs WHERE message_delivery_id = $1", [after.active_delivery_id]);
+    expect(nextRun.codex_thread_id).toBe("provider-session");
+
+    // The same idempotency key does not retry twice.
+    const before = (await q("SELECT attempt_count FROM task_assignments WHERE id = $1", [assignment.id]))[0].attempt_count;
+    await q("UPDATE task_assignments SET status = 'blocked' WHERE id = $1", [assignment.id]);
+    const key = `assignment:${assignment.id}:attempt:${before}`;
+    const replay = await call(ownerToken, "POST", `/api/agent-tools/v1/assignments/ASSIGNMENT-${number}/retry`, { idempotencyKey: key });
+    expect(replay.status).toBe(200);
+    expect((await q("SELECT attempt_count FROM task_assignments WHERE id = $1", [assignment.id]))[0].attempt_count).toBe(before);
+  });
+
+  it("counts a live worker run, and an assignee that owns the task, as live work", async () => {
+    const owner = await agent("Owner");
+    const work = await task(owner.id, "Own work");
+    const [assignment] = await q(
+      `INSERT INTO task_assignments (task_id, assignment_key, assigned_agent_id, created_by_agent_id, instructions, fingerprint, status)
+       VALUES ($1, 'self', $2, $2, 'do it', 'fp', 'running') RETURNING id`,
+      [work.id, owner.id]
+    );
+    const [thread] = await q(
+      `INSERT INTO agent_threads (agent_id, task_id, provider_instance_id, model, title, cwd, runtime_home)
+       SELECT $1, $2, id, 'gpt-test', 'own', '/tmp', '/tmp/own' FROM provider_instances LIMIT 1
+       RETURNING id`,
+      [owner.id, work.id]
+    );
+    const live = () => assignmentLiveWork(pool, { assignmentId: assignment.id, assignedAgentId: owner.id, coordinationThreadId: null, taskId: work.id });
+    expect(await live()).toBeNull();
+    expect(thread).toBeTruthy();
+    await q(
+      `WITH session AS (INSERT INTO task_sessions (task_id, agent_snapshot, codex_home) VALUES ($1, '{}'::jsonb, '/tmp/own') RETURNING id)
+       INSERT INTO task_runs (task_id, task_session_id, agent_thread_id, status, cwd, model, prompt)
+       SELECT $1, session.id, $2, 'running', '/tmp', 'gpt-test', 'work' FROM session`,
+      [work.id, thread.id]
+    );
+    expect(await live()).toBe("a live turn");
   });
 
   it("sends an assignment's result to whoever asked for it", async () => {

@@ -113,7 +113,7 @@ aisevak assignments complete ASSIGNMENT --result-stdin [--idempotency-key KEY]
 aisevak assignments block ASSIGNMENT --result-stdin [--idempotency-key KEY]
 ```
 
-Assignment keys are unique within a task. Reusing a key with the same immutable input returns the existing assignment; a different input is rejected. Retries reuse the assignment, task coordination thread, agent thread, and provider session whenever resumable.
+Assignment keys are unique within a task. Reusing a key with the same immutable input returns the existing assignment; a different input is rejected. Retries reuse the assignment, task coordination thread, agent thread, and provider session whenever resumable. An assignment left `running` after its assignee's turn ended without completing or blocking it can be retried once no delivery, turn input or turn of the assignee is still live; while one is, retry is refused and names it.
 
 ## Schedules
 
