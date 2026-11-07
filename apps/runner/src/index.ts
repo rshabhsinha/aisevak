@@ -51,7 +51,7 @@ import {
 } from "./appServerClient.js";
 import { closeAllAcpSessions } from "./acpClient.js";
 import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
-import { launchClaudeAccount, settleClaudeAccount, type ClaudeAccountChoice } from "./claudeAccounts.js";
+import { launchClaudeAccount, settleClaudeAccount, type LaunchedClaudeAccount } from "./claudeAccounts.js";
 import {
   agentGithubEnvironment,
   authenticateGithubCli,
@@ -1755,8 +1755,7 @@ export async function processOneDispatcherRun(
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
-  const runStartedAt = new Date();
-  let claudeAccount: ClaudeAccountChoice | null = null;
+  let claudeAccount: LaunchedClaudeAccount | null = null;
   let promptMayHaveBeenPresented = false;
   let ownershipLost = false;
 
@@ -2026,11 +2025,12 @@ export async function processOneDispatcherRun(
     );
     if (!finalized.rows[0]) return true;
     const accountOutcome = claudeAccount
-      ? await settleClaudeAccount(pool, claudeAccount, { startedAt: runStartedAt, status: finalStatus, stdout, stderr, secretKey: env.secretKey })
-      : { fallbackReady: false };
+      ? await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey })
+      : { fallbackReady: false, earliestReset: null };
     if (job.message_delivery_id) {
       await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {
-        retryOnFallbackAccount: accountOutcome.fallbackReady
+        retryOnFallbackAccount: accountOutcome.fallbackReady,
+        accountsResetAt: accountOutcome.earliestReset
       });
     }
     await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
@@ -2133,8 +2133,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
-  const runStartedAt = new Date();
-  let claudeAccount: ClaudeAccountChoice | null = null;
+  let claudeAccount: LaunchedClaudeAccount | null = null;
   let ownershipLost = false;
 
   try {
@@ -2327,9 +2326,6 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     // Worker turns have no redelivery path, so they finalize even while
     // stopping and keep their needs_attention signal.
     releaseActiveRun();
-    if (claudeAccount) {
-      await settleClaudeAccount(pool, claudeAccount, { startedAt: runStartedAt, status: finalStatus, stdout, stderr, secretKey: env.secretKey });
-    }
     const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,
       taskId: job.task_id,
@@ -2343,6 +2339,10 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     });
     if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
     if (finalized && finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
+    // A worker turn has no retry path; recording the limit moves later runs.
+    if (finalized && claudeAccount) {
+      await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey });
+    }
   }
   return true;
 }
@@ -2999,7 +2999,12 @@ export async function finishMessageDelivery(
   status: "succeeded" | "failed" | "cancelled",
   error: string,
   promptMayHaveBeenPresented = false,
-  options: { retryOnFallbackAccount?: boolean } = {}
+  options: {
+    /** Another Claude account is free: retry within seconds. */
+    retryOnFallbackAccount?: boolean;
+    /** Every Claude account is limited: the soonest any of them resets. */
+    accountsResetAt?: Date | null;
+  } = {}
 ): Promise<void> {
   const messageDeliveryId = job.message_delivery_id;
   if (!messageDeliveryId) return;
@@ -3084,9 +3089,14 @@ export async function finishMessageDelivery(
       ) {
         // Another Claude account can take the turn now: retry shortly instead
         // of waiting for this account's reset.
+        // With every Claude account limited, wake for whichever resets first.
+        const ownRetryAt = usageLimitRetryAt(usageLimit, delivery.limit_wait_count ?? 0);
+        const accountsRetryAt = options.accountsResetAt
+          ? usageLimitRetryAt({ resetAt: options.accountsResetAt }, 0)
+          : null;
         const retryAt = options.retryOnFallbackAccount
           ? new Date(Date.now() + FALLBACK_ACCOUNT_RETRY_MS)
-          : usageLimitRetryAt(usageLimit, delivery.limit_wait_count ?? 0);
+          : accountsRetryAt && accountsRetryAt < ownRetryAt ? accountsRetryAt : ownRetryAt;
         const presented = Boolean(delivery.presented_at || promptMayHaveBeenPresented);
         const waitNote = options.retryOnFallbackAccount
           ? "The Claude account hit its usage limit; retrying on the next available Claude account."

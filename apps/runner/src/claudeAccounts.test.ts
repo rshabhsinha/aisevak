@@ -1,6 +1,6 @@
 import { encryptSecret, type DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { chooseClaudeAccount, rateLimitResetFromOutput, settleClaudeAccount } from "./claudeAccounts.js";
+import { chooseClaudeAccount, launchClaudeAccount, MIN_LIMIT_MS, rateLimitResetFromOutput, settleClaudeAccount } from "./claudeAccounts.js";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
 const NOW = new Date("2026-11-07T12:00:00Z");
@@ -36,6 +36,7 @@ function accountsPool(accounts: Account[]) {
       const credential = accounts.find((account) => account.id === id)?.credential;
       return { rows: credential ? [{ encrypted_value: encryptSecret(credential, KEY) }] : [] };
     }
+    if (sql.includes("RETURNING now() AS started_at")) return { rows: [{ started_at: NOW }] };
     if (sql.includes("INSERT INTO provider_account_limits")) {
       limits.set(String(params[0]), params[1] as Date);
     }
@@ -53,7 +54,8 @@ describe("chooseClaudeAccount", () => {
     expect(await chooseClaudeAccount(pool, "claude-local", KEY, NOW)).toEqual({
       instanceId: "claude-local",
       fallbackFrom: null,
-      allLimited: false
+      allLimited: false,
+      earliestReset: null
     });
   });
 
@@ -65,7 +67,8 @@ describe("chooseClaudeAccount", () => {
     expect(await chooseClaudeAccount(pool, null, KEY, NOW)).toEqual({
       instanceId: "claude-work",
       fallbackFrom: "claude-local",
-      allLimited: false
+      allLimited: false,
+      earliestReset: null
     });
   });
 
@@ -89,15 +92,18 @@ describe("chooseClaudeAccount", () => {
     expect((await chooseClaudeAccount(pool, "claude-local", KEY, NOW)).instanceId).toBe("claude-spare");
   });
 
-  it("stays on the thread's account when every account is limited", async () => {
+  it("stays on the thread's account when every account is limited, reporting the soonest reset", async () => {
+    const soon = new Date("2026-11-07T13:00:00Z");
     const { pool } = accountsPool([
       { id: "claude-local", credential: TOKEN, limitedUntil: LATER },
-      { id: "claude-work", credential: TOKEN, limitedUntil: LATER }
+      { id: "claude-work", credential: TOKEN, limitedUntil: soon },
+      { id: "claude-billed", credential: API_KEY, limitedUntil: new Date("2026-11-07T12:30:00Z") }
     ]);
     expect(await chooseClaudeAccount(pool, "claude-local", KEY, NOW)).toEqual({
       instanceId: "claude-local",
       fallbackFrom: null,
-      allLimited: true
+      allLimited: true,
+      earliestReset: soon
     });
   });
 });
@@ -109,11 +115,39 @@ describe("settleClaudeAccount", () => {
     const { pool, limits } = accountsPool([{ id: "claude-local", credential: TOKEN }, { id: "claude-work", credential: TOKEN }]);
     const outcome = await settleClaudeAccount(
       pool,
-      { instanceId: "claude-local", fallbackFrom: null, allLimited: false },
-      { startedAt: EARLIER, status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: NOW }
+      { instanceId: "claude-local", fallbackFrom: null, allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: NOW }
     );
     expect(limits.get("claude-local")?.toISOString()).toBe(LATER.toISOString());
     expect(outcome.fallbackReady).toBe(true);
+  });
+
+  it("holds an account whose printed reset has just passed instead of retrying it at once", async () => {
+    const { pool, limits } = accountsPool([{ id: "claude-local", credential: TOKEN }]);
+    const justAfter = new Date("2026-11-07T15:00:30Z");
+    const outcome = await settleClaudeAccount(
+      pool,
+      { instanceId: "claude-local", fallbackFrom: null, allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: justAfter }
+    );
+    expect(limits.get("claude-local")!.getTime()).toBe(justAfter.getTime() + MIN_LIMIT_MS);
+    expect(outcome.fallbackReady).toBe(false);
+    expect(outcome.earliestReset?.getTime()).toBe(justAfter.getTime() + MIN_LIMIT_MS);
+  });
+
+  it("never reports the account that just failed as the fallback", async () => {
+    // claude-work failed as the fallback while claude-local is still limited.
+    const { pool } = accountsPool([
+      { id: "claude-local", credential: TOKEN, limitedUntil: new Date("2026-11-07T18:00:00Z") },
+      { id: "claude-work", credential: TOKEN }
+    ]);
+    const justAfter = new Date("2026-11-07T15:00:30Z");
+    const outcome = await settleClaudeAccount(
+      pool,
+      { instanceId: "claude-work", fallbackFrom: "claude-local", allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: justAfter }
+    );
+    expect(outcome.fallbackReady).toBe(false);
   });
 
   it("reports no fallback when the last account hits its limit", async () => {
@@ -123,8 +157,8 @@ describe("settleClaudeAccount", () => {
     ]);
     const outcome = await settleClaudeAccount(
       pool,
-      { instanceId: "claude-work", fallbackFrom: "claude-local", allLimited: false },
-      { startedAt: EARLIER, status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: NOW }
+      { instanceId: "claude-work", fallbackFrom: "claude-local", allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "failed", stdout: "", stderr: limitError, secretKey: KEY, now: NOW }
     );
     expect(outcome.fallbackReady).toBe(false);
   });
@@ -133,8 +167,8 @@ describe("settleClaudeAccount", () => {
     const { pool, queries } = accountsPool([{ id: "claude-local", credential: TOKEN }]);
     const outcome = await settleClaudeAccount(
       pool,
-      { instanceId: "claude-local", fallbackFrom: null, allLimited: false },
-      { startedAt: EARLIER, status: "failed", stdout: "", stderr: "ACP session closed", secretKey: KEY, now: NOW }
+      { instanceId: "claude-local", fallbackFrom: null, allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "failed", stdout: "", stderr: "ACP session closed", secretKey: KEY, now: NOW }
     );
     expect(outcome.fallbackReady).toBe(false);
     expect(queries.some((query) => query.sql.includes("provider_account_limits"))).toBe(false);
@@ -144,10 +178,11 @@ describe("settleClaudeAccount", () => {
     const { pool, queries } = accountsPool([{ id: "claude-local", credential: TOKEN }]);
     await settleClaudeAccount(
       pool,
-      { instanceId: "claude-local", fallbackFrom: null, allLimited: false },
-      { startedAt: EARLIER, status: "succeeded", stdout: "", stderr: "", secretKey: KEY, now: NOW }
+      { instanceId: "claude-local", fallbackFrom: null, allLimited: false, earliestReset: null, startedAt: EARLIER },
+      { status: "succeeded", stdout: "", stderr: "", secretKey: KEY, now: NOW }
     );
     const clear = queries.find((query) => query.sql.includes("DELETE FROM provider_account_limits"));
+    // startedAt is the database time recorded at launch, not the runner clock.
     expect(clear?.sql).toContain("limited_at < $2");
     expect(clear?.params).toEqual(["claude-local", EARLIER]);
   });
@@ -167,8 +202,32 @@ describe("rateLimitResetFromOutput", () => {
     expect(rateLimitResetFromOutput(stdout, NOW)?.toISOString()).toBe(LATER.toISOString());
   });
 
+  it("ignores overage events and resets beyond eight days", () => {
+    const event2 = (info: Record<string, unknown>) =>
+      JSON.stringify({ params: { update: { _meta: { "_claude/rateLimit": info } } } });
+    const tooFar = Math.floor(NOW.getTime() / 1000) + 30 * 24 * 3600;
+    expect(rateLimitResetFromOutput(event2({ status: "rejected", resetsAt: tooFar }), NOW)).toBeNull();
+    expect(
+      rateLimitResetFromOutput(event2({ status: "rejected", rateLimitType: "overage", resetsAt: Math.floor(LATER.getTime() / 1000) }), NOW)
+    ).toBeNull();
+  });
+
   it("ignores allowed events and output without them", () => {
     expect(rateLimitResetFromOutput(event("allowed", Math.floor(LATER.getTime() / 1000)), NOW)).toBeNull();
     expect(rateLimitResetFromOutput("not json", NOW)).toBeNull();
+  });
+});
+
+describe("launchClaudeAccount", () => {
+  it("records the chosen account on the run and stamps database time", async () => {
+    const { pool, queries } = accountsPool([
+      { id: "claude-local", credential: TOKEN, limitedUntil: new Date(Date.now() + 60 * 60_000) },
+      { id: "claude-work", credential: TOKEN }
+    ]);
+    const launched = await launchClaudeAccount(pool, "dispatcher_runs", "run-1", "claude-local", KEY);
+    expect(launched.instanceId).toBe("claude-work");
+    expect(launched.startedAt).toBe(NOW);
+    const update = queries.find((query) => query.sql.includes("UPDATE dispatcher_runs SET provider_instance_id"));
+    expect(update?.params).toEqual(["run-1", "claude-work"]);
   });
 });
