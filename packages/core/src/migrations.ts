@@ -1421,6 +1421,20 @@ ON dispatcher_runs(agent_thread_id, queued_at DESC) WHERE agent_thread_id IS NOT
 CREATE INDEX IF NOT EXISTS task_runs_task_queued_idx ON task_runs(task_id, queued_at DESC);
 CREATE INDEX IF NOT EXISTS dispatcher_runs_task_queued_idx
 ON dispatcher_runs(task_id, queued_at DESC) WHERE task_id IS NOT NULL;
+
+-- Claude account failover: an account that hit its usage limit is skipped
+-- until limited_until, and runs move to the next added Claude account.
+-- limited_at fences a late success from clearing a newer limit.
+CREATE TABLE IF NOT EXISTS provider_account_limits (
+  provider_instance_id text PRIMARY KEY REFERENCES provider_instances(id) ON DELETE CASCADE,
+  limited_until timestamptz NOT NULL,
+  limited_at timestamptz NOT NULL DEFAULT now(),
+  reason text
+);
+-- The account a run actually used, which differs from the thread's account
+-- after a failover.
+ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
+ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

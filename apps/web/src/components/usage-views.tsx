@@ -29,6 +29,8 @@ export interface HarnessAccount {
   threads: number;
   /** False for the default account and for accounts that agents or threads (archived included) use. */
   removable: boolean;
+  /** While set, this Claude account is at its usage limit and its runs use the next Claude account. */
+  limitedUntil?: string | null;
 }
 
 export function accountName(account: Pick<HarnessAccount, "label" | "isDefault"> | undefined): string {

@@ -133,18 +133,22 @@ const USAGE_FILTER = `(
 
 async function queryUsageEvents(pool: DbPool, since: Date): Promise<UsageEventRow[]> {
   const result = await pool.query<UsageEventRow>(
-    `SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title, t.provider_instance_id AS account_id
+    `SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
+            COALESCE(r.provider_instance_id, t.provider_instance_id) AS account_id
      FROM run_events e
      JOIN task_runs r ON r.id = e.run_id
      LEFT JOIN agent_threads t ON t.id = r.agent_thread_id
-     LEFT JOIN provider_instances pi ON pi.id = t.provider_instance_id
+     -- The account the run used: a Claude failover run differs from the thread's account.
+     LEFT JOIN provider_instances pi ON pi.id = COALESCE(r.provider_instance_id, t.provider_instance_id)
      WHERE e.created_at >= $1 AND ${USAGE_FILTER}
      UNION ALL
-     SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title, t.provider_instance_id AS account_id
+     SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
+            COALESCE(r.provider_instance_id, t.provider_instance_id) AS account_id
      FROM dispatcher_run_events e
      JOIN dispatcher_runs r ON r.id = e.dispatcher_run_id
      LEFT JOIN agent_threads t ON t.id = r.agent_thread_id
-     LEFT JOIN provider_instances pi ON pi.id = t.provider_instance_id
+     -- The account the run used: a Claude failover run differs from the thread's account.
+     LEFT JOIN provider_instances pi ON pi.id = COALESCE(r.provider_instance_id, t.provider_instance_id)
      WHERE e.created_at >= $1 AND ${USAGE_FILTER}`,
     [since]
   );
