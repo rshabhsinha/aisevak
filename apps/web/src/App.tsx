@@ -3917,6 +3917,14 @@ function AgentEditor(props: {
   );
 }
 
+function formatLimitedUntil(value: string): string {
+  const date = new Date(value);
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  return date.toDateString() === new Date().toDateString()
+    ? time
+    : `${date.toLocaleDateString([], { weekday: "short", month: "short", day: "numeric" })}, ${time}`;
+}
+
 interface HarnessAccountViewProps {
   /** Provider instance id of the account; omitted for the default account. */
   instanceId?: string;
@@ -5807,7 +5815,9 @@ function HarnessesView(props: {
                   <span className="harness-account-text">
                     <span className="harness-account-name">{accountName(account)}</span>
                     <span className="harness-account-meta">
-                      {status ? (status.connected ? "Connected" : status.lastError ? "Needs attention" : "Not connected") : "Checking…"}
+                      {account.limitedUntil
+                        ? `Limit reached · until ${formatLimitedUntil(account.limitedUntil)}`
+                        : status ? (status.connected ? "Connected" : status.lastError ? "Needs attention" : "Not connected") : "Checking…"}
                       {account.agents ? ` · ${account.agents} agent${account.agents === 1 ? "" : "s"}` : ""}
                     </span>
                   </span>
@@ -5956,6 +5966,12 @@ function HarnessAccountDetail(props: {
         </div>
       </header>
       {error ? <div className="notice error">{error}</div> : null}
+      {account.driver === "claude" && account.limitedUntil ? (
+        <div className="notice">
+          This account reached its usage limit. Until {formatLimitedUntil(account.limitedUntil)}, its agents run on the next
+          connected Claude account; if none is free, their work waits for the reset.
+        </div>
+      ) : null}
 
       <div className="harness-embedded">
         {account.driver === "codex" ? <CodexConnectionView {...viewProps} /> : null}
@@ -5983,6 +5999,9 @@ function HarnessAccountDetail(props: {
             <h4>Using this account</h4>
             <p>
               Choose the account per agent in Agent setup: the model picker lists every account as its own entry.
+              {account.driver === "claude" && siblings.length > 1
+                ? " When an account reaches its usage limit, its agents continue on the next added Claude account (subscription tokens only) and return once the limit resets."
+                : ""}
               {account.isDefault ? " This is the original account and cannot be removed; disconnect it instead." : ""}
             </p>
           </div>

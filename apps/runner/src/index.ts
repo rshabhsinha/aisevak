@@ -51,6 +51,7 @@ import {
 } from "./appServerClient.js";
 import { closeAllAcpSessions } from "./acpClient.js";
 import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
+import { launchClaudeAccount, settleClaudeAccount, type ClaudeAccountChoice } from "./claudeAccounts.js";
 import {
   agentGithubEnvironment,
   authenticateGithubCli,
@@ -1754,6 +1755,8 @@ export async function processOneDispatcherRun(
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  const runStartedAt = new Date();
+  let claudeAccount: ClaudeAccountChoice | null = null;
   let promptMayHaveBeenPresented = false;
   let ownershipLost = false;
 
@@ -1770,13 +1773,18 @@ export async function processOneDispatcherRun(
       driver === "codex"
         ? await materializeCodexAuth(pool, job.codex_home, job.provider_instance_id)
         : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
+    // A Claude thread whose account is at its usage limit runs on the next
+    // available Claude account (see claudeAccounts.ts).
+    if (driver === "claude") {
+      claudeAccount = await launchClaudeAccount(pool, "dispatcher_runs", job.id, job.provider_instance_id, env.secretKey);
+    }
     const harnessAuth =
       driver === "codex"
         ? null
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          }, job.model, job.provider_instance_id);
+          }, job.model, claudeAccount?.instanceId ?? job.provider_instance_id);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await dispatcherRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -2017,8 +2025,13 @@ export async function processOneDispatcherRun(
       [job.id, finalStatus, encodePostgresText(stdout), encodePostgresText(stderr), exitCode, currentRunnerId()]
     );
     if (!finalized.rows[0]) return true;
+    const accountOutcome = claudeAccount
+      ? await settleClaudeAccount(pool, claudeAccount, { startedAt: runStartedAt, status: finalStatus, stdout, stderr, secretKey: env.secretKey })
+      : { fallbackReady: false };
     if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented);
+      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {
+        retryOnFallbackAccount: accountOutcome.fallbackReady
+      });
     }
     await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
     if (finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
@@ -2120,6 +2133,8 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
   let stderr = "";
   let exitCode: number | null = null;
   let finalStatus: "succeeded" | "failed" | "cancelled" = "failed";
+  const runStartedAt = new Date();
+  let claudeAccount: ClaudeAccountChoice | null = null;
   let ownershipLost = false;
 
   try {
@@ -2140,13 +2155,16 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       driver === "codex"
         ? await materializeCodexAuth(pool, job.codex_home, job.provider_instance_id)
         : { redactionSecrets: [] as string[], apiKey: undefined, chatGptAuth: undefined, chatGptAuthRevision: undefined };
+    if (driver === "claude") {
+      claudeAccount = await launchClaudeAccount(pool, "task_runs", job.id, job.provider_instance_id, env.secretKey);
+    }
     const harnessAuth =
       driver === "codex"
         ? null
         : await materializeHarnessAuth(pool, driver, job.codex_home, env.secretKey, {
             ...codexProcessEnv(),
             HOME: job.codex_home
-          }, job.model, job.provider_instance_id);
+          }, job.model, claudeAccount?.instanceId ?? job.provider_instance_id);
     const credentialSecrets = await readAgentAccessibleSecrets(pool);
     if (!(await workerRunStillOwned(pool, job))) {
       ownershipLost = true;
@@ -2309,6 +2327,9 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
     // Worker turns have no redelivery path, so they finalize even while
     // stopping and keep their needs_attention signal.
     releaseActiveRun();
+    if (claudeAccount) {
+      await settleClaudeAccount(pool, claudeAccount, { startedAt: runStartedAt, status: finalStatus, stdout, stderr, secretKey: env.secretKey });
+    }
     const finalized = await finalizeWorkerRunState(pool, {
       runId: job.id,
       taskId: job.task_id,
@@ -2977,7 +2998,8 @@ export async function finishMessageDelivery(
   job: Pick<DispatcherJob, "id" | "message_delivery_id"> & { assignment_id?: string | null },
   status: "succeeded" | "failed" | "cancelled",
   error: string,
-  promptMayHaveBeenPresented = false
+  promptMayHaveBeenPresented = false,
+  options: { retryOnFallbackAccount?: boolean } = {}
 ): Promise<void> {
   const messageDeliveryId = job.message_delivery_id;
   if (!messageDeliveryId) return;
@@ -3060,9 +3082,16 @@ export async function finishMessageDelivery(
         (delivery.limit_wait_count ?? 0) < MAX_USAGE_LIMIT_WAITS &&
         (!delivery.agent_thread_id || delivery.agent_thread_generation === delivery.ownership_generation)
       ) {
-        const retryAt = usageLimitRetryAt(usageLimit, delivery.limit_wait_count ?? 0);
+        // Another Claude account can take the turn now: retry shortly instead
+        // of waiting for this account's reset.
+        const retryAt = options.retryOnFallbackAccount
+          ? new Date(Date.now() + FALLBACK_ACCOUNT_RETRY_MS)
+          : usageLimitRetryAt(usageLimit, delivery.limit_wait_count ?? 0);
         const presented = Boolean(delivery.presented_at || promptMayHaveBeenPresented);
-        if (await deferDeliveryForUsageLimit(client, job.id, messageDeliveryId, error, retryAt, presented, delivery.provider_thread_id)) return;
+        const waitNote = options.retryOnFallbackAccount
+          ? "The Claude account hit its usage limit; retrying on the next available Claude account."
+          : `Waiting for the provider usage limit to reset; delivery resumes at ${retryAt.toISOString()}.`;
+        if (await deferDeliveryForUsageLimit(client, job.id, messageDeliveryId, error, retryAt, presented, delivery.provider_thread_id, waitNote)) return;
       }
 
       if (status !== "failed" || delivery.attempt_count >= 3) {
@@ -3682,6 +3711,10 @@ export async function requeueUnpresentedAgentTurnInput(
   return true;
 }
 
+// A delivery held by a usage limit retries this soon when another Claude
+// account can take it.
+const FALLBACK_ACCOUNT_RETRY_MS = 5_000;
+
 // Queue the same message again on the same agent thread and provider
 // session, gated by available_at until the provider's usage limit resets. A
 // presented message is re-sent with a note so the agent checks what it did.
@@ -3693,7 +3726,8 @@ async function deferDeliveryForUsageLimit(
   error: string,
   retryAt: Date,
   presented: boolean,
-  providerThreadId: string | null
+  providerThreadId: string | null,
+  waitNote: string
 ): Promise<boolean> {
   const prompt = await runPrompt(client, runId);
   const retry = await client.query<{ id: string }>(
@@ -3719,7 +3753,6 @@ async function deferDeliveryForUsageLimit(
   );
   const newRunId = retry.rows[0]?.id;
   if (!newRunId) return false;
-  const waitNote = `Waiting for the provider usage limit to reset; delivery resumes at ${retryAt.toISOString()}.`;
   await client.query(
     `UPDATE message_deliveries
      SET status = 'retrying', available_at = $2, limit_wait_count = limit_wait_count + 1,

@@ -293,6 +293,20 @@ describe("message delivery retry", () => {
       expect(queries.some((query) => query.sql.includes("UPDATE task_assignments"))).toBe(false);
     });
 
+    it("retries at once when another Claude account can take the turn", async () => {
+      const { pool, queries } = retryPool({ providerThreadId: "provider-thread" });
+      const before = Date.now();
+      await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError, false, {
+        retryOnFallbackAccount: true
+      });
+      const wait = queries.find((query) => query.sql.includes("limit_wait_count = limit_wait_count + 1"));
+      const retryAt = wait?.params?.[1] as Date;
+      expect(retryAt.getTime() - before).toBeLessThan(60_000);
+      expect(String(wait?.params?.[2])).toContain("retrying on the next available Claude account");
+      const insert = queries.find((query) => query.sql.includes("INSERT INTO dispatcher_runs"));
+      expect(insert?.params?.[2]).toBe("provider-thread");
+    });
+
     it("re-sends an unpresented message without the note", async () => {
       const { pool, queries } = retryPool({ presentedAt: null });
       await finishMessageDelivery(pool, { id: "dispatcher-run", message_delivery_id: "delivery" }, "failed", limitError);

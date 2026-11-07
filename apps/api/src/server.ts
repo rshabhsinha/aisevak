@@ -479,9 +479,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       agents: number;
       threads: number;
       all_threads: number;
+      limited_until: Date | null;
     }>(
       `SELECT provider_instances.id, provider_instances.driver, NULLIF(provider_instances.config->>'label', '') AS label,
               provider_instances.created_at,
+              (SELECT limited_until FROM provider_account_limits
+                 WHERE provider_account_limits.provider_instance_id = provider_instances.id
+                   AND limited_until > now()) AS limited_until,
               (SELECT count(*)::int FROM agents WHERE agents.provider_instance_id = provider_instances.id) AS agents,
               (SELECT count(*)::int FROM agent_threads WHERE agent_threads.provider_instance_id = provider_instances.id
                  AND agent_threads.archived_at IS NULL) AS threads,
@@ -500,7 +504,10 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         createdAt: row.created_at,
         agents: row.agents,
         threads: row.threads,
-        removable: !isDefaultProviderInstance(row.id) && row.agents === 0 && row.all_threads === 0
+        removable: !isDefaultProviderInstance(row.id) && row.agents === 0 && row.all_threads === 0,
+        // Set while the account is at its usage limit and Claude runs fall back
+        // to the next account (apps/runner/src/claudeAccounts.ts).
+        limitedUntil: row.limited_until
       }))
     };
   });
