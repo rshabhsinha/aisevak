@@ -28,6 +28,8 @@ import {
   serializeCodexChatGptAuthFile,
   runMigrations,
   ensureConcurrentIndexes,
+  backfillUsageEvents,
+  USAGE_EVENT_PREDICATE,
   serializeCodexSkillSnapshots,
   withTransaction,
   type CodexSkillSnapshot,
@@ -64,7 +66,7 @@ import {
 } from "./githubCli.js";
 import { pruneHeartbeatRollouts } from "./heartbeatRollouts.js";
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
-import { sweepRetention } from "./retention.js";
+import { retentionPolicyFromEnv, sweepRetention } from "./retention.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { MAX_USAGE_LIMIT_WAITS, parseUsageLimit, usageLimitRetryAt, withUsageLimitPreamble } from "./providerLimits.js";
@@ -201,7 +203,10 @@ async function main(): Promise<void> {
   await mkdir(env.managedRoot, { recursive: true });
   await mkdir(sharedNpmCacheDir(), { recursive: true });
   // Built concurrently in the background: live turns keep writing events meanwhile.
-  void ensureConcurrentIndexes(pool).catch((error) => console.error("Building event indexes failed", error));
+  void ensureConcurrentIndexes(pool)
+    .then(() => backfillUsageEvents(pool, retentionPolicyFromEnv().retentionDays || 30))
+    .then((copied) => { if (copied) console.info(`Copied ${copied} stored usage events for the cost tab`); })
+    .catch((error) => console.error("Building event indexes failed", error));
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   const bootScope = bootRecoveryScope();
@@ -2785,6 +2790,14 @@ export async function persistRefreshedCodexAuth(
 
 const RETENTION_SWEEP_MS = 10 * 60_000;
 
+// Usage-bearing events are also copied into usage_events, which the cost tab
+// reads: finding them among millions of event rows on disk was too slow.
+const COPY_USAGE_EVENT = (runKind: "worker" | "dispatcher", runColumn: string) =>
+  `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
+   SELECT id, '${runKind}', ${runColumn}, event_type, payload, created_at FROM inserted
+   WHERE ${USAGE_EVENT_PREDICATE}
+   ON CONFLICT (event_id) DO NOTHING`;
+
 // A turn's raw provider stdout is parsed into run events as it streams and
 // read in memory when the turn ends; nothing reads it back from the database,
 // and storing it kept a second (or third) copy of every tool result.
@@ -2922,9 +2935,13 @@ export async function persistCodexLine(
     await pool.query("UPDATE task_runs SET codex_thread_id = $2 WHERE id = $1", [job.id, threadId]);
   }
   await pool.query(
-    `INSERT INTO run_events (run_id, seq, event_type, text, payload)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (run_id, seq) DO NOTHING`,
+    `WITH inserted AS (
+       INSERT INTO run_events (run_id, seq, event_type, text, payload)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (run_id, seq) DO NOTHING
+       RETURNING id, run_id, event_type, payload, created_at
+     )
+     ${COPY_USAGE_EVENT("worker", "run_id")}`,
     [job.id, seq, encodePostgresText(normalized.type), normalized.text === undefined ? null : encodePostgresText(normalized.text), encodePostgresJson(normalized)]
   );
 }
@@ -2950,9 +2967,13 @@ export async function persistDispatcherCodexLine(
     );
   }
   await pool.query(
-    `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
-     VALUES ($1, $2, $3, $4, $5)
-     ON CONFLICT (dispatcher_run_id, seq) DO NOTHING`,
+    `WITH inserted AS (
+       INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, text, payload)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (dispatcher_run_id, seq) DO NOTHING
+       RETURNING id, dispatcher_run_id, event_type, payload, created_at
+     )
+     ${COPY_USAGE_EVENT("dispatcher", "dispatcher_run_id")}`,
     [job.id, seq, encodePostgresText(normalized.type), normalized.text === undefined ? null : encodePostgresText(normalized.text), encodePostgresJson(normalized)]
   );
 }

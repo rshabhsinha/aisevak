@@ -1440,6 +1440,19 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 -- delete and were otherwise found by scanning the referencing table.
 CREATE INDEX IF NOT EXISTS dispatcher_runs_message_delivery_idx ON dispatcher_runs (message_delivery_id) WHERE message_delivery_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS message_deliveries_agent_thread_idx ON message_deliveries (agent_thread_id) WHERE agent_thread_id IS NOT NULL;
+
+-- Usage-bearing run events, copied as they are stored, for the cost tab.
+-- Reading them out of the event tables meant hundreds of thousands of random
+-- page reads. No foreign key: rows outlive nothing; retention expires them.
+CREATE TABLE IF NOT EXISTS usage_events (
+  event_id uuid PRIMARY KEY,
+  run_kind text NOT NULL CHECK (run_kind IN ('worker', 'dispatcher')),
+  run_id uuid NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_events_created_idx ON usage_events (created_at);
 `;
 
 /**
@@ -1475,6 +1488,40 @@ export async function ensureConcurrentIndexes(pool: Pool): Promise<void> {
       if (existing.rows[0]) await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${index.name}`);
       await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${index.name} ${index.sql}`);
     }
+  } finally {
+    try {
+      await client.query("RESET statement_timeout");
+    } catch (error) { client.release(true); throw error; }
+    client.release();
+  }
+}
+
+/**
+ * Copy usage events stored before usage_events existed (the last `days`), once:
+ * only while the table is still empty. Uses the partial usage indexes, so call
+ * it after ensureConcurrentIndexes. Safe to repeat; rows already copied are kept.
+ */
+export async function backfillUsageEvents(pool: Pool, days = 30): Promise<number> {
+  const client = await pool.connect();
+  try {
+    await client.query("SET statement_timeout = 0");
+    const existing = await client.query("SELECT 1 FROM usage_events LIMIT 1");
+    if (existing.rows[0]) return 0;
+    let copied = 0;
+    for (const [table, runKind, runColumn] of [
+      ["dispatcher_run_events", "dispatcher", "dispatcher_run_id"],
+      ["run_events", "worker", "run_id"]
+    ] as const) {
+      const result = await client.query(
+        `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
+         SELECT id, '${runKind}', ${runColumn}, event_type, payload, created_at FROM ${table}
+         WHERE created_at >= now() - $1::interval AND ${USAGE_EVENT_PREDICATE}
+         ON CONFLICT (event_id) DO NOTHING`,
+        [`${days} days`]
+      );
+      copied += result.rowCount ?? 0;
+    }
+    return copied;
   } finally {
     try {
       await client.query("RESET statement_timeout");

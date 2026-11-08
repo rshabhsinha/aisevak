@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, realpath, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -159,6 +159,13 @@ describe.skipIf(!databaseUrl)("retention sweep against Postgres", () => {
        VALUES ('coordination', 'succeeded', '/tmp', $1, 'gpt-test', 'p', now(), now())`,
       [recentlyUsed]
     );
+
+    // An agent left part of this scratch read-only (as npm package contents are).
+    await mkdir(join(scratch, "nested", "package", "lib"), { recursive: true });
+    await chmod(join(scratch, "nested", "package"), 0o555);
+    await utimes(join(scratch, "nested", "package"), old, old);
+    await utimes(join(scratch, "nested"), old, old);
+    await utimes(scratch, old, old);
 
     await sweepRetention(pool, root, POLICY);
     await expect(stat(orphan)).rejects.toMatchObject({ code: "ENOENT" });

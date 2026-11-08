@@ -9,7 +9,7 @@
 // holds long locks or one huge transaction; the next sweep continues it.
 
 import type { DbPool } from "@aisevak/core";
-import { lstat, readdir, rm } from "node:fs/promises";
+import { chmod, lstat, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathContains } from "./worktreeCleanup.js";
 
@@ -182,6 +182,12 @@ export async function sweepRetention(
                                          OR EXISTS (SELECT 1 FROM message_deliveries delivery
                                                     WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})))
                 ORDER BY thread.last_activity_at NULLS FIRST LIMIT $2)`
+      },
+      {
+        name: "usage_events",
+        size: 5000,
+        sql: `DELETE FROM usage_events WHERE event_id IN (
+                SELECT event_id FROM usage_events WHERE created_at < now() - $1::interval LIMIT $2)`
       },
       {
         name: "schedule_runs",
@@ -430,7 +436,7 @@ async function removeStaleEntries(
     try {
       // lstat: a symlink's own age, and rm never follows it.
       if ((await newestChange(path, 2)) >= cutoff) continue;
-      await rm(path, { recursive: true, force: true });
+      await forceRemove(path);
       removed += 1;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -464,4 +470,27 @@ async function newestChange(path: string, depth: number): Promise<number> {
     }
   }
   return newest;
+}
+
+/**
+ * Remove a tree, including directories an agent left read-only (npm package
+ * contents often are): on a permission error, make the tree's own directories
+ * writable and try once more. Symlinks are never followed.
+ */
+async function forceRemove(path: string): Promise<void> {
+  try {
+    await rm(path, { recursive: true, force: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM") throw error;
+    await makeDirectoriesWritable(path);
+    await rm(path, { recursive: true, force: true });
+  }
+}
+
+async function makeDirectoriesWritable(path: string): Promise<void> {
+  const stats = await lstat(path);
+  if (!stats.isDirectory()) return;
+  await chmod(path, (stats.mode & 0o777) | 0o700);
+  for (const name of await readdir(path)) await makeDirectoriesWritable(join(path, name));
 }
