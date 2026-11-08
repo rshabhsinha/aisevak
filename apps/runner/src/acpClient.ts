@@ -122,6 +122,11 @@ class PersistentAcpSession {
   // From the `initialize` result: whether `session/prompt` accepts image blocks.
   private supportsImages = false;
   private sessionId: string | null = null;
+  // claude-agent-acp reports cost as the running total of this process's
+  // session (it restarts from zero in a new process): remember the last total
+  // per session so each reading can carry the spend since the previous one.
+  private readonly reportedCost = new Map<string, number>();
+  private replaying = false;
   lastUsedAt = Date.now();
   isRunning = false;
   private lastActivityAt = Date.now();
@@ -205,6 +210,7 @@ class PersistentAcpSession {
       await this.initialize(options.authMethodId, options.skipAuthenticate === true);
       if (options.threadId) {
         loadingSession = true;
+        this.replaying = true;
         try {
           await this.request("session/load", {
             sessionId: options.threadId,
@@ -224,6 +230,7 @@ class PersistentAcpSession {
           this.sessionId = null;
         } finally {
           loadingSession = false;
+          this.replaying = false;
         }
       }
       if (!this.sessionId) {
@@ -455,7 +462,12 @@ class PersistentAcpSession {
       message?.id !== undefined &&
       Boolean(message.error) &&
       RECOVERABLE_ACP_METHODS.has(this.pending.get(String(message.id))?.method ?? "");
-    const persisted = recovered ? JSON.stringify({ ...message, aisevakRecovered: true }) : trimmed;
+    const turnCost = message && !this.replaying ? this.costSincePreviousReading(message) : undefined;
+    const persisted = recovered
+      ? JSON.stringify({ ...message, aisevakRecovered: true })
+      : turnCost !== undefined
+        ? JSON.stringify({ ...message, aisevakTurnCost: turnCost })
+        : trimmed;
     void this.onNotification?.(persisted).catch((error: unknown) => {
       this.rejectPending(error instanceof Error ? error : new Error(String(error)));
       void this.close().catch(() => undefined);
@@ -489,6 +501,18 @@ class PersistentAcpSession {
         pending.resolve((message.result as Record<string, unknown>) ?? {});
       }
     }
+  }
+
+  private costSincePreviousReading(message: Record<string, unknown>): number | undefined {
+    if (message.method !== "session/update") return undefined;
+    const params = message.params as { sessionId?: unknown; update?: { sessionUpdate?: unknown; cost?: { amount?: unknown } } } | undefined;
+    const amount = params?.update?.cost?.amount;
+    if (params?.update?.sessionUpdate !== "usage_update" || typeof amount !== "number" || !Number.isFinite(amount)) return undefined;
+    const session = typeof params.sessionId === "string" ? params.sessionId : "";
+    const previous = this.reportedCost.get(session) ?? 0;
+    this.reportedCost.set(session, amount);
+    // A lower total means the harness started counting again.
+    return amount >= previous ? amount - previous : amount;
   }
 
   private request(

@@ -265,3 +265,37 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect(handled).toEqual([]);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
+
+it("stamps each cost reading with the spend since the process's previous reading", async () => {
+  const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
+  const script = join(home, "fake.cjs");
+  // Like claude-agent-acp: cost is this process's running total for the session.
+  await writeFile(script, `const readline = require('node:readline');
+let total = 0;
+const usage = amount => console.log(JSON.stringify({method:'session/update',params:{sessionId:'s1',update:{sessionUpdate:'usage_update',used:1,size:2,cost:{amount,currency:'USD'}}}}));
+readline.createInterface({input:process.stdin}).on('line', line => {
+ const m = JSON.parse(line);
+ if(m.method === 'session/load') usage(99);
+ if(m.method === 'session/prompt') { total += m.params.prompt[0].text === 'big' ? 2.5 : 0.75; usage(total); }
+ console.log(JSON.stringify({id:m.id,result:m.method === 'session/prompt' ? {stopReason:'end_turn'} : {sessionId:'s1'}}));
+});`);
+  const stamps: unknown[] = [];
+  const options = {
+    binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
+    model: "auto", prompt: "hello", threadId: "s1", env: process.env, secrets: [],
+    onLine: async (line: string) => {
+      const message = JSON.parse(line);
+      if (message.params?.update?.sessionUpdate === "usage_update") stamps.push(message.aisevakTurnCost);
+    },
+    onThreadId: async () => {}, shouldCancel: async () => false
+  };
+  try {
+    expect((await runAcpTurn(options)).status).toBe("completed");
+    expect((await runAcpTurn({ ...options, prompt: "big" })).status).toBe("completed");
+    // A new process counts from zero again, even though its total is lower.
+    await closeAllAcpSessions();
+    expect((await runAcpTurn(options)).status).toBe("completed");
+    // Readings replayed by session/load are history, not new spend.
+    expect(stamps).toEqual([undefined, 0.75, undefined, 2.5, undefined, 0.75]);
+  } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
+});

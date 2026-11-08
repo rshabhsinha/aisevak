@@ -112,7 +112,10 @@ export interface RuntimeUsage {
   outputTokens?: number;
   reasoningTokens?: number;
   totalTokens?: number;
+  /** As the harness reports it: ACP's `usage_update` cost is the session's running total. */
   cost?: { amount: number; currency: string };
+  /** Spend since the previous cost reading from the same harness process (stamped by the runner). */
+  turnCost?: { amount: number; currency: string };
 }
 
 export interface RuntimeError {

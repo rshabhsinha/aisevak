@@ -69,6 +69,7 @@ export interface ThreadUsage {
   cachedInputTokens?: number;
   outputTokens?: number;
   reasoningTokens?: number;
+  /** What this turn spent (not the session's running total). */
   cost?: { amount: number; currency: string };
 }
 
@@ -293,7 +294,11 @@ function processRunGroup(
       const previous = blocks[blocks.length - 1];
       if (previous?.kind === "turn-end" && blocks.length - 1 >= groupStartIndex) {
         const escalate = !implicit && TURN_SEVERITY[state] > TURN_SEVERITY[previous.state];
-        const usage = summary.usage && hasUsage(summary.usage.usage) ? { ...previous.usage, ...summary.usage.usage } : previous.usage;
+        const trailing = summary.usage && hasUsage(summary.usage.usage) ? summary.usage.usage : undefined;
+        // Trailing spend belongs to the turn that just ended: add it, never replace it.
+        const usage = trailing
+          ? { ...previous.usage, ...trailing, cost: addCost(previous.usage?.cost, trailing.cost) }
+          : previous.usage;
         replace({
           ...previous,
           state: escalate ? state : previous.state,
@@ -441,7 +446,7 @@ function processRunGroup(
               cachedInputTokens: next.cachedInputTokens ?? current.cachedInputTokens,
               outputTokens: next.outputTokens ?? current.outputTokens,
               reasoningTokens: next.reasoningTokens ?? current.reasoningTokens,
-              cost: next.cost ?? current.cost
+              cost: addCost(current.cost, next.turnCost)
             }
           : {
               ...current,
@@ -449,7 +454,7 @@ function processRunGroup(
               cachedInputTokens: next.cachedInputTokens ?? current.cachedInputTokens,
               outputTokens: next.outputTokens ?? current.outputTokens,
               reasoningTokens: next.reasoningTokens ?? current.reasoningTokens,
-              cost: next.cost ?? current.cost
+              cost: addCost(current.cost, next.turnCost)
             }
     };
   };
@@ -698,6 +703,17 @@ export function splitUnifiedDiff(unified: string): ThreadFileDiff[] {
 
 function turnFailureDetail(turn: NonNullable<RuntimeEvent["turn"]>): string | undefined {
   return turn.errorMessage ?? (turn.stopReason ? `Stopped: ${turn.stopReason}` : undefined);
+}
+
+// A turn's cost is the sum of the spend stamped on each of its readings. The
+// harness's own `cost` is the session's running total and is never shown.
+function addCost(
+  current: ThreadUsage["cost"],
+  next: ThreadUsage["cost"] | undefined
+): ThreadUsage["cost"] {
+  if (!next) return current;
+  if (!current || current.currency !== next.currency) return next;
+  return { amount: current.amount + next.amount, currency: current.currency };
 }
 
 function hasUsage(usage: ThreadUsage): boolean {

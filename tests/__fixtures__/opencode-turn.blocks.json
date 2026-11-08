@@ -34,11 +34,7 @@
       "contextMaxTokens": 200000,
       "inputTokens": 6675,
       "cachedInputTokens": 1792,
-      "outputTokens": 21,
-      "cost": {
-        "amount": 0,
-        "currency": "USD"
-      }
+      "outputTokens": 21
     }
   }
 ]
