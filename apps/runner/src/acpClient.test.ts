@@ -276,13 +276,15 @@ const usage = amount => console.log(JSON.stringify({method:'session/update',para
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line);
  if(m.method === 'session/load') usage(99);
- if(m.method === 'session/prompt') { total += m.params.prompt[0].text === 'big' ? 2.5 : 0.75; usage(total); }
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'later') { total += 0.75; usage(total); setTimeout(() => { total += 1; usage(total); }, 150); }
+ else if(m.method === 'session/prompt') { total += m.params.prompt[0].text === 'big' ? 2.5 : 0.75; usage(total); }
  console.log(JSON.stringify({id:m.id,result:m.method === 'session/prompt' ? {stopReason:'end_turn'} : {sessionId:'s1'}}));
 });`);
   const stamps: unknown[] = [];
   const options = {
     binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
     model: "auto", prompt: "hello", threadId: "s1", env: process.env, secrets: [],
+    costRestartsPerProcess: true,
     onLine: async (line: string) => {
       const message = JSON.parse(line);
       if (message.params?.update?.sessionUpdate === "usage_update") stamps.push(message.aisevakTurnCost);
@@ -292,10 +294,22 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   try {
     expect((await runAcpTurn(options)).status).toBe("completed");
     expect((await runAcpTurn({ ...options, prompt: "big" })).status).toBe("completed");
+    // Spend the harness reports between turns lands in the next turn's reading.
+    expect((await runAcpTurn({ ...options, prompt: "later" })).status).toBe("completed");
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect((await runAcpTurn(options)).status).toBe("completed");
     // A new process counts from zero again, even though its total is lower.
     await closeAllAcpSessions();
     expect((await runAcpTurn(options)).status).toBe("completed");
     // Readings replayed by session/load are history, not new spend.
-    expect(stamps).toEqual([undefined, 0.75, undefined, 2.5, undefined, 0.75]);
+    expect(stamps).toEqual([undefined, 0.75, undefined, 2.5, undefined, 0.75, undefined, 1.75, undefined, 0.75]);
+    // A harness whose total may carry across processes: a new process's first
+    // reading only sets the baseline.
+    stamps.length = 0;
+    await closeAllAcpSessions();
+    const carried = { ...options, costRestartsPerProcess: false };
+    expect((await runAcpTurn(carried)).status).toBe("completed");
+    expect((await runAcpTurn(carried)).status).toBe("completed");
+    expect(stamps).toEqual([undefined, undefined, undefined, 0.75]);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });

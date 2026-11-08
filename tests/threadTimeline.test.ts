@@ -257,11 +257,14 @@ describe("deriveThreadBlocks", () => {
         // Two readings in one turn add up.
         ...providerEvents("claude", [chunk("one"), cost(23.05, 0.5), cost(23.25, 0.2), end], { runId: "run-b", createdAt: () => "2026-01-01T00:00:05Z" }),
         // A reading that lands after the ending still belongs to that turn.
-        ...providerEvents("claude", [chunk("two"), end, cost(23.89, 0.64)], { runId: "run-c", createdAt: () => "2026-01-01T00:00:09Z" })
+        ...providerEvents("claude", [chunk("two"), end, cost(23.89, 0.64)], { runId: "run-c", createdAt: () => "2026-01-01T00:00:09Z" }),
+        // ...and adds to what the turn already spent; a trailing gauge without cost keeps it.
+        ...providerEvents("claude", [chunk("three"), cost(24.09, 0.2), end, cost(24.39, 0.3), update("usage_update", { used: 5, size: 9 })], { runId: "run-d", createdAt: () => "2026-01-01T00:00:13Z" })
       ]
     });
     const endings = blocks.filter((block) => block.kind === "turn-end");
-    expect(endings.map((block) => block.kind === "turn-end" && block.usage?.cost?.amount)).toEqual([undefined, 0.7, 0.64]);
+    expect(endings.map((block) => block.kind === "turn-end" && block.usage?.cost?.amount)).toEqual([undefined, 0.7, 0.64, 0.5]);
+    expect(endings[3]).toMatchObject({ usage: { contextUsedTokens: 5 } });
   });
 
   it("drops configuration noise, replayed history and pre-v2 rows", () => {

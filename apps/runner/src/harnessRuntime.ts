@@ -174,6 +174,7 @@ export async function runHarnessTurn(input: {
       // auth methods are interactive terminal logins, so skip `authenticate`.
       authMethodId: null,
       skipAuthenticate: true,
+      costRestartsPerProcess: true,
       connectionTag: input.connectionTag
     });
   }
