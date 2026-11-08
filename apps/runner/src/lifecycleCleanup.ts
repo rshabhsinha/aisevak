@@ -103,6 +103,8 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
           if (await homeInUseByOpenTask(client, home)) throw new Error("An open task's worker session uses this runtime home");
           await rm(home,{recursive:true,force:true});
           await client.query("UPDATE agent_threads SET provider_thread_id = NULL, provider_archived_at = NULL WHERE id = $1",[thread.id]);
+          // A task chat's session id is also kept on its task session; a restore would bring it back.
+          await client.query("UPDATE task_sessions SET codex_thread_id = NULL, updated_at = now() WHERE codex_home = $1",[thread.runtime_home]);
         }
         await client.query("UPDATE agent_threads SET cleanup_state = CASE WHEN archived_at IS NULL THEN NULL WHEN $2::boolean THEN 'done' ELSE 'storage_disabled' END, cleanup_error = NULL WHERE id = $1",[thread.id,cleanupEnabled]);
       } catch (error) {

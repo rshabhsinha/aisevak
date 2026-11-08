@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.hoisted(() => { process.env.MANAGED_ROOT = "/tmp/aisevak-usage-test"; });
-import { createPool, runMigrations, type DbPool } from "@aisevak/core";
+import { createPool, ensureConcurrentIndexes, runMigrations, type DbPool } from "@aisevak/core";
 import { USAGE_FILTER } from "./usageAnalytics.js";
 
 // The cost tab's query must read usage rows through the partial indexes: a
@@ -11,7 +11,13 @@ const databaseUrl = process.env.AISEVAK_TEST_DATABASE_URL;
 
 describe.skipIf(!databaseUrl)("usage analytics indexes", () => {
   let pool: DbPool;
-  beforeAll(async () => { pool = createPool(databaseUrl); await runMigrations(pool); });
+  beforeAll(async () => {
+    pool = createPool(databaseUrl);
+    await runMigrations(pool);
+    // Twice: a second call finds them valid and leaves them alone.
+    await ensureConcurrentIndexes(pool);
+    await ensureConcurrentIndexes(pool);
+  });
   afterAll(async () => { await pool?.end(); });
 
   it.each([

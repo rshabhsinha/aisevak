@@ -27,6 +27,7 @@ import {
   resolveOpenCodeBinary,
   serializeCodexChatGptAuthFile,
   runMigrations,
+  ensureConcurrentIndexes,
   serializeCodexSkillSnapshots,
   withTransaction,
   type CodexSkillSnapshot,
@@ -199,6 +200,8 @@ async function main(): Promise<void> {
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
   await mkdir(sharedNpmCacheDir(), { recursive: true });
+  // Built concurrently in the background: live turns keep writing events meanwhile.
+  void ensureConcurrentIndexes(pool).catch((error) => console.error("Building event indexes failed", error));
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   const bootScope = bootRecoveryScope();
@@ -240,6 +243,7 @@ async function main(): Promise<void> {
       retentionJob = sweepRetention(pool, env.managedRoot)
         .then((result) => {
           const deleted = Object.entries(result.deleted).map(([table, count]) => `${table} ${count}`).join(", ");
+          for (const failure of result.errors) console.error(`Retention step failed: ${failure}`);
           if (result.archivedThreads || result.purgedThreads || deleted || result.removedPaths) {
             console.info(`Retention: archived ${result.archivedThreads} idle chats, purged ${result.purgedThreads} archived chats, removed ${result.removedPaths} paths${deleted ? `, deleted ${deleted}` : ""}${result.complete ? "" : " (continuing next sweep)"}`);
           }

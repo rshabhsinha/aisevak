@@ -168,6 +168,71 @@ describe.skipIf(!databaseUrl)("retention sweep against Postgres", () => {
     expect((await stat(liveScratch)).isDirectory()).toBe(true);
   });
 
+  it("never archives a chat whose task is still being worked on", async () => {
+    const agentId = await agent();
+    const openTask = await task(agentId, "needs_attention", 40);
+    const chat = await thread(agentId, { taskId: openTask, activeDaysAgo: 40 });
+    const doneTask = await task(agentId, "completed", 1);
+    const doneChat = await thread(agentId, { taskId: doneTask, activeDaysAgo: 40 });
+    await sweepRetention(pool, root, POLICY);
+    const archived = async (id: string) => (await q("SELECT archived_at IS NOT NULL AS archived FROM agent_threads WHERE id = $1", [id]))[0].archived;
+    expect(await archived(chat)).toBe(false);
+    expect(await archived(doneChat)).toBe(true);
+  });
+
+  it("keeps a long-finished task whose chat was used recently", async () => {
+    const agentId = await agent();
+    const finished = await task(agentId, "completed", 60);
+    const chat = await thread(agentId, { taskId: finished, activeDaysAgo: 60 });
+    // A message turn on the finished task's chat does not touch tasks.updated_at.
+    await dispatcherRun(chat, "succeeded", 1, finished);
+    await sweepRetention(pool, root, POLICY);
+    expect(await exists("tasks", finished)).toBe(true);
+    expect(await exists("agent_threads", chat)).toBe(true);
+  });
+
+  it("keeps open requests, open assignments' messages and open tasks' conversations", async () => {
+    const agentId = await agent();
+    const coordination = async (taskId: string | null) => (await q(
+      "INSERT INTO coordination_threads (title, task_id, last_activity_at) VALUES ('C', $1, $2) RETURNING id", [taskId, ago(40)]))[0].id as string;
+    const message = async (threadId: string, extra: string = "") => (await q(
+      `INSERT INTO thread_messages (thread_id, sender_agent_id, body, created_at${extra ? ", request_state" : ""})
+       VALUES ($1, $2, 'm', $3${extra ? ", $4" : ""}) RETURNING id`,
+      extra ? [threadId, agentId, ago(40), extra] : [threadId, agentId, ago(40)]))[0].id as string;
+    const quiet = await coordination(null);
+    const expired = await message(quiet);
+    const openRequest = await message(quiet, "open");
+    const assigned = await message(quiet);
+    const openTask = await task(agentId, "open", 40);
+    await q(
+      `INSERT INTO task_assignments (task_id, assignment_key, assigned_agent_id, status, instructions, fingerprint, request_message_id)
+       VALUES ($1, 'key', $2, 'running', 'do it', 'f', $3)`,
+      [openTask, agentId, assigned]
+    );
+    const working = await coordination(openTask);
+    const conversation = await message(working);
+    await sweepRetention(pool, root, POLICY);
+    expect(await exists("thread_messages", expired)).toBe(false);
+    expect(await exists("thread_messages", openRequest)).toBe(true);
+    expect(await exists("thread_messages", assigned)).toBe(true);
+    expect(await exists("thread_messages", conversation)).toBe(true);
+    // The quiet thread still holds an open request, so it stays too.
+    expect(await exists("coordination_threads", quiet)).toBe(true);
+  });
+
+  it("clears a run with more events than one delete statement takes", async () => {
+    const run = await dispatcherRun(null, "succeeded", 40);
+    await q(
+      `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, payload)
+       SELECT $1, seq, 'item', '{}'::jsonb FROM generate_series(2, 12001) seq`,
+      [run]
+    );
+    const result = await sweepRetention(pool, root, POLICY);
+    expect(result.errors).toEqual([]);
+    expect(await exists("dispatcher_runs", run)).toBe(false);
+    expect(await q("SELECT 1 FROM dispatcher_run_events WHERE dispatcher_run_id = $1 LIMIT 1", [run])).toEqual([]);
+  });
+
   it("does nothing when retention is disabled", async () => {
     const old = await dispatcherRun(null, "succeeded", 400);
     const result = await sweepRetention(pool, root, { ...POLICY, retentionDays: 0 });

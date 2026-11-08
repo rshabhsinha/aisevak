@@ -33,7 +33,7 @@ export function retentionPolicyFromEnv(environment: NodeJS.ProcessEnv = process.
     archivePurgeDays: nonNegativeInteger(environment.AISEVAK_ARCHIVE_PURGE_DAYS, 7),
     scratchDays: nonNegativeInteger(environment.AISEVAK_SCRATCH_RETENTION_DAYS, 7),
     budgetMs: 60_000,
-    batchSize: 100
+    batchSize: 50
   };
 }
 
@@ -57,7 +57,35 @@ export interface RetentionResult {
   deleted: Record<string, number>;
   removedPaths: number;
   complete: boolean;
+  /** Steps that failed this sweep; the others still ran. */
+  errors: string[];
 }
+
+/** Rows one event-delete statement removes; a run can carry thousands of events. */
+const EVENT_CHUNK = 5_000;
+/** Runs whose events are cleared per batch. */
+const RUN_CHUNK = 20;
+/** Retention statements may legitimately take longer than an API request. */
+const RETENTION_STATEMENT_TIMEOUT = "120s";
+
+/** A task that is finished and that nothing (run, chat, schedule, checkout) has used in the window. */
+const IDLE_FINISHED_TASK = (task: string) => `${task}.status IN ('completed','cancelled')
+  AND ${task}.updated_at < now() - $1::interval
+  AND NOT EXISTS (SELECT 1 FROM schedules WHERE schedules.task_id = ${task}.id AND schedules.enabled)
+  AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.task_id = ${task}.id
+                  AND (task_runs.${ACTIVE_RUN} OR task_runs.queued_at >= now() - $1::interval))
+  AND NOT EXISTS (SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.task_id = ${task}.id
+                  AND (dispatcher_runs.${ACTIVE_RUN} OR dispatcher_runs.queued_at >= now() - $1::interval))
+  AND NOT EXISTS (SELECT 1 FROM agent_threads chat WHERE chat.task_id = ${task}.id
+                  -- Archiving touches updated_at; it is not use of the chat.
+                  AND (GREATEST(CASE WHEN chat.archived_at IS NULL THEN chat.updated_at ELSE chat.created_at END,
+                                COALESCE(chat.last_activity_at, chat.created_at)) >= now() - $1::interval
+                       OR EXISTS (SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.agent_thread_id = chat.id
+                                  AND (dispatcher_runs.${ACTIVE_RUN} OR dispatcher_runs.queued_at >= now() - $1::interval))))
+  AND NOT EXISTS (SELECT 1 FROM task_runs run WHERE run.task_id = ${task}.id AND ${UNCLEANED_WORKTREE("run")})`;
+
+/** A task still being worked on: its chats, threads and messages are kept whatever their age. */
+const OPEN_TASK = (task: string) => `${task}.status NOT IN ('completed','cancelled')`;
 
 export async function sweepRetention(
   pool: DbPool,
@@ -65,116 +93,192 @@ export async function sweepRetention(
   policy: RetentionPolicy = retentionPolicyFromEnv(),
   now: () => number = Date.now
 ): Promise<RetentionResult> {
-  const result: RetentionResult = { archivedThreads: 0, purgedThreads: 0, deleted: {}, removedPaths: 0, complete: true };
+  const result: RetentionResult = { archivedThreads: 0, purgedThreads: 0, deleted: {}, removedPaths: 0, complete: true, errors: [] };
   if (policy.retentionDays === 0) return result;
   const deadline = now() + policy.budgetMs;
   const inBudget = () => now() < deadline;
-  const days = (value: number) => `${value} days`;
-
-  result.archivedThreads = await archiveInactiveThreads(pool, days(policy.retentionDays), policy.batchSize);
-  result.purgedThreads = await purgeArchivedThreads(pool, root, days(policy.archivePurgeDays), policy.batchSize, inBudget);
-
-  const cutoff = days(policy.retentionDays);
-  const steps: { name: string; sql: string }[] = [
-    {
-      // Runs (and, by cascade, their events, inputs and tool tokens).
-      name: "dispatcher_runs",
-      sql: `DELETE FROM dispatcher_runs WHERE id IN (
-              SELECT id FROM dispatcher_runs
-              WHERE ${TERMINAL_RUN} AND COALESCE(finished_at, updated_at) < now() - $1::interval
-              LIMIT $2)`
-    },
-    {
-      name: "task_runs",
-      sql: `DELETE FROM task_runs WHERE id IN (
-              SELECT run.id FROM task_runs run
-              WHERE run.${TERMINAL_RUN} AND COALESCE(run.finished_at, run.updated_at) < now() - $1::interval
-                AND NOT (${UNCLEANED_WORKTREE("run")})
-              LIMIT $2)`
-    },
-    {
-      // Finished tasks cascade to their chats, sessions, runs and comments.
-      // A task a schedule still runs into is kept.
-      name: "tasks",
-      sql: `DELETE FROM tasks WHERE id IN (
-              SELECT tasks.id FROM tasks
-              WHERE tasks.status IN ('completed','cancelled') AND tasks.updated_at < now() - $1::interval
-                AND NOT EXISTS (SELECT 1 FROM schedules WHERE schedules.task_id = tasks.id AND schedules.enabled)
-                AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.task_id = tasks.id AND task_runs.${ACTIVE_RUN})
-                AND NOT EXISTS (SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.task_id = tasks.id AND dispatcher_runs.${ACTIVE_RUN})
-                AND NOT EXISTS (SELECT 1 FROM task_runs run WHERE run.task_id = tasks.id AND ${UNCLEANED_WORKTREE("run")})
-              LIMIT $2)`
-    },
-    {
-      // Messages cascade to their deliveries; a message still being delivered stays.
-      name: "thread_messages",
-      sql: `DELETE FROM thread_messages WHERE id IN (
-              SELECT message.id FROM thread_messages message
-              WHERE message.created_at < now() - $1::interval
-                AND NOT EXISTS (SELECT 1 FROM message_deliveries delivery
-                                WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})
-              LIMIT $2)`
-    },
-    {
-      // Threads quiet for the whole window whose work is finished (or gone).
-      name: "coordination_threads",
-      sql: `DELETE FROM coordination_threads WHERE id IN (
-              SELECT thread.id FROM coordination_threads thread
-              LEFT JOIN tasks ON tasks.id = thread.task_id
-              WHERE COALESCE(thread.last_activity_at, thread.updated_at) < now() - $1::interval
-                AND (thread.task_id IS NULL OR tasks.id IS NULL OR tasks.status IN ('completed','cancelled'))
-                AND NOT EXISTS (SELECT 1 FROM thread_messages message
-                                JOIN message_deliveries delivery ON delivery.message_id = message.id
-                                WHERE message.thread_id = thread.id AND delivery.${PENDING_DELIVERY})
-              LIMIT $2)`
-    },
-    {
-      name: "schedule_runs",
-      sql: `DELETE FROM schedule_runs WHERE id IN (
-              SELECT id FROM schedule_runs WHERE created_at < now() - $1::interval LIMIT $2)`
-    },
-    {
-      name: "job_safety_events",
-      sql: `DELETE FROM job_safety_events WHERE id IN (
-              SELECT id FROM job_safety_events WHERE created_at < now() - $1::interval LIMIT $2)`
-    },
-    {
-      name: "worktree_cleanup_attempts",
-      sql: `DELETE FROM worktree_cleanup_attempts WHERE path IN (
-              SELECT attempt.path FROM worktree_cleanup_attempts attempt
-              WHERE COALESCE(attempt.cleaned_at, attempt.last_attempt_at) < now() - $1::interval
-                AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.worktree_path = attempt.path)
-              LIMIT $2)`
+  const cutoff = `${policy.retentionDays} days`;
+  const count = (name: string, rows: number) => {
+    if (rows > 0) result.deleted[name] = (result.deleted[name] ?? 0) + rows;
+  };
+  // One step failing (a timeout, a lock) is logged and the others still run.
+  const step = async (name: string, work: () => Promise<boolean | void>) => {
+    if (!inBudget()) {
+      result.complete = false;
+      return;
     }
-  ];
-  for (const step of steps) {
-    let total = 0;
-    for (;;) {
-      if (!inBudget()) {
-        result.complete = false;
-        break;
+    try {
+      if ((await work()) === false) result.complete = false;
+    } catch (error) {
+      result.complete = false;
+      result.errors.push(`${name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+
+  const client = await pool.connect();
+  try {
+    await client.query(`SET statement_timeout = '${RETENTION_STATEMENT_TIMEOUT}'`);
+    await step("archive idle chats", async () => {
+      result.archivedThreads = await archiveInactiveThreads(client, cutoff, policy.batchSize);
+    });
+    await step("purge archived chats", async () => {
+      const purge = await purgeArchivedThreads(client, root, `${policy.archivePurgeDays} days`, policy.batchSize, inBudget);
+      result.purgedThreads = purge.purged;
+      count("dispatcher_run_events", purge.events);
+      return purge.complete;
+    });
+    for (const table of ["dispatcher_runs", "task_runs"] as const) {
+      await step(`expire ${table}`, async () => {
+        const expired = `SELECT run.id FROM ${table} run
+          WHERE run.${TERMINAL_RUN} AND COALESCE(run.finished_at, run.updated_at) < now() - $1::interval
+            ${table === "task_runs" ? `AND NOT (${UNCLEANED_WORKTREE("run")})` : ""}`;
+        const removed = await deleteRunsInChunks(client, table, expired, [cutoff], inBudget);
+        count(table, removed.runs);
+        count(table === "task_runs" ? "run_events" : "dispatcher_run_events", removed.events);
+        return removed.complete;
+      });
+    }
+    const batches: { name: string; sql: string; size: number }[] = [
+      {
+        // Cascades to the task's chats, sessions, runs, comments and assignments.
+        name: "tasks",
+        size: 10,
+        sql: `DELETE FROM tasks WHERE id IN (
+                SELECT task.id FROM tasks task WHERE ${IDLE_FINISHED_TASK("task")}
+                ORDER BY task.updated_at LIMIT $2 FOR UPDATE SKIP LOCKED)`
+      },
+      {
+        // Cascades to deliveries. Kept: messages being delivered, open
+        // requests, messages an open assignment points to, and the
+        // conversation of a task still being worked on.
+        name: "thread_messages",
+        size: 500,
+        sql: `DELETE FROM thread_messages WHERE id IN (
+                SELECT message.id FROM thread_messages message
+                WHERE message.created_at < now() - $1::interval
+                  AND message.request_state IS DISTINCT FROM 'open'
+                  AND NOT EXISTS (SELECT 1 FROM message_deliveries delivery
+                                  WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})
+                  AND NOT EXISTS (SELECT 1 FROM task_assignments assignment
+                                  WHERE assignment.status NOT IN ('completed','cancelled')
+                                    AND message.id IN (assignment.request_message_id, assignment.last_message_id))
+                  AND NOT EXISTS (SELECT 1 FROM coordination_threads thread JOIN tasks task ON task.id = thread.task_id
+                                  WHERE thread.id = message.thread_id AND ${OPEN_TASK("task")})
+                ORDER BY message.created_at LIMIT $2)`
+      },
+      {
+        // Threads quiet for the window whose work is finished (or gone) and
+        // that hold nothing still pending.
+        name: "coordination_threads",
+        size: 50,
+        sql: `DELETE FROM coordination_threads WHERE id IN (
+                SELECT thread.id FROM coordination_threads thread
+                LEFT JOIN tasks task ON task.id = thread.task_id
+                WHERE COALESCE(thread.last_activity_at, thread.updated_at) < now() - $1::interval
+                  AND (task.id IS NULL OR NOT (${OPEN_TASK("task")}))
+                  AND NOT EXISTS (SELECT 1 FROM thread_messages message
+                                  WHERE message.thread_id = thread.id
+                                    AND (message.request_state = 'open'
+                                         OR EXISTS (SELECT 1 FROM message_deliveries delivery
+                                                    WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})))
+                ORDER BY thread.last_activity_at NULLS FIRST LIMIT $2)`
+      },
+      {
+        name: "schedule_runs",
+        size: 1000,
+        sql: `DELETE FROM schedule_runs WHERE id IN (
+                SELECT id FROM schedule_runs WHERE created_at < now() - $1::interval LIMIT $2)`
+      },
+      {
+        name: "job_safety_events",
+        size: 1000,
+        sql: `DELETE FROM job_safety_events WHERE id IN (
+                SELECT id FROM job_safety_events WHERE created_at < now() - $1::interval LIMIT $2)`
+      },
+      {
+        name: "worktree_cleanup_attempts",
+        size: 1000,
+        sql: `DELETE FROM worktree_cleanup_attempts WHERE path IN (
+                SELECT attempt.path FROM worktree_cleanup_attempts attempt
+                WHERE COALESCE(attempt.cleaned_at, attempt.last_attempt_at) < now() - $1::interval
+                  AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.worktree_path = attempt.path)
+                LIMIT $2)`
       }
-      const deleted = await pool.query(step.sql, [cutoff, policy.batchSize]);
-      total += deleted.rowCount ?? 0;
-      if ((deleted.rowCount ?? 0) < policy.batchSize) break;
+    ];
+    for (const batch of batches) {
+      await step(`expire ${batch.name}`, async () => {
+        for (;;) {
+          if (!inBudget()) return false;
+          const deleted = await client.query(batch.sql, [cutoff, batch.size]);
+          count(batch.name, deleted.rowCount ?? 0);
+          if ((deleted.rowCount ?? 0) < batch.size) return true;
+        }
+      });
     }
-    if (total > 0) result.deleted[step.name] = total;
-    if (!result.complete) break;
-  }
-
-  if (result.complete && inBudget()) {
-    result.removedPaths += await removeOrphanHomes(pool, root, policy.scratchDays, now);
-    result.removedPaths += await removeStaleScratch(pool, root, policy.scratchDays, now);
+    await step("remove orphan homes", async () => {
+      result.removedPaths += await removeOrphanHomes(client, root, policy.scratchDays, now);
+    });
+    await step("remove stale scratch", async () => {
+      result.removedPaths += await removeStaleScratch(client, root, policy.scratchDays, now);
+    });
+  } finally {
+    try {
+      await client.query("RESET statement_timeout");
+    } catch (error) {
+      client.release(true);
+      throw error;
+    }
+    client.release();
   }
   return result;
 }
 
 /**
- * Archive chats with no run, delivery or activity in the retention window.
- * A chat a schedule runs into keeps running; the schedule is its activity.
+ * Delete runs a query selects: each chunk's events first, in row-bounded
+ * statements, then the runs themselves (whose remaining children are small).
+ * `selectRuns` must select `run.id` and may use the given parameters.
  */
-export async function archiveInactiveThreads(pool: Queryable, window: string, limit: number): Promise<number> {
-  const archived = await pool.query(
+async function deleteRunsInChunks(
+  client: Queryable,
+  table: "dispatcher_runs" | "task_runs",
+  selectRuns: string,
+  params: unknown[],
+  inBudget: () => boolean
+): Promise<{ runs: number; events: number; complete: boolean }> {
+  const events = table === "dispatcher_runs" ? "dispatcher_run_events" : "run_events";
+  const runColumn = table === "dispatcher_runs" ? "dispatcher_run_id" : "run_id";
+  const ids = `$${params.length + 1}::uuid[]`;
+  let runs = 0;
+  let eventRows = 0;
+  for (;;) {
+    if (!inBudget()) return { runs, events: eventRows, complete: false };
+    const chunk = await client.query<{ id: string }>(`${selectRuns} ORDER BY run.id LIMIT ${RUN_CHUNK}`, params);
+    const runIds = chunk.rows.map((row) => row.id);
+    if (runIds.length === 0) return { runs, events: eventRows, complete: true };
+    for (;;) {
+      const deleted = await client.query(
+        `DELETE FROM ${events} WHERE id IN (SELECT id FROM ${events} WHERE ${runColumn} = ANY($1::uuid[]) LIMIT ${EVENT_CHUNK})`,
+        [runIds]
+      );
+      eventRows += deleted.rowCount ?? 0;
+      if ((deleted.rowCount ?? 0) < EVENT_CHUNK) break;
+      if (!inBudget()) return { runs, events: eventRows, complete: false };
+    }
+    // Re-selected under the delete: a run that stopped qualifying is kept.
+    const removed = await client.query(`DELETE FROM ${table} WHERE id IN (${selectRuns} AND run.id = ANY(${ids}))`, [...params, runIds]);
+    runs += removed.rowCount ?? 0;
+    // None removed: the chunk stopped qualifying; selecting it again would spin.
+    if (runIds.length < RUN_CHUNK || !removed.rowCount) return { runs, events: eventRows, complete: true };
+  }
+}
+
+/**
+ * Archive chats with no run, delivery or activity in the retention window.
+ * Only chats whose work is over: no task, or a finished one. A chat of a task
+ * still being worked on, or one a schedule runs into, is never archived here.
+ */
+export async function archiveInactiveThreads(client: Queryable, window: string, limit: number): Promise<number> {
+  const archived = await client.query(
     `UPDATE agent_threads thread
      SET archived_at = now(), cleanup_state = 'pending', cleanup_error = NULL, cleanup_attempt_at = NULL,
          ownership_generation = ownership_generation + 1, updated_at = now()
@@ -182,6 +286,9 @@ export async function archiveInactiveThreads(pool: Queryable, window: string, li
        SELECT candidate.id FROM agent_threads candidate
        WHERE candidate.archived_at IS NULL AND candidate.cleanup_state IS NULL
          AND GREATEST(candidate.created_at, candidate.updated_at, COALESCE(candidate.last_activity_at, candidate.created_at)) < now() - $1::interval
+         AND NOT EXISTS (SELECT 1 FROM tasks task WHERE task.id = candidate.task_id AND ${OPEN_TASK("task")})
+         AND NOT EXISTS (SELECT 1 FROM coordination_threads coordination JOIN tasks task ON task.id = coordination.task_id
+                         WHERE coordination.id = candidate.coordination_thread_id AND ${OPEN_TASK("task")})
          AND NOT EXISTS (SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.agent_thread_id = candidate.id
                          AND (dispatcher_runs.${ACTIVE_RUN} OR dispatcher_runs.queued_at >= now() - $1::interval))
          AND NOT EXISTS (SELECT 1 FROM task_runs WHERE task_runs.agent_thread_id = candidate.id
@@ -202,40 +309,40 @@ export async function archiveInactiveThreads(pool: Queryable, window: string, li
 
 /**
  * Delete archived chats whose harness cleanup finished more than the grace
- * period ago: their runs (with events) first in batches, then the chat.
+ * period ago: their runs (with events) first in chunks, then the chat. Every
+ * chunk re-checks that the chat is still archived, so a restore during the
+ * purge keeps whatever history is left.
  */
 export async function purgeArchivedThreads(
-  pool: DbPool,
+  client: Queryable,
   root: string,
   grace: string,
   limit: number,
   inBudget: () => boolean
-): Promise<number> {
-  const candidates = await pool.query<{ id: string; runtime_home: string | null }>(
+): Promise<{ purged: number; events: number; complete: boolean }> {
+  const candidates = await client.query<{ id: string; runtime_home: string | null }>(
     `SELECT id, runtime_home FROM agent_threads
      WHERE archived_at < now() - $1::interval AND cleanup_state = 'done'
      ORDER BY archived_at
      LIMIT $2`,
     [grace, limit]
   );
+  const stillPurgeable = `EXISTS (SELECT 1 FROM agent_threads purged WHERE purged.id = $1
+    AND purged.archived_at < now() - $2::interval AND purged.cleanup_state = 'done')`;
   let purged = 0;
+  let events = 0;
   for (const thread of candidates.rows) {
-    if (!inBudget()) break;
-    for (const table of ["dispatcher_runs", "task_runs"]) {
-      for (;;) {
-        const deleted = await pool.query(
-          `DELETE FROM ${table} WHERE id IN (
-             SELECT run.id FROM ${table} run WHERE run.agent_thread_id = $1 AND run.${TERMINAL_RUN}
-               ${table === "task_runs" ? `AND NOT (${UNCLEANED_WORKTREE("run")})` : ""}
-             LIMIT 50)`,
-          [thread.id]
-        );
-        if ((deleted.rowCount ?? 0) < 50 || !inBudget()) break;
-      }
+    if (!inBudget()) return { purged, events, complete: false };
+    let complete = true;
+    for (const table of ["dispatcher_runs", "task_runs"] as const) {
+      const runs = `SELECT run.id FROM ${table} run WHERE run.agent_thread_id = $1 AND run.${TERMINAL_RUN} AND ${stillPurgeable}
+        ${table === "task_runs" ? `AND NOT (${UNCLEANED_WORKTREE("run")})` : ""}`;
+      const removed = await deleteRunsInChunks(client, table, runs, [thread.id, grace], inBudget);
+      events += removed.events;
+      complete &&= removed.complete;
     }
-    if (!inBudget()) break;
-    // Re-checked under the delete: a restore or a new run since the select keeps the chat.
-    const removed = await pool.query(
+    if (!complete) return { purged, events, complete: false };
+    const removed = await client.query(
       `DELETE FROM agent_threads thread
        WHERE thread.id = $1 AND thread.archived_at < now() - $2::interval AND thread.cleanup_state = 'done'
          AND NOT EXISTS (SELECT 1 FROM dispatcher_runs WHERE dispatcher_runs.agent_thread_id = thread.id)
@@ -245,9 +352,9 @@ export async function purgeArchivedThreads(
     if (!removed.rowCount) continue;
     purged += 1;
     // Archive cleanup already removed the home; this catches one recreated since.
-    if (thread.runtime_home) await removeUnreferencedHome(pool, root, thread.runtime_home);
+    if (thread.runtime_home) await removeUnreferencedHome(client, root, thread.runtime_home);
   }
-  return purged;
+  return { purged, events, complete: true };
 }
 
 async function removeUnreferencedHome(pool: Queryable, root: string, home: string): Promise<boolean> {

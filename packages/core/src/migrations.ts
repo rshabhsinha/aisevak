@@ -1436,14 +1436,52 @@ CREATE TABLE IF NOT EXISTS provider_account_limits (
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 
--- Usage analytics reads only usage-bearing events in a date range; without
--- this it scanned (and decompressed) every event payload and timed out.
--- The predicate must stay identical to USAGE_FILTER in apps/api/src/usageAnalytics.ts.
-CREATE INDEX IF NOT EXISTS dispatcher_run_events_usage_idx ON dispatcher_run_events (created_at)
-WHERE (event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage');
-CREATE INDEX IF NOT EXISTS run_events_usage_idx ON run_events (created_at)
-WHERE (event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage');
+-- Retention deletes messages and chats; these foreign keys are set to NULL on
+-- delete and were otherwise found by scanning the referencing table.
+CREATE INDEX IF NOT EXISTS dispatcher_runs_message_delivery_idx ON dispatcher_runs (message_delivery_id) WHERE message_delivery_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS message_deliveries_agent_thread_idx ON message_deliveries (agent_thread_id) WHERE agent_thread_id IS NOT NULL;
 `;
+
+/**
+ * Usage analytics (the cost tab) reads only usage-bearing events in a date
+ * range; without these it scanned and decompressed every event payload and
+ * hit the statement timeout. The predicate must stay identical to
+ * USAGE_FILTER in apps/api/src/usageAnalytics.ts.
+ */
+export const USAGE_EVENT_PREDICATE =
+  "(event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage')";
+
+const CONCURRENT_INDEXES = [
+  { name: "dispatcher_run_events_usage_idx", sql: `ON dispatcher_run_events (created_at) WHERE ${USAGE_EVENT_PREDICATE}` },
+  { name: "run_events_usage_idx", sql: `ON run_events (created_at) WHERE ${USAGE_EVENT_PREDICATE}` }
+];
+
+/**
+ * Indexes over the large event tables are built CONCURRENTLY, outside the
+ * boot migration: a plain build there would block event inserts from live
+ * turns for as long as it reads every payload. Call it in the background
+ * after boot; a build left invalid by an interrupted run is dropped and redone.
+ */
+export async function ensureConcurrentIndexes(pool: Pool): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("SET statement_timeout = 0");
+    for (const index of CONCURRENT_INDEXES) {
+      const existing = await client.query<{ valid: boolean }>(
+        "SELECT index.indisvalid AS valid FROM pg_index index JOIN pg_class class ON class.oid = index.indexrelid WHERE class.relname = $1",
+        [index.name]
+      );
+      if (existing.rows[0]?.valid) continue;
+      if (existing.rows[0]) await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${index.name}`);
+      await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${index.name} ${index.sql}`);
+    }
+  } finally {
+    try {
+      await client.query("RESET statement_timeout");
+    } catch (error) { client.release(true); throw error; }
+    client.release();
+  }
+}
 
 export async function runMigrations(pool: Pool): Promise<void> {
   const client = await pool.connect();
