@@ -251,9 +251,20 @@ describe.skipIf(!databaseUrl)("retention sweep against Postgres", () => {
        SELECT $1, revision, 'copy ' || revision, $2 FROM generate_series(1, 25) revision`,
       [report.id, agentId]
     );
+    // A report with no more than the kept number of revisions is left alone.
+    const [short] = await q(
+      "INSERT INTO reports (title, description, status, author_agent_id, current_revision) VALUES ('Short', 'd', 'draft', $1, 20) RETURNING id",
+      [agentId]
+    );
+    await q(
+      `INSERT INTO report_versions (report_id, revision, markdown, created_by_agent_id)
+       SELECT $1, revision, 'copy ' || revision, $2 FROM generate_series(1, 20) revision`,
+      [short.id, agentId]
+    );
     await sweepRetention(pool, root, POLICY);
-    const kept = (await q("SELECT revision FROM report_versions WHERE report_id = $1 ORDER BY revision", [report.id])).map((row) => row.revision);
-    expect(kept).toEqual(Array.from({ length: 20 }, (_, index) => index + 6));
+    const revisions = async (id: string) => (await q("SELECT revision FROM report_versions WHERE report_id = $1 ORDER BY revision", [id])).map((row) => row.revision);
+    expect(await revisions(report.id)).toEqual(Array.from({ length: 20 }, (_, index) => index + 6));
+    expect(await revisions(short.id)).toEqual(Array.from({ length: 20 }, (_, index) => index + 1));
   });
 
   it("does nothing when retention is disabled", async () => {

@@ -57,6 +57,27 @@ describe.skipIf(!databaseUrl)("coordination v2 phase 3 against Postgres", () => 
     return { status: response.statusCode, body: response.json() as any };
   }
 
+  it("lets only one of two revisions based on the same report revision land", async () => {
+    const writers = [await agent("Populator"), await agent("Reviewer")];
+    for (const writer of writers) await q("UPDATE agents SET capabilities = '[\"reports:read\", \"reports:write\"]' WHERE id = $1", [writer.id]);
+    const [first, second] = await Promise.all(writers.map((writer) => token(writer.id)));
+    const created = await call(first!, "POST", "/api/agent-tools/v1/reports", { title: "Backlog", description: "Shared backlog.", markdown: "- item: pending" });
+    expect(created.status).toBe(200);
+    const ref = created.body.report.key as string;
+    expect(created.body.report.current_revision).toBe(1);
+
+    // Both read revision 1 and revise it at the same time.
+    const results = await Promise.all([
+      call(first!, "POST", `/api/agent-tools/v1/reports/${ref}/revisions`, { markdown: "- item: populating", baseRevision: 1 }),
+      call(second!, "POST", `/api/agent-tools/v1/reports/${ref}/revisions`, { markdown: "- item: reviewing", baseRevision: 1 })
+    ]);
+    expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
+    const rejected = results.find((result) => result.status === 409)!;
+    expect(rejected.body.message).toContain("is at revision 2");
+    const [report] = await q("SELECT current_revision FROM reports WHERE id = (SELECT report_id FROM report_versions WHERE markdown = '- item: pending')");
+    expect(report.current_revision).toBe(2);
+  });
+
   it("sends a keyed request, replies to it, and returns the reply to a waiter", async () => {
     const asker = await agent("Asker");
     const answerer = await agent("Answerer");

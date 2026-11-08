@@ -202,7 +202,7 @@ const reportCreateSchema = z.object({
 const markdownSchema = z.object({ markdown: z.string().min(1) });
 // A revision replaces the whole document, so it names the revision it edited:
 // a revise based on an older one would silently drop another agent's change.
-const reportRevisionSchema = markdownSchema.extend({ baseRevision: z.coerce.number().int().positive() });
+const baseRevisionSchema = z.object({ baseRevision: z.number().int().positive() });
 const incidentCreateSchema = z.object({
   title: z.string().trim().min(1),
   description: z.string().trim().min(1),
@@ -1593,11 +1593,12 @@ function registerReportRoutes(app: FastifyInstance, pool: DbPool): void {
   app.post("/api/agent-tools/v1/reports/:ref/revisions", async (request) => {
     const context = await requireAgent(pool, request); requireCapability(context, "reports:write");
     const id = await resolveResourceId(pool, "reports", "REPORT", refParams.parse(request.params).ref);
-    const parsed = reportRevisionSchema.safeParse(request.body);
-    if (!parsed.success) {
+    const { markdown } = markdownSchema.parse(request.body);
+    const base = baseRevisionSchema.safeParse(request.body);
+    if (!base.success) {
       badRequest("baseRevision is required: the current_revision you read and edited (aisevak reports revise <ref> --base-revision <n>)");
     }
-    const body = parsed.data;
+    const body = { markdown, baseRevision: base.data.baseRevision };
     const locked = await withTransaction(pool, async (client) => {
       const locked = await client.query<{ number: number; current_revision: number; title: string; description: string }>(
         "SELECT number, current_revision, title, description FROM reports WHERE id = $1 FOR UPDATE", [id]

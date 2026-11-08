@@ -112,6 +112,11 @@ describe("writing lint on report routes", () => {
     expect(response.statusCode).toBe(400);
     expect(response.json().message).toContain("baseRevision is required");
     expect(wrote(queries, "INSERT INTO report_versions")).toBe(false);
+    // A base that is not a whole revision number is refused the same way.
+    const truthy = await app.inject({
+      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: "Edited.", baseRevision: true }
+    });
+    expect(truthy.statusCode).toBe(400);
   });
 
   it("returns an empty check when the lint is off", async () => {
