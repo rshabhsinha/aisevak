@@ -54,6 +54,7 @@ import {
 } from "./appServerClient.js";
 import { closeAllAcpSessions } from "./acpClient.js";
 import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
+import { lastSessionCost } from "./sessionCost.js";
 import { launchClaudeAccount, settleClaudeAccount, type LaunchedClaudeAccount } from "./claudeAccounts.js";
 import {
   agentGithubEnvironment,
@@ -1988,6 +1989,7 @@ export async function processOneDispatcherRun(
             options: turnOptions,
             acpApiKey: harnessAuth?.acpApiKey,
             connectionTag: harnessAuth?.connectionTag,
+            sessionCostBaseline: (sessionId) => lastSessionCost(pool, sessionId),
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,
@@ -2321,6 +2323,7 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
             options: turnOptions,
             acpApiKey: harnessAuth?.acpApiKey,
             connectionTag: harnessAuth?.connectionTag,
+            sessionCostBaseline: (sessionId) => lastSessionCost(pool, sessionId),
             acpEnv: {
               ...(harnessAuth?.env ?? turnOptions.env),
               PATH: turnOptions.env.PATH,

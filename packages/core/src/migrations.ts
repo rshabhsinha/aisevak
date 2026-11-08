@@ -1469,9 +1469,13 @@ CREATE TABLE IF NOT EXISTS aisevak_maintenance (
 export const USAGE_EVENT_PREDICATE =
   "(event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage')";
 
+export const SESSION_COST_PREDICATE = "event_type = 'usage.updated' AND payload->'usage' ? 'cost'";
+
 const CONCURRENT_INDEXES = [
   { name: "dispatcher_run_events_usage_idx", sql: `ON dispatcher_run_events (created_at) WHERE ${USAGE_EVENT_PREDICATE}` },
-  { name: "run_events_usage_idx", sql: `ON run_events (created_at) WHERE ${USAGE_EVENT_PREDICATE}` }
+  { name: "run_events_usage_idx", sql: `ON run_events (created_at) WHERE ${USAGE_EVENT_PREDICATE}` },
+  // A resumed ACP session's last cost reading: the runner measures turn spend from it.
+  { name: "usage_events_session_cost_idx", sql: `ON usage_events ((payload->>'threadId'), created_at) WHERE ${SESSION_COST_PREDICATE}` }
 ];
 
 /**

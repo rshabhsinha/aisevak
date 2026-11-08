@@ -162,10 +162,12 @@ export async function runHarnessTurn(input: {
   acpEnv?: NodeJS.ProcessEnv;
   acpApiKey?: string | null;
   connectionTag?: string | null;
+  sessionCostBaseline?: (sessionId: string) => Promise<number | undefined>;
 }): Promise<AppServerTurnResult> {
   if (input.driver === "claude") {
     return runAcpTurn({
       ...input.options,
+      sessionCostBaseline: input.sessionCostBaseline,
       binary: input.claudeBinary,
       args: [],
       runtimeHome: input.options.codexHome,
@@ -174,13 +176,13 @@ export async function runHarnessTurn(input: {
       // auth methods are interactive terminal logins, so skip `authenticate`.
       authMethodId: null,
       skipAuthenticate: true,
-      costRestartsPerProcess: true,
       connectionTag: input.connectionTag
     });
   }
   if (input.driver === "devin") {
     return runAcpTurn({
       ...input.options,
+      sessionCostBaseline: input.sessionCostBaseline,
       binary: input.devinBinary,
       args: buildDevinAcpArgs(input.options.model),
       runtimeHome: input.options.codexHome,
@@ -192,6 +194,7 @@ export async function runHarnessTurn(input: {
   if (input.driver === "cursor") {
     return runAcpTurn({
       ...input.options,
+      sessionCostBaseline: input.sessionCostBaseline,
       binary: input.cursorBinary,
       args: buildCursorAcpArgs(),
       runtimeHome: input.options.codexHome,
@@ -202,6 +205,7 @@ export async function runHarnessTurn(input: {
   if (input.driver === "opencode") {
     return runAcpTurn({
       ...input.options,
+      sessionCostBaseline: input.sessionCostBaseline,
       binary: input.openCodeBinary,
       args: buildOpenCodeAcpArgs(),
       runtimeHome: input.options.codexHome,
