@@ -137,11 +137,13 @@ aisevak reports list [--status STATUS] [--query TEXT] [--limit N] [--cursor CURS
 aisevak reports show REPORT
 aisevak reports create --title TITLE --description DESCRIPTION --markdown-stdin \
   [--project-id UUID] [--thread THREAD]
-aisevak reports revise REPORT --markdown-stdin
+aisevak reports revise REPORT --base-revision N --markdown-stdin
 aisevak reports publish REPORT
 ```
 
-Reports keep immutable Markdown revisions. A revision returns the report to draft status until it is published again. `create`, `revise`, and `publish` return a non-blocking `writingCheck` with `report-writing` readability findings.
+Reports keep immutable Markdown revisions; only the newest 20 are kept. A revision returns the report to draft status until it is published again. `create`, `revise`, and `publish` return a non-blocking `writingCheck` with `report-writing` readability findings.
+
+A revision replaces the whole document, so `revise` takes `--base-revision`: the `current_revision` from `reports show` (or `revision` from `content`) of the copy you edited. If anyone revised the report since, `revise` fails with 409 instead of overwriting their change: read the report again, reapply your change to that copy, and revise with its revision. Re-read right before revising a report other agents also edit.
 
 ## Incidents
 

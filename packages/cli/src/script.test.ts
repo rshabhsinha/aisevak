@@ -65,6 +65,35 @@ describe("embedded aisevak CLI", () => {
     expect(JSON.parse((failure as { stderr: string }).stderr)).toEqual({ error: { code: "WRITING_LINT", message: "REPORT-1 was rejected" } });
   });
 
+  it("sends the revision a report edit was based on, and refuses a revise without one", async () => {
+    const bodies: unknown[] = [];
+    const server = createServer((request, response) => {
+      let raw = "";
+      request.on("data", (chunk) => { raw += chunk; });
+      request.on("end", () => {
+        bodies.push(JSON.parse(raw));
+        response.setHeader("content-type", "application/json");
+        response.end(JSON.stringify({ report: { key: "REPORT-1", current_revision: 8 } }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const env = { ...process.env, AISEVAK_API_URL: `http://127.0.0.1:${address.port}`, AISEVAK_AGENT_TOKEN: "test-token" };
+
+    await execFileAsync(process.execPath, [cliPath, "reports", "revise", "REPORT-1", "--base-revision", "7", "--markdown", "Edited."], { env });
+    const missing = await execFileAsync(process.execPath, [cliPath, "reports", "revise", "REPORT-1", "--markdown", "Edited."], { env })
+      .catch((error: { stderr: string }) => error);
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+
+    expect(bodies).toEqual([{ markdown: "Edited.", baseRevision: 7 }]);
+    expect((missing as { stderr: string }).stderr).toContain("--base-revision");
+  });
+
   it("documents the durable coordination resources", async () => {
     const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
     cleanup.push(directory);
