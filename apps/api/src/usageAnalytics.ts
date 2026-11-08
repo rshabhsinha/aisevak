@@ -124,34 +124,26 @@ export async function loadUsageAnalytics(
   return aggregateUsage(rows, { ...options, since, now, pricing });
 }
 
-// Only usage-bearing messages: Codex token updates, ACP usage updates, and ACP
-// prompt results that carry `usage`. Kept identical to USAGE_EVENT_PREDICATE,
-// the predicate of the *_usage_idx partial indexes (packages/core/src/migrations.ts),
-// so the query reads only those rows.
-export const USAGE_FILTER = `(
-  e.event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed')
-  OR e.payload->'raw'->'result' ? 'usage'
-)`;
-
 async function queryUsageEvents(pool: DbPool, since: Date): Promise<UsageEventRow[]> {
+  // usage_events holds only usage-bearing events (copied by the runner as it
+  // stores them), so this reads a small table in created_at order.
   const result = await pool.query<UsageEventRow>(
-    `SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
+    `SELECT u.created_at, u.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
             COALESCE(r.provider_instance_id, t.provider_instance_id) AS account_id
-     FROM run_events e
-     JOIN task_runs r ON r.id = e.run_id
+     FROM usage_events u
+     JOIN task_runs r ON u.run_kind = 'worker' AND r.id = u.run_id
      LEFT JOIN agent_threads t ON t.id = r.agent_thread_id
      -- The account the run used: a Claude failover run differs from the thread's account.
      LEFT JOIN provider_instances pi ON pi.id = COALESCE(r.provider_instance_id, t.provider_instance_id)
-     WHERE e.created_at >= $1 AND ${USAGE_FILTER}
+     WHERE u.created_at >= $1
      UNION ALL
-     SELECT e.created_at, e.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
+     SELECT u.created_at, u.payload, r.model, pi.driver, t.id::text AS thread_id, t.title AS thread_title,
             COALESCE(r.provider_instance_id, t.provider_instance_id) AS account_id
-     FROM dispatcher_run_events e
-     JOIN dispatcher_runs r ON r.id = e.dispatcher_run_id
+     FROM usage_events u
+     JOIN dispatcher_runs r ON u.run_kind = 'dispatcher' AND r.id = u.run_id
      LEFT JOIN agent_threads t ON t.id = r.agent_thread_id
-     -- The account the run used: a Claude failover run differs from the thread's account.
      LEFT JOIN provider_instances pi ON pi.id = COALESCE(r.provider_instance_id, t.provider_instance_id)
-     WHERE e.created_at >= $1 AND ${USAGE_FILTER}`,
+     WHERE u.created_at >= $1`,
     [since]
   );
   return result.rows;

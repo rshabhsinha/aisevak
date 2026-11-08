@@ -1,8 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 
 vi.hoisted(() => { process.env.MANAGED_ROOT = "/tmp/aisevak-usage-test"; });
-import { createPool, ensureConcurrentIndexes, runMigrations, type DbPool } from "@aisevak/core";
-import { USAGE_FILTER } from "./usageAnalytics.js";
+import { backfillUsageEvents, createPool, ensureConcurrentIndexes, runMigrations, USAGE_EVENT_PREDICATE, type DbPool } from "@aisevak/core";
+import { loadUsageAnalytics } from "./usageAnalytics.js";
 
 // The cost tab's query must read usage rows through the partial indexes: a
 // sequential scan of the event tables decompressed every payload and timed out.
@@ -29,12 +29,45 @@ describe.skipIf(!databaseUrl)("usage analytics indexes", () => {
       // Only proves the index is usable for this predicate; the planner picks it on real data volumes.
       await client.query("SET enable_seqscan = off");
       const plan = await client.query<{ "QUERY PLAN": string }>(
-        `EXPLAIN SELECT e.created_at, e.payload FROM ${table} e WHERE e.created_at >= now() - interval '30 days' AND ${USAGE_FILTER}`
+        `EXPLAIN SELECT e.created_at, e.payload FROM ${table} e WHERE e.created_at >= now() - interval '30 days' AND ${USAGE_EVENT_PREDICATE}`
       );
       expect(plan.rows.map((row) => row["QUERY PLAN"]).join("\n")).toContain(index);
     } finally {
       await client.query("RESET enable_seqscan");
       client.release();
     }
+  });
+
+  it("backfills stored usage events until it completes and serves the cost tab from them", async () => {
+    await pool.query("DELETE FROM usage_events");
+    await pool.query("DELETE FROM aisevak_maintenance WHERE name = 'usage_events_backfilled'");
+    const [run] = (await pool.query(
+      `INSERT INTO dispatcher_runs (scope, status, cwd, codex_home, model, prompt)
+       VALUES ('coordination', 'succeeded', '/tmp', '/tmp', 'claude-backfill-test', 'p') RETURNING id`
+    )).rows;
+    const turn = { v: 2, type: "turn.completed", provider: "claude", raw: { source: "acp.jsonrpc", payload: { jsonrpc: "2.0", id: 3, result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 50 } } } } };
+    await pool.query(
+      `INSERT INTO dispatcher_run_events (dispatcher_run_id, seq, event_type, payload) VALUES
+       ($1, 1, 'turn.completed', $2), ($1, 2, 'content.delta', '{"v":2,"type":"content.delta"}'::jsonb)`,
+      [run.id, JSON.stringify(turn)]
+    );
+    // A live copy already landed (usage written before the backfill ran): the
+    // backfill still runs, since only its own completion marker stops it.
+    await pool.query(
+      `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
+       VALUES (gen_random_uuid(), 'dispatcher', $1, 'usage.updated', '{}'::jsonb, now())`,
+      [run.id]
+    );
+    // Other test files share the database: count only this run's rows.
+    expect(await backfillUsageEvents(pool)).toBeGreaterThanOrEqual(1);
+    expect((await pool.query("SELECT event_type FROM usage_events WHERE run_id = $1 ORDER BY event_type", [run.id])).rows)
+      .toEqual([{ event_type: "turn.completed" }, { event_type: "usage.updated" }]);
+    await pool.query("DELETE FROM usage_events WHERE run_id = $1 AND event_type = 'usage.updated'", [run.id]);
+    // Done once both copies committed: later boots skip it.
+    expect(await backfillUsageEvents(pool)).toBeNull();
+    const pricing = { source: "bundled" as const, lookup: () => ({ input: 1, cachedInput: 0, cacheWrite: 0, output: 1 }) };
+    const analytics = await loadUsageAnalytics(pool, { days: 30, tzOffsetMinutes: 0, pricing });
+    const claude = analytics.harnesses.find((harness) => harness.driver === "claude");
+    expect(claude?.models.find((model) => model.model === "claude-backfill-test")?.totals.totalTokens).toBe(150);
   });
 });

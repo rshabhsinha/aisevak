@@ -1440,13 +1440,31 @@ ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 -- delete and were otherwise found by scanning the referencing table.
 CREATE INDEX IF NOT EXISTS dispatcher_runs_message_delivery_idx ON dispatcher_runs (message_delivery_id) WHERE message_delivery_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS message_deliveries_agent_thread_idx ON message_deliveries (agent_thread_id) WHERE agent_thread_id IS NOT NULL;
+
+-- Usage-bearing run events, copied as they are stored, for the cost tab.
+-- Reading them out of the event tables meant hundreds of thousands of random
+-- page reads. No foreign key: rows outlive nothing; retention expires them.
+CREATE TABLE IF NOT EXISTS usage_events (
+  event_id uuid PRIMARY KEY,
+  run_kind text NOT NULL CHECK (run_kind IN ('worker', 'dispatcher')),
+  run_id uuid NOT NULL,
+  event_type text NOT NULL,
+  payload jsonb NOT NULL,
+  created_at timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS usage_events_created_idx ON usage_events (created_at);
+-- One-time maintenance steps that must finish once, recorded when they did.
+CREATE TABLE IF NOT EXISTS aisevak_maintenance (
+  name text PRIMARY KEY,
+  completed_at timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 /**
  * Usage analytics (the cost tab) reads only usage-bearing events in a date
  * range; without these it scanned and decompressed every event payload and
- * hit the statement timeout. The predicate must stay identical to
- * USAGE_FILTER in apps/api/src/usageAnalytics.ts.
+ * hit the statement timeout. The runner also uses this predicate to copy
+ * usage events into usage_events, which the cost tab reads.
  */
 export const USAGE_EVENT_PREDICATE =
   "(event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage')";
@@ -1475,6 +1493,42 @@ export async function ensureConcurrentIndexes(pool: Pool): Promise<void> {
       if (existing.rows[0]) await client.query(`DROP INDEX CONCURRENTLY IF EXISTS ${index.name}`);
       await client.query(`CREATE INDEX CONCURRENTLY IF NOT EXISTS ${index.name} ${index.sql}`);
     }
+  } finally {
+    try {
+      await client.query("RESET statement_timeout");
+    } catch (error) { client.release(true); throw error; }
+    client.release();
+  }
+}
+
+/**
+ * Copy usage events stored before usage_events existed. Repeated on every boot
+ * until both copies have committed (recorded in aisevak_maintenance); rows
+ * already copied are skipped, so an interrupted run just continues. Copies
+ * the last year, the most the cost tab shows; the date bound lets it read
+ * through the partial usage indexes, so call it once ensureConcurrentIndexes succeeded.
+ */
+export async function backfillUsageEvents(pool: Pool): Promise<number | null> {
+  const client = await pool.connect();
+  try {
+    await client.query("SET statement_timeout = 0");
+    const done = await client.query("SELECT 1 FROM aisevak_maintenance WHERE name = 'usage_events_backfilled'");
+    if (done.rows[0]) return null;
+    let copied = 0;
+    for (const [table, runKind, runColumn] of [
+      ["dispatcher_run_events", "dispatcher", "dispatcher_run_id"],
+      ["run_events", "worker", "run_id"]
+    ] as const) {
+      const result = await client.query(
+        `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
+         SELECT id, '${runKind}', ${runColumn}, event_type, payload, created_at FROM ${table}
+         WHERE created_at >= now() - interval '366 days' AND ${USAGE_EVENT_PREDICATE}
+         ON CONFLICT (event_id) DO NOTHING`
+      );
+      copied += result.rowCount ?? 0;
+    }
+    await client.query("INSERT INTO aisevak_maintenance (name) VALUES ('usage_events_backfilled') ON CONFLICT (name) DO NOTHING");
+    return copied;
   } finally {
     try {
       await client.query("RESET statement_timeout");

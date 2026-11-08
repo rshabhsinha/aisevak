@@ -9,7 +9,8 @@
 // holds long locks or one huge transaction; the next sweep continues it.
 
 import type { DbPool } from "@aisevak/core";
-import { lstat, readdir, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { chmod, lstat, open, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathContains } from "./worktreeCleanup.js";
 
@@ -182,6 +183,12 @@ export async function sweepRetention(
                                          OR EXISTS (SELECT 1 FROM message_deliveries delivery
                                                     WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})))
                 ORDER BY thread.last_activity_at NULLS FIRST LIMIT $2)`
+      },
+      {
+        name: "usage_events",
+        size: 5000,
+        sql: `DELETE FROM usage_events WHERE event_id IN (
+                SELECT event_id FROM usage_events WHERE created_at < now() - $1::interval LIMIT $2)`
       },
       {
         name: "schedule_runs",
@@ -430,7 +437,7 @@ async function removeStaleEntries(
     try {
       // lstat: a symlink's own age, and rm never follows it.
       if ((await newestChange(path, 2)) >= cutoff) continue;
-      await rm(path, { recursive: true, force: true });
+      await forceRemove(path);
       removed += 1;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
@@ -464,4 +471,56 @@ async function newestChange(path: string, depth: number): Promise<number> {
     }
   }
   return newest;
+}
+
+/**
+ * Remove a tree, including directories an agent left read-only (npm package
+ * contents often are): on a permission error, make the tree's own directories
+ * writable and try once more. Symlinks are never followed.
+ */
+async function forceRemove(path: string): Promise<void> {
+  try {
+    await rm(path, { recursive: true, force: true });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code !== "EACCES" && code !== "EPERM") throw error;
+    await makeDirectoriesWritable(path);
+    await rm(path, { recursive: true, force: true });
+  }
+}
+
+async function makeDirectoriesWritable(path: string): Promise<void> {
+  // Opened without following a symlink, so a directory swapped for a link
+  // after the age check never changes the link's target.
+  let handle = await openDirectoryNoFollow(path);
+  if (!handle) {
+    // No read permission (mode 0o000): a real directory is opened after chmod by path.
+    const stats = await lstat(path).catch(() => null);
+    if (!stats?.isDirectory()) return;
+    await chmod(path, (stats.mode & 0o777) | 0o700);
+    handle = await openDirectoryNoFollow(path);
+    if (!handle) return;
+  }
+  let opened;
+  try {
+    opened = await handle.stat();
+    await handle.chmod((opened.mode & 0o777) | 0o700);
+  } finally {
+    await handle.close();
+  }
+  const names = await readdir(path);
+  // Still the directory just opened: a swap since would point the walk elsewhere.
+  const current = await lstat(path).catch(() => null);
+  if (!current?.isDirectory() || current.dev !== opened.dev || current.ino !== opened.ino) return;
+  for (const name of names) await makeDirectoriesWritable(join(path, name));
+}
+
+async function openDirectoryNoFollow(path: string) {
+  try {
+    return await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTDIR" || code === "ELOOP" || code === "ENOENT" || code === "EACCES") return null;
+    throw error;
+  }
 }
