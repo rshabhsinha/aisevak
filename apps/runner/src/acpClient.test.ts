@@ -276,7 +276,7 @@ const usage = amount => console.log(JSON.stringify({method:'session/update',para
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line);
  if(m.method === 'session/load') usage(99);
- if(m.method === 'session/prompt' && m.params.prompt[0].text === 'later') { total += 0.75; usage(total); setTimeout(() => { total += 1; usage(total); }, 150); }
+ if(m.method === 'session/prompt' && m.params.prompt[0].text === 'later') { total += 0.75; usage(total); setTimeout(() => { total += 1; usage(total); }, 20); }
  else if(m.method === 'session/prompt') { total += m.params.prompt[0].text === 'big' ? 2.5 : 0.75; usage(total); }
  console.log(JSON.stringify({id:m.id,result:m.method === 'session/prompt' ? {stopReason:'end_turn'} : {sessionId:'s1'}}));
 });`);
@@ -296,7 +296,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     expect((await runAcpTurn({ ...options, prompt: "big" })).status).toBe("completed");
     // Spend the harness reports between turns lands in the next turn's reading.
     expect((await runAcpTurn({ ...options, prompt: "later" })).status).toBe("completed");
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await new Promise(resolve => setTimeout(resolve, 1000));
     expect((await runAcpTurn(options)).status).toBe("completed");
     // A new process counts from zero again, even though its total is lower.
     await closeAllAcpSessions();
