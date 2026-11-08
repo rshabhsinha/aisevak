@@ -203,11 +203,14 @@ async function main(): Promise<void> {
   await mkdir(env.managedRoot, { recursive: true });
   await mkdir(sharedNpmCacheDir(), { recursive: true });
   // Built concurrently in the background: live turns keep writing events meanwhile.
-  void ensureConcurrentIndexes(pool)
-    .catch((error) => console.error("Building event indexes failed", error))
-    .then(() => backfillUsageEvents(pool))
-    .then((copied) => { if (copied !== null) console.info(`Copied ${copied} stored usage events for the cost tab`); })
-    .catch((error) => console.error("Copying stored usage events failed; retried at the next boot", error));
+  void ensureConcurrentIndexes(pool).then(
+    // Without the indexes the copy would scan every stored event.
+    () => backfillUsageEvents(pool).then(
+      (copied) => { if (copied !== null) console.info(`Copied ${copied} stored usage events for the cost tab`); },
+      (error) => console.error("Copying stored usage events failed; retried at the next boot", error)
+    ),
+    (error) => console.error("Building event indexes failed; the usage copy waits for the next boot", error)
+  );
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   const bootScope = bootRecoveryScope();

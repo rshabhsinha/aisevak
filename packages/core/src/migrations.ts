@@ -1504,9 +1504,9 @@ export async function ensureConcurrentIndexes(pool: Pool): Promise<void> {
 /**
  * Copy usage events stored before usage_events existed. Repeated on every boot
  * until both copies have committed (recorded in aisevak_maintenance); rows
- * already copied are skipped, so an interrupted run just continues. No date
- * bound: the cost tab can show up to a year, and retention already bounds the
- * event tables. Uses the partial usage indexes: call after ensureConcurrentIndexes.
+ * already copied are skipped, so an interrupted run just continues. Copies
+ * the last year, the most the cost tab shows; the date bound lets it read
+ * through the partial usage indexes, so call it once ensureConcurrentIndexes succeeded.
  */
 export async function backfillUsageEvents(pool: Pool): Promise<number | null> {
   const client = await pool.connect();
@@ -1522,7 +1522,7 @@ export async function backfillUsageEvents(pool: Pool): Promise<number | null> {
       const result = await client.query(
         `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
          SELECT id, '${runKind}', ${runColumn}, event_type, payload, created_at FROM ${table}
-         WHERE ${USAGE_EVENT_PREDICATE}
+         WHERE created_at >= now() - interval '366 days' AND ${USAGE_EVENT_PREDICATE}
          ON CONFLICT (event_id) DO NOTHING`
       );
       copied += result.rowCount ?? 0;

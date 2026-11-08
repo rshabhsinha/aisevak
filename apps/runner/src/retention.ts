@@ -10,7 +10,7 @@
 
 import type { DbPool } from "@aisevak/core";
 import { constants } from "node:fs";
-import { lstat, open, readdir, rm } from "node:fs/promises";
+import { chmod, lstat, open, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathContains } from "./worktreeCleanup.js";
 
@@ -492,19 +492,35 @@ async function forceRemove(path: string): Promise<void> {
 async function makeDirectoriesWritable(path: string): Promise<void> {
   // Opened without following a symlink, so a directory swapped for a link
   // after the age check never changes the link's target.
-  let handle;
-  try {
-    handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ENOTDIR" || code === "ELOOP" || code === "ENOENT") return;
-    throw error;
+  let handle = await openDirectoryNoFollow(path);
+  if (!handle) {
+    // No read permission (mode 0o000): a real directory is opened after chmod by path.
+    const stats = await lstat(path).catch(() => null);
+    if (!stats?.isDirectory()) return;
+    await chmod(path, (stats.mode & 0o777) | 0o700);
+    handle = await openDirectoryNoFollow(path);
+    if (!handle) return;
   }
+  let opened;
   try {
-    const stats = await handle.stat();
-    await handle.chmod((stats.mode & 0o777) | 0o700);
+    opened = await handle.stat();
+    await handle.chmod((opened.mode & 0o777) | 0o700);
   } finally {
     await handle.close();
   }
-  for (const name of await readdir(path)) await makeDirectoriesWritable(join(path, name));
+  const names = await readdir(path);
+  // Still the directory just opened: a swap since would point the walk elsewhere.
+  const current = await lstat(path).catch(() => null);
+  if (!current?.isDirectory() || current.dev !== opened.dev || current.ino !== opened.ino) return;
+  for (const name of names) await makeDirectoriesWritable(join(path, name));
+}
+
+async function openDirectoryNoFollow(path: string) {
+  try {
+    return await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTDIR" || code === "ELOOP" || code === "ENOENT" || code === "EACCES") return null;
+    throw error;
+  }
 }
