@@ -20,6 +20,10 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
   // ACP `authenticate` parameter (sent as _meta.api_key). Devin requires this —
   // it intentionally does not read CLI credentials in ACP mode.
   apiKey?: string | null;
+  // The harness reports cost as a running total that restarts at zero in each
+  // new process (claude-agent-acp). Other ACP harnesses may carry the total
+  // across processes, so their first reading in a process only sets the baseline.
+  costRestartsPerProcess?: boolean;
   // Extra identity for the cached harness process. Drivers that take their
   // credential or model from the environment (Claude Code) set this so a new
   // credential or model starts a fresh process instead of reusing the old one.
@@ -122,6 +126,12 @@ class PersistentAcpSession {
   // From the `initialize` result: whether `session/prompt` accepts image blocks.
   private supportsImages = false;
   private sessionId: string | null = null;
+  // claude-agent-acp reports cost as the running total of this process's
+  // session (it restarts from zero in a new process): remember the last total
+  // per session so each reading can carry the spend since the previous one.
+  private readonly reportedCost = new Map<string, number>();
+  private replaying = false;
+  private readonly costRestartsPerProcess: boolean;
   lastUsedAt = Date.now();
   isRunning = false;
   private lastActivityAt = Date.now();
@@ -135,6 +145,7 @@ class PersistentAcpSession {
     onClose: () => void
   ) {
     this.connectionKey = acpConnectionKey(initial);
+    this.costRestartsPerProcess = initial.costRestartsPerProcess === true;
     this.child = spawn(initial.binary, initial.args, {
       cwd: initial.cwd,
       env: initial.env,
@@ -205,6 +216,7 @@ class PersistentAcpSession {
       await this.initialize(options.authMethodId, options.skipAuthenticate === true);
       if (options.threadId) {
         loadingSession = true;
+        this.replaying = true;
         try {
           await this.request("session/load", {
             sessionId: options.threadId,
@@ -224,6 +236,7 @@ class PersistentAcpSession {
           this.sessionId = null;
         } finally {
           loadingSession = false;
+          this.replaying = false;
         }
       }
       if (!this.sessionId) {
@@ -455,7 +468,14 @@ class PersistentAcpSession {
       message?.id !== undefined &&
       Boolean(message.error) &&
       RECOVERABLE_ACP_METHODS.has(this.pending.get(String(message.id))?.method ?? "");
-    const persisted = recovered ? JSON.stringify({ ...message, aisevakRecovered: true }) : trimmed;
+    // Only readings delivered to a turn move the baseline, so spend reported
+    // between turns shows up in the next turn's first reading.
+    const turnCost = message && !this.replaying && this.onNotification ? this.costSincePreviousReading(message) : undefined;
+    const persisted = recovered
+      ? JSON.stringify({ ...message, aisevakRecovered: true })
+      : turnCost !== undefined
+        ? JSON.stringify({ ...message, aisevakTurnCost: turnCost })
+        : trimmed;
     void this.onNotification?.(persisted).catch((error: unknown) => {
       this.rejectPending(error instanceof Error ? error : new Error(String(error)));
       void this.close().catch(() => undefined);
@@ -489,6 +509,19 @@ class PersistentAcpSession {
         pending.resolve((message.result as Record<string, unknown>) ?? {});
       }
     }
+  }
+
+  private costSincePreviousReading(message: Record<string, unknown>): number | undefined {
+    if (message.method !== "session/update") return undefined;
+    const params = message.params as { sessionId?: unknown; update?: { sessionUpdate?: unknown; cost?: { amount?: unknown } } } | undefined;
+    const amount = params?.update?.cost?.amount;
+    if (params?.update?.sessionUpdate !== "usage_update" || typeof amount !== "number" || !Number.isFinite(amount)) return undefined;
+    const session = typeof params.sessionId === "string" ? params.sessionId : "";
+    const previous = this.reportedCost.get(session) ?? (this.costRestartsPerProcess ? 0 : undefined);
+    this.reportedCost.set(session, amount);
+    if (previous === undefined) return undefined;
+    // A lower total means the harness started counting again.
+    return amount >= previous ? amount - previous : amount;
   }
 
   private request(

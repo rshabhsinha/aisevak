@@ -68,7 +68,7 @@ export function createAcpAdapter(options: { provider: RuntimeProvider; sessionId
     lastStream = null;
   };
 
-  const sessionUpdate = (update: JsonRecord, replay: boolean): EventBody => {
+  const sessionUpdate = (update: JsonRecord, replay: boolean, turnCostAmount?: number): EventBody => {
     const kind = stringValue(update.sessionUpdate) ?? stringValue(update.session_update) ?? stringValue(update.type);
     const messageId = stringValue(update.messageId);
     switch (kind) {
@@ -93,7 +93,7 @@ export function createAcpAdapter(options: { provider: RuntimeProvider; sessionId
         breakText();
         return { type: "turn.plan.updated", plan: { entries: arrayValue(update.entries).flatMap(planEntry) } };
       case "usage_update":
-        return { type: "usage.updated", usage: contextUsage(update) };
+        return { type: "usage.updated", usage: contextUsage(update, turnCostAmount) };
       case "notice": {
         const severity = stringValue(update.severity);
         const message = stringValue(update.title) ?? "Notice";
@@ -179,7 +179,7 @@ export function createAcpAdapter(options: { provider: RuntimeProvider; sessionId
       let body: EventBody;
       if (!record) body = { type: "provider.event" };
       else if (method === "session/update" || method === "session/update_session") {
-        body = sessionUpdate(objectValue(params.update) ?? params, replay);
+        body = sessionUpdate(objectValue(params.update) ?? params, replay, numberValue(record.aisevakTurnCost));
       } else if (method === "session/request_permission") {
         const toolCallRecord = objectValue(params.toolCall);
         body = { type: "request.opened", itemId: stringValue(toolCallRecord?.toolCallId), text: stringValue(toolCallRecord?.title) };
@@ -359,14 +359,16 @@ function planEntry(value: unknown): RuntimePlanEntry[] {
   return [{ step, status: status === "completed" ? "completed" : status === "in_progress" ? "in_progress" : "pending" }];
 }
 
-function contextUsage(update: JsonRecord): RuntimeUsage {
+function contextUsage(update: JsonRecord, turnCostAmount: number | undefined): RuntimeUsage {
   const cost = objectValue(update.cost);
   const amount = numberValue(cost?.amount);
+  const currency = stringValue(cost?.currency) ?? "USD";
   return compact({
     scope: "context" as const,
     usedTokens: numberValue(update.used),
     maxTokens: numberValue(update.size),
-    cost: amount !== undefined ? { amount, currency: stringValue(cost?.currency) ?? "USD" } : undefined
+    cost: amount !== undefined ? { amount, currency } : undefined,
+    turnCost: amount !== undefined && turnCostAmount !== undefined ? { amount: turnCostAmount, currency } : undefined
   });
 }
 
