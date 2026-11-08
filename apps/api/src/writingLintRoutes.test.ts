@@ -32,9 +32,6 @@ async function lintServer(reportMarkdown: string, publishMatches = true): Promis
     }
     if (sql.startsWith("SELECT id FROM reports")) return { rows: [{ id: "report" }] };
     if (sql.startsWith("SELECT id FROM incidents")) return { rows: [{ id: "incident" }] };
-    if (sql.startsWith("SELECT current_revision, title, description FROM reports")) {
-      return { rows: [{ current_revision: 2, title: "Daily review", description: "Scope." }] };
-    }
     if (sql.includes("FROM reports")) {
       return { rows: [{ number: 9, current_revision: 2, title: "Daily review", description: "Scope.", markdown: reportMarkdown }] };
     }
@@ -89,12 +86,37 @@ describe("writing lint on report routes", () => {
   it("advises on the markdown a revise call wrote, not the stored revision", async () => {
     const { app, queries } = await lintServer("All quiet.");
     const response = await app.inject({
-      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: tooLong }
+      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: tooLong, baseRevision: 2 }
     });
     expect(response.statusCode).toBe(200);
     expect(response.json().writingCheck).toMatchObject({ passed: false });
     expect(response.json().report.markdown).toBeUndefined();
     expect(wrote(queries, "INSERT INTO report_versions")).toBe(true);
+  });
+
+  it("rejects a revise based on an older revision instead of overwriting the newer one", async () => {
+    const { app, queries } = await lintServer("All quiet.");
+    const response = await app.inject({
+      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: "Edited.", baseRevision: 1 }
+    });
+    expect(response.statusCode).toBe(409);
+    expect(response.json().message).toContain("REPORT-9 is at revision 2");
+    expect(wrote(queries, "INSERT INTO report_versions")).toBe(false);
+  });
+
+  it("requires the revision a revise was based on", async () => {
+    const { app, queries } = await lintServer("All quiet.");
+    const response = await app.inject({
+      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: "Edited." }
+    });
+    expect(response.statusCode).toBe(400);
+    expect(response.json().message).toContain("baseRevision is required");
+    expect(wrote(queries, "INSERT INTO report_versions")).toBe(false);
+    // A base that is not a whole revision number is refused the same way.
+    const truthy = await app.inject({
+      method: "POST", url: "/api/agent-tools/v1/reports/REPORT-9/revisions", headers, payload: { markdown: "Edited.", baseRevision: true }
+    });
+    expect(truthy.statusCode).toBe(400);
   });
 
   it("returns an empty check when the lint is off", async () => {

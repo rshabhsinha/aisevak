@@ -62,6 +62,8 @@ export interface RetentionResult {
   errors: string[];
 }
 
+/** Revisions kept per report, the current one included. */
+export const REPORT_REVISIONS_KEPT = 20;
 /** Rows one event-delete statement removes; a run can carry thousands of events. */
 const EVENT_CHUNK = 5_000;
 /** Runs whose events are cleared per batch. */
@@ -183,6 +185,18 @@ export async function sweepRetention(
                                          OR EXISTS (SELECT 1 FROM message_deliveries delivery
                                                     WHERE delivery.message_id = message.id AND delivery.${PENDING_DELIVERY})))
                 ORDER BY thread.last_activity_at NULLS FIRST LIMIT $2)`
+      },
+      {
+        // Every revision is a full copy of the document, and only the current
+        // one is read: keep the newest REPORT_REVISIONS_KEPT per report.
+        name: "report_versions",
+        size: 200,
+        sql: `DELETE FROM report_versions WHERE id IN (
+                SELECT version.id FROM report_versions version
+                JOIN reports report ON report.id = version.report_id
+                WHERE version.revision <= report.current_revision - ${REPORT_REVISIONS_KEPT}
+                  AND $1::interval IS NOT NULL
+                LIMIT $2)`
       },
       {
         name: "usage_events",

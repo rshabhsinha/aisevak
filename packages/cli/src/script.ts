@@ -257,7 +257,14 @@ async function reports() {
   }) }));
   const ref = required(args[2], "Report reference");
   if (command === "show") return print(await request("/api/agent-tools/v1/reports/" + encodeURIComponent(ref)));
-  if (command === "revise") return print(await request("/api/agent-tools/v1/reports/" + encodeURIComponent(ref) + "/revisions", { method: "POST", body: { markdown: await markdown("--markdown") } }));
+  if (command === "revise") {
+    // The revision this edit started from (current_revision from reports show,
+    // or revision from content): a stale base is rejected instead of silently
+    // overwriting someone else's revision.
+    const base = option("--base-revision");
+    if (!base || !/^[1-9][0-9]*$/.test(base)) fail("--base-revision <n> is required: the current_revision of the report you read and edited", "USAGE");
+    return print(await request("/api/agent-tools/v1/reports/" + encodeURIComponent(ref) + "/revisions", { method: "POST", body: { markdown: await markdown("--markdown"), baseRevision: Number(base) } }));
+  }
   if (command === "publish") return print(await request("/api/agent-tools/v1/reports/" + encodeURIComponent(ref) + "/publish", { method: "POST" }));
   fail("Usage: aisevak reports list|show|create|revise|publish", "USAGE");
 }
@@ -327,7 +334,7 @@ function help() { console.log([
   "aisevak tasks reparent TASK... --parent TASK | policy TASK --max-active-children N",
   "aisevak assignments list TASK | show ASSIGNMENT | create TASK --key KEY --to AGENT --instructions-stdin | send | retry | complete | block",
   "aisevak schedules list | show | create | update SCHEDULE --task TASK|none | pause | resume | delete",
-  "aisevak reports list | show | create | revise | publish",
+  "aisevak reports list | show | create | revise <ref> --base-revision <n> | publish",
   "aisevak incidents list [--include-resolved] | show | declare | update | resolve",
   "",
   "Markdown flags accept stdin, for example: --body-stdin, --purpose-stdin, --summary-stdin.",
