@@ -1435,6 +1435,14 @@ CREATE TABLE IF NOT EXISTS provider_account_limits (
 -- after a failover.
 ALTER TABLE dispatcher_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
 ALTER TABLE task_runs ADD COLUMN IF NOT EXISTS provider_instance_id text;
+
+-- Usage analytics reads only usage-bearing events in a date range; without
+-- this it scanned (and decompressed) every event payload and timed out.
+-- The predicate must stay identical to USAGE_FILTER in apps/api/src/usageAnalytics.ts.
+CREATE INDEX IF NOT EXISTS dispatcher_run_events_usage_idx ON dispatcher_run_events (created_at)
+WHERE (event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage');
+CREATE INDEX IF NOT EXISTS run_events_usage_idx ON run_events (created_at)
+WHERE (event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage');
 `;
 
 export async function runMigrations(pool: Pool): Promise<void> {

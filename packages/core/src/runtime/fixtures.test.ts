@@ -2,6 +2,7 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { RuntimeEvent, RuntimeProvider } from "./events.js";
+import { keepsRawPayload } from "./limits.js";
 import { createRuntimeNormalizer } from "./normalizer.js";
 
 // Each fixtures/<provider>-<case>.jsonl holds raw harness stdout lines (shapes
@@ -22,7 +23,7 @@ export function normalizeFixture(name: string): RuntimeEvent[] {
     });
 }
 
-/** The raw payload is the input line itself; leave it out of the expected file. */
+/** A kept raw payload is the input line itself; leave it out of the expected file. */
 function withoutRawPayload(event: RuntimeEvent): unknown {
   const { payload: _payload, ...raw } = event.raw;
   return { ...event, raw };
@@ -46,7 +47,9 @@ describe("runtime event fixtures", () => {
           return lines[index];
         }
       })();
-      expect(event.raw.payload).toEqual(parsed);
+      // Only events something reads the raw message from keep it.
+      if (keepsRawPayload(event)) expect(event.raw.payload).toEqual(parsed);
+      else expect(event.raw.payload).toBeUndefined();
     }
     const actual = events.map(withoutRawPayload);
     const expectedPath = join(fixturesDir, `${name}.expected.json`);

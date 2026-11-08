@@ -63,6 +63,7 @@ import {
 } from "./githubCli.js";
 import { pruneHeartbeatRollouts } from "./heartbeatRollouts.js";
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
+import { sweepRetention } from "./retention.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { MAX_USAGE_LIMIT_WAITS, parseUsageLimit, usageLimitRetryAt, withUsageLimitPreamble } from "./providerLimits.js";
@@ -197,6 +198,7 @@ async function main(): Promise<void> {
   const pool = createPool(env.databaseUrl);
   await runMigrations(pool);
   await mkdir(env.managedRoot, { recursive: true });
+  await mkdir(sharedNpmCacheDir(), { recursive: true });
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   const bootScope = bootRecoveryScope();
@@ -218,6 +220,8 @@ async function main(): Promise<void> {
   );
   let cleanupJob: Promise<void> | null = null;
   let nextCleanupAt = 0;
+  let retentionJob: Promise<void> | null = null;
+  let nextRetentionAt = Date.now() + 60_000;
   let nextLeaseSweepAt = Date.now() + RUN_LEASE_MS;
   while (!shuttingDown) {
     if (Date.now() >= nextLeaseSweepAt) {
@@ -230,6 +234,20 @@ async function main(): Promise<void> {
       cleanupJob = sweepLifecycleCleanup(pool, env.managedRoot, env.codexBinary)
         .catch(error => console.error("Lifecycle cleanup failed", error))
         .finally(() => { cleanupJob = null; });
+    }
+    if (process.platform === "linux" && !retentionJob && Date.now() >= nextRetentionAt) {
+      nextRetentionAt = Date.now() + RETENTION_SWEEP_MS;
+      retentionJob = sweepRetention(pool, env.managedRoot)
+        .then((result) => {
+          const deleted = Object.entries(result.deleted).map(([table, count]) => `${table} ${count}`).join(", ");
+          if (result.archivedThreads || result.purgedThreads || deleted || result.removedPaths) {
+            console.info(`Retention: archived ${result.archivedThreads} idle chats, purged ${result.purgedThreads} archived chats, removed ${result.removedPaths} paths${deleted ? `, deleted ${deleted}` : ""}${result.complete ? "" : " (continuing next sweep)"}`);
+          }
+          // A backlog continues soon instead of waiting a full interval.
+          if (!result.complete) nextRetentionAt = Date.now() + 60_000;
+        })
+        .catch(error => console.error("Retention sweep failed", error))
+        .finally(() => { retentionJob = null; });
     }
     startAvailableRunJobs(pool, activeRunJobs, env.maxConcurrency);
     // Each step fails on its own: one broken schedule or import must not stop
@@ -247,6 +265,7 @@ async function main(): Promise<void> {
   await waitForRunJobs(activeRunJobs);
   stopHeartbeat();
   if (cleanupJob) await cleanupJob;
+  if (retentionJob) await retentionJob;
   await closeAllCodexAppServers();
   await closeAllAcpSessions();
   await pool.end();
@@ -2021,7 +2040,7 @@ export async function processOneDispatcherRun(
          AND status IN ('running', 'cancel_requested')
          AND (runner_id IS NULL OR runner_id = $6)
        RETURNING id`,
-      [job.id, finalStatus, encodePostgresText(stdout), encodePostgresText(stderr), exitCode, currentRunnerId()]
+      [job.id, finalStatus, STORED_RAW_STDOUT, encodePostgresText(storedStderr(stderr)), exitCode, currentRunnerId()]
     );
     if (!finalized.rows[0]) return true;
     const accountOutcome = claudeAccount
@@ -2613,7 +2632,7 @@ export async function finalizeWorkerRunState(
          AND status IN ('running', 'cancel_requested')
          AND (runner_id IS NULL OR runner_id = $6)
        RETURNING id`,
-      [input.runId, input.finalStatus, encodePostgresText(input.stdout), encodePostgresText(input.stderr), input.exitCode, currentRunnerId()]
+      [input.runId, input.finalStatus, STORED_RAW_STDOUT, encodePostgresText(storedStderr(input.stderr)), input.exitCode, currentRunnerId()]
     );
     if (!finalized.rows[0]) return false;
     if (!ownsCurrentThread) return true;
@@ -2760,10 +2779,30 @@ export async function persistRefreshedCodexAuth(
   return Boolean(result.rows[0]);
 }
 
+const RETENTION_SWEEP_MS = 10 * 60_000;
+
+// A turn's raw provider stdout is parsed into run events as it streams and
+// read in memory when the turn ends; nothing reads it back from the database,
+// and storing it kept a second (or third) copy of every tool result.
+const STORED_RAW_STDOUT = "";
+/** stderr is kept for diagnosis, but only its end: that is where errors are. */
+const MAX_STORED_STDERR_CHARS = 64 * 1024;
+export function storedStderr(stderr: string): string {
+  return stderr.length <= MAX_STORED_STDERR_CHARS ? stderr : stderr.slice(stderr.length - MAX_STORED_STDERR_CHARS);
+}
+
+// Agents run with HOME set to their per-thread runtime home, so npm's default
+// ~/.npm cache was duplicated (often ~1GB) into every thread and filled the disk.
+// npm's content-addressed cache is safe to share between concurrent processes.
+function sharedNpmCacheDir(): string {
+  return join(env.managedRoot, "cache", "npm");
+}
+
 function codexProcessEnv(): NodeJS.ProcessEnv {
   return {
     ...safeChildEnvironment(),
-    ...agentGithubEnvironment(env.managedRoot)
+    ...agentGithubEnvironment(env.managedRoot),
+    npm_config_cache: sharedNpmCacheDir()
   };
 }
 
@@ -2865,7 +2904,9 @@ export async function persistCodexLine(
   normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
-  if (!normalized) return;
+  // A reloaded session replays its whole history, which earlier runs already
+  // stored; persisting it again duplicated every past tool output per run.
+  if (!normalized || normalized.replay) return;
   const threadId = normalized.threadId;
   if (threadId) {
     if (!job.agent_thread_id) {
@@ -2894,7 +2935,9 @@ export async function persistDispatcherCodexLine(
   normalizer: RuntimeNormalizer
 ): Promise<void> {
   const normalized = normalizer.normalize(line);
-  if (!normalized) return;
+  // A reloaded session replays its whole history, which earlier runs already
+  // stored; persisting it again duplicated every past tool output per run.
+  if (!normalized || normalized.replay) return;
   const threadId = normalized.threadId;
   if (threadId) {
     await pool.query(

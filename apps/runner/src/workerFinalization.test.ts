@@ -1,6 +1,6 @@
 import type { DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
-import { finalizeWorkerRunState } from "./index.js";
+import { finalizeWorkerRunState, storedStderr } from "./index.js";
 import { decodePostgresText, POSTGRES_TEXT_ESCAPE_PREFIX } from "./postgresText.js";
 
 function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?: unknown[] }> } {
@@ -21,7 +21,7 @@ function recordingPool(): { pool: DbPool; queries: Array<{ sql: string; params?:
 }
 
 describe("worker run finalization", () => {
-  it("stores exceptional stdout/stderr losslessly so failure finalization remains writable", async () => {
+  it("stores exceptional stderr losslessly so failure finalization remains writable", async () => {
     const { pool, queries } = recordingPool();
     const stdout = "tool bytes\u0000with \"quotes\" and \\slashes";
     const stderr = "failure\u0000\ud800";
@@ -33,9 +33,18 @@ describe("worker run finalization", () => {
     for (const value of update.params ?? []) {
       if (typeof value === "string") expect(value).not.toContain("\u0000");
     }
-    expect(update.params?.[2]).toContain(POSTGRES_TEXT_ESCAPE_PREFIX);
-    expect(decodePostgresText(update.params?.[2] as string)).toBe(stdout);
+    // stdout is parsed into run events as it streams; it is not stored again.
+    expect(update.params?.[2]).toBe("");
+    expect(update.params?.[3]).toContain(POSTGRES_TEXT_ESCAPE_PREFIX);
     expect(decodePostgresText(update.params?.[3] as string)).toBe(stderr);
+  });
+
+  it("keeps only the end of very long stderr, where errors are", () => {
+    const stderr = `${"noise\n".repeat(20_000)}Internal error: You've hit your weekly limit`;
+    const stored = storedStderr(stderr);
+    expect(stored.length).toBe(64 * 1024);
+    expect(stored.endsWith("You've hit your weekly limit")).toBe(true);
+    expect(storedStderr("short")).toBe("short");
   });
 
   it("completes the run, task, and coordination thread in one transaction", async () => {

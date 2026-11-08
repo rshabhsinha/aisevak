@@ -1,4 +1,4 @@
-import { createRuntimeNormalizer, normalizeCodexMessage, redactSecrets, type DbPool } from "@aisevak/core";
+import { boundRuntimeEvent, createRuntimeNormalizer, normalizeCodexMessage, redactSecrets, type DbPool } from "@aisevak/core";
 import { describe, expect, it } from "vitest";
 import { persistCodexLine, persistDispatcherCodexLine } from "./index.js";
 import { decodePostgresJson, decodePostgresText, POSTGRES_TEXT_ESCAPE_PREFIX } from "./postgresText.js";
@@ -50,7 +50,9 @@ describe("normalized provider event storage", () => {
       await persistDispatcherCodexLine(pool, { id: "run-1" }, line, 7, createRuntimeNormalizer("codex"));
     }
     const stored = queries.at(-1)!;
-    const normalized = normalizeCodexMessage(JSON.parse(line));
+    // Stored as bounded: a tool event keeps its normalized item, not the raw message.
+    const normalized = boundRuntimeEvent(normalizeCodexMessage(JSON.parse(line)));
+    expect(normalized.raw.payload).toBeUndefined();
     expect(stored.sql).toContain(kind === "worker" ? "INSERT INTO run_events" : "INSERT INTO dispatcher_run_events");
     expect(stored.params.slice(0, 3)).toEqual(["run-1", 7, "item.completed"]);
     expect(decodePostgresText(stored.params[3] as string)).toBe(normalized.text);
@@ -63,7 +65,7 @@ describe("normalized provider event storage", () => {
     const { pool, queries } = recordingPool();
     const raw = { method: "item/agentMessage/delta", params: { delta: "normal 日本語 😀" } };
     await persistDispatcherCodexLine(pool, { id: "run-1" }, JSON.stringify(raw), 42, createRuntimeNormalizer("codex"));
-    expect(queries[0]?.params).toEqual(["run-1", 42, "content.delta", raw.params.delta, normalizeCodexMessage(raw)]);
+    expect(queries[0]?.params).toEqual(["run-1", 42, "content.delta", raw.params.delta, boundRuntimeEvent(normalizeCodexMessage(raw))]);
   });
 
   it("runs every line of an ACP turn through one normalizer and stores the session id", async () => {
@@ -96,5 +98,31 @@ describe("normalized provider event storage", () => {
     await persistDispatcherCodexLine(pool, { id: "run-1" }, line, 2, createRuntimeNormalizer("codex"));
     expect(queries[0]?.params[2]).toBe("parse.error");
     expect(decodePostgresJson(queries[0]?.params[4])).toMatchObject({ v: 2, type: "parse.error", raw: { payload: line } });
+  });
+});
+
+describe("replayed session history", () => {
+  it.each(["worker", "dispatcher"] as const)("is normalized but not stored for %s runs", async (kind) => {
+    const { pool, queries } = recordingPool();
+    const normalizer = createRuntimeNormalizer("claude");
+    const update = (text: string, replay: boolean) =>
+      JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: { sessionId: "ses_1", update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text } } },
+        ...(replay ? { aisevakReplay: true } : {})
+      });
+    const persist = (line: string, seq: number) =>
+      kind === "worker"
+        ? persistCodexLine(pool, { id: "run-1", task_session_id: "session-1", agent_thread_id: "thread-1" }, line, seq, normalizer)
+        : persistDispatcherCodexLine(pool, { id: "run-1" }, line, seq, normalizer);
+
+    await persist(update("from an earlier run", true), 1);
+    expect(queries).toHaveLength(0);
+
+    await persist(update("new reply", false), 2);
+    const inserts = queries.filter((query) => query.sql.includes("INSERT INTO"));
+    expect(inserts).toHaveLength(1);
+    expect(inserts[0]!.params.slice(0, 3)).toEqual(["run-1", 2, "content.delta"]);
   });
 });

@@ -34,6 +34,17 @@ async function cleanWorkspace(client: PoolClient, worktree: Worktree, root: stri
   await removeCleanManagedWorktree({root,repo:worktree.repo,path:worktree.path,branch:worktree.branch});
 }
 
+async function pathExists(path: string): Promise<boolean> {
+  try { await lstat(path); return true; }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false; throw error; }
+}
+
+async function homeInUseByOpenTask(client: PoolClient, home: string): Promise<boolean> {
+  const result = await client.query(`SELECT 1 FROM task_sessions JOIN tasks ON tasks.id = task_sessions.task_id
+    WHERE task_sessions.codex_home = $1 AND tasks.status NOT IN ('completed','cancelled') LIMIT 1`,[home]);
+  return Boolean(result.rows[0]);
+}
+
 export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: string): Promise<void> {
   const cleanupEnabled = process.env.AISEVAK_AUTO_WORKTREE_CLEANUP !== "0";
   await pool.query("DELETE FROM agent_tool_tokens WHERE expires_at < now()");
@@ -62,12 +73,18 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
         try { await assertNoSymlinks(home); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
         if (await hasLiveWorktreeProcess(home,cachedPids([home]))) throw new Error("Runtime home still has live processes");
         await closeHome(home);
-        if (thread.driver === 'codex' && thread.provider_thread_id) {
-          const archived = Boolean(thread.archived_at);
-          if (thread.cleanup_state === 'restoring' || archived !== Boolean(thread.provider_archived_at)) {
+        // The Codex thread is archived in its provider only when the home is
+        // kept (storage cleanup off). With cleanup on, the whole home is
+        // deleted below, so archiving it first is pointless, and it needs a
+        // working app-server in that home: it used to fail and retry forever.
+        // A restore unarchives a thread whose home is still on disk.
+        if (thread.driver === 'codex' && thread.provider_thread_id && await pathExists(home)) {
+          const archive = Boolean(thread.archived_at) && !cleanupEnabled && !thread.provider_archived_at;
+          const restore = thread.cleanup_state === 'restoring';
+          if (archive || restore) {
             await setCodexThreadArchived({codexBinary:binary,codexHome:home,cwd:root,
-              env:{...process.env,HOME:home,CODEX_HOME:home}},thread.provider_thread_id,archived);
-            await client.query("UPDATE agent_threads SET provider_archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",[thread.id,archived]);
+              env:{...process.env,HOME:home,CODEX_HOME:home}},thread.provider_thread_id,archive);
+            await client.query("UPDATE agent_threads SET provider_archived_at = CASE WHEN $2 THEN now() ELSE NULL END WHERE id = $1",[thread.id,archive]);
           }
         }
         if (thread.archived_at && cleanupEnabled) {
@@ -78,11 +95,14 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
             if (worktree.task_id !== thread.task_id) throw new Error("Historical checkout ownership changed; deferred to completed-task cleanup");
             await cleanWorkspace(client,worktree,root);
           }
-          // Only this runner's re-materialized skill copies are disposable.
-          // Rollouts, transcripts, provider databases and local branches remain.
-          const skills = join(home,'.agents','skills');
-          try { await lstat(skills); await assertNoSymlinks(skills); await rm(skills,{recursive:true}); }
-          catch(error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          // Archiving clears the chat from its harness: the whole runtime home
+          // (provider sessions, transcripts, caches) goes, unless an open
+          // task's worker session still runs in it. A restored chat starts a
+          // fresh provider session; its history stays in the database until
+          // the archive is purged (retention.ts).
+          if (await homeInUseByOpenTask(client, home)) throw new Error("An open task's worker session uses this runtime home");
+          await rm(home,{recursive:true,force:true});
+          await client.query("UPDATE agent_threads SET provider_thread_id = NULL, provider_archived_at = NULL WHERE id = $1",[thread.id]);
         }
         await client.query("UPDATE agent_threads SET cleanup_state = CASE WHEN archived_at IS NULL THEN NULL WHEN $2::boolean THEN 'done' ELSE 'storage_disabled' END, cleanup_error = NULL WHERE id = $1",[thread.id,cleanupEnabled]);
       } catch (error) {

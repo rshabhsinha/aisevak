@@ -19,7 +19,10 @@ import {
 import type { ThreadToolCall } from "../../threadBlocks";
 import { normalizeCompactToolLabel } from "../../agentRunTimeline";
 
-export type ToolCallEntry = Pick<ThreadToolCall, "title" | "command" | "output" | "diffs" | "status" | "exitCode" | "icon">;
+export type ToolCallEntry = Pick<
+  ThreadToolCall,
+  "title" | "command" | "output" | "outputOmittedChars" | "outputEventId" | "diffs" | "status" | "exitCode" | "icon"
+>;
 
 export function ToolCall({ entry }: { entry: ToolCallEntry }): ReactElement {
   const running = entry.status === "running";
@@ -62,12 +65,61 @@ export function ToolCall({ entry }: { entry: ToolCallEntry }): ReactElement {
           {entry.diffs?.map((diff) => (
             <FileDiff key={diff.path} filename={diff.path} diff={diff.diff} defaultExpanded={true} />
           ))}
-          {hasOutput ? (
-            <CodeBlock label={entry.icon === "terminal" ? "output" : "result"} code={entry.output!} streaming={running} />
-          ) : null}
+          {hasOutput ? <ToolOutput entry={entry} running={running} /> : null}
         </div>
       ) : null}
     </div>
+  );
+}
+
+type FullOutput =
+  | { state: "idle" }
+  | { state: "loading" }
+  | { state: "loaded"; output: string; omittedChars: number }
+  | { state: "failed"; error: string };
+
+/** Tool output as sent with the timeline, clipped when large, with the full text on request. */
+function ToolOutput({ entry, running }: { entry: ToolCallEntry; running: boolean }): ReactElement {
+  const [full, setFull] = useState<FullOutput>({ state: "idle" });
+  const omitted = full.state === "loaded" ? full.omittedChars : entry.outputOmittedChars ?? 0;
+  const canLoad = Boolean(entry.outputEventId && entry.outputOmittedChars && full.state !== "loaded");
+
+  async function loadFullOutput() {
+    if (!entry.outputEventId) return;
+    setFull({ state: "loading" });
+    try {
+      const response = await fetch(`/api/timeline-events/${entry.outputEventId}/output`, { credentials: "include" });
+      if (!response.ok) throw new Error((await response.text()) || `Request failed (${response.status})`);
+      const data = (await response.json()) as { output: string; omittedChars: number };
+      setFull({ state: "loaded", output: data.output, omittedChars: data.omittedChars });
+    } catch (error) {
+      setFull({ state: "failed", error: error instanceof Error ? error.message : "Could not load the full output" });
+    }
+  }
+
+  return (
+    <>
+      <CodeBlock
+        label={entry.icon === "terminal" ? "output" : "result"}
+        code={full.state === "loaded" ? full.output : entry.output!}
+        streaming={running}
+      />
+      {omitted > 0 ? (
+        <div className="work-entry-truncated">
+          <span>
+            {full.state === "loaded"
+              ? `${omitted.toLocaleString()} characters were too large to keep.`
+              : `${omitted.toLocaleString()} characters hidden.`}
+          </span>
+          {canLoad ? (
+            <button type="button" onClick={() => void loadFullOutput()} disabled={full.state === "loading"}>
+              {full.state === "loading" ? "Loading…" : "Load full output"}
+            </button>
+          ) : null}
+          {full.state === "failed" ? <span role="alert">{full.error}</span> : null}
+        </div>
+      ) : null}
+    </>
   );
 }
 

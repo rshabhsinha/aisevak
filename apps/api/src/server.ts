@@ -92,6 +92,7 @@ import {
   type AgentContext
 } from "./coordination.js";
 import { assertThreadAcceptsInput, setThreadArchived } from "./threadArchive.js";
+import { fullTimelineOutput, slimTimelineEvent } from "./timelinePayload.js";
 import { agentDeletionBlockReason, planAgentModelUpdate } from "./agents.js";
 import {
   normalizeWorkKey,
@@ -1603,7 +1604,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     ]);
     return {
       run: runResult.rows[0] ?? null,
-      events: withSyntheticUserMessages(runResult.rows, eventsResult.rows)
+      events: withSyntheticUserMessages(runResult.rows, timelineRows(eventsResult.rows))
     };
   });
 
@@ -1628,7 +1629,23 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   app.get("/api/agent-threads/:id", async (request) => {
     requireUser(request);
     const { id } = idParams.parse(request.params);
-    return getAgentThreadTimeline(pool, id);
+    const { after } = z.object({ after: z.string().datetime().optional() }).parse(request.query);
+    return getAgentThreadTimeline(pool, id, after ? new Date(after) : null);
+  });
+
+  app.get("/api/timeline-events/:id/output", async (request) => {
+    requireUser(request);
+    const { id } = idParams.parse(request.params);
+    const result = await pool.query<{ payload: unknown }>(
+      `SELECT payload FROM run_events WHERE id = $1
+       UNION ALL
+       SELECT payload FROM dispatcher_run_events WHERE id = $1
+       LIMIT 1`,
+      [id]
+    );
+    const output = result.rows[0] ? fullTimelineOutput(result.rows[0].payload) : null;
+    if (!output) throwNotFound("This event has no tool output");
+    return output;
   });
 
   app.patch("/api/agent-threads/:id", async (request) => {
@@ -1771,7 +1788,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
       ]);
       return {
         run: mustRow(runResult.rows[0]),
-        events: withSyntheticUserMessages(runResult.rows, eventsResult.rows)
+        events: withSyntheticUserMessages(runResult.rows, timelineRows(eventsResult.rows))
       };
     }
     const source = await pool.query<{ task_id: string; agent_thread_id: string | null }>(
@@ -3115,15 +3132,126 @@ async function getAgentThread(pool: Pick<DbPool, "query">, id: string): Promise<
   return mustRow(result.rows[0]);
 }
 
-async function getAgentThreadTimeline(pool: DbPool, id: string): Promise<{
+// Events commit in roughly created_at order; re-reading this window behind
+// the cursor catches stragglers, and the client dedupes by id.
+const TIMELINE_CURSOR_OVERLAP_MS = 10_000;
+
+/**
+ * A thread's timeline in two parts. `events` are provider and aisevak rows,
+ * which are insert-only, so a poll passes `after` (the previous `cursor`) and
+ * receives only rows created since. `liveEvents` (steer messages, whose
+ * delivery status changes, and prompts synthesized from runs) are small and
+ * always sent whole, replacing the client's previous set.
+ */
+export async function getAgentThreadTimeline(pool: DbPool, id: string, after: Date | null = null): Promise<{
   thread: AgentThreadRow;
   run: TimelineRunRow | null;
   events: TimelineEventRow[];
+  liveEvents: TimelineEventRow[];
+  mode: "full" | "delta";
+  cursor: string | null;
   eventsTruncated?: boolean;
 }> {
   const thread = await getAgentThread(pool, id);
-  const timeline = await getTaskSessionTimeline(pool, thread.task_id, id, false);
-  return { thread, ...timeline };
+  const since = after ? new Date(after.getTime() - TIMELINE_CURSOR_OVERLAP_MS) : null;
+  const [runsResult, initialEvents, inputsResult, userMessageRunsResult] = await Promise.all([
+    queryTimelineRuns(pool, thread.task_id, id),
+    queryAgentThreadEvents(pool, id, since),
+    pool.query<TimelineEventRow>(
+      `SELECT agent_turn_inputs.id,
+              agent_turn_inputs.task_run_id AS run_id,
+              agent_turn_inputs.dispatcher_run_id,
+              0 AS seq,
+              'thread.message-sent' AS event_type,
+              agent_turn_inputs.message AS text,
+              jsonb_build_object(
+                'type', 'thread.message-sent',
+                'role', 'user',
+                'text', agent_turn_inputs.message,
+                'steer', true,
+                'deliveryStatus', agent_turn_inputs.status,
+                'error', agent_turn_inputs.error
+              ) AS payload,
+              agent_turn_inputs.created_at
+       FROM agent_turn_inputs
+       WHERE agent_turn_inputs.agent_thread_id = $1
+       ORDER BY agent_turn_inputs.created_at ASC`,
+      [id]
+    ),
+    pool.query<{ run_id: string }>(
+      `SELECT run_events.run_id
+       FROM run_events
+       JOIN task_runs ON task_runs.id = run_events.run_id
+       WHERE task_runs.agent_thread_id = $1 AND run_events.event_type = 'thread.message-sent'
+       UNION
+       SELECT dispatcher_run_events.dispatcher_run_id
+       FROM dispatcher_run_events
+       JOIN dispatcher_runs ON dispatcher_runs.id = dispatcher_run_events.dispatcher_run_id
+       WHERE dispatcher_runs.agent_thread_id = $1 AND dispatcher_run_events.event_type = 'thread.message-sent'`,
+      [id]
+    )
+  ]);
+  // More new rows than one page: the client's copy has a gap, so resend in full.
+  const delta = since !== null && !initialEvents.truncated;
+  const eventsPage = since !== null && !delta ? await queryAgentThreadEvents(pool, id, null) : initialEvents;
+  const runs = runsResult.rows;
+  const latest = selectPreferredTimelineRun(runs);
+  const inputs = inputsResult.rows;
+  const runsWithUserMessages = new Set([
+    ...userMessageRunsResult.rows.map((row) => row.run_id),
+    ...inputs.flatMap((input) => [input.run_id, input.dispatcher_run_id].filter((runId): runId is string => Boolean(runId)))
+  ]);
+  const latestCreatedAt = eventsPage.rows.reduce<string | null>((latestAt, event) => {
+    const createdAt = dateString(event.created_at);
+    return createdAt && (!latestAt || createdAt > latestAt) ? createdAt : latestAt;
+  }, null);
+  return {
+    thread,
+    run: latest ? { ...latest, prompt: null } : null,
+    events: eventsPage.rows.filter((event) => !isReplayEvent(event)).map(slimTimelineEvent),
+    liveEvents: [...syntheticUserMessages(runs, runsWithUserMessages), ...inputs].sort(compareTimelineEvents),
+    mode: delta ? "delta" : "full",
+    cursor: latestCreatedAt ?? (delta && after ? after.toISOString() : null),
+    ...(!delta && eventsPage.truncated ? { eventsTruncated: true } : {})
+  };
+}
+
+/** The newest page of a thread's insert-only events, optionally only those created after `since`. */
+async function queryAgentThreadEvents(
+  pool: Pick<DbPool, "query">,
+  agentThreadId: string,
+  since: Date | null
+): Promise<{ rows: TimelineEventRow[]; truncated: boolean }> {
+  if (since === null) {
+    // Steer inputs are sent separately as live events.
+    const { events, truncated } = await loadTimelineEvents(pool, null, agentThreadId, MAX_AGENT_THREAD_EVENTS, false);
+    return { rows: events, truncated };
+  }
+  // Only rows created since the client's cursor; one extra row detects a gap.
+  const result = await pool.query<TimelineEventRow>(
+    `SELECT id, run_id, dispatcher_run_id, seq, event_type, text, payload, created_at
+     FROM (
+       SELECT run_events.id, run_events.run_id, NULL::uuid AS dispatcher_run_id, run_events.seq, run_events.event_type,
+              run_events.text, run_events.payload - 'raw' AS payload, run_events.created_at, task_runs.queued_at
+       FROM task_runs
+       JOIN run_events ON run_events.run_id = task_runs.id AND run_events.created_at > $2
+       WHERE task_runs.run_kind = 'worker' AND task_runs.agent_thread_id = $1
+       UNION ALL
+       SELECT dispatcher_run_events.id, NULL::uuid, dispatcher_run_events.dispatcher_run_id, dispatcher_run_events.seq,
+              dispatcher_run_events.event_type, dispatcher_run_events.text, dispatcher_run_events.payload - 'raw',
+              dispatcher_run_events.created_at, dispatcher_runs.queued_at
+       FROM dispatcher_runs
+       JOIN dispatcher_run_events ON dispatcher_run_events.dispatcher_run_id = dispatcher_runs.id
+         AND dispatcher_run_events.created_at > $2
+       WHERE dispatcher_runs.agent_thread_id = $1
+       ORDER BY queued_at DESC, created_at DESC, seq DESC
+       LIMIT $3
+     ) newest_thread_events
+     ORDER BY queued_at ASC, created_at ASC, seq ASC`,
+    [agentThreadId, since, MAX_AGENT_THREAD_EVENTS + 1]
+  );
+  const truncated = result.rows.length > MAX_AGENT_THREAD_EVENTS;
+  return { rows: truncated ? result.rows.slice(1) : result.rows, truncated };
 }
 
 async function createAgentChatThread(
@@ -4729,7 +4857,8 @@ export async function loadTimelineEvents(
   pool: Pick<DbPool, "query">,
   taskId: string | null,
   agentThreadId: string | null,
-  limit: number
+  limit: number,
+  includeInputs = true
 ): Promise<{ events: TimelineEventRow[]; truncated: boolean }> {
   const scopeId = agentThreadId ?? taskId;
   if (!scopeId) return { events: [], truncated: false };
@@ -4776,24 +4905,24 @@ export async function loadTimelineEvents(
         FROM agent_turn_inputs
         LEFT JOIN task_runs ON task_runs.id = agent_turn_inputs.task_run_id
         LEFT JOIN dispatcher_runs ON dispatcher_runs.id = agent_turn_inputs.dispatcher_run_id
-        WHERE ${inputScope}
+        WHERE ${inputScope} AND $3::boolean
         ORDER BY 5 DESC, 4 DESC, 3 DESC, 2 DESC
         LIMIT $2)
      ) task_event_keys
      ORDER BY queued_at DESC, created_at DESC, seq DESC, id DESC
      LIMIT $2`,
-    [scopeId, limit + 1]
+    [scopeId, limit + 1, includeInputs]
   );
   const truncated = keysResult.rows.length > limit;
   const keys = keysResult.rows.slice(0, limit).reverse();
   if (keys.length === 0) return { events: [], truncated };
   const idsFor = (source: TimelineEventSource) => keys.filter((key) => key.source === source).map((key) => key.id);
   const bodiesResult = await pool.query<TimelineEventRow & { source: TimelineEventSource }>(
-    `SELECT 'run'::text AS source, id, run_id, NULL::uuid AS dispatcher_run_id, seq, event_type, text, payload, created_at
+    `SELECT 'run'::text AS source, id, run_id, NULL::uuid AS dispatcher_run_id, seq, event_type, text, payload - 'raw' AS payload, created_at
      FROM run_events
      WHERE id = ANY($1::uuid[])
      UNION ALL
-     SELECT 'dispatcher'::text, id, NULL::uuid, dispatcher_run_id, seq, event_type, text, payload, created_at
+     SELECT 'dispatcher'::text, id, NULL::uuid, dispatcher_run_id, seq, event_type, text, payload - 'raw', created_at
      FROM dispatcher_run_events
      WHERE id = ANY($2::uuid[])
      UNION ALL
@@ -4823,19 +4952,9 @@ export async function loadTimelineEvents(
   return { events, truncated };
 }
 
-export async function getTaskSessionTimeline(
-  pool: DbPool,
-  taskId: string | null,
-  agentThreadId?: string,
-  includeTaskComments = true
-): Promise<{
-  run: TimelineRunRow | null;
-  events: TimelineEventRow[];
-  eventsTruncated?: boolean;
-}> {
-  const [runsResult, eventsResult, commentsResult] = await Promise.all([
-    pool.query<TimelineRunRow>(
-      `SELECT id, kind, trigger, status, model, task_id, task_number, task_title,
+function queryTimelineRuns(pool: Pick<DbPool, "query">, taskId: string | null, agentThreadId?: string) {
+  return pool.query<TimelineRunRow>(
+    `SELECT id, kind, trigger, status, model, task_id, task_number, task_title,
               project_name, agent_name, prompt, queued_at, started_at, finished_at, created_at, error
        FROM (
          SELECT task_runs.id,
@@ -4890,8 +5009,33 @@ export async function getTaskSessionTimeline(
            )
        ) task_runs_and_dispatches
        ORDER BY queued_at ASC, created_at ASC`,
-      [taskId, agentThreadId ?? null]
-    ),
+    [taskId, agentThreadId ?? null]
+  );
+}
+
+/** Stored event rows as a timeline shows them: no replayed history, slimmed payloads. */
+function timelineRows(rows: TimelineEventRow[]): TimelineEventRow[] {
+  return rows.filter((event) => !isReplayEvent(event)).map(slimTimelineEvent);
+}
+
+/** A reloaded harness session's history, stored by runs before the runner stopped persisting it. */
+function isReplayEvent(event: Pick<TimelineEventRow, "payload">): boolean {
+  const payload = event.payload;
+  return Boolean(payload && typeof payload === "object" && (payload as { replay?: unknown }).replay === true);
+}
+
+export async function getTaskSessionTimeline(
+  pool: DbPool,
+  taskId: string | null,
+  agentThreadId?: string,
+  includeTaskComments = true
+): Promise<{
+  run: TimelineRunRow | null;
+  events: TimelineEventRow[];
+  eventsTruncated?: boolean;
+}> {
+  const [runsResult, eventsResult, commentsResult] = await Promise.all([
+    queryTimelineRuns(pool, taskId, agentThreadId),
     loadTimelineEvents(pool, taskId, agentThreadId ?? null, MAX_AGENT_THREAD_EVENTS),
     pool.query<TimelineEventRow>(
       `SELECT task_comments.id,
@@ -4912,7 +5056,8 @@ export async function getTaskSessionTimeline(
   ]);
   const runs = runsResult.rows;
   const latest = selectPreferredTimelineRun(runs);
-  const { events: timelineEvents, truncated: eventsTruncated } = eventsResult;
+  const timelineEvents = timelineRows(eventsResult.events);
+  const eventsTruncated = eventsResult.truncated;
   return {
     run: latest ? { ...latest, prompt: null } : null,
     events: withSyntheticUserMessages(runs, [...timelineEvents, ...commentsResult.rows]),
@@ -4997,7 +5142,15 @@ function withSyntheticUserMessages(
       .map((event) => event.run_id ?? event.dispatcher_run_id)
       .filter((id): id is string => typeof id === "string" && id.length > 0)
   );
-  const synthetic = runs.flatMap((run): TimelineEventRow[] => {
+  return [...syntheticUserMessages(runs, runsWithUserEvents), ...events].sort(compareTimelineEvents);
+}
+
+/** Runs whose prompt has no stored user message get one synthesized from the prompt. */
+function syntheticUserMessages(
+  runs: ReadonlyArray<Pick<TimelineRunRow, "id" | "prompt" | "queued_at">>,
+  runsWithUserEvents: ReadonlySet<string>
+): TimelineEventRow[] {
+  return runs.flatMap((run): TimelineEventRow[] => {
     if (!run.prompt?.trim() || runsWithUserEvents.has(run.id)) return [];
     return [
       {
@@ -5011,7 +5164,6 @@ function withSyntheticUserMessages(
       }
     ];
   });
-  return [...synthetic, ...events].sort(compareTimelineEvents);
 }
 
 function compareTimelineEvents(left: TimelineEventRow, right: TimelineEventRow): number {
@@ -5172,6 +5324,12 @@ function validateSkillFiles(files: Record<string, string>): void {
       throwBadRequest("Aisevak generates SKILL.md from the skill instructions");
     }
   }
+}
+
+function throwNotFound(message: string): never {
+  const error = new Error(message) as Error & { statusCode: number };
+  error.statusCode = 404;
+  throw error;
 }
 
 function throwBadRequest(message: string): never {
@@ -5396,8 +5554,10 @@ async function streamRunEvents(pool: DbPool, runId: string, reply: FastifyReply)
       "SELECT * FROM run_events WHERE run_id = $1 AND seq > $2 ORDER BY seq ASC",
       [runId, seq]
     );
-    for (const event of events.rows) {
-      seq = Math.max(seq, Number(event.seq));
+    for (const row of events.rows) {
+      seq = Math.max(seq, Number(row.seq));
+      if (isReplayEvent(row)) continue;
+      const event = slimTimelineEvent(row);
       reply.raw.write(`event: run_event\n`);
       reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
     }
