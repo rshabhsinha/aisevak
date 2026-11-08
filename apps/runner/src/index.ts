@@ -1421,8 +1421,9 @@ export async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   ].join("\n");
   await pool.query(
     `INSERT INTO dispatcher_runs
-       (trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot)
-     VALUES ('heartbeat', 'heartbeat', '', 'unknown', 'unknown', 'queued', $1, $2, $3, $4, $5, $6)`,
+       (trigger, scope, workspace_key, workspace_mode, workspace_source, status, cwd, codex_home, codex_thread_id, model, prompt, skills_snapshot,
+        provider_instance_id, model_options)
+     VALUES ('heartbeat', 'heartbeat', '', 'unknown', 'unknown', 'queued', $1, $2, $3, $4, $5, $6, $7, $8)`,
     [
       env.managedRoot,
       codexHome,
@@ -1434,7 +1435,11 @@ export async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
       null,
       dispatcher.model,
       heartbeatPrompt,
-      serializeCodexSkillSnapshots(skillsSnapshot)
+      serializeCodexSkillSnapshots(skillsSnapshot),
+      // A heartbeat has no thread to carry the harness: run on the
+      // dispatcher's own, or its model goes to the wrong one.
+      dispatcher.provider_instance_id,
+      JSON.stringify(dispatcher.model_options ?? [])
     ]
   );
 }
@@ -1748,7 +1753,9 @@ export async function processOneDispatcherRun(
             provider_instances.id AS provider_instance_id
      FROM dispatcher_runs
      LEFT JOIN agent_threads ON agent_threads.id = dispatcher_runs.agent_thread_id
-     LEFT JOIN provider_instances ON provider_instances.id = agent_threads.provider_instance_id
+     -- Threadless runs (heartbeats) carry their own harness.
+     LEFT JOIN provider_instances
+       ON provider_instances.id = COALESCE(agent_threads.provider_instance_id, dispatcher_runs.provider_instance_id)
      LEFT JOIN tasks ON tasks.id = dispatcher_runs.task_id
      LEFT JOIN tasks parent ON parent.id = tasks.parent_task_id
      LEFT JOIN task_assignments ON task_assignments.id = dispatcher_runs.assignment_id
@@ -4089,10 +4096,12 @@ async function failPendingAgentTurnInputs(
 export async function getDispatcherAgent(pool: Queryable): Promise<{
   id: string;
   model: string;
+  model_options: unknown;
+  provider_instance_id: string | null;
   instructions: string;
 }> {
-  const result = await pool.query<{ id: string; model: string; instructions: string }>(
-    `SELECT id, model, instructions
+  const result = await pool.query<{ id: string; model: string; model_options: unknown; provider_instance_id: string | null; instructions: string }>(
+    `SELECT id, model, model_options, provider_instance_id, instructions
      FROM agents
      WHERE kind = 'dispatcher' AND enabled = true
      ORDER BY created_at ASC

@@ -23,7 +23,10 @@ describe("dispatcher heartbeat session", () => {
         if (sql.includes("max(created_at)")) return { rows: [{ last_run_at: null }] };
         if (sql.includes("SELECT count(*)")) return { rows: [{ count: "1" }] };
         if (sql.includes("kind = 'dispatcher' AND enabled = true")) {
-          return { rows: [{ id: "dispatcher-id", model: "gpt-test", instructions: "route work" }] };
+          return { rows: [{
+            id: "dispatcher-id", model: "claude-opus-5-5", instructions: "route work",
+            provider_instance_id: "claude-local", model_options: [{ id: "reasoningEffort", value: "xhigh" }]
+          }] };
         }
         return { rows: [] };
       }
@@ -34,6 +37,11 @@ describe("dispatcher heartbeat session", () => {
     const insert = queries.find((query) => query.sql.includes("INSERT INTO dispatcher_runs"));
     expect(insert?.params?.[1]).toBe(`${managedRoot}/codex-homes/dispatcher-heartbeat`);
     expect(insert?.params?.[2]).toBeNull();
+    // A heartbeat has no thread, so it carries the dispatcher's own harness:
+    // without it a Claude model was launched on Codex.
+    expect(insert?.params?.[3]).toBe("claude-opus-5-5");
+    expect(insert?.params?.[6]).toBe("claude-local");
+    expect(JSON.parse(String(insert?.params?.[7]))).toEqual([{ id: "reasoningEffort", value: "xhigh" }]);
     expect(queries.some((query) => query.sql.includes("codex_thread_id") && !query.sql.includes("INSERT"))).toBe(false);
   });
 });
