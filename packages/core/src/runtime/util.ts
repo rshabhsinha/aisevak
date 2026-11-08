@@ -25,11 +25,60 @@ export function compact<T extends object>(value: T): T {
 export function displayText(value: unknown): string | undefined {
   if (value === undefined || value === null) return undefined;
   if (typeof value === "string") return value.length > 0 ? value : undefined;
+  if (isContentBlockList(value)) return contentBlocksText(value);
   try {
-    return JSON.stringify(value, null, 2);
+    return JSON.stringify(value, null, 2).replace(BASE64_RUN, (run) => base64Placeholder(run.length));
   } catch {
     return String(value);
   }
+}
+
+// A JSON string value that is one long base64 run: inline image or file bytes.
+const BASE64_RUN = /(?<=")[A-Za-z0-9+/]{1024,}={0,2}(?=")/g;
+
+function base64Placeholder(chars: number): string {
+  return `[base64 data, ${formatBytes(Math.floor((chars * 3) / 4))}]`;
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+const CONTENT_BLOCK_TYPES = new Set(["text", "image", "audio", "resource", "resource_link"]);
+
+function isContentBlockList(value: unknown): value is unknown[] {
+  return (
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every((entry) => CONTENT_BLOCK_TYPES.has(stringValue(objectValue(entry)?.type) ?? ""))
+  );
+}
+
+/**
+ * MCP / Anthropic content blocks as display text. Images become a short
+ * placeholder: their base64 bytes are unreadable in a timeline and were the
+ * bulk of stored tool output.
+ */
+function contentBlocksText(blocks: unknown[]): string | undefined {
+  const parts = blocks.flatMap((entry) => {
+    const block = objectValue(entry)!;
+    const type = stringValue(block.type);
+    if (type === "text") return [stringValue(block.text) ?? ""];
+    if (type === "image" || type === "audio") {
+      const source = objectValue(block.source);
+      const data = stringValue(block.data) ?? stringValue(source?.data);
+      const mime = stringValue(block.mimeType) ?? stringValue(source?.media_type);
+      const details = [mime, data ? formatBytes(Math.floor((data.length * 3) / 4)) : undefined].filter(Boolean);
+      return [`[${type}${details.length ? `: ${details.join(", ")}` : ""}]`];
+    }
+    if (type === "resource_link") return [stringValue(block.uri) ?? ""];
+    const resource = objectValue(block.resource);
+    return [stringValue(resource?.text) ?? stringValue(resource?.uri) ?? ""];
+  });
+  const text = parts.filter(Boolean).join("\n");
+  return text || undefined;
 }
 
 /** Text of an MCP-style `content: [{type: "text", text}]` result, else its JSON. */

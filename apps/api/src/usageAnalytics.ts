@@ -125,8 +125,10 @@ export async function loadUsageAnalytics(
 }
 
 // Only usage-bearing messages: Codex token updates, ACP usage updates, and ACP
-// prompt results that carry `usage`.
-const USAGE_FILTER = `(
+// prompt results that carry `usage`. Kept identical to USAGE_EVENT_PREDICATE,
+// the predicate of the *_usage_idx partial indexes (packages/core/src/migrations.ts),
+// so the query reads only those rows.
+export const USAGE_FILTER = `(
   e.event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed')
   OR e.payload->'raw'->'result' ? 'usage'
 )`;

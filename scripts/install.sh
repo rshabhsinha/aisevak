@@ -219,6 +219,30 @@ set_env_value() {
   fi
 }
 
+# Each deploy writes a full dump (several GB), so keep only the newest (AISEVAK_BACKUP_KEEP, default 1).
+# Only called after a successful dump, so a failed backup never removes older copies.
+prune_database_backups() {
+  local keep="${AISEVAK_BACKUP_KEEP:-1}"
+  if ! [[ "${keep}" =~ ^[1-9][0-9]*$ ]]; then
+    log "Ignoring invalid AISEVAK_BACKUP_KEEP=${keep}; keeping all database backups"
+    return
+  fi
+
+  local backups=()
+  local backup
+  # Timestamped names sort chronologically; newest last.
+  while IFS= read -r backup; do
+    backups+=("${backup}")
+  done < <(find "${BACKUP_DIR}" -maxdepth 1 -type f -name 'postgres-*.sql.gz' | sort)
+
+  local excess=$(( ${#backups[@]} - keep ))
+  local i
+  for (( i = 0; i < excess; i++ )); do
+    log "Removing old database backup ${backups[i]}"
+    rm -f -- "${backups[i]}"
+  done
+}
+
 backup_database() {
   local required="${1:-${AISEVAK_REQUIRE_BACKUP:-0}}"
 
@@ -265,6 +289,7 @@ backup_database() {
   log "Backing up Postgres to ${DATABASE_BACKUP_FILE}"
   if compose_current exec -T postgres pg_dump -U aisevak -d aisevak | gzip > "${DATABASE_BACKUP_FILE}"; then
     chmod 0600 "${DATABASE_BACKUP_FILE}"
+    prune_database_backups
   else
     rm -f "${DATABASE_BACKUP_FILE}"
     DATABASE_BACKUP_FILE=""

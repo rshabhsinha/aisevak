@@ -145,7 +145,7 @@ describe("agent thread timeline selection", () => {
 
     expect(result.truncated).toBe(true);
     expect(result.events.map((event) => event.id)).toEqual(["e2", "e3"]);
-    expect(queries[0]?.params).toEqual(["task-id", 3]);
+    expect(queries[0]?.params).toEqual(["task-id", 3, true]);
     expect(queries[0]?.sql).toContain("dispatcher_runs.task_id = $1");
     expect(queries[0]?.sql).not.toMatch(/OVER \(|payload|\.text\b|\.message\b/);
     expect(queries[1]?.params).toEqual([["e2", "e3"], [], []]);

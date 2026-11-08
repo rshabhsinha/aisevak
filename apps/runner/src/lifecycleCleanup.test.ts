@@ -10,7 +10,7 @@ vi.mock("./worktreeCleanup.js",async original=>({...await original<typeof import
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
 let root:string;
 afterEach(async()=>{vi.clearAllMocks();vi.unstubAllEnvs();mocks.archive.mockReset();mocks.live.mockResolvedValue(false);if(root)await rm(root,{recursive:true,force:true});});
-async function fixture(options:{restore?:boolean;busy?:boolean;shared?:boolean}={}) {
+async function fixture(options:{restore?:boolean;busy?:boolean;shared?:boolean;openTaskSession?:boolean}={}) {
  root=await realpath(await mkdtemp(join(tmpdir(),"aisevak-lifecycle-")));
  const home=join(root,"codex-homes","chat");await mkdir(join(home,".agents","skills"),{recursive:true});await writeFile(join(home,"history.jsonl"),"retained transcript");
  const thread={id:'chat',task_id:'task',runtime_home:home,provider_thread_id:'provider',driver:'codex',archived_at:options.restore?null:new Date(),cleanup_state:options.restore?'restoring':'pending',provider_archived_at:null as Date|null};
@@ -20,16 +20,19 @@ async function fixture(options:{restore?:boolean;busy?:boolean;shared?:boolean}=
   if(sql.includes('provider_instances.driver'))return {rows:[thread]};
   if(sql.includes('SELECT 1 FROM (SELECT agent_thread_id'))return {rows:options.busy?[{id:'run'}]:[]};
   if(sql.includes('runtime_home = $2'))return {rows:options.shared?[{id:'another-chat'}]:[]};
+  if(sql.includes('FROM task_sessions JOIN tasks'))return {rows:options.openTaskSession?[{}]:[]};
   return {rows:[]};};
  const pool={query,connect:async()=>({query,release(){}})} as unknown as DbPool;
  return {home,thread,queries,pool};
 }
 describe('durable lifecycle cleanup',()=>{
- it('archives Codex and removes generated skills while retaining chat history',async()=>{
+ it('clears an archived chat from its harness: the whole runtime home goes',async()=>{
   const f=await fixture();await sweepLifecycleCleanup(f.pool,root,'codex');
-  expect(mocks.archive).toHaveBeenCalledWith(expect.anything(),'provider',true);
-  await expect(lstat(join(f.home,'.agents','skills'))).rejects.toMatchObject({code:'ENOENT'});
-  expect(await readFile(join(f.home,'history.jsonl'),'utf8')).toBe('retained transcript');
+  // Deleting the home makes archiving the provider thread first pointless.
+  expect(mocks.archive).not.toHaveBeenCalled();
+  await expect(lstat(f.home)).rejects.toMatchObject({code:'ENOENT'});
+  // A restored chat starts a fresh provider session.
+  expect(f.queries.find(q=>q.sql.includes('SET provider_thread_id = NULL'))?.params).toEqual(['chat']);
   expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(true);
   // The transaction outlives the pool's idle-in-transaction limit while it archives and removes files.
   const optOut=f.queries.findIndex(q=>q.sql==="SET LOCAL idle_in_transaction_session_timeout = 0");
@@ -41,8 +44,14 @@ describe('durable lifecycle cleanup',()=>{
   expect(mocks.archive).not.toHaveBeenCalled();expect(await lstat(join(f.home,'.agents','skills'))).toBeTruthy();
   expect(f.queries.some(q=>q.sql.includes('SET cleanup_error = $2'))).toBe(true);
  });
+ it('keeps the home while an open task worker session still uses it',async()=>{
+  const f=await fixture({openTaskSession:true});
+  await sweepLifecycleCleanup(f.pool,root,'codex');
+  expect(await readFile(join(f.home,'history.jsonl'),'utf8')).toBe('retained transcript');
+  expect(f.queries.find(q=>q.sql.includes('SET cleanup_error = $2'))?.params).toEqual(['chat',"An open task's worker session uses this runtime home"]);
+ });
  it('retains pending retry state after archive RPC failure',async()=>{
-  const f=await fixture();mocks.archive.mockRejectedValue(new Error('provider unavailable'));
+  const f=await fixture();vi.stubEnv('AISEVAK_AUTO_WORKTREE_CLEANUP','0');mocks.archive.mockRejectedValue(new Error('provider unavailable'));
   await sweepLifecycleCleanup(f.pool,root,'codex');
   expect(f.queries.find(q=>q.sql.includes('SET cleanup_error = $2'))?.params).toEqual(['chat','provider unavailable']);
   expect(f.queries.some(q=>q.sql.includes("THEN 'done' ELSE 'storage_disabled' END"))).toBe(false);

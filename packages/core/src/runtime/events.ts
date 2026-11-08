@@ -61,6 +61,8 @@ export interface RuntimeItem {
   cwd?: string;
   exitCode?: number;
   output?: string;
+  /** Characters cut from the middle of `output` to keep it within size limits. */
+  outputOmittedChars?: number;
   changes?: RuntimeFileChange[];
   toolName?: string;
   input?: unknown;
@@ -128,7 +130,8 @@ export interface RuntimeNotice {
 export interface RuntimeRaw {
   source: "codex.app-server" | "acp.jsonrpc" | "aisevak";
   method?: string;
-  payload: unknown;
+  /** Kept only where something reads it after storage (see keepsRawPayload). */
+  payload?: unknown;
 }
 
 export interface RuntimeEvent {

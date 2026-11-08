@@ -331,7 +331,7 @@ describe("provider fixtures render", () => {
     const blocks = deriveThreadBlocks({ run: null, events: providerEvents(name.split("-")[0] as RuntimeProvider, lines) });
     // Block ids embed counters; snapshot the content.
     const content = blocks.map(({ id: _id, createdAt: _createdAt, ...block }) =>
-      block.kind === "tools" ? { ...block, entries: block.entries.map(({ createdAt: _entryCreatedAt, ...entry }) => entry) } : block
+      block.kind === "tools" ? { ...block, entries: block.entries.map(({ createdAt: _entryCreatedAt, outputEventId: _outputEventId, ...entry }) => entry) } : block
     );
     await expect(`${JSON.stringify(content, null, 2)}\n`).toMatchFileSnapshot(`./__fixtures__/${name}.blocks.json`);
   });
