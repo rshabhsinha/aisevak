@@ -20,10 +20,10 @@ export interface AcpTurnOptions extends Omit<AppServerTurnOptions, "codexBinary"
   // ACP `authenticate` parameter (sent as _meta.api_key). Devin requires this —
   // it intentionally does not read CLI credentials in ACP mode.
   apiKey?: string | null;
-  // The harness reports cost as a running total that restarts at zero in each
-  // new process (claude-agent-acp). Other ACP harnesses may carry the total
-  // across processes, so their first reading in a process only sets the baseline.
-  costRestartsPerProcess?: boolean;
+  // The session's last stored cost reading. ACP harnesses report cost as the
+  // session's running total, which claude-agent-acp restores when a new
+  // process loads the session, so a resumed session's spend is measured from it.
+  sessionCostBaseline?: (sessionId: string) => Promise<number | undefined>;
   // Extra identity for the cached harness process. Drivers that take their
   // credential or model from the environment (Claude Code) set this so a new
   // credential or model starts a fresh process instead of reusing the old one.
@@ -126,12 +126,10 @@ class PersistentAcpSession {
   // From the `initialize` result: whether `session/prompt` accepts image blocks.
   private supportsImages = false;
   private sessionId: string | null = null;
-  // claude-agent-acp reports cost as the running total of this process's
-  // session (it restarts from zero in a new process): remember the last total
-  // per session so each reading can carry the spend since the previous one.
+  // The last cost total seen per session, so each reading can carry the
+  // spend since the previous one.
   private readonly reportedCost = new Map<string, number>();
   private replaying = false;
-  private readonly costRestartsPerProcess: boolean;
   lastUsedAt = Date.now();
   isRunning = false;
   private lastActivityAt = Date.now();
@@ -145,7 +143,6 @@ class PersistentAcpSession {
     onClose: () => void
   ) {
     this.connectionKey = acpConnectionKey(initial);
-    this.costRestartsPerProcess = initial.costRestartsPerProcess === true;
     this.child = spawn(initial.binary, initial.args, {
       cwd: initial.cwd,
       env: initial.env,
@@ -239,11 +236,21 @@ class PersistentAcpSession {
           this.replaying = false;
         }
       }
+      let createdSession = false;
       if (!this.sessionId) {
         const created = await this.request("session/new", { cwd: options.cwd, mcpServers: [] });
         this.sessionId = extractAcpSessionId(created) ?? null;
+        createdSession = true;
       }
       if (!this.sessionId) throw new Error("ACP harness did not return a session id");
+      if (!this.reportedCost.has(this.sessionId)) {
+        // A new session starts at zero; a resumed one from its last stored
+        // reading. Without one, its first reading only sets the baseline.
+        const baseline = createdSession
+          ? 0
+          : await options.sessionCostBaseline?.(this.sessionId).catch(() => undefined);
+        if (baseline !== undefined) this.reportedCost.set(this.sessionId, baseline);
+      }
       await options.onThreadId(this.sessionId);
       await this.applyModel(options);
 
@@ -517,7 +524,7 @@ class PersistentAcpSession {
     const amount = params?.update?.cost?.amount;
     if (params?.update?.sessionUpdate !== "usage_update" || typeof amount !== "number" || !Number.isFinite(amount)) return undefined;
     const session = typeof params.sessionId === "string" ? params.sessionId : "";
-    const previous = this.reportedCost.get(session) ?? (this.costRestartsPerProcess ? 0 : undefined);
+    const previous = this.reportedCost.get(session);
     this.reportedCost.set(session, amount);
     if (previous === undefined) return undefined;
     // A lower total means the harness started counting again.

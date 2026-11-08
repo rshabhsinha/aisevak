@@ -266,12 +266,13 @@ readline.createInterface({input:process.stdin}).on('line', line => {
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
 
-it("stamps each cost reading with the spend since the process's previous reading", async () => {
+it("stamps each cost reading with the spend since the session's previous reading", async () => {
   const home = await mkdtemp(join(tmpdir(), "aisevak-acp-test-"));
   const script = join(home, "fake.cjs");
-  // Like claude-agent-acp: cost is this process's running total for the session.
+  // Like claude-agent-acp: cost is the session's running total, restored (START)
+  // when a new process loads the session.
   await writeFile(script, `const readline = require('node:readline');
-let total = 0;
+let total = Number(process.env.START || 0);
 const usage = amount => console.log(JSON.stringify({method:'session/update',params:{sessionId:'s1',update:{sessionUpdate:'usage_update',used:1,size:2,cost:{amount,currency:'USD'}}}}));
 readline.createInterface({input:process.stdin}).on('line', line => {
  const m = JSON.parse(line);
@@ -281,35 +282,54 @@ readline.createInterface({input:process.stdin}).on('line', line => {
  console.log(JSON.stringify({id:m.id,result:m.method === 'session/prompt' ? {stopReason:'end_turn'} : {sessionId:'s1'}}));
 });`);
   const stamps: unknown[] = [];
+  const lookups: string[] = [];
+  let stored: number | undefined;
   const options = {
     binary: process.execPath, args: [script], cwd: home, runtimeHome: home,
-    model: "auto", prompt: "hello", threadId: "s1", env: process.env, secrets: [],
-    costRestartsPerProcess: true,
+    model: "auto", prompt: "hello", threadId: null as string | null, env: process.env, secrets: [],
+    sessionCostBaseline: async (sessionId: string) => { lookups.push(sessionId); return stored; },
     onLine: async (line: string) => {
       const message = JSON.parse(line);
       if (message.params?.update?.sessionUpdate === "usage_update") stamps.push(message.aisevakTurnCost);
     },
     onThreadId: async () => {}, shouldCancel: async () => false
   };
+  const resumed = { ...options, threadId: "s1" };
   try {
+    // A new session starts at zero.
     expect((await runAcpTurn(options)).status).toBe("completed");
-    expect((await runAcpTurn({ ...options, prompt: "big" })).status).toBe("completed");
+    // The cached process remembers its last reading; replays from
+    // session/load (99) are history, not spend.
+    expect((await runAcpTurn({ ...resumed, prompt: "big" })).status).toBe("completed");
     // Spend the harness reports between turns lands in the next turn's reading.
-    expect((await runAcpTurn({ ...options, prompt: "later" })).status).toBe("completed");
+    expect((await runAcpTurn({ ...resumed, prompt: "later" })).status).toBe("completed");
     await new Promise(resolve => setTimeout(resolve, 1000));
-    expect((await runAcpTurn(options)).status).toBe("completed");
-    // A new process counts from zero again, even though its total is lower.
-    await closeAllAcpSessions();
-    expect((await runAcpTurn(options)).status).toBe("completed");
-    // Readings replayed by session/load are history, not new spend.
-    expect(stamps).toEqual([undefined, 0.75, undefined, 2.5, undefined, 0.75, undefined, 1.75, undefined, 0.75]);
-    // A harness whose total may carry across processes: a new process's first
-    // reading only sets the baseline.
+    expect((await runAcpTurn(resumed)).status).toBe("completed");
+    expect(stamps).toEqual([0.75, undefined, 2.5, undefined, 0.75, undefined, 1.75]);
+    expect(lookups).toEqual([]);
+
+    // A new process that restores the total measures from the stored reading.
     stamps.length = 0;
     await closeAllAcpSessions();
-    const carried = { ...options, costRestartsPerProcess: false };
-    expect((await runAcpTurn(carried)).status).toBe("completed");
-    expect((await runAcpTurn(carried)).status).toBe("completed");
+    stored = 28.32;
+    const restored = { ...resumed, env: { ...process.env, START: "28.32" } };
+    expect((await runAcpTurn(restored)).status).toBe("completed");
+    expect(stamps.at(-1)).toBeCloseTo(0.75);
+    expect(lookups).toEqual(["s1"]);
+
+    // Without a stored reading, the first reading only sets the baseline.
+    stamps.length = 0;
+    await closeAllAcpSessions();
+    stored = undefined;
+    expect((await runAcpTurn(restored)).status).toBe("completed");
+    expect((await runAcpTurn(restored)).status).toBe("completed");
     expect(stamps).toEqual([undefined, undefined, undefined, 0.75]);
+
+    // A total lower than the stored one means the harness counted afresh.
+    stamps.length = 0;
+    await closeAllAcpSessions();
+    stored = 40;
+    expect((await runAcpTurn(resumed)).status).toBe("completed");
+    expect(stamps).toEqual([undefined, 0.75]);
   } finally { await closeAllAcpSessions(); await rm(home, { recursive: true, force: true }); }
 });
