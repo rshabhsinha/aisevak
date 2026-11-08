@@ -9,7 +9,8 @@
 // holds long locks or one huge transaction; the next sweep continues it.
 
 import type { DbPool } from "@aisevak/core";
-import { chmod, lstat, readdir, rm } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, open, readdir, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathContains } from "./worktreeCleanup.js";
 
@@ -489,8 +490,21 @@ async function forceRemove(path: string): Promise<void> {
 }
 
 async function makeDirectoriesWritable(path: string): Promise<void> {
-  const stats = await lstat(path);
-  if (!stats.isDirectory()) return;
-  await chmod(path, (stats.mode & 0o777) | 0o700);
+  // Opened without following a symlink, so a directory swapped for a link
+  // after the age check never changes the link's target.
+  let handle;
+  try {
+    handle = await open(path, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOTDIR" || code === "ELOOP" || code === "ENOENT") return;
+    throw error;
+  }
+  try {
+    const stats = await handle.stat();
+    await handle.chmod((stats.mode & 0o777) | 0o700);
+  } finally {
+    await handle.close();
+  }
   for (const name of await readdir(path)) await makeDirectoriesWritable(join(path, name));
 }

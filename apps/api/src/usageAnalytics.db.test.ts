@@ -38,8 +38,9 @@ describe.skipIf(!databaseUrl)("usage analytics indexes", () => {
     }
   });
 
-  it("backfills stored usage events once and serves the cost tab from them", async () => {
+  it("backfills stored usage events until it completes and serves the cost tab from them", async () => {
     await pool.query("DELETE FROM usage_events");
+    await pool.query("DELETE FROM aisevak_maintenance WHERE name = 'usage_events_backfilled'");
     const [run] = (await pool.query(
       `INSERT INTO dispatcher_runs (scope, status, cwd, codex_home, model, prompt)
        VALUES ('coordination', 'succeeded', '/tmp', '/tmp', 'claude-backfill-test', 'p') RETURNING id`
@@ -50,11 +51,20 @@ describe.skipIf(!databaseUrl)("usage analytics indexes", () => {
        ($1, 1, 'turn.completed', $2), ($1, 2, 'content.delta', '{"v":2,"type":"content.delta"}'::jsonb)`,
       [run.id, JSON.stringify(turn)]
     );
+    // A live copy already landed (usage written before the backfill ran): the
+    // backfill still runs, since only its own completion marker stops it.
+    await pool.query(
+      `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
+       VALUES (gen_random_uuid(), 'dispatcher', $1, 'usage.updated', '{}'::jsonb, now())`,
+      [run.id]
+    );
     // Other test files share the database: count only this run's rows.
     expect(await backfillUsageEvents(pool)).toBeGreaterThanOrEqual(1);
-    expect((await pool.query("SELECT event_type FROM usage_events WHERE run_id = $1", [run.id])).rows).toEqual([{ event_type: "turn.completed" }]);
-    // Only while the table is empty: later boots copy nothing.
-    expect(await backfillUsageEvents(pool)).toBe(0);
+    expect((await pool.query("SELECT event_type FROM usage_events WHERE run_id = $1 ORDER BY event_type", [run.id])).rows)
+      .toEqual([{ event_type: "turn.completed" }, { event_type: "usage.updated" }]);
+    await pool.query("DELETE FROM usage_events WHERE run_id = $1 AND event_type = 'usage.updated'", [run.id]);
+    // Done once both copies committed: later boots skip it.
+    expect(await backfillUsageEvents(pool)).toBeNull();
     const pricing = { source: "bundled" as const, lookup: () => ({ input: 1, cachedInput: 0, cacheWrite: 0, output: 1 }) };
     const analytics = await loadUsageAnalytics(pool, { days: 30, tzOffsetMinutes: 0, pricing });
     const claude = analytics.harnesses.find((harness) => harness.driver === "claude");

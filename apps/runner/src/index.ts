@@ -66,7 +66,7 @@ import {
 } from "./githubCli.js";
 import { pruneHeartbeatRollouts } from "./heartbeatRollouts.js";
 import { sweepLifecycleCleanup } from "./lifecycleCleanup.js";
-import { retentionPolicyFromEnv, sweepRetention } from "./retention.js";
+import { sweepRetention } from "./retention.js";
 import { recreateManagedWorktree } from "./worktreeCleanup.js";
 import { skillMarkdown } from "./skillMarkdown.js";
 import { MAX_USAGE_LIMIT_WAITS, parseUsageLimit, usageLimitRetryAt, withUsageLimitPreamble } from "./providerLimits.js";
@@ -204,9 +204,10 @@ async function main(): Promise<void> {
   await mkdir(sharedNpmCacheDir(), { recursive: true });
   // Built concurrently in the background: live turns keep writing events meanwhile.
   void ensureConcurrentIndexes(pool)
-    .then(() => backfillUsageEvents(pool, retentionPolicyFromEnv().retentionDays || 30))
-    .then((copied) => { if (copied) console.info(`Copied ${copied} stored usage events for the cost tab`); })
-    .catch((error) => console.error("Building event indexes failed", error));
+    .catch((error) => console.error("Building event indexes failed", error))
+    .then(() => backfillUsageEvents(pool))
+    .then((copied) => { if (copied !== null) console.info(`Copied ${copied} stored usage events for the cost tab`); })
+    .catch((error) => console.error("Copying stored usage events failed; retried at the next boot", error));
   await recoverInterruptedGithubJobs(pool);
   await recoverAmbiguousWorkspaceRuns(pool);
   const bootScope = bootRecoveryScope();

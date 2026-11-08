@@ -50,7 +50,7 @@ export async function sweepLifecycleCleanup(pool: DbPool, root: string, binary: 
   await pool.query("DELETE FROM agent_tool_tokens WHERE expires_at < now()");
   const pending = await pool.query<{id:string;task_id:string|null}>(`SELECT id, task_id FROM agent_threads
     WHERE cleanup_state IN ('pending','restoring','storage_disabled') AND ($1::boolean OR cleanup_state <> 'storage_disabled') AND (cleanup_attempt_at IS NULL OR cleanup_attempt_at < now() - interval '5 minutes')
-    ORDER BY cleanup_attempt_at NULLS FIRST, updated_at LIMIT 5`,[cleanupEnabled]);
+    ORDER BY cleanup_attempt_at NULLS FIRST, updated_at LIMIT 25`,[cleanupEnabled]);
   for (const candidate of pending.rows) {
     await withTransaction(pool, async client => {
       // Cleanup holds its row locks across slow filesystem, git and provider work.

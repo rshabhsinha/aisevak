@@ -1453,13 +1453,18 @@ CREATE TABLE IF NOT EXISTS usage_events (
   created_at timestamptz NOT NULL
 );
 CREATE INDEX IF NOT EXISTS usage_events_created_idx ON usage_events (created_at);
+-- One-time maintenance steps that must finish once, recorded when they did.
+CREATE TABLE IF NOT EXISTS aisevak_maintenance (
+  name text PRIMARY KEY,
+  completed_at timestamptz NOT NULL DEFAULT now()
+);
 `;
 
 /**
  * Usage analytics (the cost tab) reads only usage-bearing events in a date
  * range; without these it scanned and decompressed every event payload and
- * hit the statement timeout. The predicate must stay identical to
- * USAGE_FILTER in apps/api/src/usageAnalytics.ts.
+ * hit the statement timeout. The runner also uses this predicate to copy
+ * usage events into usage_events, which the cost tab reads.
  */
 export const USAGE_EVENT_PREDICATE =
   "(event_type IN ('usage.updated', 'thread/tokenUsage/updated', 'usage_update', 'turn.completed') OR payload->'raw'->'result' ? 'usage')";
@@ -1497,16 +1502,18 @@ export async function ensureConcurrentIndexes(pool: Pool): Promise<void> {
 }
 
 /**
- * Copy usage events stored before usage_events existed (the last `days`), once:
- * only while the table is still empty. Uses the partial usage indexes, so call
- * it after ensureConcurrentIndexes. Safe to repeat; rows already copied are kept.
+ * Copy usage events stored before usage_events existed. Repeated on every boot
+ * until both copies have committed (recorded in aisevak_maintenance); rows
+ * already copied are skipped, so an interrupted run just continues. No date
+ * bound: the cost tab can show up to a year, and retention already bounds the
+ * event tables. Uses the partial usage indexes: call after ensureConcurrentIndexes.
  */
-export async function backfillUsageEvents(pool: Pool, days = 30): Promise<number> {
+export async function backfillUsageEvents(pool: Pool): Promise<number | null> {
   const client = await pool.connect();
   try {
     await client.query("SET statement_timeout = 0");
-    const existing = await client.query("SELECT 1 FROM usage_events LIMIT 1");
-    if (existing.rows[0]) return 0;
+    const done = await client.query("SELECT 1 FROM aisevak_maintenance WHERE name = 'usage_events_backfilled'");
+    if (done.rows[0]) return null;
     let copied = 0;
     for (const [table, runKind, runColumn] of [
       ["dispatcher_run_events", "dispatcher", "dispatcher_run_id"],
@@ -1515,12 +1522,12 @@ export async function backfillUsageEvents(pool: Pool, days = 30): Promise<number
       const result = await client.query(
         `INSERT INTO usage_events (event_id, run_kind, run_id, event_type, payload, created_at)
          SELECT id, '${runKind}', ${runColumn}, event_type, payload, created_at FROM ${table}
-         WHERE created_at >= now() - $1::interval AND ${USAGE_EVENT_PREDICATE}
-         ON CONFLICT (event_id) DO NOTHING`,
-        [`${days} days`]
+         WHERE ${USAGE_EVENT_PREDICATE}
+         ON CONFLICT (event_id) DO NOTHING`
       );
       copied += result.rowCount ?? 0;
     }
+    await client.query("INSERT INTO aisevak_maintenance (name) VALUES ('usage_events_backfilled') ON CONFLICT (name) DO NOTHING");
     return copied;
   } finally {
     try {
