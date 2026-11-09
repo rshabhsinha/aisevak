@@ -81,6 +81,7 @@ import {
   runTakenOver,
   startRunLeaseHeartbeat,
   trackActiveRun,
+  activeRunIds,
   withInterruptedPreamble,
   type RecoveryScope
 } from "./runLeases.js";
@@ -409,6 +410,8 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool, scope: Re
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("dispatcher"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
 
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
@@ -565,6 +568,8 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool, scope: Reco
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("dispatcher"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
 
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
@@ -629,6 +634,8 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("worker"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
     const error = run.status === "cancel_requested"

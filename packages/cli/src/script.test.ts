@@ -15,6 +15,38 @@ afterEach(async () => {
 });
 
 describe("embedded aisevak CLI", () => {
+  it("prints a command's help for --help anywhere and never sends the command", async () => {
+    let requests = 0;
+    const server = createServer((_request, response) => {
+      requests += 1;
+      response.setHeader("content-type", "application/json");
+      response.end("{}");
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const run = (...cliArgs: string[]) => execFileAsync(process.execPath, [cliPath, ...cliArgs], {
+      env: { ...process.env, AISEVAK_API_URL: `http://127.0.0.1:${address.port}`, AISEVAK_AGENT_TOKEN: "test-token" }
+    });
+    try {
+      // Before, these resolved the incident and published the report.
+      expect((await run("incidents", "resolve", "INC-1", "--help")).stdout).toContain("aisevak incidents resolve INCIDENT [--markdown-stdin]");
+      expect((await run("reports", "publish", "REPORT-1", "-h")).stdout).toContain("--base-revision N");
+      // Before, these failed with "Task reference is required".
+      expect((await run("tasks", "--help")).stdout).toContain("aisevak tasks update TASK [--title T]");
+      expect((await run("task", "update", "--help")).stdout).toContain("aisevak tasks update TASK");
+      expect((await run("help", "threads")).stdout).toContain("aisevak threads send THREAD --body-stdin");
+      expect((await run("--help")).stdout).toContain("aisevak COMMAND --help");
+      expect(requests).toBe(0);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("does not advertise an empty POST body as JSON", async () => {
     let contentType: string | undefined;
     const server = createServer((request, response) => {

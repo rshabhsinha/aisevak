@@ -30,9 +30,9 @@ describe("run leases", () => {
     expect(sql).toBe("(runs.runner_id IS NULL OR runs.runner_id = $1 OR runs.lease_expires_at < now() - interval '120000 milliseconds')");
   });
 
-  it("lets a sweep take over only other runners' expired turns", () => {
+  it("lets a sweep take over expired turns, this runner's own included", () => {
     const sql = recoverableRunPredicate({ runnerId: "runner-a", boot: false }, "runs", "$2");
-    expect(sql).toBe("(runs.runner_id IS NOT NULL AND runs.runner_id <> $2 AND runs.lease_expires_at < now() - interval '120000 milliseconds')");
+    expect(sql).toBe("($2::text IS NOT NULL AND runs.runner_id IS NOT NULL AND runs.lease_expires_at < now() - interval '120000 milliseconds')");
   });
 
   it("recovers everything at boot and nothing in sweeps in legacy mode, still binding the parameter", () => {

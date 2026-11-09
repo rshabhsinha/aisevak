@@ -57,12 +57,17 @@ export function bootRecoveryScope(): RecoveryScope {
 export function recoverableRunPredicate(scope: RecoveryScope, alias: string, param: string): string {
   // The legacy forms still reference the parameter so callers bind the same values.
   if (legacyCoordination()) return scope.boot ? `(${param}::text IS NULL OR true)` : `(${param}::text IS NULL AND false)`;
-  // Another runner's turn is only taken over past the grace period, at boot
-  // as in sweeps; this runner's own previous turns are recovered at once.
-  const othersExpired = `${alias}.lease_expires_at < now() - interval '${RUN_TAKEOVER_GRACE_MS} milliseconds'`;
+  // A turn is only taken over past the grace period. At boot this runner's own
+  // previous turns are recovered at once. A sweep also takes over this
+  // runner's own expired turns: a job that failed between claiming a turn and
+  // tracking it (a database timeout, say) leaves a row nothing renews, and
+  // without this it stayed 'running' until the next restart. Callers skip the
+  // turns this process is executing (see activeRunIds), whose leases a
+  // database outage may have let lapse.
+  const expired = `${alias}.lease_expires_at < now() - interval '${RUN_TAKEOVER_GRACE_MS} milliseconds'`;
   return scope.boot
-    ? `(${alias}.runner_id IS NULL OR ${alias}.runner_id = ${param} OR ${othersExpired})`
-    : `(${alias}.runner_id IS NOT NULL AND ${alias}.runner_id <> ${param} AND ${othersExpired})`;
+    ? `(${alias}.runner_id IS NULL OR ${alias}.runner_id = ${param} OR ${expired})`
+    : `(${param}::text IS NOT NULL AND ${alias}.runner_id IS NOT NULL AND ${expired})`;
 }
 
 
