@@ -11,7 +11,13 @@ if (!token) fail("AISEVAK_AGENT_TOKEN is missing", "AUTH_MISSING");
 main().catch((error) => fail(error && error.message ? error.message : String(error), error && error.code));
 
 async function main() {
-  if (!args.length || ["help", "--help", "-h"].includes(args[0])) return help();
+  // --help anywhere prints help and returns before any request: an ignored
+  // flag would let "incidents resolve INC-1 --help" resolve the incident.
+  if (!args.length || args[0] === "help") return help(args[1]);
+  // "--help" can never be a value or message text (both skip "--" words), so it
+  // counts anywhere. "-h" only counts right after the command or last, so a
+  // "-h" inside positional message text is still sent as text.
+  if (args.includes("--help") || args.some((arg, index) => arg === "-h" && (index <= 2 || index === args.length - 1))) return help(args[0]);
   const root = args[0];
   if (root === "whoami") return print(await request("/api/agent-tools/v1/whoami"));
   if (root === "capabilities") return print(await request("/api/agent-tools/v1/capabilities"));
@@ -321,7 +327,74 @@ async function markdown(flag, restIndex) { const value = await optionalMarkdown(
 async function readStdin() { let value = ""; for await (const chunk of process.stdin) value += String(chunk); return value.replace(/\\r?\\n$/, ""); }
 function print(value) { console.log(JSON.stringify(value, null, 2)); }
 function fail(message, code = "CLI_ERROR") { console.error(JSON.stringify({ error: { code, message } })); process.exit(1); }
-function help() { console.log([
+// A function, not a constant: main() runs before top-level constants below it are initialized.
+function commandHelp() { return {
+  agents: [
+    "aisevak agents list [--status S] [--query Q] [--limit N] [--cursor C]",
+    "aisevak agents show AGENT | agents status AGENT"
+  ],
+  threads: [
+    "aisevak threads list [--status S] [--query Q] [--limit N] [--cursor C]",
+    "aisevak threads show THREAD | status THREAD | messages THREAD [--limit N] [--cursor C]",
+    "aisevak threads create --title T --description D --to AGENT --purpose-stdin [--task TASK] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--origin-thread THREAD] [--origin-message MESSAGE] [--idempotency-key KEY]",
+    "aisevak threads send THREAD --body-stdin [--to AGENT] [--reply-to MESSAGE] [--idempotency-key KEY]",
+    "aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]",
+    "aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]",
+    "aisevak threads refresh THREAD [--every N|none] [--now]",
+    "Thread references accept THREAD-n, TASK-n, or a thread id shown in the UI."
+  ],
+  tasks: [
+    "aisevak tasks list [--status S] [--query Q] [--limit N] [--cursor C]",
+    "aisevak tasks show TASK",
+    "aisevak tasks create --title T --description D --body-stdin [--status S] [--agent AGENT] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--parent-task TASK] [--idempotency-key KEY]",
+    "aisevak tasks update TASK [--title T] [--description D] [--body-stdin] [--status S]",
+    "aisevak tasks comment TASK --body-stdin",
+    "aisevak tasks attention TASK --reason-stdin",
+    "aisevak tasks assign TASK --agent AGENT",
+    "aisevak tasks complete|reopen TASK [--summary-stdin]",
+    "aisevak tasks reparent TASK... --parent TASK",
+    "aisevak tasks policy TASK [--max-active-assignments N] [--max-active-children N] [--max-child-depth N] [--max-assignment-attempts N]"
+  ],
+  assignments: [
+    "aisevak assignments list TASK | show ASSIGNMENT",
+    "aisevak assignments create TASK --key KEY --to AGENT --instructions-stdin [--idempotency-key KEY]",
+    "aisevak assignments send ASSIGNMENT --body-stdin [--idempotency-key KEY]",
+    "aisevak assignments retry ASSIGNMENT [--body-stdin] [--idempotency-key KEY]",
+    "aisevak assignments complete|block ASSIGNMENT --result-stdin [--idempotency-key KEY]"
+  ],
+  schedules: [
+    "aisevak schedules list [--status S] [--query Q] [--limit N] [--cursor C] | show SCHEDULE",
+    "aisevak schedules create --title T --agent AGENT --at ISO_TIME --prompt-stdin [--interval-seconds N] [--task TASK] [--overlap-policy P] [--idempotency-key KEY]",
+    "aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy P]",
+    "aisevak schedules pause|resume|delete SCHEDULE"
+  ],
+  reports: [
+    "aisevak reports list [--status S] [--query Q] [--limit N] [--cursor C] | show REPORT",
+    "aisevak reports create --title T --description D --markdown-stdin [--project-id ID] [--thread THREAD]",
+    "aisevak reports revise REPORT --base-revision N --markdown-stdin",
+    "  N is the current_revision from reports show (or revision from content); a stale base is rejected.",
+    "aisevak reports publish REPORT"
+  ],
+  incidents: [
+    "aisevak incidents list [--include-resolved] [--status S] [--query Q] [--limit N] [--cursor C] | show INCIDENT",
+    "aisevak incidents declare --title T --description D --markdown-stdin [--severity S] [--project-id ID] [--to AGENT]",
+    "aisevak incidents update INCIDENT --markdown-stdin",
+    "aisevak incidents resolve INCIDENT [--markdown-stdin]"
+  ],
+  credentials: [
+    "aisevak credentials list | get NAME | add NAME|--name NAME [--description D] --value-stdin"
+  ],
+  skills: ["aisevak skills path | skills install DIRECTORY"]
+}; }
+
+function help(topic) {
+  const all = commandHelp();
+  const key = [topic, topic + "s"].find((name) => topic && Object.prototype.hasOwnProperty.call(all, name));
+  if (key) return console.log(all[key].concat(["", "Markdown flags accept stdin (--body-stdin) or an inline value (--body TEXT)."]).join("\\n"));
+  return generalHelp();
+}
+
+function generalHelp() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT | agents status AGENT",
   "aisevak inbox [--thread THREAD] [--recent] [--limit N] [--wait SECONDS]",
@@ -338,7 +411,8 @@ function help() { console.log([
   "aisevak incidents list [--include-resolved] | show | declare | update | resolve",
   "",
   "Markdown flags accept stdin, for example: --body-stdin, --purpose-stdin, --summary-stdin.",
-  "All list commands support --limit, --cursor, --status, and --query."
+  "All list commands support --limit, --cursor, --status, and --query.",
+  "Run aisevak COMMAND --help (for example aisevak tasks --help) for that command's flags."
 ].join("\\n")); }
 `;
 }

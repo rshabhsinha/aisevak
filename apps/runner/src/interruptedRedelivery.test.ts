@@ -1,7 +1,7 @@
 import type { DbPool } from "@aisevak/core";
 import { afterEach, describe, expect, it } from "vitest";
-import { recoverInterruptedCoordinationRuns, recoverInterruptedWorkerRuns, redeliverInterruptedRun } from "./index.js";
-import { INTERRUPTED_PREAMBLE } from "./runLeases.js";
+import { recoverInterruptedCoordinationRuns, recoverInterruptedDispatcherRuns, recoverInterruptedWorkerRuns, redeliverInterruptedRun } from "./index.js";
+import { INTERRUPTED_PREAMBLE, trackActiveRun } from "./runLeases.js";
 
 type Entry = { sql: string; params?: unknown[] };
 
@@ -129,9 +129,61 @@ describe("lease-gated restart recovery", () => {
     await recoverInterruptedCoordinationRuns(pool, { runnerId: "runner-a", boot: false });
 
     const scan = queries.find((entry) => entry.sql.trim().startsWith("SELECT id, status::text, message_delivery_id"))!;
-    expect(scan.sql).toContain("dispatcher_runs.runner_id <> $1 AND dispatcher_runs.lease_expires_at < now()");
+    expect(scan.sql).toContain("dispatcher_runs.runner_id IS NOT NULL AND dispatcher_runs.lease_expires_at < now()");
     expect(queries.some((entry) => entry.sql.includes("SELECT dispatcher_runs.id AS run_id"))).toBe(false);
     expect(queries.some((entry) => entry.sql.includes("SELECT agent_turn_inputs.id AS input_id"))).toBe(false);
+  });
+
+  it("lets a sweep fail this runner's own orphaned turn but not one it is still executing", async () => {
+    // A heartbeat whose claim committed but whose next query timed out was
+    // never tracked, so its lease lapsed while this runner kept running.
+    const { pool, queries } = fakePool((sql) => {
+      if (sql.startsWith("SELECT id, status::text, message_delivery_id, agent_thread_id")) {
+        return { rows: [
+          { id: "orphaned-run", status: "running", message_delivery_id: null, agent_thread_id: null },
+          { id: "executing-run", status: "running", message_delivery_id: null, agent_thread_id: null }
+        ] };
+      }
+      if (sql.includes("FOR UPDATE")) return { rows: [{ message_delivery_id: null, status: "running" }] };
+      return undefined;
+    });
+    const release = trackActiveRun("dispatcher", "executing-run");
+    try {
+      await recoverInterruptedDispatcherRuns(pool, { runnerId: "runner-a", boot: false });
+    } finally {
+      release();
+    }
+
+    const failed = queries.filter((entry) => entry.sql.includes("UPDATE dispatcher_runs") && entry.sql.includes("finished_at = now()"));
+    expect(failed.map((entry) => entry.params?.[0])).toEqual(["orphaned-run"]);
+    expect(failed[0]?.params?.[1]).toBe("failed");
+  });
+
+  it("skips coordination and worker turns this process is executing during a sweep", async () => {
+    const { pool, queries } = fakePool((sql) => {
+      if (sql.startsWith("SELECT id, status::text, message_delivery_id")) {
+        return { rows: [{ id: "executing-coordination", status: "running", message_delivery_id: "delivery" }] };
+      }
+      if (sql.startsWith("SELECT id, status::text, agent_thread_id")) {
+        return { rows: [
+          { id: "orphaned-worker", status: "running", agent_thread_id: null },
+          { id: "executing-worker", status: "running", agent_thread_id: null }
+        ] };
+      }
+      if (sql.includes("UPDATE task_runs") && sql.includes("RETURNING id")) return { rows: [{ id: "orphaned-worker" }] };
+      return undefined;
+    });
+    const releases = [trackActiveRun("dispatcher", "executing-coordination"), trackActiveRun("worker", "executing-worker")];
+    try {
+      await recoverInterruptedCoordinationRuns(pool, { runnerId: "runner-a", boot: false });
+      await recoverInterruptedWorkerRuns(pool, { runnerId: "runner-a", boot: false });
+    } finally {
+      for (const release of releases) release();
+    }
+
+    expect(queries.some((entry) => entry.params?.includes("executing-coordination"))).toBe(false);
+    expect(queries.some((entry) => entry.params?.includes("executing-worker"))).toBe(false);
+    expect(queries.filter((entry) => entry.sql.includes("UPDATE task_runs")).map((entry) => entry.params?.[0])).toEqual(["orphaned-worker"]);
   });
 
   it("terminalizes worker turns a stopped runner left running", async () => {

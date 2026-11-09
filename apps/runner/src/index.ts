@@ -81,6 +81,7 @@ import {
   runTakenOver,
   startRunLeaseHeartbeat,
   trackActiveRun,
+  activeRunIds,
   withInterruptedPreamble,
   type RecoveryScope
 } from "./runLeases.js";
@@ -409,6 +410,8 @@ export async function recoverInterruptedCoordinationRuns(pool: DbPool, scope: Re
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("dispatcher"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
 
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
@@ -565,6 +568,8 @@ export async function recoverInterruptedDispatcherRuns(pool: DbPool, scope: Reco
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("dispatcher"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
 
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
@@ -629,6 +634,8 @@ export async function recoverInterruptedWorkerRuns(pool: DbPool, scope: Recovery
      ORDER BY started_at ASC NULLS FIRST, id ASC`,
     [scope.runnerId]
   );
+  const executing = new Set(activeRunIds("worker"));
+  interrupted.rows = interrupted.rows.filter((run) => !executing.has(run.id));
   for (const run of interrupted.rows) {
     const finalStatus = run.status === "cancel_requested" ? "cancelled" : "failed";
     const error = run.status === "cancel_requested"
@@ -2032,55 +2039,60 @@ export async function processOneDispatcherRun(
     stderr += `\n${String(error instanceof Error ? error.stack ?? error.message : error)}`;
     finalStatus = "failed";
   } finally {
-    releaseActiveRun();
-    // A heartbeat conversation is used for one turn only. Closing the cached
-    // app-server releases it; otherwise every heartbeat's thread stays loaded
-    // in the one long-lived Codex process.
-    if (job.scope === "heartbeat") {
-      await closeIdleCodexSession(job.codex_home).catch((error) =>
-        console.warn(`Could not close the heartbeat Codex session: ${String(error instanceof Error ? error.message : error)}`)
+    // Released only once the turn is settled: until then the lease sweep must
+    // not take it for an orphan.
+    try {
+      // A heartbeat conversation is used for one turn only. Closing the cached
+      // app-server releases it; otherwise every heartbeat's thread stays loaded
+      // in the one long-lived Codex process.
+      if (job.scope === "heartbeat") {
+        await closeIdleCodexSession(job.codex_home).catch((error) =>
+          console.warn(`Could not close the heartbeat Codex session: ${String(error instanceof Error ? error.message : error)}`)
+        );
+      }
+      if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
+        console.warn(`Leaving turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
+        return true;
+      }
+      // Fenced on ownership: if this runner's lease lapsed and another runner
+      // recovered the turn (and possibly redelivered it), the recovery already
+      // settled its delivery and inputs, and settling them again here would
+      // cancel the redelivery.
+      const finalized = await pool.query<{ id: string }>(
+        `UPDATE dispatcher_runs
+         SET status = $2::run_status,
+             raw_stdout = $3,
+             raw_stderr = $4,
+             exit_code = $5,
+             finished_at = now(),
+             updated_at = now(),
+             error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
+         WHERE id = $1
+           AND status IN ('running', 'cancel_requested')
+           AND (runner_id IS NULL OR runner_id = $6)
+         RETURNING id`,
+        [job.id, finalStatus, STORED_RAW_STDOUT, encodePostgresText(storedStderr(stderr)), exitCode, currentRunnerId()]
       );
-    }
-    if (deferFinalizationForShutdown(shuttingDown, finalStatus)) {
-      console.warn(`Leaving turn ${job.id} for recovery at the next boot: it ended while the runner was stopping`);
-      return true;
-    }
-    // Fenced on ownership: if this runner's lease lapsed and another runner
-    // recovered the turn (and possibly redelivered it), the recovery already
-    // settled its delivery and inputs, and settling them again here would
-    // cancel the redelivery.
-    const finalized = await pool.query<{ id: string }>(
-      `UPDATE dispatcher_runs
-       SET status = $2::run_status,
-           raw_stdout = $3,
-           raw_stderr = $4,
-           exit_code = $5,
-           finished_at = now(),
-           updated_at = now(),
-           error = CASE WHEN $2::run_status = 'failed' THEN NULLIF($4, '') ELSE NULL END
-       WHERE id = $1
-         AND status IN ('running', 'cancel_requested')
-         AND (runner_id IS NULL OR runner_id = $6)
-       RETURNING id`,
-      [job.id, finalStatus, STORED_RAW_STDOUT, encodePostgresText(storedStderr(stderr)), exitCode, currentRunnerId()]
-    );
-    if (!finalized.rows[0]) return true;
-    const accountOutcome = claudeAccount
-      ? await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey })
-      : { fallbackReady: false, earliestReset: null };
-    if (job.message_delivery_id) {
-      await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {
-        retryOnFallbackAccount: accountOutcome.fallbackReady,
-        accountsResetAt: accountOutcome.earliestReset
-      });
-    }
-    await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
-    if (finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
-    if (job.agent_thread_id) {
-      await pool.query(
-        "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
-        [job.agent_thread_id]
-      );
+      if (!finalized.rows[0]) return true;
+      const accountOutcome = claudeAccount
+        ? await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey })
+        : { fallbackReady: false, earliestReset: null };
+      if (job.message_delivery_id) {
+        await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {
+          retryOnFallbackAccount: accountOutcome.fallbackReady,
+          accountsResetAt: accountOutcome.earliestReset
+        });
+      }
+      await failPendingAgentTurnInputs(pool, "dispatcher", job.id, finalStatus);
+      if (finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
+      if (job.agent_thread_id) {
+        await pool.query(
+          "UPDATE agent_threads SET last_activity_at = now(), updated_at = now() WHERE id = $1",
+          [job.agent_thread_id]
+        );
+      }
+    } finally {
+      releaseActiveRun();
     }
   }
   return true;
@@ -2367,23 +2379,28 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
   } finally {
     // Worker turns have no redelivery path, so they finalize even while
     // stopping and keep their needs_attention signal.
-    releaseActiveRun();
-    const finalized = await finalizeWorkerRunState(pool, {
-      runId: job.id,
-      taskId: job.task_id,
-      agentThreadId: job.agent_thread_id,
-      agentThreadGeneration: job.agent_thread_generation,
-      coordinationThreadId: job.coordination_thread_id,
-      finalStatus,
-      stdout,
-      stderr,
-      exitCode
-    });
-    if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
-    if (finalized && finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
-    // A worker turn has no retry path; recording the limit moves later runs.
-    if (finalized && claudeAccount) {
-      await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey });
+    // Released only once the turn is settled: until then the lease sweep must
+    // not take it for an orphan.
+    try {
+      const finalized = await finalizeWorkerRunState(pool, {
+        runId: job.id,
+        taskId: job.task_id,
+        agentThreadId: job.agent_thread_id,
+        agentThreadGeneration: job.agent_thread_generation,
+        coordinationThreadId: job.coordination_thread_id,
+        finalStatus,
+        stdout,
+        stderr,
+        exitCode
+      });
+      if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
+      if (finalized && finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
+      // A worker turn has no retry path; recording the limit moves later runs.
+      if (finalized && claudeAccount) {
+        await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey });
+      }
+    } finally {
+      releaseActiveRun();
     }
   }
   return true;
