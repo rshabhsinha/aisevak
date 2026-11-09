@@ -159,6 +159,33 @@ describe("lease-gated restart recovery", () => {
     expect(failed[0]?.params?.[1]).toBe("failed");
   });
 
+  it("skips coordination and worker turns this process is executing during a sweep", async () => {
+    const { pool, queries } = fakePool((sql) => {
+      if (sql.startsWith("SELECT id, status::text, message_delivery_id")) {
+        return { rows: [{ id: "executing-coordination", status: "running", message_delivery_id: "delivery" }] };
+      }
+      if (sql.startsWith("SELECT id, status::text, agent_thread_id")) {
+        return { rows: [
+          { id: "orphaned-worker", status: "running", agent_thread_id: null },
+          { id: "executing-worker", status: "running", agent_thread_id: null }
+        ] };
+      }
+      if (sql.includes("UPDATE task_runs") && sql.includes("RETURNING id")) return { rows: [{ id: "orphaned-worker" }] };
+      return undefined;
+    });
+    const releases = [trackActiveRun("dispatcher", "executing-coordination"), trackActiveRun("worker", "executing-worker")];
+    try {
+      await recoverInterruptedCoordinationRuns(pool, { runnerId: "runner-a", boot: false });
+      await recoverInterruptedWorkerRuns(pool, { runnerId: "runner-a", boot: false });
+    } finally {
+      for (const release of releases) release();
+    }
+
+    expect(queries.some((entry) => entry.params?.includes("executing-coordination"))).toBe(false);
+    expect(queries.some((entry) => entry.params?.includes("executing-worker"))).toBe(false);
+    expect(queries.filter((entry) => entry.sql.includes("UPDATE task_runs")).map((entry) => entry.params?.[0])).toEqual(["orphaned-worker"]);
+  });
+
   it("terminalizes worker turns a stopped runner left running", async () => {
     const { pool, queries } = fakePool((sql) => {
       if (sql.startsWith("SELECT id, status::text, agent_thread_id")) return { rows: [{ id: "worker-run", status: "running", agent_thread_id: "session" }] };

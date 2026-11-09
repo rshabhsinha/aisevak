@@ -14,7 +14,9 @@ async function main() {
   // --help anywhere prints help and returns before any request: an ignored
   // flag would let "incidents resolve INC-1 --help" resolve the incident.
   if (!args.length || args[0] === "help") return help(args[1]);
-  if (args.includes("--help") || args.includes("-h")) return help(args[0]);
+  // Only where a help request goes (right after the command or last), so a
+  // "-h" inside positional message text is still sent as text.
+  if (args.some((arg, index) => (arg === "--help" || arg === "-h") && (index <= 2 || index === args.length - 1))) return help(args[0]);
   const root = args[0];
   if (root === "whoami") return print(await request("/api/agent-tools/v1/whoami"));
   if (root === "capabilities") return print(await request("/api/agent-tools/v1/capabilities"));
@@ -333,7 +335,7 @@ function commandHelp() { return {
   threads: [
     "aisevak threads list [--status S] [--query Q] [--limit N] [--cursor C]",
     "aisevak threads show THREAD | status THREAD | messages THREAD [--limit N] [--cursor C]",
-    "aisevak threads create --title T --description D --to AGENT [--purpose-stdin] [--task TASK] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--origin-thread THREAD] [--origin-message MESSAGE] [--idempotency-key KEY]",
+    "aisevak threads create --title T --description D --to AGENT --purpose-stdin [--task TASK] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--origin-thread THREAD] [--origin-message MESSAGE] [--idempotency-key KEY]",
     "aisevak threads send THREAD --body-stdin [--to AGENT] [--reply-to MESSAGE] [--idempotency-key KEY]",
     "aisevak threads complete THREAD --summary-stdin [--idempotency-key KEY]",
     "aisevak threads block THREAD --reason-stdin [--idempotency-key KEY]",
@@ -343,7 +345,7 @@ function commandHelp() { return {
   tasks: [
     "aisevak tasks list [--status S] [--query Q] [--limit N] [--cursor C]",
     "aisevak tasks show TASK",
-    "aisevak tasks create --title T --description D [--body-stdin] [--status S] [--agent AGENT] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--parent-task TASK] [--idempotency-key KEY]",
+    "aisevak tasks create --title T --description D --body-stdin [--status S] [--agent AGENT] [--project-id ID] [--work-key KEY] [--work-scope SCOPE] [--parent-task TASK] [--idempotency-key KEY]",
     "aisevak tasks update TASK [--title T] [--description D] [--body-stdin] [--status S]",
     "aisevak tasks comment TASK --body-stdin",
     "aisevak tasks attention TASK --reason-stdin",
@@ -379,7 +381,7 @@ function commandHelp() { return {
     "aisevak incidents resolve INCIDENT [--markdown-stdin]"
   ],
   credentials: [
-    "aisevak credentials list | get NAME | add NAME [--description D] --value-stdin"
+    "aisevak credentials list | get NAME | add NAME|--name NAME [--description D] --value-stdin"
   ],
   skills: ["aisevak skills path | skills install DIRECTORY"]
 }; }
