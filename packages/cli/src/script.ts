@@ -14,9 +14,10 @@ async function main() {
   // --help anywhere prints help and returns before any request: an ignored
   // flag would let "incidents resolve INC-1 --help" resolve the incident.
   if (!args.length || args[0] === "help") return help(args[1]);
-  // Only where a help request goes (right after the command or last), so a
+  // "--help" can never be a value or message text (both skip "--" words), so it
+  // counts anywhere. "-h" only counts right after the command or last, so a
   // "-h" inside positional message text is still sent as text.
-  if (args.some((arg, index) => (arg === "--help" || arg === "-h") && (index <= 2 || index === args.length - 1))) return help(args[0]);
+  if (args.includes("--help") || args.some((arg, index) => arg === "-h" && (index <= 2 || index === args.length - 1))) return help(args[0]);
   const root = args[0];
   if (root === "whoami") return print(await request("/api/agent-tools/v1/whoami"));
   if (root === "capabilities") return print(await request("/api/agent-tools/v1/capabilities"));

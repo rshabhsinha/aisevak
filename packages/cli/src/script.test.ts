@@ -42,6 +42,7 @@ describe("embedded aisevak CLI", () => {
       expect((await run("help", "threads")).stdout).toContain("aisevak threads send THREAD --body-stdin");
       expect((await run("--help")).stdout).toContain("aisevak COMMAND --help");
       expect((await run("tasks", "--help")).stdout).toContain("aisevak tasks create --title T --description D --body-stdin");
+      expect((await run("threads", "send", "THREAD-1", "--help", "--body", "hello")).stdout).toContain("aisevak threads send");
       expect(requests).toBe(0);
       // A "-h" inside message text is not a help request.
       await run("threads", "send", "THREAD-1", "use", "the", "-h", "flag");
