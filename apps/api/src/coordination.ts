@@ -133,10 +133,17 @@ const taskPolicySchema = z.object({
   maxChildDepth: z.coerce.number().int().positive().max(32).optional(),
   maxAssignmentAttempts: z.coerce.number().int().positive().max(100).optional()
 }).refine((value) => Object.keys(value).length > 0, "At least one orchestration limit is required");
+// Idle skipping: a task-bound tick is skipped while nothing changed on its
+// task, but runs at least every idleSkipMaxSeconds. null turns it off.
+const idleSkipMaxSecondsSchema = z.coerce.number().int().min(60).max(31_536_000).nullable();
 const scheduleUpdateSchema = z.object({
   task: z.string().nullable().optional(),
-  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional()
-}).refine((value) => value.task !== undefined || value.overlapPolicy !== undefined, "Nothing to update");
+  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional(),
+  idleSkipMaxSeconds: idleSkipMaxSecondsSchema.optional()
+}).refine(
+  (value) => value.task !== undefined || value.overlapPolicy !== undefined || value.idleSkipMaxSeconds !== undefined,
+  "Nothing to update"
+);
 const refreshSchema = z.object({ everyTurns: z.coerce.number().int().min(1).max(10_000).nullable().optional(), now: z.boolean().optional() });
 const threadCreateSchema = z.object({
   title: z.string().trim().min(1),
@@ -220,6 +227,7 @@ const scheduleCreateSchema = z.object({
   intervalSeconds: z.coerce.number().int().min(60).max(31_536_000).optional(),
   task: z.string().optional(),
   overlapPolicy: z.enum(["skip", "queue", "allow"]).default("skip"),
+  idleSkipMaxSeconds: idleSkipMaxSecondsSchema.optional(),
   idempotencyKey: z.string().trim().min(1).max(200).optional()
 });
 const skillInstallSchema = z.object({
@@ -1455,8 +1463,8 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
     const result = await pool.query<{ id: string }>(
       `INSERT INTO schedules
          (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds,
-          created_by_agent_id, idempotency_key, task_id, overlap_policy)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+          created_by_agent_id, idempotency_key, task_id, overlap_policy, idle_skip_max_seconds)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
        ON CONFLICT (created_by_agent_id, idempotency_key)
        WHERE created_by_agent_id IS NOT NULL AND idempotency_key IS NOT NULL
        DO UPDATE SET updated_at = schedules.updated_at
@@ -1471,7 +1479,8 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
         context.agentId,
         body.idempotencyKey ?? null,
         taskId,
-        body.overlapPolicy
+        body.overlapPolicy,
+        body.idleSkipMaxSeconds ?? null
       ]
     );
     return { schedule: await showSchedule(pool, result.rows[0]!.id) };
@@ -1534,9 +1543,11 @@ function registerScheduleRoutes(app: FastifyInstance, pool: DbPool): void {
       `UPDATE schedules
        SET task_id = CASE WHEN $2::boolean THEN $3::uuid ELSE task_id END,
            overlap_policy = COALESCE($4, overlap_policy),
+           idle_skip_max_seconds = CASE WHEN $5::boolean THEN $6::integer ELSE idle_skip_max_seconds END,
            updated_at = now()
        WHERE id = $1`,
-      [id, taskId !== undefined, taskId ?? null, body.overlapPolicy ?? null]
+      [id, taskId !== undefined, taskId ?? null, body.overlapPolicy ?? null,
+        body.idleSkipMaxSeconds !== undefined, body.idleSkipMaxSeconds ?? null]
     );
     return { schedule: await showSchedule(pool, id) };
   });
@@ -3502,6 +3513,12 @@ async function parentTaskOwner(queryable: Queryable, taskId: string): Promise<st
 // the parent task's owner on the parent's coordination thread, so a
 // long-lived controller (for example a campaign task) reacts to events instead
 // of polling, whichever run created the child.
+//
+// A completion of a child whose parent is driven by an enabled interval
+// schedule is recorded on the parent thread but does not wake the parent's
+// owner: the next tick reconciles it (an idle-skipping schedule counts the
+// child's change as activity). Waking a long-lived controller for every
+// completion cost a full turn each time. Other events still wake it.
 export async function notifyParentOfChildEvent(
   client: PoolClient,
   managedRoot: string,
@@ -3531,6 +3548,7 @@ export async function notifyParentOfChildEvent(
     type: `child.${event}`
   });
   if (row.parent_agent_id === actorAgentId) return;
+  if (event === "completed" && await parentHasIntervalSchedule(client, childTaskId)) return;
   // The parent's session may be archived or restoring; that must never block
   // the child's own status change. The event stays on the parent thread.
   await client.query("SAVEPOINT child_event_delivery");
@@ -3541,6 +3559,22 @@ export async function notifyParentOfChildEvent(
     await client.query("ROLLBACK TO SAVEPOINT child_event_delivery");
     console.error(`Could not deliver the child.${event} event for task ${childTaskId} to its parent's owner`, error);
   }
+}
+
+async function parentHasIntervalSchedule(queryable: Queryable, childTaskId: string): Promise<boolean> {
+  const result = await queryable.query(
+    `SELECT 1
+     FROM tasks child
+     JOIN schedules ON schedules.task_id = child.parent_task_id
+     JOIN tasks parent ON parent.id = child.parent_task_id
+     WHERE child.id = $1
+       AND schedules.enabled = true
+       AND schedules.schedule_kind = 'interval'
+       AND schedules.agent_id = parent.agent_id
+     LIMIT 1`,
+    [childTaskId]
+  );
+  return result.rows.length > 0;
 }
 
 export const REQUEST_TIMED_OUT_TYPE = "request.timed_out";

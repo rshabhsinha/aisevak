@@ -1458,6 +1458,14 @@ CREATE TABLE IF NOT EXISTS aisevak_maintenance (
   name text PRIMARY KEY,
   completed_at timestamptz NOT NULL DEFAULT now()
 );
+-- Idle skipping for task-bound schedules: when set, a tick is skipped while
+-- nothing changed on the target task (its thread, children or assignments)
+-- since the last tick that ran, but one tick still runs at least this often.
+ALTER TABLE schedules ADD COLUMN IF NOT EXISTS idle_skip_max_seconds integer;
+DO $$ BEGIN
+  ALTER TABLE schedules ADD CONSTRAINT schedules_idle_skip_max_seconds_check
+    CHECK (idle_skip_max_seconds IS NULL OR idle_skip_max_seconds >= 60);
+EXCEPTION WHEN duplicate_object THEN NULL; END $$;
 `;
 
 /**

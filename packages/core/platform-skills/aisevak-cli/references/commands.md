@@ -121,14 +121,14 @@ Assignment keys are unique within a task. Reusing a key with the same immutable 
 aisevak schedules list [--status scheduled|paused|completed] [--query TEXT] [--limit N] [--cursor CURSOR]
 aisevak schedules show SCHEDULE
 aisevak schedules create --title TITLE --agent AGENT --at ISO-8601 --prompt-stdin \
-  [--task TASK] [--overlap-policy skip|queue|allow] [--interval-seconds N] [--idempotency-key KEY]
-aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy skip|queue|allow]
+  [--task TASK] [--overlap-policy skip|queue|allow] [--interval-seconds N] [--idle-skip-max-seconds N] [--idempotency-key KEY]
+aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy skip|queue|allow] [--idle-skip-max-seconds N|none]
 aisevak schedules pause SCHEDULE
 aisevak schedules resume SCHEDULE
 aisevak schedules delete SCHEDULE
 ```
 
-Omit `--interval-seconds` for a one-time run. With `--task`, each run is a message on that task's thread instead of a new task. That is how a long-lived campaign task receives its periodic check. `skip`, the default, drops a tick while the previous one is still being handled. A repeating schedule advances from the current time after downtime instead of replaying every missed interval. Creating, pausing, resuming, or deleting schedules requires `schedules:write`, which is available to the Orchestrator by default; other agents can inspect schedules.
+Omit `--interval-seconds` for a one-time run. With `--task`, each run is a message on that task's thread instead of a new task. That is how a long-lived campaign task receives its periodic check. `skip`, the default, drops a tick while the previous one is still being handled. With `--task`, `--idle-skip-max-seconds N` also drops a tick while nothing changed on the task since the last tick ran (no message from anyone else on its thread, no child task or assignment change), but still runs one at least every N seconds; `none` turns it off. A repeating schedule advances from the current time after downtime instead of replaying every missed interval. Creating, pausing, resuming, or deleting schedules requires `schedules:write`, which is available to the Orchestrator by default; other agents can inspect schedules.
 
 ## Reports
 

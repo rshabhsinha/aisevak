@@ -51,6 +51,13 @@ export interface AppServerTurnOptions {
   cancelGraceMs?: number;
   nextInput?: () => Promise<AppServerTurnInput | null>;
   onInputHandled?: (input: AppServerTurnInput, error?: string) => Promise<void>;
+  /**
+   * ACP only. Receives what the harness emits after this turn ended and before
+   * the next one starts: a cycle the harness started on its own, such as
+   * Claude Code continuing once a background command it launched finishes.
+   * Lines arrive redacted. Errors are the receiver's to handle.
+   */
+  onBackgroundLine?: (line: string) => Promise<void>;
 }
 
 export interface AppServerTurnResult {

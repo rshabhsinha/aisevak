@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import Fastify, { type FastifyInstance } from "fastify";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { createPool, hashToken, runMigrations, type DbPool } from "@aisevak/core";
-import { assignmentLiveWork, expireRequests, registerCoordinationRoutes } from "./coordination.js";
+import { assignmentLiveWork, expireRequests, notifyParentOfChildEvent, registerCoordinationRoutes } from "./coordination.js";
 
 // Phase 3 of coordination v2 through the real agent-tools routes and a real
 // Postgres. Runs when AISEVAK_TEST_DATABASE_URL points at a disposable database.
@@ -231,6 +231,59 @@ describe.skipIf(!databaseUrl)("coordination v2 phase 3 against Postgres", () => 
     expect(done.body.task.status).toBe("completed");
     const events = await q("SELECT message_type FROM thread_messages WHERE thread_id = $1 AND message_type = 'child.completed'", [campaign.threadId]);
     expect(events).toHaveLength(1);
+  });
+
+  it("records a child completion without waking a parent its schedule drives", async () => {
+    const controller = await agent("Controller");
+    const populator = await agent("Populator");
+    const campaign = await task(controller.id, "Scheduled campaign");
+    const child = await task(populator.id, "Child", campaign.id);
+    const blockedChild = await task(populator.id, "Blocked child", campaign.id);
+    await q(
+      `INSERT INTO agent_threads (agent_id, task_id, provider_instance_id, model, cwd, runtime_home, coordination_thread_id)
+       VALUES ($1, $2, 'codex-local', 'gpt-test', '/tmp', '/tmp/h', $3)`,
+      [controller.id, campaign.id, campaign.threadId]
+    );
+    const [schedule] = await q(
+      `INSERT INTO schedules (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, task_id)
+       VALUES ('tick', 'Check the campaign', $1, 'interval', now() + interval '1 hour', 1800, $2) RETURNING number`,
+      [controller.id, campaign.id]
+    );
+    await q("UPDATE agents SET capabilities = '[\"schedules:read\", \"schedules:write\"]' WHERE id = $1", [controller.id]);
+    const controllerToken = await token(controller.id, campaign.id, campaign.threadId);
+    const idle = await call(controllerToken, "PATCH", `/api/agent-tools/v1/schedules/SCHEDULE-${schedule.number}`, { idleSkipMaxSeconds: 7200 });
+    expect(idle.status).toBe(200);
+    expect(idle.body.schedule.idle_skip_max_seconds).toBe(7200);
+    const tooShort = await call(controllerToken, "PATCH", `/api/agent-tools/v1/schedules/SCHEDULE-${schedule.number}`, { idleSkipMaxSeconds: 10 });
+    // Validation rejects it (the bare test app maps schema errors to 500).
+    expect(tooShort.status).not.toBe(200);
+
+    await q("UPDATE agents SET capabilities = '[\"tasks:read\", \"tasks:complete\"]' WHERE id = $1", [populator.id]);
+    const done = await call(await token(populator.id, child.id, child.threadId), "POST", `/api/agent-tools/v1/tasks/TASK-${child.number}/complete`, { body: "Done" });
+    expect(done.status).toBe(200);
+    const completed = await q(
+      `SELECT thread_messages.message_type, count(message_deliveries.id)::int AS deliveries
+       FROM thread_messages LEFT JOIN message_deliveries ON message_deliveries.message_id = thread_messages.id
+       WHERE thread_messages.thread_id = $1 AND thread_messages.message_type = 'child.completed'
+       GROUP BY 1`,
+      [campaign.threadId]
+    );
+    expect(completed).toEqual([{ message_type: "child.completed", deliveries: 0 }]);
+
+    // Events that need attention still wake the parent's owner.
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await notifyParentOfChildEvent(client, managedRoot, blockedChild.id, "blocked", populator.id, "Needs a decision");
+      await client.query("COMMIT");
+    } finally { client.release(); }
+    const [blockedEvent] = await q(
+      `SELECT count(message_deliveries.id)::int AS deliveries
+       FROM thread_messages LEFT JOIN message_deliveries ON message_deliveries.message_id = thread_messages.id
+       WHERE thread_messages.thread_id = $1 AND thread_messages.message_type = 'child.blocked'`,
+      [campaign.threadId]
+    );
+    expect(blockedEvent.deliveries).toBe(1);
   });
 
   it("does not let a child's owner move it out of its controller's tree", async () => {

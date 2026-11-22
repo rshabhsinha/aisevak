@@ -1033,8 +1033,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
     await requireEnabledAgent(pool, body.agentId);
     const result = await pool.query<{ id: string }>(
       `INSERT INTO schedules
-         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by, task_id, overlap_policy)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+         (title, prompt, agent_id, schedule_kind, next_run_at, interval_seconds, created_by, task_id, overlap_policy, idle_skip_max_seconds)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
        RETURNING id`,
       [
         body.title,
@@ -1045,7 +1045,8 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         body.scheduleKind === "interval" ? body.intervalSeconds : null,
         user.id,
         body.taskId ?? null,
-        body.overlapPolicy ?? "skip"
+        body.overlapPolicy ?? "skip",
+        body.idleSkipMaxSeconds ?? null
       ]
     );
     return { schedule: await getSchedule(pool, mustRow(result.rows[0]).id) };
@@ -1094,6 +1095,7 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
              enabled = $8,
              task_id = CASE WHEN $9::boolean THEN $10 ELSE task_id END,
              overlap_policy = COALESCE($11, overlap_policy),
+             idle_skip_max_seconds = CASE WHEN $12::boolean THEN $13::integer ELSE idle_skip_max_seconds END,
              updated_at = now()
          WHERE id = $1`,
         [
@@ -1107,7 +1109,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
           enabled,
           Object.prototype.hasOwnProperty.call(body, "taskId"),
           body.taskId ?? null,
-          body.overlapPolicy ?? null
+          body.overlapPolicy ?? null,
+          body.idleSkipMaxSeconds !== undefined,
+          body.idleSkipMaxSeconds ?? null
         ]
       );
     });
@@ -2309,7 +2313,10 @@ const scheduleFieldsSchema = z.object({
   nextRunAt: z.string().datetime(),
   intervalSeconds: z.number().int().min(60).max(31_536_000).nullable().optional(),
   taskId: z.string().uuid().nullable().optional(),
-  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional()
+  overlapPolicy: z.enum(["skip", "queue", "allow"]).optional(),
+  // Task-bound ticks are skipped while nothing changed on the task, but one
+  // runs at least this often. null turns idle skipping off.
+  idleSkipMaxSeconds: z.number().int().min(60).max(31_536_000).nullable().optional()
 });
 const scheduleSchema = scheduleFieldsSchema;
 const schedulePatchSchema = scheduleFieldsSchema.partial().extend({ enabled: z.boolean().optional() });
@@ -2665,6 +2672,7 @@ interface ScheduleTimingRow {
   enabled: boolean;
   task_id?: string | null;
   overlap_policy?: "skip" | "queue" | "allow";
+  idle_skip_max_seconds?: number | null;
 }
 
 interface ScheduleRow extends ScheduleTimingRow {
