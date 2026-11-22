@@ -135,6 +135,9 @@ class PersistentAcpSession {
   private lastActivityAt = Date.now();
   private readonly closePromise: Promise<{ code: number | null; error?: Error }>;
   private onNotification: ((line: string) => Promise<void>) | null = null;
+  // The last turn's receiver for what the harness does between turns.
+  private onBackgroundLine: ((line: string) => Promise<void>) | null = null;
+  private backgroundSecrets: Array<string | null | undefined> = [];
 
   get processId(): number | undefined { return this.child.pid; }
 
@@ -207,10 +210,17 @@ class PersistentAcpSession {
     };
 
     this.onNotification = emit;
+    this.onBackgroundLine = options.onBackgroundLine ?? null;
+    this.backgroundSecrets = options.secrets;
     this.lastUsedAt = Date.now();
     this.apiKey = options.apiKey ?? null;
     try {
       await this.initialize(options.authMethodId, options.skipAuthenticate === true);
+      // No stored session means a new conversation: a context refresh or an
+      // ownership change cleared it. The process may still hold the previous
+      // session; continuing it would silently undo the refresh and write the
+      // old id back (a long-lived thread kept one session for days).
+      if (!options.threadId) this.sessionId = null;
       if (options.threadId) {
         loadingSession = true;
         this.replaying = true;
@@ -475,9 +485,17 @@ class PersistentAcpSession {
       message?.id !== undefined &&
       Boolean(message.error) &&
       RECOVERABLE_ACP_METHODS.has(this.pending.get(String(message.id))?.method ?? "");
-    // Only readings delivered to a turn move the baseline, so spend reported
-    // between turns shows up in the next turn's first reading.
-    const turnCost = message && !this.replaying && this.onNotification ? this.costSincePreviousReading(message) : undefined;
+    // Between turns, a notification is a cycle the harness started on its own
+    // (it never answers a request of ours): it goes to the last turn's
+    // background receiver when there is one.
+    const background = !this.onNotification && !this.replaying && !this.closed &&
+      typeof message?.method === "string" && message.id === undefined
+      ? this.onBackgroundLine
+      : null;
+    if (background) this.lastUsedAt = Date.now();
+    // Only readings delivered to a turn (or a recorded background cycle) move
+    // the baseline, so unrecorded spend shows up in the next turn's first reading.
+    const turnCost = message && !this.replaying && (this.onNotification || background) ? this.costSincePreviousReading(message) : undefined;
     const persisted = recovered
       ? JSON.stringify({ ...message, aisevakRecovered: true })
       : turnCost !== undefined
@@ -487,6 +505,11 @@ class PersistentAcpSession {
       this.rejectPending(error instanceof Error ? error : new Error(String(error)));
       void this.close().catch(() => undefined);
     });
+    if (background) {
+      void background(redactSecrets(persisted, this.backgroundSecrets)).catch((error: unknown) => {
+        console.warn("Could not record a background ACP cycle", error instanceof Error ? error.message : String(error));
+      });
+    }
     if (!message) return;
     if (typeof message.method === "string" && message.id !== undefined) {
       if (message.method === "session/request_permission") {

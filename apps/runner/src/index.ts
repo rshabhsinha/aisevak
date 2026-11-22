@@ -54,6 +54,7 @@ import {
 } from "./appServerClient.js";
 import { closeAllAcpSessions } from "./acpClient.js";
 import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
+import { createBackgroundCycleRecorder } from "./backgroundCycles.js";
 import { lastSessionCost } from "./sessionCost.js";
 import { launchClaudeAccount, settleClaudeAccount, type LaunchedClaudeAccount } from "./claudeAccounts.js";
 import {
@@ -780,6 +781,7 @@ interface DueSchedule {
   model_options: Array<{ id: string; value: string | number | boolean }>;
   task_id: string | null;
   overlap_policy: "skip" | "queue" | "allow";
+  idle_skip_max_seconds: number | null;
   provider_instance_id: string | null;
 }
 
@@ -907,6 +909,7 @@ async function enqueueDueScheduleInTransaction(pool: DbPool, onClaim: (scheduleI
               schedules.interval_seconds,
               schedules.task_id,
               schedules.overlap_policy,
+              schedules.idle_skip_max_seconds,
               agents.model,
               agents.model_options,
               agents.provider_instance_id
@@ -968,6 +971,26 @@ async function enqueueDueScheduleInTransaction(pool: DbPool, onClaim: (scheduleI
         );
         return;
       }
+    }
+
+    if (target?.rows[0] && schedule.idle_skip_max_seconds && await scheduledTaskIsIdle(client, {
+      scheduleId: schedule.id,
+      agentId: schedule.agent_id,
+      taskId: target.rows[0].id,
+      coordinationThreadId: target.rows[0].coordination_thread_id,
+      maxIdleSeconds: schedule.idle_skip_max_seconds
+    })) {
+      // Recorded like an overlap skip, but last_run_at keeps the last tick
+      // that ran, so the forced tick and activity checks measure from it.
+      await client.query(
+        `INSERT INTO schedule_runs (schedule_id, scheduled_for) VALUES ($1, $2) ON CONFLICT (schedule_id, scheduled_for) DO NOTHING`,
+        [schedule.id, scheduledFor]
+      );
+      await client.query(
+        `UPDATE schedules SET enabled = CASE WHEN schedule_kind = 'once' THEN false ELSE enabled END,
+           next_run_at = $2, updated_at = now() WHERE id = $1`, [schedule.id, nextRunAt]
+      );
+      return;
     }
 
     let taskId = target?.rows[0]?.id ?? null;
@@ -1150,6 +1173,45 @@ async function enqueueDueScheduleInTransaction(pool: DbPool, onClaim: (scheduleI
       [schedule.id, nextRunAt, agentThread.id]
     );
   });
+}
+
+// Whether a task-bound schedule tick can be skipped: nothing happened on the
+// task since the last tick that ran started (a message from someone else on
+// its thread, a child task or an assignment changed), and that tick was less
+// than maxIdleSeconds ago. A tick that never ran, or has not started yet, is
+// never treated as idle (the overlap policy handles a queued one).
+export async function scheduledTaskIsIdle(
+  client: Pick<DbPool, "query">,
+  input: { scheduleId: string; agentId: string; taskId: string; coordinationThreadId: string | null; maxIdleSeconds: number }
+): Promise<boolean> {
+  const result = await client.query<{ idle: boolean }>(
+    `WITH last_tick AS (
+       SELECT max(dispatcher_runs.started_at) AS started_at
+       FROM schedule_runs
+       JOIN dispatcher_runs ON dispatcher_runs.id = schedule_runs.dispatcher_run_id
+       WHERE schedule_runs.schedule_id = $1
+     )
+     SELECT last_tick.started_at IS NOT NULL
+       AND last_tick.started_at > now() - ($5::integer * interval '1 second')
+       AND NOT EXISTS (
+         SELECT 1 FROM thread_messages
+         WHERE thread_messages.thread_id = $4::uuid
+           AND thread_messages.created_at > last_tick.started_at
+           AND thread_messages.sender_agent_id IS DISTINCT FROM $2::uuid
+           AND thread_messages.message_type <> 'schedule'
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM tasks child
+         WHERE child.parent_task_id = $3 AND child.updated_at > last_tick.started_at
+       )
+       AND NOT EXISTS (
+         SELECT 1 FROM task_assignments
+         WHERE task_assignments.task_id = $3 AND task_assignments.updated_at > last_tick.started_at
+       ) AS idle
+     FROM last_tick`,
+    [input.scheduleId, input.agentId, input.taskId, input.coordinationThreadId, input.maxIdleSeconds]
+  );
+  return result.rows[0]?.idle === true;
 }
 
 async function processOneGithubConnection(pool: DbPool): Promise<void> {
@@ -1921,6 +1983,13 @@ export async function processOneDispatcherRun(
       },
       secrets: [...codexAuth.redactionSecrets, ...(harnessAuth?.secrets ?? []), toolToken, ...credentialSecrets],
       onLine: (line, seq) => persistDispatcherCodexLine(pool, job, line, seq, normalizer),
+      // A cycle the harness starts on its own after this turn (Claude Code
+      // continuing once a background command finishes) is recorded as its
+      // own run on the thread instead of running unseen.
+      onBackgroundLine: job.agent_thread_id
+        ? createBackgroundCycleRecorder(pool, { sourceRunId: job.id, driver }, (runId, line, seq, cycleNormalizer) =>
+            persistDispatcherCodexLine(pool, { id: runId }, line, seq, cycleNormalizer))
+        : undefined,
       onThreadId: async (threadId) => {
         await pool.query(
           "UPDATE dispatcher_runs SET codex_thread_id = $2, updated_at = now() WHERE id = $1",

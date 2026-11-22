@@ -388,6 +388,7 @@ export const schedules = pgTable("schedules", {
   intervalSeconds: integer("interval_seconds"),
   taskId: uuid("task_id").references(() => tasks.id, { onDelete: "set null" }),
   overlapPolicy: text("overlap_policy").notNull().default("skip"),
+  idleSkipMaxSeconds: integer("idle_skip_max_seconds"),
   enabled: boolean("enabled").notNull().default(true),
   lastRunAt: timestamp("last_run_at", { withTimezone: true }),
   lastAgentThreadId: uuid("last_agent_thread_id").references(() => agentThreads.id, {

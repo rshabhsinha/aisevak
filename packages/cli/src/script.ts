@@ -239,6 +239,7 @@ async function schedules() {
     title: option("--title", true), prompt: await markdown("--prompt"), agent: option("--agent", true),
     at: option("--at", true), intervalSeconds: option("--interval-seconds"),
     task: option("--task"), overlapPolicy: option("--overlap-policy"),
+    idleSkipMaxSeconds: option("--idle-skip-max-seconds"),
     idempotencyKey: option("--idempotency-key")
   }) }));
   const ref = required(args[2], "Schedule reference");
@@ -247,8 +248,10 @@ async function schedules() {
   if (command === "delete") return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref), { method: "DELETE" }));
   if (command === "update") {
     const task = option("--task");
+    const idleSkip = option("--idle-skip-max-seconds");
     return print(await request("/api/agent-tools/v1/schedules/" + encodeURIComponent(ref), { method: "PATCH", body: compact({
-      task: task === "none" ? null : task, overlapPolicy: option("--overlap-policy")
+      task: task === "none" ? null : task, overlapPolicy: option("--overlap-policy"),
+      idleSkipMaxSeconds: idleSkip === "none" ? null : idleSkip
     }) }));
   }
   fail("Usage: aisevak schedules list|show|create|update|pause|resume|delete", "USAGE");
@@ -364,8 +367,8 @@ function commandHelp() { return {
   ],
   schedules: [
     "aisevak schedules list [--status S] [--query Q] [--limit N] [--cursor C] | show SCHEDULE",
-    "aisevak schedules create --title T --agent AGENT --at ISO_TIME --prompt-stdin [--interval-seconds N] [--task TASK] [--overlap-policy P] [--idempotency-key KEY]",
-    "aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy P]",
+    "aisevak schedules create --title T --agent AGENT --at ISO_TIME --prompt-stdin [--interval-seconds N] [--task TASK] [--overlap-policy P] [--idle-skip-max-seconds N] [--idempotency-key KEY]",
+    "aisevak schedules update SCHEDULE [--task TASK|none] [--overlap-policy P] [--idle-skip-max-seconds N|none]",
     "aisevak schedules pause|resume|delete SCHEDULE"
   ],
   reports: [
