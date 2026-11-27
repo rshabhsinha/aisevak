@@ -6099,6 +6099,11 @@ function HarnessAccountDetail(props: {
           This account reached its usage limit. Until {formatLimitedUntil(account.limitedUntil)}, its agents run on the next
           connected Claude account; if none is free, their work waits for the reset.
         </div>
+      ) : account.limitedUntil ? (
+        <div className="notice">
+          This account reached its usage limit. Its agents' work waits until {formatLimitedUntil(account.limitedUntil)} and
+          then resumes on its own.
+        </div>
       ) : null}
 
       <div className="harness-embedded">

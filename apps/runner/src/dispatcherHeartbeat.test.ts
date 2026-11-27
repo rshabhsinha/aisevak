@@ -44,4 +44,38 @@ describe("dispatcher heartbeat session", () => {
     expect(JSON.parse(String(insert?.params?.[7]))).toEqual([{ id: "reasoningEffort", value: "xhigh" }]);
     expect(queries.some((query) => query.sql.includes("codex_thread_id") && !query.sql.includes("INSERT"))).toBe(false);
   });
+
+  function heldPool(limitedAccount: string, actionableCount = "1") {
+    const queries: Array<{ sql: string; params?: unknown[] }> = [];
+    const pool = {
+      async query(sql: string, params?: unknown[]) {
+        queries.push({ sql, params });
+        if (sql.includes("FROM provider_account_limits account_limit")) {
+          return { rows: [{ provider_instance_id: limitedAccount, limited_until: new Date(Date.now() + 3_600_000), driver: "codex" }] };
+        }
+        if (sql.includes("SELECT count(*) FROM dispatcher_runs")) return { rows: [{ count: "0" }] };
+        if (sql.includes("max(created_at)")) return { rows: [{ last_run_at: null }] };
+        if (sql.includes("SELECT count(*)")) return { rows: [{ count: actionableCount }] };
+        if (sql.includes("kind = 'dispatcher' AND enabled = true")) {
+          return { rows: [{ id: "dispatcher-id", model: "gpt-test", instructions: "route work", provider_instance_id: "codex-local", model_options: [] }] };
+        }
+        return { rows: [] };
+      }
+    } as unknown as DbPool;
+    return { pool, queries };
+  }
+
+  it("queues no heartbeat while the dispatcher's own account is at its usage limit", async () => {
+    const { pool, queries } = heldPool("codex-local");
+    await enqueueDispatcherHeartbeat(pool);
+    expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+  });
+
+  it("does not count tasks of agents on a held account as work for the dispatcher", async () => {
+    const { pool, queries } = heldPool("codex-other", "0");
+    await enqueueDispatcherHeartbeat(pool);
+    const actionable = queries.find((query) => query.sql.includes("LEFT JOIN agents task_agent"));
+    expect(actionable?.params).toEqual(["codex-local", ["codex-other"]]);
+    expect(queries.some((query) => query.sql.includes("INSERT INTO dispatcher_runs"))).toBe(false);
+  });
 });

@@ -15,6 +15,13 @@ Use the `aisevak` CLI as the interface to Aisevak's shared coordination state. I
 - Treat CLI output as structured JSON. Preserve stable references such as `AGENT-Builder`, `THREAD-12`, `TASK-34`, `SCHEDULE-3`, `REPORT-5`, and `INC-2` in follow-up actions.
 - Check command help or [references/commands.md](references/commands.md) when exact syntax is uncertain.
 
+## Plan around usage limits
+
+- Before fanning out a large or long batch of work, run `aisevak providers` to see each harness account's remaining 5-hour session and weekly usage, when each resets, and which agents run on it.
+- Route heavy work to agents whose account has room, size batches to the remaining budget, and leave the rest for after `resetsAt` rather than starting work that will stop part-way.
+- An account with `available: false` is at its limit. Aisevak already holds its queued turns, schedule ticks and heartbeats until the reset and then resumes them: do not retry, re-send, or create new tasks or threads to work around it.
+- Check it at planning points, not every turn.
+
 ## Install reusable skills
 
 - Run `aisevak skills path` to inspect the skills resolved for this thread. Aisevak also exposes this isolated, regenerated view as `$AISEVAK_SKILLS_DIR`.

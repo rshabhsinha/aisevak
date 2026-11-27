@@ -46,6 +46,7 @@ async function main() {
     const ref = required(args[1], "Message reference");
     return print(await request("/api/agent-tools/v1/messages/" + encodeURIComponent(ref) + "/reply" + query({ wait: option("--timeout") })));
   }
+  if (["provider", "providers", "usage", "limits"].includes(root)) return providers();
   if (["agent", "agents"].includes(root)) return agents();
   if (["skill", "skills"].includes(root)) return skills();
   if (["thread", "threads"].includes(root)) return threads();
@@ -116,6 +117,15 @@ function readSkillDirectory(directory) {
   if (Object.keys(files).length > 64) fail("A skill may contain at most 64 supporting files", "SKILL_INVALID");
   if (totalBytes > 500000) fail("Installed skill content may not exceed 500 KB", "SKILL_INVALID");
   return { markdown, files };
+}
+
+async function providers() {
+  const command = args[1] || "list";
+  if (command !== "list") fail("Usage: aisevak providers [list] [--driver claude|codex|...]", "USAGE");
+  const result = await request("/api/agent-tools/v1/providers");
+  const driver = option("--driver");
+  if (driver) result.providers = result.providers.filter((provider) => provider.driver === driver);
+  return print(result);
 }
 
 async function agents() {
@@ -387,7 +397,14 @@ function commandHelp() { return {
   credentials: [
     "aisevak credentials list | get NAME | add NAME|--name NAME [--description D] --value-stdin"
   ],
-  skills: ["aisevak skills path | skills install DIRECTORY"]
+  skills: ["aisevak skills path | skills install DIRECTORY"],
+  providers: [
+    "aisevak providers [list] [--driver claude|codex|cursor|opencode|devin]",
+    "Lists every harness account (two Claude accounts show as two entries) with session (5h) and weekly",
+    "usage: usedPercent, remainingPercent, resetsAt. available=false means the account is at its limit and",
+    "no turn starts on it until limitedUntil. current=true is the account your own thread runs on;",
+    "agents lists the agents that run on each account. Readings are cached for about a minute."
+  ]
 }; }
 
 function help(topic) {
@@ -400,6 +417,7 @@ function help(topic) {
 function generalHelp() { console.log([
   "aisevak whoami | capabilities | show REF | content REF [--cursor CURSOR]",
   "aisevak agents list | agents show AGENT | agents status AGENT",
+  "aisevak providers [--driver D]   harness accounts with remaining 5h and weekly usage",
   "aisevak inbox [--thread THREAD] [--recent] [--limit N] [--wait SECONDS]",
   "aisevak send --to AGENT [--thread THREAD] [--key KEY] [--expect-reply [--timeout SECONDS]] --body-stdin",
   "aisevak reply MESSAGE --body-stdin | wait MESSAGE [--timeout SECONDS]",

@@ -80,6 +80,8 @@ describe("dispatcher message delivery", () => {
     let picked = false;
     const query = async (sql: string) => {
       if (["BEGIN", "COMMIT", "ROLLBACK"].includes(sql)) return { rows: [] };
+      // Accounts held at their usage limit are read before the claim.
+      if (sql.includes("FROM provider_account_limits")) return { rows: [] };
       if (sql.includes("SELECT candidate.id") && sql.includes("FROM dispatcher_runs candidate")) {
         expect(sql).toContain("delivery.status IN ('queued', 'retrying')");
         return { rows: [] };

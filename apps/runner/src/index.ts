@@ -57,6 +57,7 @@ import { materializeHarnessAuth, runHarnessTurn } from "./harnessRuntime.js";
 import { createBackgroundCycleRecorder } from "./backgroundCycles.js";
 import { lastSessionCost } from "./sessionCost.js";
 import { launchClaudeAccount, settleClaudeAccount, type LaunchedClaudeAccount } from "./claudeAccounts.js";
+import { heldProviderAccounts, heldUntil, settleProviderAccount, UNSET_ACCOUNT_ID } from "./accountHolds.js";
 import {
   agentGithubEnvironment,
   authenticateGithubCli,
@@ -939,6 +940,15 @@ async function enqueueDueScheduleInTransaction(pool: DbPool, onClaim: (scheduleI
       ? nextScheduleRunAt(scheduledFor, schedule.interval_seconds)
       : scheduledFor;
 
+    // The agent's account is at its usage limit with no other account free:
+    // a tick now would only fail on the limit and wake the thread. Move it to
+    // the reset instead of skipping it, so it still runs once.
+    const accountHeldUntil = heldUntil(await heldProviderAccounts(pool, env.secretKey), [schedule.provider_instance_id]);
+    if (accountHeldUntil) {
+      await client.query("UPDATE schedules SET next_run_at = $2, updated_at = now() WHERE id = $1", [schedule.id, accountHeldUntil]);
+      return;
+    }
+
     const target = schedule.task_id
       ? await client.query<{
           id: string; number: number; title: string; agent_id: string; project_id: string | null;
@@ -1448,26 +1458,36 @@ export async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
   const lastRunAt = due.rows[0]?.last_run_at?.getTime() ?? 0;
   if (lastRunAt && Date.now() - lastRunAt < env.dispatcherHeartbeatMs) return;
 
+  // Tasks whose agent is held at its usage limit are not actionable: waking
+  // the dispatcher for them would only retry work that cannot run yet.
+  const held = await heldProviderAccounts(pool, env.secretKey);
   const actionable = await pool.query<{ count: string }>(
     `SELECT count(*)
      FROM tasks
+     LEFT JOIN agents task_agent ON task_agent.id = tasks.agent_id
      LEFT JOIN LATERAL (
        SELECT status FROM task_runs
        WHERE task_runs.task_id = tasks.id AND task_runs.run_kind = 'worker'
        ORDER BY created_at DESC
        LIMIT 1
      ) latest ON true
-     WHERE (latest.status = 'failed' AND tasks.status = 'open')
-        OR tasks.status IN ('needs_attention', 'blocked')
-        OR (
-          tasks.status = 'open'
-          AND COALESCE(latest.status::text, '') NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
-        )`
+     WHERE (
+         (latest.status = 'failed' AND tasks.status = 'open')
+         OR tasks.status IN ('needs_attention', 'blocked')
+         OR (
+           tasks.status = 'open'
+           AND COALESCE(latest.status::text, '') NOT IN ('queued', 'running', 'cancel_requested', 'succeeded')
+         )
+       )
+       AND (task_agent.id IS NULL OR NOT (COALESCE(task_agent.provider_instance_id, $1::text) = ANY($2::text[])))`,
+    [UNSET_ACCOUNT_ID, [...held.keys()]]
   );
   if (Number(actionable.rows[0]?.count ?? 0) === 0) return;
 
   const codexHome = managedCodexHome(env.managedRoot, "dispatcher-heartbeat");
   const dispatcher = await getDispatcherAgent(pool);
+  // The dispatcher's own account is held: a heartbeat would fail on the limit.
+  if (heldUntil(held, [dispatcher.provider_instance_id])) return;
   const context = await getDispatcherContext(pool);
   await mkdir(codexHome, { recursive: true });
   // No heartbeat is pending or running here, so none of these rollouts is open.
@@ -1515,9 +1535,12 @@ export async function enqueueDispatcherHeartbeat(pool: DbPool): Promise<void> {
 
 interface ClaimedRun {
   id: string;
+  started_at: Date;
 }
 
-async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
+// heldAccounts: accounts at their usage limit with no other account to take
+// the work (accountHolds.ts). Their runs stay queued until the reset.
+export async function claimDispatcherRun(pool: DbPool, heldAccounts: string[]): Promise<ClaimedRun | null> {
   return withTransaction(pool, async (client) => {
     const candidateResult = await client.query<{
       id: string;
@@ -1536,6 +1559,7 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
            candidate.agent_thread_id IS NULL
            OR (candidate.agent_thread_generation = candidate_thread.ownership_generation AND candidate_thread.archived_at IS NULL AND candidate_thread.cleanup_state IS DISTINCT FROM 'restoring')
          )
+         AND NOT (COALESCE(candidate_thread.provider_instance_id, candidate.provider_instance_id, $1::text) = ANY($2::text[]))
          AND (
            candidate.message_delivery_id IS NULL
            OR EXISTS (
@@ -1580,7 +1604,8 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
            )
          )
        ORDER BY candidate.queued_at ASC
-       LIMIT 1`
+       LIMIT 1`,
+      [UNSET_ACCOUNT_ID, heldAccounts]
     );
     const candidate = candidateResult.rows[0];
     if (!candidate) return null;
@@ -1636,19 +1661,19 @@ async function claimDispatcherRun(pool: DbPool): Promise<ClaimedRun | null> {
       [candidate.id]
     );
     if (!lockedCandidate.rows[0]) return null;
-    const claimed = await client.query<{ id: string }>(
+    const claimed = await client.query<ClaimedRun>(
       `UPDATE dispatcher_runs
        SET status = 'running', started_at = now(), updated_at = now(),
            runner_id = $2, lease_expires_at = now() + ($3::integer * interval '1 millisecond')
        WHERE id = $1 AND status = 'queued'
-       RETURNING id`,
+       RETURNING id, started_at`,
       [candidate.id, currentRunnerId(), RUN_LEASE_MS]
     );
     return claimed.rows[0] ?? null;
   });
 }
 
-async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
+export async function claimWorkerRun(pool: DbPool, heldAccounts: string[]): Promise<ClaimedRun | null> {
   return withTransaction(pool, async (client) => {
     const candidateResult = await client.query<{
       id: string;
@@ -1664,6 +1689,7 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
        JOIN tasks candidate_task ON candidate_task.id = candidate.task_id
        WHERE candidate.status = 'queued'
          AND candidate.run_kind = 'worker'
+         AND NOT (COALESCE(candidate_thread.provider_instance_id, $1::text) = ANY($2::text[]))
          AND (
            candidate.agent_thread_id IS NULL
            OR (candidate.agent_thread_generation = candidate_thread.ownership_generation AND candidate_thread.archived_at IS NULL AND candidate_thread.cleanup_state IS DISTINCT FROM 'restoring')
@@ -1701,7 +1727,8 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
            )
          )
        ORDER BY candidate.queued_at ASC
-       LIMIT 1`
+       LIMIT 1`,
+      [UNSET_ACCOUNT_ID, heldAccounts]
     );
     const candidate = candidateResult.rows[0];
     if (!candidate) return null;
@@ -1757,12 +1784,12 @@ async function claimWorkerRun(pool: DbPool): Promise<ClaimedRun | null> {
       [candidate.id]
     );
     if (!lockedCandidate.rows[0]) return null;
-    const claimed = await client.query<{ id: string }>(
+    const claimed = await client.query<ClaimedRun>(
       `UPDATE task_runs
        SET status = 'running', started_at = now(), updated_at = now(),
            runner_id = $2, lease_expires_at = now() + ($3::integer * interval '1 millisecond')
        WHERE id = $1 AND status = 'queued'
-       RETURNING id`,
+       RETURNING id, started_at`,
       [candidate.id, currentRunnerId(), RUN_LEASE_MS]
     );
     return claimed.rows[0] ?? null;
@@ -1773,7 +1800,7 @@ export async function processOneDispatcherRun(
   pool: DbPool,
   runTurn: typeof runCodexAppServerTurn = runCodexAppServerTurn
 ): Promise<boolean> {
-  const picked = await claimDispatcherRun(pool);
+  const picked = await claimDispatcherRun(pool, [...(await heldProviderAccounts(pool, env.secretKey)).keys()]);
   if (!picked) return false;
   const detail = await pool.query<DispatcherJob>(
     `SELECT dispatcher_runs.id,
@@ -2145,7 +2172,17 @@ export async function processOneDispatcherRun(
       if (!finalized.rows[0]) return true;
       const accountOutcome = claudeAccount
         ? await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey })
-        : { fallbackReady: false, earliestReset: null };
+        : {
+            fallbackReady: false,
+            earliestReset: (await settleProviderAccount(pool, {
+              driver: harnessDriver(job.provider_driver),
+              instanceId: job.provider_instance_id,
+              startedAt: picked.started_at ?? new Date(0),
+              status: finalStatus,
+              stdout,
+              stderr
+            })).limitedUntil
+          };
       if (job.message_delivery_id) {
         await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {
           retryOnFallbackAccount: accountOutcome.fallbackReady,
@@ -2198,7 +2235,7 @@ export async function dispatcherRunStillOwned(
 }
 
 export async function processOneRunJob(pool: DbPool): Promise<boolean> {
-  const picked = await claimWorkerRun(pool);
+  const picked = await claimWorkerRun(pool, [...(await heldProviderAccounts(pool, env.secretKey)).keys()]);
   if (!picked) return false;
   const detail = await pool.query<RunJob>(
     `SELECT task_runs.id,
@@ -2464,9 +2501,19 @@ export async function processOneRunJob(pool: DbPool): Promise<boolean> {
       });
       if (finalized) await failPendingAgentTurnInputs(pool, "worker", job.id, finalStatus);
       if (finalized && finalStatus === "succeeded" && job.agent_thread_id) await noteTurnForRefresh(pool, job.agent_thread_id);
-      // A worker turn has no retry path; recording the limit moves later runs.
+      // A worker turn has no retry path; recording the limit moves later runs
+      // to another account or holds them until the reset.
       if (finalized && claudeAccount) {
         await settleClaudeAccount(pool, claudeAccount, { status: finalStatus, stdout, stderr, secretKey: env.secretKey });
+      } else if (finalized) {
+        await settleProviderAccount(pool, {
+          driver: harnessDriver(job.provider_driver),
+          instanceId: job.provider_instance_id,
+          startedAt: picked.started_at ?? new Date(0),
+          status: finalStatus,
+          stdout,
+          stderr
+        });
       }
     } finally {
       releaseActiveRun();
@@ -3170,7 +3217,10 @@ export async function finishMessageDelivery(
   options: {
     /** Another Claude account is free: retry within seconds. */
     retryOnFallbackAccount?: boolean;
-    /** Every Claude account is limited: the soonest any of them resets. */
+    /**
+     * No account can take the turn: for Claude, the soonest reset across its
+     * accounts; for other harnesses, the reset recorded for this account.
+     */
     accountsResetAt?: Date | null;
   } = {}
 ): Promise<void> {
