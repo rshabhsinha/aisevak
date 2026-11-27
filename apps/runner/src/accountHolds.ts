@@ -69,6 +69,12 @@ export function heldUntil(held: Map<string, Date>, accountIds: Array<string | nu
 export interface ProviderAccountOutcome {
   /** Set when the turn failed on a usage limit: when the account may run again. */
   limitedUntil: Date | null;
+  /**
+   * The reset the provider reported, or null when it gave none and the hold
+   * is only a cooldown. A delivery waits for a reported reset; without one it
+   * keeps its own growing backoff, so a long limit does not use up its waits.
+   */
+  reportedReset: Date | null;
 }
 
 /**
@@ -90,7 +96,7 @@ export async function settleProviderAccount(
     now?: Date;
   }
 ): Promise<ProviderAccountOutcome> {
-  const none: ProviderAccountOutcome = { limitedUntil: null };
+  const none: ProviderAccountOutcome = { limitedUntil: null, reportedReset: null };
   if (input.driver === "claude") return none;
   const instanceId = input.instanceId || defaultProviderInstanceId(input.driver);
   const now = input.now ?? new Date();
@@ -105,10 +111,9 @@ export async function settleProviderAccount(
     if (input.status !== "failed") return none;
     const limit = parseUsageLimit(input.stderr, now);
     if (!limit) return none;
-    const reported =
-      (input.driver === "codex" ? codexRateLimitResetFromOutput(input.stdout, now) : null) ??
-      limit.resetAt ??
-      new Date(now.getTime() + UNKNOWN_RESET_COOLDOWN_MS);
+    const reportedReset =
+      (input.driver === "codex" ? codexRateLimitResetFromOutput(input.stdout, now) : null) ?? limit.resetAt;
+    const reported = reportedReset ?? new Date(now.getTime() + UNKNOWN_RESET_COOLDOWN_MS);
     const limitedUntil = new Date(Math.max(reported.getTime(), now.getTime() + MIN_LIMIT_MS));
     await pool.query(
       `INSERT INTO provider_account_limits (provider_instance_id, limited_until, limited_at, reason)
@@ -117,7 +122,7 @@ export async function settleProviderAccount(
        SET limited_until = EXCLUDED.limited_until, limited_at = now(), reason = EXCLUDED.reason`,
       [instanceId, limitedUntil, "usage limit reached"]
     );
-    return { limitedUntil };
+    return { limitedUntil, reportedReset };
   } catch (error) {
     console.warn(`Could not update harness account limits: ${error instanceof Error ? error.message : String(error)}`);
     return none;

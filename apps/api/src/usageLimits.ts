@@ -52,6 +52,13 @@ export interface AccountLimits {
   credits: { label: string; value: string }[];
   note: string | null;
   error: string | null;
+  /**
+   * Set only for a Claude reading taken from rate-limit headers: Anthropic's
+   * unified status (allowed, allowed_warning, rejected), or null when absent.
+   * Such a reading says nothing about extra usage, so only a rejected status
+   * shows the account is stopped.
+   */
+  unifiedStatus?: string | null;
 }
 
 const SESSION_MINUTES = 300;
@@ -288,7 +295,8 @@ async function claudeHeaderProbe(context: LimitsContext, credential: string, res
     source: "live",
     plan: "Claude subscription",
     windows,
-    note: status && status !== "allowed" ? `Anthropic reports this account as ${status.replace(/_/g, " ")}.` : null
+    note: status && status !== "allowed" ? `Anthropic reports this account as ${status.replace(/_/g, " ")}.` : null,
+    unifiedStatus: status
   };
 }
 

@@ -98,6 +98,7 @@ describe("settleProviderAccount", () => {
       driver: "codex", instanceId: null, startedAt: NOW, status: "failed", stdout, stderr: codexLimit, now: NOW
     });
     expect(outcome.limitedUntil).toEqual(LATER);
+    expect(outcome.reportedReset).toEqual(LATER);
     const insert = queries.find((query) => query.sql.includes("INSERT INTO provider_account_limits"));
     expect(insert?.params.slice(0, 2)).toEqual(["codex-local", LATER]);
   });
@@ -112,6 +113,9 @@ describe("settleProviderAccount", () => {
       driver: "codex", instanceId: "codex-work", startedAt: NOW, status: "failed", stdout: "", stderr: "Usage limit reached.", now: NOW
     });
     expect(passed.limitedUntil!.getTime()).toBeGreaterThanOrEqual(NOW.getTime() + MIN_LIMIT_MS);
+    // No reset reported: the account is held for a cooldown, but the delivery
+    // keeps its own backoff instead of waking at the cooldown.
+    expect(passed.reportedReset).toBeNull();
   });
 
   it("clears only a limit recorded before a successful run started", async () => {

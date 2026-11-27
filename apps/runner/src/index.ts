@@ -2181,7 +2181,7 @@ export async function processOneDispatcherRun(
               status: finalStatus,
               stdout,
               stderr
-            })).limitedUntil
+            })).reportedReset
           };
       if (job.message_delivery_id) {
         await finishMessageDelivery(pool, job, finalStatus, stderr, promptMayHaveBeenPresented, {

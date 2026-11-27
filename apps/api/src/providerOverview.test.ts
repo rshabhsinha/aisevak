@@ -58,6 +58,10 @@ describe("recordExhaustedAccounts", () => {
       reading({ source: "snapshot" }),
       reading({ windows: reading().windows.map((window) => ({ ...window, usedPercent: 99 })) }),
       reading({ windows: [{ ...reading().windows[0]!, resetsAt: "2026-11-27T11:00:00.000Z" }] }),
+      // Header readings cannot see extra usage: only a rejected status counts.
+      reading({ unifiedStatus: "allowed" }),
+      reading({ unifiedStatus: "allowed_warning" }),
+      reading({ unifiedStatus: null }),
       // A per-model weekly limit does not stop the account.
       reading({
         windows: [],
@@ -65,6 +69,12 @@ describe("recordExhaustedAccounts", () => {
       })
     ], NOW);
     expect(inserts).toEqual([]);
+  });
+
+  it("trusts a header reading that Anthropic reports as rejected", async () => {
+    const { pool, inserts } = recordingPool();
+    await recordExhaustedAccounts(pool, [reading({ unifiedStatus: "rejected" })], NOW);
+    expect(inserts).toEqual([["claude-local", new Date(RESET)]]);
   });
 });
 

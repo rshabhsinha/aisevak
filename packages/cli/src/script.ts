@@ -120,7 +120,7 @@ function readSkillDirectory(directory) {
 }
 
 async function providers() {
-  const command = args[1] || "list";
+  const command = args[1] && !args[1].startsWith("--") ? args[1] : "list";
   if (command !== "list") fail("Usage: aisevak providers [list] [--driver claude|codex|...]", "USAGE");
   const result = await request("/api/agent-tools/v1/providers");
   const driver = option("--driver");
@@ -409,7 +409,8 @@ function commandHelp() { return {
 
 function help(topic) {
   const all = commandHelp();
-  const key = [topic, topic + "s"].find((name) => topic && Object.prototype.hasOwnProperty.call(all, name));
+  const aliases = { usage: "providers", limits: "providers" };
+  const key = [aliases[topic], topic, topic + "s"].find((name) => name && Object.prototype.hasOwnProperty.call(all, name));
   if (key) return console.log(all[key].concat(["", "Markdown flags accept stdin (--body-stdin) or an inline value (--body TEXT)."]).join("\\n"));
   return generalHelp();
 }

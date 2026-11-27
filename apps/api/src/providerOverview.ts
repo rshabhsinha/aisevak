@@ -143,6 +143,9 @@ async function callerAccount(pool: DbPool, agentThreadId: string | null, agentId
 export async function recordExhaustedAccounts(pool: Pick<DbPool, "query">, limits: AccountLimits[], now: Date = new Date()): Promise<void> {
   for (const limit of limits) {
     if (limit.source !== "live" || limit.credits.length) continue;
+    // A header reading cannot see extra usage: trust it only when Anthropic
+    // itself reports the account as stopped.
+    if (limit.unifiedStatus !== undefined && limit.unifiedStatus !== "rejected") continue;
     let resetAt: number | null = null;
     for (const window of limit.windows) {
       if ((window.kind !== "session" && window.kind !== "weekly") || window.usedPercent < 100 || !window.resetsAt) continue;

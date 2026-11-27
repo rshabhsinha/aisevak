@@ -81,10 +81,14 @@ describe("embedded aisevak CLI", () => {
       expect(all.providers.map((provider: { accountId: string }) => provider.accountId)).toEqual(["claude-local", "claude-second", "codex-local"]);
       const claude = JSON.parse((await run("providers", "list", "--driver", "claude")).stdout);
       expect(claude.providers).toHaveLength(2);
-      expect(paths).toEqual(["/api/agent-tools/v1/providers", "/api/agent-tools/v1/providers"]);
+      // The form the general help shows, without "list".
+      const codex = JSON.parse((await run("providers", "--driver", "codex")).stdout);
+      expect(codex.providers.map((provider: { accountId: string }) => provider.accountId)).toEqual(["codex-local"]);
+      expect(paths).toEqual(Array(3).fill("/api/agent-tools/v1/providers"));
       expect((await run("providers", "--help")).stdout).toContain("remainingPercent");
+      expect((await run("usage", "--help")).stdout).toContain("remainingPercent");
       expect((await run("--help")).stdout).toContain("aisevak providers");
-      expect(paths).toHaveLength(2);
+      expect(paths).toHaveLength(3);
     } finally {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     }
