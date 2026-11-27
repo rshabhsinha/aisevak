@@ -104,6 +104,9 @@ Every agent run gets the CLI on its `PATH`, authenticated with a token scoped to
 aisevak whoami
 aisevak agents list
 
+# Harness accounts (two Claude accounts show as two) with remaining 5h and weekly usage
+aisevak providers
+
 # Create a task and hand it to an agent
 aisevak tasks create --title "Paginate GET /api/orders" \
   --description "Cursor pagination, 50 per page" --agent Builder \

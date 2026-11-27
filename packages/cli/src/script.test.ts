@@ -52,6 +52,48 @@ describe("embedded aisevak CLI", () => {
     }
   });
 
+  it("lists harness accounts with their usage and filters by harness", async () => {
+    const paths: string[] = [];
+    const server = createServer((request, response) => {
+      paths.push(String(request.url));
+      response.setHeader("content-type", "application/json");
+      response.end(JSON.stringify({
+        currentAccountId: "claude-second",
+        providers: [
+          { accountId: "claude-local", driver: "claude", session: { remainingPercent: 0 }, weekly: { remainingPercent: 38 } },
+          { accountId: "claude-second", driver: "claude", session: { remainingPercent: 80 }, weekly: { remainingPercent: 90 } },
+          { accountId: "codex-local", driver: "codex", session: null, weekly: null }
+        ]
+      }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("Test server did not bind to a port");
+    const directory = await mkdtemp(join(tmpdir(), "aisevak-cli-test-"));
+    cleanup.push(directory);
+    const cliPath = join(directory, "aisevak");
+    await writeFile(cliPath, agentToolScript(), { mode: 0o700 });
+    const run = (...cliArgs: string[]) => execFileAsync(process.execPath, [cliPath, ...cliArgs], {
+      env: { ...process.env, AISEVAK_API_URL: `http://127.0.0.1:${address.port}`, AISEVAK_AGENT_TOKEN: "test-token" }
+    });
+    try {
+      const all = JSON.parse((await run("providers")).stdout);
+      expect(all.providers.map((provider: { accountId: string }) => provider.accountId)).toEqual(["claude-local", "claude-second", "codex-local"]);
+      const claude = JSON.parse((await run("providers", "list", "--driver", "claude")).stdout);
+      expect(claude.providers).toHaveLength(2);
+      // The form the general help shows, without "list".
+      const codex = JSON.parse((await run("providers", "--driver", "codex")).stdout);
+      expect(codex.providers.map((provider: { accountId: string }) => provider.accountId)).toEqual(["codex-local"]);
+      expect(paths).toEqual(Array(3).fill("/api/agent-tools/v1/providers"));
+      expect((await run("providers", "--help")).stdout).toContain("remainingPercent");
+      expect((await run("usage", "--help")).stdout).toContain("remainingPercent");
+      expect((await run("--help")).stdout).toContain("aisevak providers");
+      expect(paths).toHaveLength(3);
+    } finally {
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    }
+  });
+
   it("does not advertise an empty POST body as JSON", async () => {
     let contentType: string | undefined;
     const server = createServer((request, response) => {

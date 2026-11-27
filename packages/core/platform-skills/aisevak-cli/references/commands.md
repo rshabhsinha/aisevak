@@ -17,6 +17,21 @@ aisevak skills install DIRECTORY
 `skills path` returns the isolated skill view resolved for the current thread. Do not modify that regenerated view.
 `skills install` publishes a separate local skill directory through the authenticated API for discovery by the Skills tab. It requires `skills:write`, which the Orchestrator has by default.
 
+## Harness accounts and usage limits
+
+```text
+aisevak providers [--driver claude|codex|cursor|opencode|devin]
+```
+
+Lists every harness account, including several accounts of one harness (for example two Claude accounts), with:
+
+- `session` and `weekly`: `usedPercent`, `remainingPercent`, `resetsAt` (ISO time) and `windowMinutes`, or `null` when the provider reports no such window. `otherWindows` holds monthly and per-model limits.
+- `available`: `false` while the account is at its usage limit. The runner starts no turn on it until `limitedUntil`; work for it waits and resumes on its own. A Claude account's work moves to another Claude account that is still available.
+- `current`: the account your own thread runs on. `agents`: the agents that run on that account.
+- `source`: `live` (fetched now), `snapshot` (last reading a run reported, see `checkedAt`) or `unavailable` (see `note`).
+
+Readings are cached for about a minute; do not poll it in a loop.
+
 ## Generic resources
 
 ```text

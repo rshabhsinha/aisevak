@@ -81,6 +81,7 @@ import { OpenCodeAuthManager, scratchHomeEnv } from "./openCodeAuth.js";
 import { runHarnessCommand } from "./harnessCommand.js";
 import { loadUsageAnalytics } from "./usageAnalytics.js";
 import { forgetAccountLimits, loadAccountLimits } from "./usageLimits.js";
+import { loadProviderOverview, recordExhaustedAccounts } from "./providerOverview.js";
 import {
   cancelPendingAssignmentDelivery,
   cancelStaleQueuedAgentThreadRuns,
@@ -506,8 +507,9 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
         agents: row.agents,
         threads: row.threads,
         removable: !isDefaultProviderInstance(row.id) && row.agents === 0 && row.all_threads === 0,
-        // Set while the account is at its usage limit and Claude runs fall back
-        // to the next account (apps/runner/src/claudeAccounts.ts).
+        // Set while the account is at its usage limit: Claude runs fall back to
+        // the next account, and work no account can take waits for the reset
+        // (apps/runner/src/accountHolds.ts).
         limitedUntil: row.limited_until
       }))
     };
@@ -590,9 +592,11 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
        ORDER BY created_at ASC, id ASC`,
       [PROVIDER_DRIVERS]
     );
-    return { limits: await loadAccountLimits(pool, env.secretKey, accounts.rows, {
+    const limits = await loadAccountLimits(pool, env.secretKey, accounts.rows, {
       refresh: query.refresh === "1" ? true : query.refresh && query.refresh !== "0" ? [query.refresh] : false
-    }) };
+    });
+    await recordExhaustedAccounts(pool, limits);
+    return { limits };
   });
 
   app.get("/api/usage/analytics", async (request) => {
@@ -2222,6 +2226,13 @@ export async function buildServer(pool: DbPool): Promise<FastifyInstance> {
   });
 
   await registerCoordinationRoutes(app, pool, { managedRoot: env.managedRoot });
+
+  // Every harness account with its remaining 5-hour and weekly usage, so an
+  // agent can plan work around provider limits (`aisevak providers`).
+  app.get("/api/agent-tools/v1/providers", async (request) => {
+    const context = await requireAgent(pool, request);
+    return loadProviderOverview(pool, env.secretKey, { agentThreadId: context.agentThreadId, agentId: context.agentId });
+  });
   return app;
 }
 
